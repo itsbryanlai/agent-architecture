@@ -1,0 +1,67 @@
+# Notion connector manifest.
+#
+# risk: read | write_reversible | write_irreversible. Writes always need the
+#   requester's approval before they run.
+# requester_scoped: the input field that names the person. The runtime fills it
+#   in from the requester's Slack identity and removes it from the schema the
+#   LLM sees, so the LLM can never choose whose records are read.
+# idempotency: how a retried write avoids creating a duplicate. marker_property
+#   means the item carries a hidden text property holding the idempotency key,
+#   and the connector queries for it before creating.
+# offer_to_llm: false keeps a tool for runtime use only.
+connector: notion
+tools:
+  search_items:
+    risk: read
+    description: >-
+      Search the granted Notion databases for items whose title contains the
+      query. Returns title, status and link for each match.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Words to look for in item titles.
+      required: [query]
+
+  my_items:
+    risk: read
+    requester_scoped: requester_email
+    description: >-
+      List the items the person asking has requested, with title, status and
+      link. Use this for questions like "my open requests".
+    input_schema:
+      type: object
+      properties:
+        requester_email:
+          type: string
+          description: Email of the person whose items to list.
+      required: [requester_email]
+
+  create_item:
+    risk: write_irreversible
+    idempotency: marker_property
+    description: >-
+      Draft a new item in the request database. Nothing is created until the
+      requester approves the draft in Slack.
+    input_schema:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Short title for the request.
+        details:
+          type: string
+          description: What is needed and any useful context.
+      required: [title, details]
+
+  get_item:
+    risk: read
+    offer_to_llm: false
+    description: Read one item's title, status and link.
+    input_schema:
+      type: object
+      properties:
+        page_id:
+          type: string
+      required: [page_id]

@@ -1,0 +1,20 @@
+# Local dependencies for the walking skeleton: Postgres (chat history,
+# idempotency records, task links) and a Temporal dev server.
+services:
+  postgres:
+    image: postgres:16.15
+    environment:
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: agentos
+      POSTGRES_DB: agentos
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+
+  temporal:
+    image: temporalio/temporal:1.9.1
+    command: ["server", "start-dev", "--ip", "0.0.0.0"]
+    ports:
+      - "7233:7233"
+      - "8233:8233"

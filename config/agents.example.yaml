@@ -1,0 +1,29 @@
+tenant_id: acme
+slack_team_id: T00000000
+agents:
+  it-helper:
+    version: 1
+    name: IT helper
+    system_prompt: |
+      You help employees with IT requests. Answer from the IT requests database and cite page links.
+      When someone wants something done, use create_item; it will ask them to approve.
+    max_steps: 6
+    grants:
+      notion:
+        databases:
+          - id: "00000000000000000000000000000000"
+            name: IT requests
+            properties:
+              title: Name
+              status: Status
+              done_values: [Done]
+              requested_by: Requested by
+              request_id: Agent request ID
+    follow_up:
+      poll_interval_minutes: 15
+      stale_after_days: 3
+      max_watch_days: 30
+    approval:
+      expires_after_hours: 72
+      reminder_after_hours: 24
+default_agent: it-helper

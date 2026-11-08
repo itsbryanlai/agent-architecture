@@ -1,0 +1,212 @@
+"""Settings from the environment and agent definitions from YAML.
+
+Secrets come only from environment variables that the operator exports in their
+own shell. Nothing here writes, prints or logs a secret, and nothing fails at
+import time when one is unset: a missing secret only becomes an error when the
+real client that needs it is constructed (see ``Settings.require``).
+
+This module is the only place that reads environment variables.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
+DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:5432/agentos"
+DEFAULT_CONFIG_PATH = "config/agents.yaml"
+
+TASK_QUEUE = "agentos-main"
+
+
+class ConfigError(ValueError):
+    """The agents file is malformed or incomplete."""
+
+
+@dataclass(frozen=True)
+class Settings:
+    # Secret values are excluded from repr so that logging a Settings object
+    # can never leak them.
+    slack_bot_token: str | None = field(default=None, repr=False)
+    slack_signing_secret: str | None = field(default=None, repr=False)
+    notion_token: str | None = field(default=None, repr=False)
+    anthropic_api_key: str | None = field(default=None, repr=False)
+    model: str = DEFAULT_MODEL
+    temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
+    database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
+    config_path: str = DEFAULT_CONFIG_PATH
+
+    def require(self, name: str) -> str:
+        """Return a secret setting, or fail with a message naming the variable.
+
+        The message names the environment variable only, never a value.
+        """
+        value = getattr(self, name)
+        if not value:
+            raise RuntimeError(
+                f"{name.upper()} is not set. Export it in the shell that runs this process."
+            )
+        return value
+
+
+def load_settings() -> Settings:
+    env = os.environ
+    return Settings(
+        slack_bot_token=env.get("SLACK_BOT_TOKEN"),
+        slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
+        notion_token=env.get("NOTION_TOKEN"),
+        anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
+        model=env.get("AGENTOS_MODEL") or DEFAULT_MODEL,
+        temporal_address=env.get("TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
+        database_url=env.get("DATABASE_URL") or DEFAULT_DATABASE_URL,
+        config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
+    )
+
+
+# The dataclasses below travel through Temporal (``load_agent`` returns an
+# AgentVersion), so they hold only primitives, lists and nested dataclasses.
+
+
+@dataclass
+class NotionDatabaseGrant:
+    """One Notion database the agent may use, with its property mapping.
+
+    Property names differ per database, so the creator maps them when granting
+    the database. ``request_id_prop`` is the hidden text property that holds the
+    idempotency key of items the agent creates.
+    """
+
+    id: str
+    name: str
+    title_prop: str
+    status_prop: str
+    done_values: list[str]
+    requested_by_prop: str
+    request_id_prop: str
+
+
+@dataclass
+class Grants:
+    notion_databases: list[NotionDatabaseGrant] = field(default_factory=list)
+
+
+@dataclass
+class FollowUpPolicy:
+    poll_interval_minutes: int = 15
+    stale_after_days: int = 3
+    max_watch_days: int = 30
+
+
+@dataclass
+class ApprovalPolicy:
+    expires_after_hours: int = 72
+    reminder_after_hours: int = 24
+
+
+@dataclass
+class AgentVersion:
+    agent_id: str
+    version: int
+    name: str
+    system_prompt: str
+    max_steps: int
+    grants: Grants
+    follow_up: FollowUpPolicy
+    approval: ApprovalPolicy
+
+
+@dataclass
+class AgentsConfig:
+    tenant_id: str
+    slack_team_id: str
+    agents: dict[str, AgentVersion]
+    default_agent: str
+
+
+_PROPERTY_FIELDS = {
+    "title": "title_prop",
+    "status": "status_prop",
+    "done_values": "done_values",
+    "requested_by": "requested_by_prop",
+    "request_id": "request_id_prop",
+}
+
+
+def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
+    if not isinstance(mapping, dict) or key not in mapping or mapping[key] in (None, ""):
+        raise ConfigError(f"{where}: missing required field '{key}'")
+    return mapping[key]
+
+
+def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseGrant:
+    where = f"agent '{agent_id}' notion database grant"
+    db_id = str(_require(raw, "id", where))
+    name = str(_require(raw, "name", where))
+    props = raw.get("properties")
+    if not isinstance(props, dict):
+        raise ConfigError(f"agent '{agent_id}' grant '{name}': missing required field 'properties'")
+    values: dict[str, Any] = {}
+    for key, attr in _PROPERTY_FIELDS.items():
+        if key not in props or props[key] in (None, "", []):
+            raise ConfigError(
+                f"agent '{agent_id}' grant '{name}': missing property mapping 'properties.{key}'"
+            )
+        values[attr] = props[key]
+    done_values = values["done_values"]
+    if not isinstance(done_values, list):
+        done_values = [done_values]
+    return NotionDatabaseGrant(
+        id=db_id,
+        name=name,
+        title_prop=str(values["title_prop"]),
+        status_prop=str(values["status_prop"]),
+        done_values=[str(v) for v in done_values],
+        requested_by_prop=str(values["requested_by_prop"]),
+        request_id_prop=str(values["request_id_prop"]),
+    )
+
+
+def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
+    where = f"agent '{agent_id}'"
+    grants_raw = raw.get("grants") or {}
+    notion_raw = (grants_raw.get("notion") or {}).get("databases") or []
+    databases = [_parse_database_grant(agent_id, db) for db in notion_raw]
+    follow = raw.get("follow_up") or {}
+    approval = raw.get("approval") or {}
+    return AgentVersion(
+        agent_id=agent_id,
+        version=int(_require(raw, "version", where)),
+        name=str(_require(raw, "name", where)),
+        system_prompt=str(_require(raw, "system_prompt", where)),
+        max_steps=int(_require(raw, "max_steps", where)),
+        grants=Grants(notion_databases=databases),
+        follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
+        approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
+    )
+
+
+def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("agents config: expected a mapping at the top level")
+    agents_raw = _require(raw, "agents", "agents config")
+    agents = {aid: _parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
+    default_agent = str(_require(raw, "default_agent", "agents config"))
+    if default_agent not in agents:
+        raise ConfigError(f"agents config: default_agent '{default_agent}' is not defined")
+    return AgentsConfig(
+        tenant_id=str(_require(raw, "tenant_id", "agents config")),
+        slack_team_id=str(_require(raw, "slack_team_id", "agents config")),
+        agents=agents,
+        default_agent=default_agent,
+    )
+
+
+def load_agents_config(path: str | Path) -> AgentsConfig:
+    with open(path, encoding="utf-8") as fh:
+        return parse_agents_config(yaml.safe_load(fh))

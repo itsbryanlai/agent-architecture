@@ -18,15 +18,31 @@ from typing import Any
 import yaml
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:5432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
 
 TASK_QUEUE = "agentos-main"
 
+# Which model provider the worker uses. Anthropic is the default; Qwen is a
+# second provider selectable for testing.
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_QWEN = "qwen"
+LLM_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_QWEN)
+DEFAULT_LLM_PROVIDER = PROVIDER_ANTHROPIC
+# Model used when AGENTOS_MODEL is unset, per provider.
+DEFAULT_MODELS = {PROVIDER_ANTHROPIC: DEFAULT_MODEL, PROVIDER_QWEN: DEFAULT_QWEN_MODEL}
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
 
 class ConfigError(ValueError):
-    """The agents file is malformed or incomplete."""
+    """The agents file or a setting is malformed or incomplete."""
+
+
+# Settings whose environment variable is not simply the field name upper-cased.
+_ENV_NAMES = {"qwen_base_url": "RESEARCH_QWEN_BASE_URL"}
 
 
 @dataclass(frozen=True)
@@ -37,32 +53,58 @@ class Settings:
     slack_signing_secret: str | None = field(default=None, repr=False)
     notion_token: str | None = field(default=None, repr=False)
     anthropic_api_key: str | None = field(default=None, repr=False)
+    qwen_api_key: str | None = field(default=None, repr=False)
+    llm_provider: str = DEFAULT_LLM_PROVIDER
     model: str = DEFAULT_MODEL
+    # The OpenAI-compatible endpoint that serves Qwen; not a secret.
+    qwen_base_url: str | None = None
+    # Qwen thinking is off by default: thinking output counts toward the
+    # response token limit and makes each turn slower.
+    qwen_thinking: bool = False
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
 
     def require(self, name: str) -> str:
-        """Return a secret setting, or fail with a message naming the variable.
+        """Return a required setting, or fail with a message naming the variable.
 
         The message names the environment variable only, never a value.
         """
         value = getattr(self, name)
         if not value:
+            env_name = _ENV_NAMES.get(name, name.upper())
             raise RuntimeError(
-                f"{name.upper()} is not set. Export it in the shell that runs this process."
+                f"{env_name} is not set. Export it in the shell that runs this process."
             )
         return value
 
 
+def _parse_provider(raw: str | None) -> str:
+    provider = (raw or DEFAULT_LLM_PROVIDER).strip().lower()
+    if provider not in LLM_PROVIDERS:
+        raise ConfigError(
+            f"AGENTOS_LLM_PROVIDER must be one of {', '.join(LLM_PROVIDERS)}; got {raw!r}"
+        )
+    return provider
+
+
+def _parse_flag(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in _TRUE_VALUES
+
+
 def load_settings() -> Settings:
     env = os.environ
+    provider = _parse_provider(env.get("AGENTOS_LLM_PROVIDER"))
     return Settings(
         slack_bot_token=env.get("SLACK_BOT_TOKEN"),
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token=env.get("NOTION_TOKEN"),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
-        model=env.get("AGENTOS_MODEL") or DEFAULT_MODEL,
+        qwen_api_key=env.get("QWEN_API_KEY"),
+        llm_provider=provider,
+        model=env.get("AGENTOS_MODEL") or DEFAULT_MODELS[provider],
+        qwen_base_url=env.get("RESEARCH_QWEN_BASE_URL") or None,
+        qwen_thinking=_parse_flag(env.get("AGENTOS_QWEN_THINKING")),
         temporal_address=env.get("TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,

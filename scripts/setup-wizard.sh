@@ -230,6 +230,14 @@ cat <<'EXPORTS'
     export ANTHROPIC_API_KEY='<paste here>'
 EXPORTS
 printf '\n'
+note "To test with Qwen instead of Claude, also export these (ANTHROPIC_API_KEY"
+note "is then not needed):"
+cat <<'QWEN'
+    export AGENTOS_LLM_PROVIDER=qwen
+    export RESEARCH_QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
+    export QWEN_API_KEY='<paste here>'
+QWEN
+printf '\n'
 say "Then run, each in its own terminal:"
 step "uv run python -m agentos.worker"
 step "uv run uvicorn agentos.gateway.app:app --port 8000"

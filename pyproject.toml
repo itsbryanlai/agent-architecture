@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.162.2",
     "httpx>=0.28.1",
     "notion-client>=3.1.0",
+    "openai>=3.46.0",
     "psycopg[binary,pool]>=3.3.8",
     "pyyaml>=6.0.3",
     "slack-sdk>=3.46.0",

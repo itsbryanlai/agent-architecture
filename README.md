@@ -55,10 +55,38 @@ export ANTHROPIC_API_KEY='<paste here>'
 
 Secrets are read only from the environment. Don't put them in a file.
 
-Optional settings: `AGENTOS_MODEL` (default `claude-sonnet-5-5`),
+Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
+below),
 `TEMPORAL_ADDRESS` (default `localhost:7233`), `DATABASE_URL` (default
 `postgresql://agentos:agentos@localhost:5432/agentos`, matching Compose) and
 `AGENTOS_CONFIG` (default `config/agents.yaml`).
+
+## Model provider
+
+The worker talks to Claude by default. For testing, it can use Qwen instead,
+through Qwen's OpenAI-compatible Chat Completions endpoint. The provider is
+chosen once, when the worker starts. Chat history is stored in the same format
+whichever provider is in use.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTOS_LLM_PROVIDER` | `anthropic` | `anthropic` or `qwen` |
+| `QWEN_API_KEY` | none | Qwen API key (secret; export it, never save it). Needed only for `qwen` |
+| `RESEARCH_QWEN_BASE_URL` | none | Qwen's OpenAI-compatible base URL. Needed only for `qwen` |
+| `AGENTOS_QWEN_THINKING` | `false` | `true`, `1`, `yes` or `on` turns Qwen thinking on |
+
+`AGENTOS_MODEL` defaults to `claude-sonnet-5-5` for `anthropic` and
+`qwen3.7-plus` for `qwen`. With `qwen`, `ANTHROPIC_API_KEY` is not needed.
+
+Qwen thinking is off unless `AGENTOS_QWEN_THINKING=true`: thinking output
+counts toward the per-reply token limit (3072 tokens for both providers) and
+makes replies slower.
+
+```bash
+export AGENTOS_LLM_PROVIDER=qwen
+export RESEARCH_QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
+export QWEN_API_KEY='<paste here>'
+```
 
 ## Run
 

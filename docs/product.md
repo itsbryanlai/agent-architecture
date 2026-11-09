@@ -38,7 +38,7 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 ## Core journeys (v1)
 
 1. **First contact.** The employee DMs the front-door assistant or @mentions an agent in a channel where it's deployed. There's no setup: the agent already has the access its creator granted.
-2. **Ask.** The agent answers from the sources it was granted and cites each one. Questions about the employee's own records ("my open requests", "my PTO balance") are answered privately. The platform fills in who is asking, so the agent can only look up the asker's own records.
+2. **Ask.** The agent answers from the sources it was granted and cites each one. Questions about the employee's own records ("my open requests", "my PTO balance") are answered where they are asked. The platform fills in who is asking, so "my" always means the asker. Answering in a channel is safe because the creator has confirmed that the channel's members may see what the agent can reach.
 3. **Act.** The agent drafts the action (for example "Add to IT requests in Notion: laptop battery swelling, priority high") and shows it as a Slack card with *Submit*, *Edit*, and *Cancel*. Only the requesting user can approve it. The action runs exactly once.
 4. **Follow up.** The agent keeps watching the request. Days later it posts in the same thread: "Your request was marked Done. Anything else?" Or: "No movement in 3 days. Want me to nudge the assignee?"
 5. **Route.** The front-door assistant answers general questions itself and hands specialist ones to the right agent, saying which agent took over.

@@ -194,7 +194,7 @@ Creators can make a policy stricter but never looser than the admin's ceiling.
 ### Requester-scoped data (D-17)
 Some questions are about the requester's own records ("my open requests", "my PTO balance"). With an agent-level credential the agent can technically read *everyone's* records, so the runtime must not rely on the LLM to filter by person.
 
-- **Pinned arguments (default).** Tools marked `requester_scoped` in the manifest have their person field (such as "Requested by" or employee ID) filled in by the runtime from the requester's Slack identity. The field is removed from the schema the LLM sees, so the LLM can't set it. Results go to the requester privately (DM or ephemeral message).
+- **Pinned arguments (default).** Tools marked `requester_scoped` in the manifest have their person field (such as "Requested by" or employee ID) filled in by the runtime from the requester's Slack identity. The field is removed from the schema the LLM sees, so the LLM can't set it. Results are answered in the conversation where they were asked. The audience rule (D-07) already covers who can see them: everyone in a channel the agent serves may see what the agent can reach. Pinning is about correctness ("my" is always the asker), not confidentiality.
 - **Identity mapping.** The runtime maps the Slack user to the target system's user by verified email, and the result is cached per tenant. If there's no match, the tool returns `unknown_requester` instead of guessing.
 - **User delegation (exception).** Only for systems whose API can't filter by person: those tools use the requester's own OAuth token (a *Connect* button) and answer only in a DM.
 

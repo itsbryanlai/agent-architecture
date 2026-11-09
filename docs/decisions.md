@@ -22,7 +22,7 @@ Last reviewed 2026-11-08.
 | D-14 | Python on the Temporal Python SDK; Postgres with row-level security; pgvector for v1 | Decided |
 | D-15 | Connectors are defined by a manifest (risk class, idempotency, attribution, watch, indexing) on top of MCP or OpenAPI. Two tiers: certified (by us, exactly-once guaranteed) and custom (by tenant admins, conservative defaults) | Proposed |
 | D-16 | Connector self-repair (roadmap): connector failures go into a Temporal remediation workflow (one per failure signature) with a circuit breaker; a sandboxed coding agent proposes fixes; humans approve deploys; failed writes are never replayed automatically | Proposed |
-| D-17 | Requester-scoped tools: the runtime fills in the requester's identity (the LLM can't set it) and replies privately. The requester's own account is used only for systems whose API can't filter by person | Decided |
+| D-17 | Requester-scoped tools: the runtime fills in the requester's identity (the LLM can't set it) and answers where the question was asked, since the audience rule (D-07) covers visibility. The requester's own account is used only for systems whose API can't filter by person, and those answers go only to a DM | Decided |
 
 ## Context for the main decisions
 
@@ -47,7 +47,8 @@ Last reviewed 2026-11-08.
 
 ### D-17 Requester-scoped data
 - **Why:** an agent-level credential can read everyone's records, and the LLM can't be trusted to filter by person. The runtime pins the person field instead and removes it from what the LLM sees.
-- **Alternative kept as an exception:** the requester's own account (OAuth), for systems whose API can't filter by person.
+- **Alternative kept as an exception:** the requester's own account (OAuth), for systems whose API can't filter by person. That account can reach beyond the agent's grants, so those answers go only to a DM.
+- **Where answers go:** in the conversation where the question was asked. Everyone the agent serves may already see what it can reach (D-07), so a private reply would add nothing. Rejected: always answering requester-scoped questions privately.
 
 ### D-10 Separate task workflows
 - **Why:** work outlives the conversation. Keeping tasks separate gives each one its own lifecycle, its own audit trail, and an ID that approvals and webhooks can target. It also keeps conversation workflows short.

@@ -41,10 +41,6 @@ class ConfigError(ValueError):
     """The agents file or a setting is malformed or incomplete."""
 
 
-# Settings whose environment variable is not simply the field name upper-cased.
-_ENV_NAMES = {"qwen_base_url": "RESEARCH_QWEN_BASE_URL"}
-
-
 @dataclass(frozen=True)
 class Settings:
     # Secret values are excluded from repr so that logging a Settings object
@@ -72,7 +68,7 @@ class Settings:
         """
         value = getattr(self, name)
         if not value:
-            env_name = _ENV_NAMES.get(name, name.upper())
+            env_name = name.upper()
             raise RuntimeError(
                 f"{env_name} is not set. Export it in the shell that runs this process."
             )
@@ -103,7 +99,7 @@ def load_settings() -> Settings:
         qwen_api_key=env.get("QWEN_API_KEY"),
         llm_provider=provider,
         model=env.get("AGENTOS_MODEL") or DEFAULT_MODELS[provider],
-        qwen_base_url=env.get("RESEARCH_QWEN_BASE_URL") or None,
+        qwen_base_url=env.get("QWEN_BASE_URL") or None,
         qwen_thinking=_parse_flag(env.get("AGENTOS_QWEN_THINKING")),
         temporal_address=env.get("TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("DATABASE_URL") or DEFAULT_DATABASE_URL,

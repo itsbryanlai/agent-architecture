@@ -72,7 +72,7 @@ whichever provider is in use.
 |---|---|---|
 | `AGENTOS_LLM_PROVIDER` | `anthropic` | `anthropic` or `qwen` |
 | `QWEN_API_KEY` | none | Qwen API key (secret; export it, never save it). Needed only for `qwen` |
-| `RESEARCH_QWEN_BASE_URL` | none | Qwen's OpenAI-compatible base URL. Needed only for `qwen` |
+| `QWEN_BASE_URL` | none | Qwen's OpenAI-compatible base URL. Needed only for `qwen` |
 | `AGENTOS_QWEN_THINKING` | `false` | `true`, `1`, `yes` or `on` turns Qwen thinking on |
 
 `AGENTOS_MODEL` defaults to `claude-sonnet-5-5` for `anthropic` and
@@ -84,7 +84,7 @@ makes replies slower.
 
 ```bash
 export AGENTOS_LLM_PROVIDER=qwen
-export RESEARCH_QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
+export QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
 export QWEN_API_KEY='<paste here>'
 ```
 

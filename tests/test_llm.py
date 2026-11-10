@@ -22,7 +22,7 @@ PROVIDER_VARS = (
     "AGENTOS_LLM_PROVIDER",
     "AGENTOS_MODEL",
     "AGENTOS_QWEN_THINKING",
-    "RESEARCH_QWEN_BASE_URL",
+    "QWEN_BASE_URL",
     "QWEN_API_KEY",
 )
 
@@ -245,7 +245,7 @@ def test_require_qwen_key_names_variable(monkeypatch):
     assert "QWEN_API_KEY" in str(exc.value)
     with pytest.raises(RuntimeError) as exc:
         Settings().require("qwen_base_url")
-    assert "RESEARCH_QWEN_BASE_URL" in str(exc.value)
+    assert "QWEN_BASE_URL" in str(exc.value)
 
 
 def test_build_llm_selects_provider(monkeypatch):

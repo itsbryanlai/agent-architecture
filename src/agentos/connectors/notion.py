@@ -173,8 +173,13 @@ class FakeNotionAPI:
         self.users: list[dict] = list(users or [])
         self.calls: list[tuple[str, dict]] = []
         self._fail_next_create = False
+        self._fail_next_query: Exception | None = None
 
     # Test hooks.
+
+    def fail_next_query(self, error: Exception) -> None:
+        """Make the next query_database raise ``error``."""
+        self._fail_next_query = error
 
     def fail_next_create_after_write(self) -> None:
         """Make the next create store the page, then raise a timeout."""
@@ -225,6 +230,9 @@ class FakeNotionAPI:
 
     async def query_database(self, database_id: str, filter: dict | None) -> list[dict]:
         self.calls.append(("query_database", {"database_id": database_id, "filter": filter}))
+        if self._fail_next_query is not None:
+            error, self._fail_next_query = self._fail_next_query, None
+            raise error
         db_key = normalize_id(database_id)
         name = self._name_for_id(db_key, filter["property"]) if filter else None
         pages = self.databases.get(db_key, {}).values()

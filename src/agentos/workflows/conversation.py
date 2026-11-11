@@ -11,6 +11,9 @@ Rules this workflow keeps:
   TaskWorkflow, which asks the requester to approve before anything is created.
   The task is abandoned (not cancelled) when this conversation closes, because
   the work outlives the conversation.
+* A failed turn is reported in the thread and never ends the conversation: the
+  placeholder is replaced with a short error, history is left valid, and the
+  workflow goes on to wait for the next message.
 * Workflow code is deterministic: no I/O, ``workflow.uuid4()`` for IDs.
 """
 
@@ -20,6 +23,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.converter import value_to_type
+from temporalio.exceptions import ActivityError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -42,6 +46,17 @@ IDLE_TIMEOUT = timedelta(days=7)
 SEEN_LIMIT = 500
 OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
+TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
+TOOL_NOT_COMPLETED = "The tool call did not complete."
+
+
+class _TurnState:
+    """What a turn has done so far, so a failure can be cleaned up."""
+
+    def __init__(self) -> None:
+        self.ctx: TurnContext | None = None
+        self.placeholder_ts: str | None = None
+        self.pending_tool_ids: list[str] = []
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -97,7 +112,71 @@ class ConversationWorkflow:
                 workflow.continue_as_new(args=[ref, list(self.inbox), list(self.seen)])
 
     async def _turn(self, ref: ConversationRef, m: InboundMessage) -> None:
+        """Run one turn. A failed activity is reported, never raised."""
         conv_id = ids.conversation_id(ref.tenant_id, ref.channel, ref.thread_ts)
+        state = _TurnState()
+        try:
+            await self._run_turn(ref, m, conv_id, state)
+        except ActivityError as err:
+            self._log_failure(ref, err)
+            if state.ctx is None or state.placeholder_ts is None:
+                # Nothing was posted yet, so there is nothing to replace.
+                return
+            await self._recover(ref, conv_id, state)
+
+    def _log_failure(self, ref: ConversationRef, err: ActivityError, step: str = "turn") -> None:
+        # IDs and the activity type only; never message text.
+        workflow.logger.warning(
+            "%s failed tenant_id=%s agent_id=%s workflow_id=%s activity=%s",
+            step,
+            ref.tenant_id,
+            ref.agent_id,
+            workflow.info().workflow_id,
+            err.activity_type,
+        )
+
+    async def _recover(self, ref: ConversationRef, conv_id: str, state: "_TurnState") -> None:
+        """Leave valid history and tell the user. Each step is best effort."""
+        ctx = state.ctx
+        placeholder_ts = state.placeholder_ts
+        assert ctx is not None and placeholder_ts is not None
+        try:
+            if state.pending_tool_ids:
+                # Every tool_use needs a matching tool_result, or each later
+                # model call in this thread would be rejected.
+                await self._append(
+                    ctx,
+                    conv_id,
+                    "user",
+                    [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": TOOL_NOT_COMPLETED,
+                            "is_error": True,
+                        }
+                        for tool_use_id in state.pending_tool_ids
+                    ],
+                )
+        except ActivityError as err:
+            self._log_failure(ref, err, "recovery")
+        try:
+            await self._append(ctx, conv_id, "assistant", [{"type": "text", "text": TURN_FAILED}])
+        except ActivityError as err:
+            self._log_failure(ref, err, "recovery")
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_reply,
+                args=[ctx, placeholder_ts, TURN_FAILED],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        except ActivityError as err:
+            self._log_failure(ref, err, "recovery")
+
+    async def _run_turn(
+        self, ref: ConversationRef, m: InboundMessage, conv_id: str, state: "_TurnState"
+    ) -> None:
         agent: AgentVersion = await workflow.execute_activity_method(
             AgentActivities.load_agent,
             ref.agent_id,
@@ -120,6 +199,8 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+        state.ctx = ctx
+        state.placeholder_ts = placeholder_ts
 
         for _ in range(agent.max_steps):
             resp: LLMResponse = await workflow.execute_activity_method(
@@ -143,9 +224,17 @@ class ConversationWorkflow:
                 return
 
             await self._append(ctx, conv_id, "assistant", _assistant_blocks(resp))
-            results = await asyncio.gather(
-                *[self._dispatch(ctx, agent, call) for call in resp.tool_calls]
+            # From here until the results are stored, history has tool_use
+            # blocks with no tool_result; a failure must close them.
+            state.pending_tool_ids = [call.id for call in resp.tool_calls]
+            outcomes = await asyncio.gather(
+                *[self._dispatch(ctx, agent, call) for call in resp.tool_calls],
+                return_exceptions=True,
             )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
             await self._append(
                 ctx,
                 conv_id,
@@ -160,6 +249,7 @@ class ConversationWorkflow:
                     for r in results
                 ],
             )
+            state.pending_tool_ids = []
 
         await workflow.execute_activity_method(
             AgentActivities.finalize_reply,

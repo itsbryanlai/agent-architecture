@@ -231,7 +231,7 @@ tools:
 index: { documents: pages_in_granted_scopes }   # how to ingest for knowledge
 ```
 
-Property names such as "Status", "Done", and "Requested by" differ per database. The creator maps them when granting the agent a database, and the runtime checks the mapping against the database schema. Webhook event names are to be confirmed against Notion's API docs during implementation.
+Property names such as "Status", "Done", and "Requested by" differ per database. The creator maps them when granting the agent a database. The mapping is stored by the system's stable property IDs, so a rename doesn't break the agent; names are kept only as labels. The runtime checks the mapping against the live schema (each property exists, has the expected type, and the done values are real options) before the agent starts, and refuses to run a grant that fails. Webhook event names are to be confirmed against Notion's API docs during implementation.
 
 Connectors come in two tiers:
 

@@ -55,6 +55,21 @@ export ANTHROPIC_API_KEY='<paste here>'
 
 Secrets are read only from the environment. Don't put them in a file.
 
+After the wizard, with `NOTION_TOKEN` exported, check the Notion grant and get
+the stable property IDs:
+
+```bash
+uv run python -m agentos.check_grants
+```
+
+The property names in `config/agents.yaml` are labels; the worker addresses
+Notion properties only by ID, so a rename in Notion doesn't break it. The
+command reads the database's schema (it never changes it), reports any
+misnamed, mistyped or missing property, and prints a `property_ids` block. Paste
+that block into the grant in `config/agents.yaml`. The worker checks the same
+things at startup and refuses to start if anything is wrong or an ID is
+missing. The command exits 1 on any problem.
+
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
 `TEMPORAL_ADDRESS` (default `localhost:7233`), `DATABASE_URL` (default

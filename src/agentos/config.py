@@ -118,6 +118,12 @@ class NotionDatabaseGrant:
     Property names differ per database, so the creator maps them when granting
     the database. ``request_id_prop`` is the hidden text property that holds the
     idempotency key of items the agent creates.
+
+    The ``*_prop`` fields are names, kept as labels for people. The runtime
+    addresses Notion properties only by the ``*_prop_id`` fields, which are
+    stable across renames. They may be missing in a names-only config so the
+    check command can read it and print the IDs; the worker refuses to start
+    until all four are set.
     """
 
     id: str
@@ -127,6 +133,20 @@ class NotionDatabaseGrant:
     done_values: list[str]
     requested_by_prop: str
     request_id_prop: str
+    title_prop_id: str | None = None
+    status_prop_id: str | None = None
+    requested_by_prop_id: str | None = None
+    request_id_prop_id: str | None = None
+
+    def missing_property_ids(self) -> list[str]:
+        """Roles that have no property ID configured."""
+        ids = {
+            "title": self.title_prop_id,
+            "status": self.status_prop_id,
+            "requested_by": self.requested_by_prop_id,
+            "request_id": self.request_id_prop_id,
+        }
+        return [role for role, value in ids.items() if not value]
 
 
 @dataclass
@@ -176,6 +196,14 @@ _PROPERTY_FIELDS = {
 }
 
 
+_PROPERTY_ID_FIELDS = {
+    "title": "title_prop_id",
+    "status": "status_prop_id",
+    "requested_by": "requested_by_prop_id",
+    "request_id": "request_id_prop_id",
+}
+
+
 def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     if not isinstance(mapping, dict) or key not in mapping or mapping[key] in (None, ""):
         raise ConfigError(f"{where}: missing required field '{key}'")
@@ -196,6 +224,21 @@ def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseG
                 f"agent '{agent_id}' grant '{name}': missing property mapping 'properties.{key}'"
             )
         values[attr] = props[key]
+    ids_raw = raw.get("property_ids")
+    if ids_raw is None:
+        ids_raw = {}
+    if not isinstance(ids_raw, dict):
+        raise ConfigError(
+            f"agent '{agent_id}' grant '{name}': 'property_ids' must be a mapping of role to ID"
+        )
+    id_values: dict[str, str | None] = {attr: None for attr in _PROPERTY_ID_FIELDS.values()}
+    for key, value in ids_raw.items():
+        if key not in _PROPERTY_ID_FIELDS:
+            raise ConfigError(
+                f"agent '{agent_id}' grant '{name}': unknown key 'property_ids.{key}'"
+            )
+        if value not in (None, ""):
+            id_values[_PROPERTY_ID_FIELDS[key]] = str(value)
     done_values = values["done_values"]
     if not isinstance(done_values, list):
         done_values = [done_values]
@@ -207,6 +250,7 @@ def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseG
         done_values=[str(v) for v in done_values],
         requested_by_prop=str(values["requested_by_prop"]),
         request_id_prop=str(values["request_id_prop"]),
+        **id_values,
     )
 
 

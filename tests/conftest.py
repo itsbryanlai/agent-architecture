@@ -27,6 +27,22 @@ ALICE = "U_ALICE"
 BOB = "U_BOB"
 ALICE_NOTION = "notion-user-alice"
 BOB_NOTION = "notion-user-bob"
+PROPERTY_IDS = {
+    "title": "title",
+    "status": "stat1",
+    "requested_by": "reqby1",
+    "request_id": "reqid1",
+}
+
+
+def default_schema() -> dict:
+    """The schema of the shared test database, matching the grant's names."""
+    return {
+        "Name": {"id": "title", "type": "title"},
+        "Status": {"id": "stat1", "type": "status", "options": ["To do", "Done"]},
+        "Requested by": {"id": "reqby1", "type": "people"},
+        "Agent request ID": {"id": "reqid1", "type": "rich_text"},
+    }
 
 
 def agents_dict() -> dict:
@@ -52,6 +68,7 @@ def agents_dict() -> dict:
                                     "requested_by": "Requested by",
                                     "request_id": "Agent request ID",
                                 },
+                                "property_ids": dict(PROPERTY_IDS),
                             }
                         ]
                     }
@@ -93,6 +110,7 @@ def make_fake_notion() -> FakeNotionAPI:
     )
     api.add_database(DB_ID)
     api.add_database(OTHER_DB_ID)
+    api.set_schema(DB_ID, default_schema())
     return api
 
 

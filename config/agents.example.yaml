@@ -19,6 +19,13 @@ agents:
               done_values: [Done]
               requested_by: Requested by
               request_id: Agent request ID
+            # Stable Notion property IDs. Run `uv run python -m agentos.check_grants`
+            # and paste the block it prints; the worker will not start without it.
+            property_ids:
+              title: title
+              status: "<status property id>"
+              requested_by: "<requested-by property id>"
+              request_id: "<request id property id>"
     follow_up:
       poll_interval_minutes: 15
       stale_after_days: 3

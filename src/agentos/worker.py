@@ -18,11 +18,12 @@ from agentos.activities import AgentActivities
 from agentos.config import (
     PROVIDER_QWEN,
     TASK_QUEUE,
+    AgentsConfig,
     Settings,
     load_agents_config,
     load_settings,
 )
-from agentos.connectors.notion import RealNotionAPI
+from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import PostgresHistoryStore, PostgresIdempotencyStore, PostgresTaskLinkStore
@@ -46,12 +47,63 @@ def build_llm(settings: Settings) -> LLMClient:
     return AnthropicLLMClient(settings.require("anthropic_api_key"), settings.model)
 
 
+async def check_grants_at_startup(
+    api: NotionAPI, agents: AgentsConfig, log: logging.Logger
+) -> str | None:
+    """Check every agent's Notion grants against the live schemas.
+
+    Returns None when all is well, or a one-line failure summary when any grant
+    has a problem (including a missing property ID); the caller must then exit
+    rather than run a half-working agent. Notes, such as a property renamed in
+    Notion but still found by its ID, are logged as warnings. Only the
+    granted databases' schemas are read, with the agent's own token, and the
+    agent never changes a schema. Logs name the tenant, agent and grant, and
+    never a token or page content.
+    """
+    failed = 0
+    missing_ids = False
+    for agent in agents.agents.values():
+        for grant in agent.grants.notion_databases:
+            check = await check_grant(api, grant, require_ids=True)
+            for note in check.notes:
+                log.warning(
+                    "tenant_id=%s agent=%s grant=%s: %s",
+                    agents.tenant_id,
+                    agent.agent_id,
+                    grant.name,
+                    note,
+                )
+            for problem in check.problems:
+                log.error(
+                    "tenant_id=%s agent=%s grant=%s: %s",
+                    agents.tenant_id,
+                    agent.agent_id,
+                    grant.name,
+                    problem,
+                )
+            failed += bool(check.problems)
+            missing_ids = missing_ids or bool(grant.missing_property_ids())
+    if not failed:
+        return None
+    summary = f"{failed} Notion grant(s) have problems; the worker will not start."
+    if missing_ids:
+        summary += (
+            " Property IDs are missing: run `uv run python -m agentos.check_grants`"
+            " and paste its property_ids block into the config."
+        )
+    return summary
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("agentos.worker")
     settings = load_settings()
     agents = load_agents_config(settings.config_path)
     llm = build_llm(settings)
+    notion_api = RealNotionAPI(settings.require("notion_token"))
+    failure = await check_grants_at_startup(notion_api, agents, log)
+    if failure:
+        raise SystemExit(failure)
     # Provider and model name only; never a key.
     log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
 
@@ -66,7 +118,7 @@ async def main() -> None:
             links=PostgresTaskLinkStore(pool),
             llm=llm,
             slack=RealSlackPoster(settings.require("slack_bot_token")),
-            notion_api=RealNotionAPI(settings.require("notion_token")),
+            notion_api=notion_api,
         )
         client = await Client.connect(settings.temporal_address)
         worker = Worker(

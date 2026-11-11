@@ -238,6 +238,10 @@ cat <<'QWEN'
     export QWEN_API_KEY='<paste here>'
 QWEN
 printf '\n'
+say "Then, with NOTION_TOKEN exported, check the Notion grant and print its"
+say "property IDs; paste the property_ids block it prints into config/agents.yaml:"
+step "uv run python -m agentos.check_grants"
+printf '\n'
 say "Then run, each in its own terminal:"
 step "uv run python -m agentos.worker"
 step "uv run uvicorn agentos.gateway.app:app --port 8000"

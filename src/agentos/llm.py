@@ -253,13 +253,16 @@ def from_openai_response(resp) -> LLMResponse:
 
 
 class ScriptedLLMClient:
-    """Test fake: returns queued responses in order and records every call."""
+    """Test fake: returns queued responses in order and records every call.
 
-    def __init__(self, responses: list[LLMResponse] | None = None):
-        self.responses: list[LLMResponse] = list(responses or [])
+    A queued exception instance is raised instead of returned.
+    """
+
+    def __init__(self, responses: list[LLMResponse | Exception] | None = None):
+        self.responses: list[LLMResponse | Exception] = list(responses or [])
         self.calls: list[dict] = []
 
-    def queue(self, *responses: LLMResponse) -> None:
+    def queue(self, *responses: LLMResponse | Exception) -> None:
         self.responses.extend(responses)
 
     async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
@@ -268,4 +271,7 @@ class ScriptedLLMClient:
         )
         if not self.responses:
             raise RuntimeError("ScriptedLLMClient has no more responses queued")
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item

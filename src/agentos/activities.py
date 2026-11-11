@@ -45,9 +45,17 @@ def _non_retryable(err: Exception) -> ApplicationError:
 
 
 def _is_client_error(err: Exception) -> bool:
-    """A 4xx from Notion (other than rate limiting) will not succeed on retry."""
-    status = getattr(err, "status", None)
-    return isinstance(status, int) and 400 <= status < 500 and status != 429
+    """A 4xx (other than 408 and 429) will not succeed on retry.
+
+    Notion's errors carry the HTTP status in ``status``; the Anthropic and
+    OpenAI SDK errors carry it in ``status_code``. Timeouts (408) and rate
+    limits (429) are transient, so they stay retryable.
+    """
+    for attr in ("status", "status_code"):
+        status = getattr(err, attr, None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return 400 <= status < 500 and status not in (408, 429)
+    return False
 
 
 class AgentActivities:
@@ -157,7 +165,20 @@ class AgentActivities:
         agent = self._agent(ctx.agent_id)
         messages = await self.history.load(ctx.tenant_id, conversation_id)
         tools = self._connector(ctx.agent_id).tools_for_llm()
-        return await self.llm.complete(agent.system_prompt, messages, tools)
+        try:
+            return await self.llm.complete(agent.system_prompt, messages, tools)
+        except Exception as err:
+            if _is_client_error(err):
+                # The provider rejected the request (bad key, bad request):
+                # retrying sends the same request and fails the same way.
+                log.warning(
+                    "call_llm rejected tenant_id=%s agent_id=%s error_type=%s",
+                    ctx.tenant_id,
+                    ctx.agent_id,
+                    type(err).__name__,
+                )
+                raise _non_retryable(err) from err
+            raise
 
     @activity.defn(name="post_placeholder")
     async def post_placeholder(self, ctx: TurnContext, idem_key: str) -> str:

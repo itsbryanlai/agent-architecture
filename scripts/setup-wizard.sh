@@ -117,7 +117,7 @@ pause
 # ── 2 ─────────────────────────────────────────────────────────────────────
 stage "Start Postgres and Temporal"
 say "This runs: docker compose up -d"
-note "Postgres on localhost:5432, Temporal on localhost:7233 (web UI on http://localhost:8233)."
+note "Postgres on localhost:55432, Temporal on localhost:7233 (web UI on http://localhost:8233)."
 if confirm "Start them now?"; then
   docker compose up -d
   ok "services started"

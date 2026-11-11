@@ -72,9 +72,13 @@ missing. The command exits 1 on any problem.
 
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
-`TEMPORAL_ADDRESS` (default `localhost:7233`), `DATABASE_URL` (default
-`postgresql://agentos:agentos@localhost:5432/agentos`, matching Compose) and
-`AGENTOS_CONFIG` (default `config/agents.yaml`).
+`AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`), `AGENTOS_DATABASE_URL`
+(default `postgresql://agentos:agentos@localhost:55432/agentos`, matching
+Compose, which publishes Postgres on host port 55432) and `AGENTOS_CONFIG`
+(default `config/agents.yaml`).
+
+If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
+export the `AGENTOS_` names instead: the old ones are now ignored.
 
 ## Model provider
 

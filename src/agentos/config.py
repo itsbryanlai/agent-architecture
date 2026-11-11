@@ -6,6 +6,12 @@ import time when one is unset: a missing secret only becomes an error when the
 real client that needs it is constructed (see ``Settings.require``).
 
 This module is the only place that reads environment variables.
+
+The two infrastructure variables carry the AGENTOS_ prefix
+(AGENTOS_DATABASE_URL, AGENTOS_TEMPORAL_ADDRESS) and never fall back to the
+generic names DATABASE_URL and TEMPORAL_ADDRESS. A generic name is often set in
+the shell for some other project, and the platform must never be redirected to
+that project's database or server by accident.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import yaml
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
-DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:5432/agentos"
+DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
 
 TASK_QUEUE = "agentos-main"
@@ -101,8 +107,8 @@ def load_settings() -> Settings:
         model=env.get("AGENTOS_MODEL") or DEFAULT_MODELS[provider],
         qwen_base_url=env.get("QWEN_BASE_URL") or None,
         qwen_thinking=_parse_flag(env.get("AGENTOS_QWEN_THINKING")),
-        temporal_address=env.get("TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
-        database_url=env.get("DATABASE_URL") or DEFAULT_DATABASE_URL,
+        temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
+        database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
     )
 

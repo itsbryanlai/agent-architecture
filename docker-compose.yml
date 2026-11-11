@@ -8,7 +8,8 @@ services:
       POSTGRES_PASSWORD: agentos
       POSTGRES_DB: agentos
     ports:
-      - "5432:5432"
+      # Host port 55432, not 5432: a native Postgres often already holds 5432.
+      - "55432:5432"
     volumes:
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
 

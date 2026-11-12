@@ -33,6 +33,10 @@ class SlackPoster(Protocol):
         """Return the user's verified profile email (needs ``users:read.email``)."""
         ...
 
+    async def open_view(self, trigger_id: str, view: dict) -> None:
+        """Open a modal. The trigger ID from a click is valid for 3 seconds."""
+        ...
+
 
 class RealSlackPoster:
     def __init__(self, token: str):
@@ -62,6 +66,9 @@ class RealSlackPoster:
     async def user_email(self, user_id: str) -> str | None:
         resp = await self._client.users_info(user=user_id)
         return (resp.get("user") or {}).get("profile", {}).get("email")
+
+    async def open_view(self, trigger_id: str, view: dict) -> None:
+        await self._client.views_open(trigger_id=trigger_id, view=view)
 
 
 class FakeSlack:
@@ -112,6 +119,12 @@ class FakeSlack:
     async def user_email(self, user_id: str) -> str | None:
         self.calls.append(("user_email", {"user_id": user_id}))
         return self.emails.get(user_id)
+
+    async def open_view(self, trigger_id: str, view: dict) -> None:
+        self.calls.append(("open_view", {"trigger_id": trigger_id, "view": view}))
+
+    def views(self) -> list[dict]:
+        return [kw for name, kw in self.calls if name == "open_view"]
 
     def posts(self) -> list[dict]:
         return [kw for name, kw in self.calls if name == "post_message"]

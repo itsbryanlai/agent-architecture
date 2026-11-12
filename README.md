@@ -20,6 +20,13 @@ The code here is a walking skeleton of that design, built on Temporal
 5. The task watches the item's status and posts in the original thread when it
    reaches a "done" value.
 
+Claude can also draft a comment on an existing item (`add_comment`). The same
+approval card is sent, and the comment is posted only after **Submit**, exactly
+once, and only on items in a database the agent was granted. Every approval
+card has an **Edit** button: it opens a form prefilled with the draft, and
+saving replaces the draft and asks for a fresh approval (the old buttons stop
+working). A request can be edited up to 5 times.
+
 The skeleton runs one tenant, set in `config/agents.yaml`, but every workflow
 ID, database row and log line already carries the tenant ID.
 
@@ -54,6 +61,10 @@ export ANTHROPIC_API_KEY='<paste here>'
 ```
 
 Secrets are read only from the environment. Don't put them in a file.
+
+In the Notion integration's settings, enable the **Read comments** and
+**Insert comments** capabilities (both are off by default). The agent needs
+them to comment on items.
 
 After the wizard, with `NOTION_TOKEN` exported, check the Notion grant and get
 the stable property IDs:

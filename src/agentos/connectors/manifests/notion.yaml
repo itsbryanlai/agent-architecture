@@ -8,6 +8,8 @@
 # idempotency: how a retried write avoids creating a duplicate. marker_property
 #   means the item carries a hidden text property holding the idempotency key,
 #   and the connector queries for it before creating.
+# marker_text means the comment ends with a short ref and the connector looks
+#   for it in the page's comments before posting.
 # offer_to_llm: false keeps a tool for runtime use only.
 connector: notion
 tools:
@@ -54,6 +56,23 @@ tools:
           type: string
           description: What is needed and any useful context.
       required: [title, details]
+
+  add_comment:
+    risk: write_reversible
+    idempotency: marker_text
+    description: >-
+      Draft a comment on an existing item. Nothing is posted until the
+      requester approves the draft in Slack.
+    input_schema:
+      type: object
+      properties:
+        item:
+          type: string
+          description: Link or ID of the item to comment on, from search results.
+        comment:
+          type: string
+          description: The comment text.
+      required: [item, comment]
 
   get_item:
     risk: read

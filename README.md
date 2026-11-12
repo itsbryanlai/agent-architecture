@@ -73,8 +73,8 @@ missing. The command exits 1 on any problem.
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
 `AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`), `AGENTOS_DATABASE_URL`
-(default `postgresql://agentos:agentos@localhost:55432/agentos`, matching
-Compose, which publishes Postgres on host port 55432) and `AGENTOS_CONFIG`
+(default `postgresql://agentos_app:agentos_app@localhost:55432/agentos`, the
+local development app role, on the host port 55432 that Compose publishes) and `AGENTOS_CONFIG`
 (default `config/agents.yaml`).
 
 If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
@@ -137,6 +137,18 @@ docker compose up -d postgres
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/002_tool_outputs.sql
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/003_knowledge.sql
 ```
+
+Tenant separation is now also enforced by the database with row-level security.
+Apply `004` as the owner role, `agentos`, the same way:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/004_row_level_security.sql
+```
+
+It creates the `agentos_app` role, and the app now connects as `agentos_app`
+by default. The table owner and any superuser bypass row-level security, so the
+app must not connect as `agentos`; use `agentos` only to run migrations. If you
+set `AGENTOS_DATABASE_URL` yourself, point it at `agentos_app`.
 
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes

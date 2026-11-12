@@ -26,7 +26,9 @@ import yaml
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
-DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:55432/agentos"
+# The app connects as agentos_app, which cannot bypass row-level security. The
+# password is a local development value, like the Compose one.
+DEFAULT_DATABASE_URL = "postgresql://agentos_app:agentos_app@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
 DEFAULT_EMBED_MODEL = "text-embedding-v4"
 # Must match the vector(1024) column in the knowledge_chunks table.

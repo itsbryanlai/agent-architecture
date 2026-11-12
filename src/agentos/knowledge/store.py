@@ -6,6 +6,9 @@ Rules kept here:
   passes (the roots granted to that agent), and the tenant and scope filter is
   part of the SQL query itself, never applied to results afterwards.
 * Every row and every query carries the tenant ID.
+* The database enforces tenant separation with row-level security: every call
+  runs in a transaction that first sets the tenant. The explicit tenant
+  conditions in the SQL are a second line of defense.
 * Page text lives only in this store, never in Temporal workflow history.
 """
 
@@ -16,6 +19,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from psycopg_pool import AsyncConnectionPool
+
+from agentos.stores import tenant_transaction
 
 
 @dataclass
@@ -73,7 +78,7 @@ class PostgresKnowledgeStore:
         self._pool = pool
 
     async def page_hashes(self, tenant_id: str, scope: str) -> dict[str, str]:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 "SELECT page_id, content_hash FROM knowledge_pages"
                 " WHERE tenant_id = %s AND scope = %s",
@@ -91,7 +96,7 @@ class PostgresKnowledgeStore:
         content_hash: str,
         chunks: list[tuple[str, list[float]]],
     ) -> None:
-        async with self._pool.connection() as conn, conn.transaction():
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                     INSERT INTO knowledge_pages
@@ -120,7 +125,7 @@ class PostgresKnowledgeStore:
     async def delete_pages(self, tenant_id: str, scope: str, page_ids: list[str]) -> int:
         if not page_ids:
             return 0
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 "DELETE FROM knowledge_pages"
                 " WHERE tenant_id = %s AND scope = %s AND page_id = ANY(%s)",
@@ -133,7 +138,7 @@ class PostgresKnowledgeStore:
     ) -> list[ChunkHit]:
         if not scopes:
             return []
-        async with self._pool.connection() as conn, conn.transaction():
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
             cur = await conn.execute(
                 """
@@ -160,7 +165,7 @@ class PostgresKnowledgeStore:
     ) -> dict[str, tuple[str, str]]:
         if not scopes or not page_ids:
             return {}
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
                 SELECT page_id, title, url FROM knowledge_pages

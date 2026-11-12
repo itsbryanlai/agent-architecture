@@ -6,6 +6,11 @@ carries a conversation ID and small values and never document or chat content.
 Every method takes ``tenant_id`` explicitly and every table is keyed by it
 first. There is no global tenant state.
 
+The database enforces tenant separation with row-level security: every Postgres
+call runs in a transaction that first sets ``app.tenant_id``, and the app
+connects as a role that cannot bypass the policies. The explicit ``tenant_id``
+conditions in the SQL stay as a second line of defense.
+
 A history append is named by a step key, so a retried append never stores a
 message twice.
 
@@ -16,6 +21,7 @@ carries only the reference, never the text a tool read.
 from __future__ import annotations
 
 import copy
+from contextlib import asynccontextmanager
 from typing import Protocol
 
 from psycopg.types.json import Jsonb
@@ -69,6 +75,16 @@ class TaskLinkStore(Protocol):
 # --- Postgres -----------------------------------------------------------------
 
 
+@asynccontextmanager
+async def tenant_transaction(pool: AsyncConnectionPool, tenant_id: str):
+    """A connection in a transaction scoped to one tenant by row-level security."""
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+        yield conn
+
+
 class PostgresHistoryStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
@@ -76,7 +92,7 @@ class PostgresHistoryStore:
     async def append(
         self, tenant_id: str, conversation_id: str, step_key: str, role: str, content: list[dict]
     ) -> int:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
                 INSERT INTO conversation_messages (tenant_id, conversation_id, seq, step_key, role, content)
@@ -110,7 +126,7 @@ class PostgresHistoryStore:
             return int(row[0])
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
                 SELECT role, content FROM conversation_messages
@@ -128,7 +144,7 @@ class PostgresIdempotencyStore:
         self._pool = pool
 
     async def get(self, tenant_id: str, key: str) -> dict | None:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 "SELECT value FROM idempotency_records WHERE tenant_id = %s AND idem_key = %s",
                 (tenant_id, key),
@@ -137,7 +153,7 @@ class PostgresIdempotencyStore:
             return row[0] if row else None
 
     async def put_if_absent(self, tenant_id: str, key: str, value: dict) -> dict:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO idempotency_records (tenant_id, idem_key, value)
@@ -161,7 +177,7 @@ class PostgresToolOutputStore:
     async def put(
         self, tenant_id: str, conversation_id: str, tool_use_id: str, content: str, is_error: bool
     ) -> None:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO tool_outputs (tenant_id, conversation_id, tool_use_id, content, is_error)
@@ -176,7 +192,7 @@ class PostgresToolOutputStore:
     ) -> dict[str, tuple[str, bool]]:
         if not tool_use_ids:
             return {}
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
                 SELECT tool_use_id, content, is_error FROM tool_outputs
@@ -193,7 +209,7 @@ class PostgresTaskLinkStore:
         self._pool = pool
 
     async def link(self, tenant_id: str, page_id: str, task_id: str) -> None:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO task_links (tenant_id, page_id, task_id)
@@ -204,7 +220,7 @@ class PostgresTaskLinkStore:
             )
 
     async def task_for_page(self, tenant_id: str, page_id: str) -> str | None:
-        async with self._pool.connection() as conn:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 "SELECT task_id FROM task_links WHERE tenant_id = %s AND page_id = %s",
                 (tenant_id, page_id),

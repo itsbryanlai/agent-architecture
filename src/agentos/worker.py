@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 from psycopg_pool import AsyncConnectionPool
 from temporalio.client import Client
@@ -25,7 +26,7 @@ from agentos.config import (
     load_settings,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
-from agentos.knowledge.embedder import Embedder, QwenEmbedder
+from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
@@ -60,12 +61,22 @@ def build_llm(settings: Settings) -> LLMClient:
 def build_embedder(settings: Settings, agents: AgentsConfig) -> Embedder | None:
     """Build the embedder, only when some agent has a Notion page grant.
 
-    Agents without knowledge need no Qwen settings, so the Anthropic provider
-    keeps working without them. Returns None when no agent has a page grant.
+    Agents without knowledge need no embedding settings, so the Anthropic
+    provider keeps working without them. Returns None when no agent has a page
+    grant. When ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no
+    Qwen setting is needed (a local server needs no key, but the SDK requires a
+    non-empty string). Otherwise the Qwen settings are used.
     """
     if not any(agent.grants.notion_pages for agent in agents.agents.values()):
         return None
-    return QwenEmbedder(
+    if settings.embed_base_url:
+        return OpenAICompatibleEmbedder(
+            settings.embed_api_key or "not-needed",
+            settings.embed_base_url,
+            settings.embed_model,
+            EMBED_DIMENSIONS,
+        )
+    return OpenAICompatibleEmbedder(
         settings.require("qwen_api_key"),
         settings.require("qwen_base_url"),
         settings.embed_model,
@@ -145,7 +156,13 @@ async def main() -> None:
     # Provider and model name only; never a key.
     log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
     if embedder is not None:
-        log.info("embedder model=%s dimensions=%d", embedder.model, embedder.dimensions)
+        # Host and port only; never a key or a path.
+        log.info(
+            "embedder model=%s dimensions=%d host=%s",
+            embedder.model,
+            embedder.dimensions,
+            urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
+        )
 
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()

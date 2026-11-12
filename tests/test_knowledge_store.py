@@ -7,7 +7,7 @@ import pytest
 from agentos import ids
 from agentos.config import AgentsConfig, ConfigError, Settings, parse_agents_config
 from agentos.connectors.notion import check_page_grant
-from agentos.knowledge.embedder import BATCH_SIZE, FakeEmbedder, QwenEmbedder
+from agentos.knowledge.embedder import BATCH_SIZE, FakeEmbedder, OpenAICompatibleEmbedder
 from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.worker import build_embedder, check_grants_at_startup
 from tests.conftest import agents_dict, make_fake_notion
@@ -122,14 +122,14 @@ class FakeOpenAI:
 
 async def test_qwen_embedder_batches_and_checks_dimensions():
     client = FakeOpenAI()
-    emb = QwenEmbedder("k", "http://x", "m", 8, client=client)
+    emb = OpenAICompatibleEmbedder("k", "http://x", "m", 8, client=client)
     out = await emb.embed([f"t{i}" for i in range(23)])
 
     assert len(out) == 23
     assert [len(c) for c in client.embeddings.calls] == [10, 10, 3]
     assert max(len(c) for c in client.embeddings.calls) <= BATCH_SIZE
 
-    bad = QwenEmbedder("k", "http://x", "m", 8, client=FakeOpenAI(bad_dimensions=True))
+    bad = OpenAICompatibleEmbedder("k", "http://x", "m", 8, client=FakeOpenAI(bad_dimensions=True))
     with pytest.raises(ValueError):
         await bad.embed(["a"])
 

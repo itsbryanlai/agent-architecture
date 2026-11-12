@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from temporalio import activity
 
+from agentos.activities import _is_client_error, _non_retryable
 from agentos.config import EMBED_DIMENSIONS
 from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
 from agentos.knowledge.embedder import Embedder
@@ -73,10 +74,36 @@ class IndexActivities:
             return SyncResult(skipped=True)
         except Exception as err:
             if not is_unreachable(err):
+                if _is_client_error(err):
+                    log.warning(
+                        "page rejected tenant_id=%s scope=%s page_id=%s error_type=%s",
+                        tenant_id,
+                        scope,
+                        page_id,
+                        type(err).__name__,
+                    )
+                    raise _non_retryable(err) from err
                 raise
             log.info("page skipped tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
             return SyncResult(skipped=True)
 
+        try:
+            return await self._index(tenant_id, scope, page_id, content)
+        except Exception as err:
+            if _is_client_error(err):
+                # The embedder or the store rejected the request for good:
+                # retrying sends the same request and fails the same way.
+                log.warning(
+                    "page rejected tenant_id=%s scope=%s page_id=%s error_type=%s",
+                    tenant_id,
+                    scope,
+                    page_id,
+                    type(err).__name__,
+                )
+                raise _non_retryable(err) from err
+            raise
+
+    async def _index(self, tenant_id: str, scope: str, page_id: str, content) -> SyncResult:
         chunks = chunk(content.title, content.blocks)
         digest = content_hash(self.embedder.model, content.title, chunks)
         stored = await self.store.page_hashes(tenant_id, scope)

@@ -1,7 +1,7 @@
 """Text embeddings behind one interface, so the provider can be swapped.
 
-``QwenEmbedder`` calls an OpenAI-compatible embeddings endpoint (Qwen's) and
-imports the SDK only when it builds a real client, so importing this module
+``OpenAICompatibleEmbedder`` calls any OpenAI-compatible embeddings endpoint
+(Qwen's, a local Ollama, and so on) and imports the SDK only when it builds a real client, so importing this module
 never needs a key or the network. ``FakeEmbedder`` is deterministic and local,
 for tests. Keys are passed in by the caller and are never read, logged or
 printed here.
@@ -27,7 +27,7 @@ class Embedder(Protocol):
         ...
 
 
-class QwenEmbedder:
+class OpenAICompatibleEmbedder:
     """Embeds through an OpenAI-compatible endpoint, at most 10 texts per call.
 
     ``client`` lets tests pass a fake; when it is ``None`` the real

@@ -84,8 +84,10 @@ Knowledge settings, used only when an agent has a Notion page grant:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AGENTOS_EMBED_MODEL` | `text-embedding-v4` | Embedding model on the Qwen OpenAI-compatible endpoint. Output is 1024 dimensions, fixed to match the database column |
-| `QWEN_API_KEY`, `QWEN_BASE_URL` | none | Needed for embeddings whenever any agent has a page grant, whichever model provider is in use |
+| `AGENTOS_EMBED_MODEL` | `text-embedding-v4` | Embedding model served by whichever embedding endpoint is configured. Output is 1024 dimensions, fixed to match the database column |
+| `AGENTOS_EMBED_BASE_URL` | none | An OpenAI-compatible embeddings endpoint of its own, such as a local Ollama. When unset, the Qwen settings are used |
+| `EMBED_API_KEY` | none | Key for that endpoint (secret; export it, never save it). A local Ollama needs none |
+| `QWEN_API_KEY`, `QWEN_BASE_URL` | none | Needed for embeddings, when any agent has a page grant, only if `AGENTOS_EMBED_BASE_URL` is unset |
 
 ## Model provider
 
@@ -136,6 +138,23 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/003_knowledge.sql
 ```
 
+The new image's system library (glibc) is older than the one the previous image
+used, so Postgres may warn about a collation version mismatch, and text indexes
+built under the old library must be rebuilt. After recreating the container,
+rebuild the indexes and refresh the collation version for the `agentos`,
+`postgres` and `template1` databases:
+
+```bash
+for db in agentos postgres template1; do
+  docker compose exec -T postgres psql -U agentos -d "$db" \
+    -c "REINDEX DATABASE $db" \
+    -c "ALTER DATABASE $db REFRESH COLLATION VERSION"
+done
+```
+
+`REINDEX DATABASE` and `ALTER DATABASE ... REFRESH COLLATION VERSION` act on the
+database you are connected to, so run them once per database.
+
 ## Run
 
 ```bash
@@ -179,6 +198,18 @@ Two agents granted the same page share one run. `--schedule` creates or updates
 one schedule per granted page and deletes the schedules of pages that are no
 longer granted. Pages removed from the tree, trashed or unreachable are removed
 from the index on the next run.
+
+### Local embeddings with Ollama
+
+To embed on your own machine instead of a hosted endpoint:
+
+1. Install the Ollama app. The Homebrew build may lack the runner `bge-m3` needs.
+2. Run `ollama pull bge-m3`.
+3. Export `AGENTOS_EMBED_BASE_URL=http://localhost:11434/v1` and
+   `AGENTOS_EMBED_MODEL=bge-m3`, then restart the worker. No key is needed, and
+   the Qwen variables are not used for embeddings.
+4. Changing the embedding model re-embeds every page on the next run, because
+   the content hash includes the model name.
 
 The agent's `search_knowledge` tool searches only its own granted pages. Every
 page found is re-checked with Notion before the model sees it (not trashed, still

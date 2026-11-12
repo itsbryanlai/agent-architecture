@@ -66,8 +66,12 @@ class Settings:
     # Qwen thinking is off by default: thinking output counts toward the
     # response token limit and makes each turn slower.
     qwen_thinking: bool = False
-    # The embedding model served by the same OpenAI-compatible endpoint.
+    # The embedding model served by whichever embedding endpoint is configured.
     embed_model: str = DEFAULT_EMBED_MODEL
+    # An OpenAI-compatible embeddings endpoint of its own (for example a local
+    # Ollama). Unset means the Qwen settings are used.
+    embed_base_url: str | None = None
+    embed_api_key: str | None = field(default=None, repr=False)
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
@@ -113,6 +117,8 @@ def load_settings() -> Settings:
         qwen_base_url=env.get("QWEN_BASE_URL") or None,
         qwen_thinking=_parse_flag(env.get("AGENTOS_QWEN_THINKING")),
         embed_model=env.get("AGENTOS_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
+        embed_base_url=env.get("AGENTOS_EMBED_BASE_URL") or None,
+        embed_api_key=env.get("EMBED_API_KEY") or None,
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,

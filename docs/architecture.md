@@ -46,7 +46,7 @@ Inside a shared cell:
 |---|---|
 | Temporal | Every workflow ID starts with the tenant ID, plus a `tenant_id` search attribute. Payloads are encrypted by a payload codec using the **tenant's own KMS key**. Rate limits per tenant stop one tenant from starving the others |
 | Postgres | `tenant_id` on every row, enforced by row-level security. Queries run with the tenant set on the session, so a missing `WHERE` clause can't leak data |
-| Vector index | Partitioned by tenant (a namespace or collection per tenant). A query can never cross partitions |
+| Vector index | pgvector tables in the cell's Postgres, so the Postgres row applies: `tenant_id` on every row, and every search filters by tenant and the agent's granted scopes inside the query itself, never on results afterwards. A tenant that needs physical separation gets a dedicated cell |
 | Vault | Per-tenant encryption key. Deleting a tenant destroys its key (crypto-shredding) |
 | LLM | Per-tenant allowlist of providers and models, optional bring-your-own API key, and a monthly budget limit |
 | Audit and logs | Tagged with the tenant. No document content is written to application logs |
@@ -274,7 +274,8 @@ So adding a new system usually means writing and testing a manifest, not a whole
 - One distributed Slack app (Events API + interactivity + OAuth install), listed on the Slack Marketplace.
 - The 3-second rule: the gateway acknowledges first and then signals Temporal. Slack retries are dropped as duplicates by event ID.
 - Responsiveness: post a "thinking…" placeholder or assistant-thread status immediately, update it with progress ("Searching Confluence…"), and replace it with the final answer.
-- Slack posts are idempotent: keep the posted message's `ts` keyed by idempotency key, and on retry update the existing message instead of posting again.
+- Slack posts are at least once. The posted message's `ts` is kept under an idempotency key, and a retry that finds it uses the existing message instead of posting again. Slack has no idempotency key of its own, so a crash between Slack accepting a post and the `ts` being recorded can repeat the post; a pending marker written before each post makes such a duplicate visible in the logs. Closing that window would need channel-history read scopes, which the app deliberately doesn't request.
+- The model writes Markdown, which Slack doesn't render. Replies are converted to Slack's mrkdwn when they are posted; code, links and citation numbers pass through unchanged, and stored history keeps the model's Markdown.
 
 ## 10. Data and storage
 

@@ -141,7 +141,9 @@ class TaskWorkflow:
         task_id = workflow.info().workflow_id
         ctx = spec.ctx
 
-        agent: AgentVersion = await self._act(AgentActivities.load_agent, ctx.agent_id)
+        agent: AgentVersion = await self._act(
+            AgentActivities.load_agent, ctx.tenant_id, ctx.agent_id
+        )
         if spec.tool_name == "add_comment":
             # Resolve the item and check its database is granted before any card.
             try:

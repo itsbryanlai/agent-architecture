@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, Settings, parse_agents_config
+from agentos.config import TASK_QUEUE, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.stores import InMemoryTaskLinkStore
@@ -28,6 +29,14 @@ from tests.test_gateway import FakeTemporalClient
 from tests.test_indexing import SCOPE_A, run_index
 
 TOKEN = "refresh-test-token"
+
+
+@pytest.fixture(autouse=True)
+def webhook_secret(monkeypatch):
+    """The gateway reads the tenant's webhook secret from its named variable."""
+    monkeypatch.setenv("NOTION_WEBHOOK_VERIFICATION_TOKEN", TOKEN)
+
+
 NEW_PAGE = "aaaaaaaa-0000-0000-0000-000000000099"
 PLAIN = lambda page_id: page_id.replace("-", "")
 
@@ -57,10 +66,10 @@ def _payload_data(node):
 
 
 def gateway(raw_agents: dict, temporal: FakeTemporalClient, links=None) -> TestClient:
-    settings = Settings(notion_webhook_token=TOKEN)
+    settings = Settings()
     app = create_app(
         settings,
-        parse_agents_config(raw_agents),
+        TenantsConfig.of(parse_agents_config(raw_agents)),
         temporal,
         links or InMemoryTaskLinkStore(),
         SignatureVerifier("x"),

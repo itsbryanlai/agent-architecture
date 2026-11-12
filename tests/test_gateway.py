@@ -11,7 +11,7 @@ from slack_sdk.signature import SignatureVerifier
 from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, Settings
+from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.gateway.app import create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.stores import InMemoryTaskLinkStore
@@ -55,7 +55,11 @@ def temporal() -> FakeTemporalClient:
 @pytest.fixture
 def client(agents, temporal, secret) -> TestClient:
     app = create_app(
-        Settings(), agents, temporal, InMemoryTaskLinkStore(), SignatureVerifier(secret)
+        Settings(),
+        TenantsConfig.of(agents),
+        temporal,
+        InMemoryTaskLinkStore(),
+        SignatureVerifier(secret),
     )
     return TestClient(app)
 
@@ -154,6 +158,7 @@ def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
 def interactivity(client, secret, action_id: str, task_id: str, clicker: str = ALICE):
     payload = {
         "type": "block_actions",
+        "team": {"id": TEAM},
         "user": {"id": clicker},
         "actions": [
             {"action_id": action_id, "value": json.dumps({"task_id": task_id, "nonce": "n1"})}

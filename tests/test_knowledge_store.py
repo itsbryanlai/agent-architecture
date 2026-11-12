@@ -5,7 +5,13 @@ import logging
 import pytest
 
 from agentos import ids
-from agentos.config import AgentsConfig, ConfigError, Settings, parse_agents_config
+from agentos.config import (
+    AgentsConfig,
+    ConfigError,
+    Settings,
+    TenantsConfig,
+    parse_agents_config,
+)
 from agentos.connectors.notion import check_page_grant
 from agentos.knowledge.embedder import BATCH_SIZE, FakeEmbedder, OpenAICompatibleEmbedder
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -135,9 +141,9 @@ async def test_qwen_embedder_batches_and_checks_dimensions():
 
 
 def test_build_embedder_only_when_pages_granted():
-    assert build_embedder(Settings(), with_pages([])) is None
+    assert build_embedder(Settings(), TenantsConfig.of(with_pages([]))) is None
 
-    cfg = with_pages([{"id": ROOT, "name": "IT wiki"}])
+    cfg = TenantsConfig.of(with_pages([{"id": ROOT, "name": "IT wiki"}]))
     with pytest.raises(RuntimeError, match="QWEN_API_KEY"):
         build_embedder(Settings(), cfg)
     embedder = build_embedder(

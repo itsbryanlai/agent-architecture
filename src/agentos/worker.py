@@ -1,8 +1,9 @@
 """The Temporal worker: runs both workflows and every activity.
 
-Real clients are built here, at startup. Each one needs its secret from the
-environment and fails with a message naming the missing variable (never its
-value) if it is not exported.
+Real clients are built here, at startup, one Slack client and one Notion
+client for each tenant. Each one needs its secret from the environment
+variable the tenant's config names, and fails with a message naming the tenant
+and the missing variable (never its value) if it is not exported.
 """
 
 from __future__ import annotations
@@ -22,11 +23,11 @@ from agentos.config import (
     TASK_QUEUE,
     AgentsConfig,
     Settings,
-    load_agents_config,
+    TenantsConfig,
     load_settings,
+    load_tenants_config,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
-from agentos.index_knowledge import granted_roots
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -38,6 +39,7 @@ from agentos.stores import (
     PostgresTaskLinkStore,
     PostgresToolOutputStore,
 )
+from agentos.tenants import build_registry
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
@@ -60,16 +62,20 @@ def build_llm(settings: Settings) -> LLMClient:
     return AnthropicLLMClient(settings.require("anthropic_api_key"), settings.model)
 
 
-def build_embedder(settings: Settings, agents: AgentsConfig) -> Embedder | None:
-    """Build the embedder, only when some agent has a Notion page grant.
+def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | None:
+    """Build the embedder, only when some agent of any tenant has a Notion page grant.
 
-    Agents without knowledge need no embedding settings, so the Anthropic
-    provider keeps working without them. Returns None when no agent has a page
-    grant. When ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no
+    The embedder is the platform's own, shared by every tenant. Agents without
+    knowledge need no embedding settings, so the Anthropic provider keeps
+    working without them. Returns None when no agent has a page grant. When ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no
     Qwen setting is needed (a local server needs no key, but the SDK requires a
     non-empty string). Otherwise the Qwen settings are used.
     """
-    if not any(agent.grants.notion_pages for agent in agents.agents.values()):
+    if not any(
+        agent.grants.notion_pages
+        for config in tenants.tenants.values()
+        for agent in config.agents.values()
+    ):
         return None
     if settings.embed_base_url:
         return OpenAICompatibleEmbedder(
@@ -148,13 +154,19 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("agentos.worker")
     settings = load_settings()
-    agents = load_agents_config(settings.config_path)
+    tenants = load_tenants_config(settings.config_path)
     llm = build_llm(settings)
-    embedder = build_embedder(settings, agents)
-    notion_api = RealNotionAPI(settings.require("notion_token"))
-    failure = await check_grants_at_startup(notion_api, agents, log)
-    if failure:
-        raise SystemExit(failure)
+    embedder = build_embedder(settings, tenants)
+    registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
+    failures = []
+    for tenant_id in registry.tenants():
+        runtime = registry.get(tenant_id)
+        log.info("tenant_id=%s checking grants", tenant_id)
+        failure = await check_grants_at_startup(runtime.notion_api, runtime.config, log)
+        if failure:
+            failures.append(f"tenant '{tenant_id}': {failure}")
+    if failures:
+        raise SystemExit("\n".join(failures))
     # Provider and model name only; never a key.
     log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
     if embedder is not None:
@@ -172,13 +184,11 @@ async def main() -> None:
         knowledge = PostgresKnowledgeStore(pool)
         activities = AgentActivities(
             settings=settings,
-            agents=agents,
+            registry=registry,
             history=PostgresHistoryStore(pool),
             idem=PostgresIdempotencyStore(pool),
             links=PostgresTaskLinkStore(pool),
             llm=llm,
-            slack=RealSlackPoster(settings.require("slack_bot_token")),
-            notion_api=notion_api,
             tool_outputs=PostgresToolOutputStore(pool),
             knowledge=knowledge,
             embedder=embedder,
@@ -188,9 +198,7 @@ async def main() -> None:
         if embedder is not None:
             # Indexing runs only where some agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
-            all_activities += IndexActivities(
-                notion_api, knowledge, embedder, granted_roots(agents)
-            ).all()
+            all_activities += IndexActivities(registry, knowledge, embedder).all()
         client = await Client.connect(settings.temporal_address)
         worker = Worker(
             client,
@@ -198,7 +206,7 @@ async def main() -> None:
             workflows=workflows,
             activities=all_activities,
         )
-        log.info("tenant_id=%s worker started on %s", agents.tenant_id, TASK_QUEUE)
+        log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
         await worker.run()
     finally:
         await pool.close()

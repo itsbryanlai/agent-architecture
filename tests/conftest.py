@@ -12,9 +12,14 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
-from agentos.config import TASK_QUEUE, AgentsConfig, Settings, parse_agents_config
+from agentos.config import (
+    TASK_QUEUE,
+    AgentsConfig,
+    Settings,
+    TenantsConfig,
+    parse_agents_config,
+)
 from agentos.connectors.notion import FakeNotionAPI, text_block
-from agentos.index_knowledge import granted_roots
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -26,6 +31,7 @@ from agentos.stores import (
     InMemoryTaskLinkStore,
     InMemoryToolOutputStore,
 )
+from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
@@ -163,13 +169,11 @@ async def harness(agents):
     )
     acts = AgentActivities(
         settings=Settings(),
-        agents=agents,
+        registry=TenantRegistry({TENANT: runtime_for(agents, h.slack, h.notion)}),
         history=h.history,
         idem=h.idem,
         links=h.links,
         llm=h.llm,
-        slack=h.slack,
-        notion_api=h.notion,
         tool_outputs=h.tool_outputs,
     )
     worker = Worker(
@@ -287,25 +291,107 @@ async def kharness():
         knowledge=InMemoryKnowledgeStore(),
         embedder=FakeEmbedder(),
     )
+    registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, notion)})
     h.acts = AgentActivities(
         settings=Settings(),
-        agents=cfg,
+        registry=registry,
         history=h.history,
         idem=h.idem,
         links=h.links,
         llm=h.llm,
-        slack=h.slack,
-        notion_api=notion,
         tool_outputs=h.tool_outputs,
         knowledge=h.knowledge,
         embedder=h.embedder,
     )
-    index_acts = IndexActivities(notion, h.knowledge, h.embedder, granted_roots(cfg))
+    index_acts = IndexActivities(registry, h.knowledge, h.embedder)
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,
         workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
         activities=h.acts.all() + index_acts.all(),
+    )
+    async with worker:
+        yield h
+    await wf_env.shutdown()
+
+
+# --- Two tenants in one deployment, each with its own Slack and Notion fakes.
+
+GLOBEX = "globex"
+GLOBEX_TEAM = "T0GLOBEX"
+ACME_WORKSPACE = "ws-acme"
+GLOBEX_WORKSPACE = "ws-globex"
+
+
+def tenant_dict(tenant: str, team: str, workspace: str, suffix: str) -> dict:
+    """A tenant's config that names its own secret variables (``*_<SUFFIX>``)."""
+    raw = agents_dict()
+    raw["tenant_id"] = tenant
+    raw["slack_team_id"] = team
+    raw["notion_workspace_id"] = workspace
+    raw["secrets"] = {
+        "slack_bot_token_env": f"SLACK_BOT_TOKEN_{suffix}",
+        "notion_token_env": f"NOTION_TOKEN_{suffix}",
+        "notion_webhook_token_env": f"NOTION_WEBHOOK_VERIFICATION_TOKEN_{suffix}",
+    }
+    return raw
+
+
+def two_tenant_dicts() -> tuple[dict, dict]:
+    return (
+        tenant_dict(TENANT, TEAM, ACME_WORKSPACE, "ACME"),
+        tenant_dict(GLOBEX, GLOBEX_TEAM, GLOBEX_WORKSPACE, "GLOBEX"),
+    )
+
+
+@dataclass
+class TwoTenantHarness:
+    wf_env: WorkflowEnvironment
+    tenants: TenantsConfig
+    registry: TenantRegistry
+    llm: ScriptedLLMClient
+    slacks: dict[str, FakeSlack]
+    notions: dict[str, FakeNotionAPI]
+    history: InMemoryHistoryStore
+
+    @property
+    def client(self):
+        return self.wf_env.client
+
+
+@pytest.fixture
+async def two_tenants():
+    acme_raw, globex_raw = two_tenant_dicts()
+    tenants = TenantsConfig.of(parse_agents_config(acme_raw), parse_agents_config(globex_raw))
+    wf_env = await WorkflowEnvironment.start_time_skipping()
+    slacks = {t: FakeSlack(emails={ALICE: "alice@example.com"}) for t in tenants.tenants}
+    notions = {t: make_fake_notion() for t in tenants.tenants}
+    registry = TenantRegistry(
+        {t: runtime_for(cfg, slacks[t], notions[t]) for t, cfg in tenants.tenants.items()}
+    )
+    h = TwoTenantHarness(
+        wf_env=wf_env,
+        tenants=tenants,
+        registry=registry,
+        llm=ScriptedLLMClient(),
+        slacks=slacks,
+        notions=notions,
+        history=InMemoryHistoryStore(),
+    )
+    acts = AgentActivities(
+        settings=Settings(),
+        registry=registry,
+        history=h.history,
+        idem=InMemoryIdempotencyStore(),
+        links=InMemoryTaskLinkStore(),
+        llm=h.llm,
+        tool_outputs=InMemoryToolOutputStore(),
+    )
+    worker = Worker(
+        wf_env.client,
+        task_queue=TASK_QUEUE,
+        workflows=[ConversationWorkflow, TaskWorkflow],
+        activities=acts.all(),
     )
     async with worker:
         yield h

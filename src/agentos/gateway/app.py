@@ -10,14 +10,18 @@ It acknowledges every request quickly and hands the work to Temporal:
   task workflow decides whether that person may approve. An Edit click opens a
   form prefilled from the task's current draft (only for the requester, only
   while the draft is editable); saving the form becomes an ``edit`` signal.
-* ``POST /notion/webhook``: a page update becomes an ``external_update`` signal
-  to the task watching that page. Polling covers anything the webhook misses.
-  Events must carry a valid ``X-Notion-Signature``; the subscription
-  handshake's verification token is written to an owner-only file, never logged.
+* ``POST /notion/webhook/{tenant_id}``: a page update becomes an
+  ``external_update`` signal to the task watching that page. Polling covers
+  anything the webhook misses. Events must carry a valid ``X-Notion-Signature``,
+  made with that tenant's own verification token; the subscription handshake's
+  token is written to an owner-only file, never logged. ``POST /notion/webhook``
+  is an alias that works only while exactly one tenant is configured.
 
-Every Slack request must carry a valid Slack signature. Events from any Slack
-workspace other than the configured one are dropped. The tenant comes from
-configuration and is part of every workflow ID and log line.
+Every Slack request must carry a valid Slack signature. The gateway decides the
+tenant from the request itself: the Slack ``team_id``, or the Notion webhook
+path. It never takes the tenant from text a user wrote, and it drops (with a
+log line holding IDs only) what it cannot map to a configured tenant. The
+tenant is part of every workflow ID and log line.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -35,7 +40,7 @@ from fastapi import FastAPI, Request, Response
 from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, AgentsConfig, Settings
+from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
@@ -72,26 +77,28 @@ MULTILINE_FIELDS = {"details", "comment"}
 @dataclass
 class GatewayDeps:
     settings: Settings
-    agents: AgentsConfig
+    tenants: TenantsConfig
     temporal_client: Any
     links: TaskLinkStore
     verifier: Any  # slack_sdk.signature.SignatureVerifier or compatible
-    slack: Any = None  # a SlackPoster; used to open the Edit form
+    # A tenant's own SlackPoster, used to open the Edit form in that tenant's
+    # workspace. Unset in tests that never open a form.
+    slack_for: Callable[[str], Any] | None = None
 
 
 def create_app(
     settings: Settings | None,
-    agents: AgentsConfig | None,
+    tenants: TenantsConfig | None,
     temporal_client: Any,
     links: TaskLinkStore | None,
     verifier: Any,
     lifespan: Any = None,
-    slack: Any = None,
+    slack_for: Callable[[str], Any] | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
-        app.state.deps = GatewayDeps(settings, agents, temporal_client, links, verifier, slack)
+        app.state.deps = GatewayDeps(settings, tenants, temporal_client, links, verifier, slack_for)
 
     def deps(request: Request) -> GatewayDeps:
         return request.app.state.deps
@@ -121,11 +128,12 @@ def create_app(
                 media_type="application/json",
             )
         d = deps(request)
-        tenant = d.agents.tenant_id
         if payload.get("type") != "event_callback":
             return Response(status_code=200)
-        if payload.get("team_id") != d.agents.slack_team_id:
-            log.warning("tenant_id=%s ignored event from another Slack workspace", tenant)
+        team_id = payload.get("team_id")
+        tenant = d.tenants.by_slack_team(team_id)
+        if tenant is None:
+            log.warning("ignored event from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
 
         event = payload.get("event") or {}
@@ -151,7 +159,7 @@ def create_app(
         workflow_id = ids.conversation_id(tenant, channel, thread_ts)
         await d.temporal_client.start_workflow(
             "ConversationWorkflow",
-            ConversationRef(tenant, d.agents.default_agent, channel, thread_ts),
+            ConversationRef(tenant, d.tenants.tenants[tenant].default_agent, channel, thread_ts),
             id=workflow_id,
             task_queue=TASK_QUEUE,
             start_signal="message",
@@ -166,9 +174,13 @@ def create_app(
         if body is None:
             return Response(status_code=401)
         d = deps(request)
-        tenant = d.agents.tenant_id
         form = parse_qs(body.decode("utf-8"))
         payload = json.loads((form.get("payload") or ["{}"])[0])
+        team_id = (payload.get("team") or {}).get("id")
+        tenant = d.tenants.by_slack_team(team_id)
+        if tenant is None:
+            log.warning("ignored interaction from an unknown Slack workspace team_id=%s", team_id)
+            return Response(status_code=200)
         if payload.get("type") == "view_submission":
             return await _edit_submitted(d, tenant, payload)
         if payload.get("type") != "block_actions":
@@ -195,90 +207,123 @@ def create_app(
             )
         return Response(status_code=200)
 
+    @app.post("/notion/webhook/{tenant_id}")
+    async def notion_webhook(tenant_id: str, request: Request) -> Response:
+        return await _notion_webhook(deps(request), tenant_id, request)
+
     @app.post("/notion/webhook")
-    async def notion_webhook(request: Request) -> Response:
+    async def notion_webhook_single_tenant(request: Request) -> Response:
+        # Kept so a subscription made before there were several tenants keeps
+        # working: it is the only tenant's, while exactly one is configured.
         d = deps(request)
-        tenant = d.agents.tenant_id
-        body = await request.body()
-        signature = request.headers.get("X-Notion-Signature")
-        try:
-            payload = json.loads(body)
-        except ValueError:
-            return Response(status_code=400)
-        if not isinstance(payload, dict):
-            return Response(status_code=400)
-        if isinstance(payload.get("verification_token"), str) and "type" not in payload:
-            # One-time subscription handshake, recognised by its body (a token
-            # and no event type), whatever its headers. Notion's handshake can
-            # carry a signature header, but it cannot be verified: its key is
-            # the very token being delivered. The token goes to an owner-only
-            # file, never to a log, and the operator pastes it into Notion.
-            # Once a token is configured the handshake is closed, so nobody can
-            # overwrite the file with a value of their own.
-            if d.settings.notion_webhook_token:
-                log.warning(
-                    "tenant_id=%s Notion webhook handshake refused: a verification token is "
-                    "already configured; unset NOTION_WEBHOOK_VERIFICATION_TOKEN and restart "
-                    "the gateway to accept a new subscription",
-                    tenant,
-                )
-                return Response(status_code=409)
-            path = _write_token_file(
-                d.settings.notion_token_file, str(payload["verification_token"])
-            )
-            log.warning(
-                "tenant_id=%s Notion webhook verification token written to %s; "
-                "paste it into the Notion integration and export it as "
-                "NOTION_WEBHOOK_VERIFICATION_TOKEN",
-                tenant,
-                path,
-            )
-            return Response(status_code=200)
-        token = d.settings.notion_webhook_token
-        if not token:
-            log.warning(
-                "tenant_id=%s Notion webhook event refused: NOTION_WEBHOOK_VERIFICATION_TOKEN "
-                "is not set",
-                tenant,
-            )
-            return Response(status_code=503)
-        if not verify_notion_signature(body, signature, token):
-            reason = "missing" if signature is None else "invalid"
-            log.warning("tenant_id=%s Notion webhook event refused: %s signature", tenant, reason)
-            return Response(status_code=401)
-        if payload.get("type") in NOTION_PAGE_EVENTS:
-            entity = payload.get("entity") or {}
-            page_id = entity.get("id")
-            if entity.get("type") == "page" and page_id:
-                task_id = await d.links.task_for_page(tenant, normalize_id(page_id))
-                if task_id:
-                    await _signal(
-                        d,
-                        tenant,
-                        task_id,
-                        "external_update",
-                        ExternalUpdate(page_id=page_id, source="notion_webhook"),
-                    )
-                if any(a.grants.notion_pages for a in d.agents.agents.values()):
-                    # Signal-with-start: a burst of events for one page lands in
-                    # the one running refresh workflow.
-                    refresh_id = ids.page_refresh_id(tenant, page_id)
-                    await d.temporal_client.start_workflow(
-                        "PageRefreshWorkflow",
-                        args=[tenant, normalize_id(page_id)],
-                        id=refresh_id,
-                        task_queue=TASK_QUEUE,
-                        start_signal="changed",
-                    )
-                    log.info(
-                        "tenant_id=%s workflow_id=%s signalled changed event_type=%s",
-                        tenant,
-                        refresh_id,
-                        payload.get("type"),
-                    )
-        return Response(status_code=200)
+        tenant_id = d.tenants.only_tenant()
+        if tenant_id is None:
+            return Response(status_code=404)
+        return await _notion_webhook(d, tenant_id, request)
 
     return app
+
+
+async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Response:
+    """Handle one Notion webhook request for the tenant its URL names.
+
+    The tenant comes from the path, never from the body. The signature is
+    checked with that tenant's own verification token, read from the variable
+    its config names, so another tenant's token cannot pass.
+    """
+    if not TENANT_ID_PATTERN.fullmatch(tenant):
+        # Never look up, or build a file name from, a path that is not a tenant ID.
+        return Response(status_code=404)
+    config = d.tenants.get(tenant)
+    if config is None:
+        log.warning("Notion webhook for an unknown tenant tenant_id=%s", tenant)
+        return Response(status_code=404)
+    token_env = config.secrets.notion_webhook_token_env
+    body = await request.body()
+    signature = request.headers.get("X-Notion-Signature")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return Response(status_code=400)
+    if not isinstance(payload, dict):
+        return Response(status_code=400)
+    token = read_secret(token_env)
+    if isinstance(payload.get("verification_token"), str) and "type" not in payload:
+        # One-time subscription handshake, recognised by its body (a token
+        # and no event type), whatever its headers. Notion's handshake can
+        # carry a signature header, but it cannot be verified: its key is
+        # the very token being delivered. The token goes to an owner-only
+        # file, never to a log, and the operator pastes it into Notion.
+        # Once a token is configured the handshake is closed, so nobody can
+        # overwrite the file with a value of their own.
+        if token:
+            log.warning(
+                "tenant_id=%s Notion webhook handshake refused: a verification token is "
+                "already configured; unset %s and restart the gateway to accept a new "
+                "subscription",
+                tenant,
+                token_env,
+            )
+            return Response(status_code=409)
+        path = _write_token_file(
+            _token_file(d.settings.notion_token_dir, tenant), str(payload["verification_token"])
+        )
+        log.warning(
+            "tenant_id=%s Notion webhook verification token written to %s; "
+            "paste it into the Notion integration and export it as %s",
+            tenant,
+            path,
+            token_env,
+        )
+        return Response(status_code=200)
+    if not token:
+        log.warning("tenant_id=%s Notion webhook event refused: %s is not set", tenant, token_env)
+        return Response(status_code=503)
+    if not verify_notion_signature(body, signature, token):
+        reason = "missing" if signature is None else "invalid"
+        log.warning("tenant_id=%s Notion webhook event refused: %s signature", tenant, reason)
+        return Response(status_code=401)
+    if config.notion_workspace_id and payload.get("workspace_id") != config.notion_workspace_id:
+        # A genuine event, but from a Notion workspace that is not this
+        # tenant's (or that does not say which it is): never act on it.
+        log.warning("tenant_id=%s Notion webhook event ignored: another workspace", tenant)
+        return Response(status_code=200)
+    if payload.get("type") in NOTION_PAGE_EVENTS:
+        entity = payload.get("entity") or {}
+        page_id = entity.get("id")
+        if entity.get("type") == "page" and page_id:
+            task_id = await d.links.task_for_page(tenant, normalize_id(page_id))
+            if task_id:
+                await _signal(
+                    d,
+                    tenant,
+                    task_id,
+                    "external_update",
+                    ExternalUpdate(page_id=page_id, source="notion_webhook"),
+                )
+            if any(a.grants.notion_pages for a in config.agents.values()):
+                # Signal-with-start: a burst of events for one page lands in
+                # the one running refresh workflow.
+                refresh_id = ids.page_refresh_id(tenant, page_id)
+                await d.temporal_client.start_workflow(
+                    "PageRefreshWorkflow",
+                    args=[tenant, normalize_id(page_id)],
+                    id=refresh_id,
+                    task_queue=TASK_QUEUE,
+                    start_signal="changed",
+                )
+                log.info(
+                    "tenant_id=%s workflow_id=%s signalled changed event_type=%s",
+                    tenant,
+                    refresh_id,
+                    payload.get("type"),
+                )
+    return Response(status_code=200)
+
+
+def _token_file(directory: str, tenant: str) -> str:
+    """The file that holds one tenant's Notion verification token."""
+    return os.path.join(directory, f"notion-webhook-verification-token-{tenant}")
 
 
 def _write_token_file(configured: str, token: str) -> str:
@@ -318,7 +363,10 @@ async def _open_edit_form(
     if not draft.editable:
         log.info("tenant_id=%s workflow_id=%s draft not editable", tenant, task_id)
         return
-    await d.slack.open_view(payload.get("trigger_id", ""), _edit_view(task_id, draft))
+    if d.slack_for is None:
+        log.warning("tenant_id=%s edit form not opened: no Slack client", tenant)
+        return
+    await d.slack_for(tenant).open_view(payload.get("trigger_id", ""), _edit_view(task_id, draft))
 
 
 async def _query_draft(d: GatewayDeps, tenant: str, task_id: str) -> DraftView | None:
@@ -417,20 +465,21 @@ async def _real_lifespan(app: FastAPI):
     from slack_sdk.signature import SignatureVerifier
     from temporalio.client import Client
 
-    from agentos.config import load_agents_config, load_settings
+    from agentos.config import load_settings, load_tenants_config
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
+    from agentos.tenants import build_slack_clients
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    agents = load_agents_config(settings.config_path)
+    tenants = load_tenants_config(settings.config_path)
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
     client = await Client.connect(settings.temporal_address)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
-    slack = RealSlackPoster(settings.require("slack_bot_token"))
+    slack_clients = build_slack_clients(tenants, RealSlackPoster)
     app.state.deps = GatewayDeps(
-        settings, agents, client, PostgresTaskLinkStore(pool), verifier, slack
+        settings, tenants, client, PostgresTaskLinkStore(pool), verifier, slack_clients.__getitem__
     )
     try:
         yield

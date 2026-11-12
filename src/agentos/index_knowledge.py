@@ -3,6 +3,7 @@
     uv run python -m agentos.index_knowledge             # start one run per scope
     uv run python -m agentos.index_knowledge --wait      # ... and wait for each summary
     uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
+    uv run python -m agentos.index_knowledge --tenant acme  # only one tenant
 
 Needs a running worker (``uv run python -m agentos.worker``), which does the
 reading and embedding with its own Notion token and Qwen key. This command
@@ -11,8 +12,10 @@ only asks Temporal to start the work and never reads a token itself.
 Indexing calls the embeddings endpoint, so it spends embedding credit; pages
 whose content has not changed are not embedded again.
 
-One run starts per distinct granted scope: two agents granted the same root
-page share one run. A run that is already going is not started twice.
+One run starts per distinct granted scope of each tenant: two agents of the
+same tenant granted the same root page share one run. A run that is already
+going is not started twice. Schedules are planned and deleted per tenant, by
+that tenant's ID prefix, so one tenant's command never touches another's.
 """
 
 from __future__ import annotations
@@ -36,18 +39,11 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, AgentsConfig, load_agents_config, load_settings
-from agentos.connectors.notion import normalize_id
+from agentos.config import TASK_QUEUE, AgentsConfig, load_settings, load_tenants_config
+from agentos.tenants import granted_roots
 from agentos.workflows.indexing import IndexingWorkflow
 
-
-def granted_roots(agents: AgentsConfig) -> dict[str, str]:
-    """Scope to root page ID, for every distinct page granted to any agent."""
-    roots: dict[str, str] = {}
-    for agent in agents.agents.values():
-        for grant in agent.grants.notion_pages:
-            roots.setdefault(ids.knowledge_scope(grant.id), normalize_id(grant.id))
-    return roots
+__all__ = ["apply_schedules", "granted_roots", "plan_schedules", "start_indexing"]
 
 
 async def start_indexing(client: Client, agents: AgentsConfig) -> list[tuple[str, WorkflowHandle]]:
@@ -126,24 +122,32 @@ async def apply_schedules(client: Client, agents: AgentsConfig) -> SchedulePlan:
     return plan
 
 
-async def run(wait: bool, schedule: bool) -> None:
+async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
     settings = load_settings()
-    agents = load_agents_config(settings.config_path)
-    if not granted_roots(agents):
+    tenants = load_tenants_config(settings.config_path)
+    if tenant is not None and tenant not in tenants.tenants:
+        raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
+    selected = [tenants.tenants[tenant]] if tenant else list(tenants.tenants.values())
+    if not any(granted_roots(a) for a in selected):
         print("No agent has a Notion page grant, so there is nothing to index.")
         return
     client = await Client.connect(settings.temporal_address)
     if schedule:
-        plan = await apply_schedules(client, agents)
-        for label, items in (
-            ("created", plan.create),
-            ("updated", plan.update),
-            ("deleted", plan.delete),
-        ):
-            for schedule_id in items:
-                print(f"{label} schedule {schedule_id}")
+        # Every selected tenant is planned, including one with no grants left
+        # while another has some, so its stale schedules are deleted.
+        for agents in selected:
+            plan = await apply_schedules(client, agents)
+            for label, items in (
+                ("created", plan.create),
+                ("updated", plan.update),
+                ("deleted", plan.delete),
+            ):
+                for schedule_id in items:
+                    print(f"{label} schedule {schedule_id}")
         return
-    started = await start_indexing(client, agents)
+    started = []
+    for agents in selected:
+        started += await start_indexing(client, agents)
     for workflow_id, _ in started:
         print(f"started {workflow_id}")
     if wait:
@@ -168,8 +172,9 @@ def main() -> None:
         action="store_true",
         help="create or update one nightly (03:00 UTC) schedule per scope and delete stale ones",
     )
+    parser.add_argument("--tenant", help="only this tenant (default: every configured tenant)")
     args = parser.parse_args()
-    asyncio.run(run(args.wait, args.schedule))
+    asyncio.run(run(args.wait, args.schedule, args.tenant))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, Settings
+from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.gateway.app import create_app
 from agentos.models import (
     ApprovalDecision,
@@ -28,7 +28,7 @@ from agentos.slack_client import FakeSlack
 from agentos.stores import InMemoryTaskLinkStore
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import MAX_EDITS, TaskWorkflow
-from tests.conftest import ALICE, BOB, DB_ID, OTHER_DB_ID, TENANT, eventually, title_prop
+from tests.conftest import ALICE, BOB, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, title_prop
 from tests.test_gateway import FakeTemporalClient, signed_headers
 
 NONCE = "nonce-1"
@@ -241,11 +241,11 @@ def gateway(agents, draft: DraftView):
     slack = FakeSlack()
     app = create_app(
         Settings(),
-        agents,
+        TenantsConfig.of(agents),
         temporal,
         InMemoryTaskLinkStore(),
         SignatureVerifier(sec),
-        slack=slack,
+        slack_for=lambda tenant: slack,
     )
     return TestClient(app), sec, temporal, slack
 
@@ -269,6 +269,7 @@ def an_edit_draft(editable: bool = True) -> DraftView:
 def edit_click(clicker: str, nonce: str = "n-current") -> dict:
     return {
         "type": "block_actions",
+        "team": {"id": TEAM},
         "user": {"id": clicker},
         "trigger_id": "trig-1",
         "actions": [
@@ -313,6 +314,7 @@ def test_edit_click_by_someone_else_is_ignored(agents):
 def submission(values: dict, user: str = ALICE) -> dict:
     return {
         "type": "view_submission",
+        "team": {"id": TEAM},
         "user": {"id": user},
         "view": {
             "callback_id": "task_edit",

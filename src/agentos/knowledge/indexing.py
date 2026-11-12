@@ -4,6 +4,10 @@ Rules kept here:
 
 * Page text is fetched, chunked, embedded and stored inside one activity per
   page. Temporal workflow history sees only page IDs and counts, never text.
+* Every activity works for exactly one tenant, named by its ``tenant_id``
+  argument. It reads pages with that tenant's own Notion client and only under
+  the root pages that tenant granted. An unknown tenant is a non-retryable
+  failure, never a fallback to another tenant.
 * The agent uses its own access: pages are read with the same Notion token the
   agents use, and only under a root page an agent was granted.
 * Log lines carry the tenant, scope and page ID only.
@@ -19,11 +23,12 @@ from temporalio import activity
 
 from agentos.activities import _is_client_error, _non_retryable
 from agentos.config import EMBED_DIMENSIONS
-from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
+from agentos.connectors.notion import is_unreachable, normalize_id
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.notion_text import PageUnavailable, chunk, page_text
 from agentos.knowledge.search import PageChecker
 from agentos.knowledge.store import KnowledgeStore
+from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant, granted_roots
 
 log = logging.getLogger("agentos.indexing")
 
@@ -60,16 +65,20 @@ def content_hash(model: str, title: str, chunks: list[str]) -> str:
 class IndexActivities:
     def __init__(
         self,
-        notion_api: NotionAPI,
+        registry: TenantRegistry,
         store: KnowledgeStore,
         embedder: Embedder,
-        roots: dict[str, str] | None = None,
     ):
-        self.api = notion_api
+        self.registry = registry
         self.store = store
         self.embedder = embedder
-        # Scope to root page ID, for every page granted to any agent.
-        self.roots = roots or {}
+
+    def _runtime(self, tenant_id: str) -> TenantRuntime:
+        """The config and Notion client of the tenant an activity works for."""
+        try:
+            return self.registry.get(tenant_id)
+        except UnknownTenant as err:
+            raise _non_retryable(err) from err
 
     def all(self) -> list:
         return [self.sync_page, self.prune_scope, self.refresh_page]
@@ -85,7 +94,7 @@ class IndexActivities:
         """
         page_id = normalize_id(page_id)
         try:
-            content = await page_text(self.api, page_id)
+            content = await page_text(self._runtime(tenant_id).notion_api, page_id)
         except PageUnavailable:
             log.info("page skipped tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
             return SyncResult(skipped=True)
@@ -134,9 +143,10 @@ class IndexActivities:
         and page IDs only, never page text.
         """
         page_id = normalize_id(page_id)
-        checker = PageChecker(self.api)
+        runtime = self._runtime(tenant_id)
+        checker = PageChecker(runtime.notion_api)
         result = RefreshResult()
-        for scope, root in self.roots.items():
+        for scope, root in granted_roots(runtime.config).items():
             if await checker.under_root(page_id, root):
                 synced = await self.sync_page(tenant_id, scope, page_id)
                 if not synced.skipped:

@@ -27,8 +27,9 @@ card has an **Edit** button: it opens a form prefilled with the draft, and
 saving replaces the draft and asks for a fresh approval (the old buttons stop
 working). A request can be edited up to 5 times.
 
-The skeleton runs one tenant, set in `config/agents.yaml`, but every workflow
-ID, database row and log line already carries the tenant ID.
+One deployment can serve several tenants (see [Several tenants](#several-tenants)).
+A single tenant is set in `config/agents.yaml`. Every workflow ID, database
+row and log line carries the tenant ID.
 
 ## Prerequisites
 
@@ -86,7 +87,8 @@ below),
 `AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`), `AGENTOS_DATABASE_URL`
 (default `postgresql://agentos_app:agentos_app@localhost:55432/agentos`, the
 local development app role, on the host port 55432 that Compose publishes) and `AGENTOS_CONFIG`
-(default `config/agents.yaml`).
+(default `config/agents.yaml`; a file for one tenant, or a directory with one
+`*.yaml` per tenant).
 
 If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
 export the `AGENTOS_` names instead: the old ones are now ignored.
@@ -107,28 +109,82 @@ poll. Notion signs every event, and the gateway refuses any event whose
 signature it cannot check, so set it up in this order:
 
 1. In the Notion integration, add a webhook subscription that points at
-   `POST /notion/webhook` on the gateway.
+   `POST /notion/webhook/<tenant_id>` on the gateway. (`POST /notion/webhook`
+   without a tenant works only while exactly one tenant is configured, so a
+   subscription made before there were several tenants keeps working.)
 2. Notion sends a one-time handshake. The gateway writes the verification token
-   to a file readable only by you, and logs the path (never the token). The path
-   is `~/.agentos/notion-webhook-verification-token` unless you set
-   `AGENTOS_NOTION_TOKEN_FILE`.
+   to a file readable only by you, and logs the path (never the token). The file
+   is `notion-webhook-verification-token-<tenant_id>` in `~/.agentos`, unless
+   you set `AGENTOS_NOTION_TOKEN_DIR`.
 3. Paste the token from that file into the Notion integration to finish
-   subscribing, then `export NOTION_WEBHOOK_VERIFICATION_TOKEN='<token>'` and
-   restart the gateway.
+   subscribing, then export it in the variable the tenant's config names
+   (`NOTION_WEBHOOK_VERIFICATION_TOKEN` by default), for example
+   `export NOTION_WEBHOOK_VERIFICATION_TOKEN='<token>'`, and restart the
+   gateway.
 
 The setup message is accepted only while no token is configured.
 
 Once the token is exported, the gateway refuses further handshakes (409) so the
-file cannot be overwritten; to re-subscribe, unset
-`NOTION_WEBHOOK_VERIFICATION_TOKEN` and restart the gateway first.
+file cannot be overwritten; to re-subscribe, unset that tenant's webhook token
+variable and restart the gateway first.
 
 Until the token is exported, events get a 503. Events with a missing or wrong
-signature get a 401. Neither reaches a workflow.
+signature (a signature made with another tenant's token is wrong) get a 401. A
+path that names no tenant gets a 404. None of these reaches a workflow. If the
+tenant's config sets `notion_workspace_id`, a correctly signed event from any
+other Notion workspace is ignored (200, no action).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token (secret; export it, never save it in a dotenv file). Without it every webhook event is refused |
-| `AGENTOS_NOTION_TOKEN_FILE` | `~/.agentos/notion-webhook-verification-token` | Where the gateway writes the token it receives at subscription time (mode `0600`) |
+| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token for a tenant that has no `secrets` block (secret; export it, never save it in a dotenv file). Without it every webhook event for that tenant is refused. Other tenants name their own variable |
+| `AGENTOS_NOTION_TOKEN_DIR` | `~/.agentos` | Directory where the gateway writes each tenant's token file, `notion-webhook-verification-token-<tenant_id>`, at subscription time (mode `0600`, directory `0700`) |
+
+## Several tenants
+
+`AGENTOS_CONFIG` may name a **directory**. Every `*.yaml` directly inside it is
+one tenant, in the same format as `config/agents.yaml`. The gateway and the
+worker serve all of them side by side:
+
+```
+config/tenants/
+  acme.yaml
+  globex.yaml
+```
+
+```yaml
+# config/tenants/globex.yaml (the agents block is as in agents.yaml)
+tenant_id: globex
+slack_team_id: T0GLOBEX
+notion_workspace_id: "<globex's Notion workspace ID>"   # optional: webhook cross-check
+secrets:                                                # names of variables, not values
+  slack_bot_token_env: SLACK_BOT_TOKEN_GLOBEX
+  notion_token_env: NOTION_TOKEN_GLOBEX
+  notion_webhook_token_env: NOTION_WEBHOOK_VERIFICATION_TOKEN_GLOBEX
+default_agent: it-helper
+agents: { ... }
+```
+
+```bash
+export SLACK_BOT_TOKEN_GLOBEX='<paste here>'
+export NOTION_TOKEN_GLOBEX='<paste here>'
+export AGENTOS_CONFIG=config/tenants
+```
+
+- Each tenant's Slack workspace and Notion webhook path (`/notion/webhook/<tenant_id>`)
+  reach only that tenant, and each tenant's tokens are used only for its own
+  work. The gateway drops a Slack event from a workspace it has no tenant for.
+- Secrets still come only from the environment. The `secrets` block names the
+  variables; a tenant without one uses `SLACK_BOT_TOKEN`, `NOTION_TOKEN` and
+  `NOTION_WEBHOOK_VERIFICATION_TOKEN`, and only one tenant may. The worker
+  refuses to start, naming the tenant and the variable, if one is unset.
+- A `tenant_id` is 1 to 63 lowercase letters, digits and hyphens, starting with a letter or digit; anything else fails at load.
+- Two tenants may not share a `tenant_id`, a `slack_team_id`, a
+  `notion_workspace_id` or a secret variable; loading fails naming both.
+- `SLACK_SIGNING_SECRET` stays one value, because there is one Slack app. The
+  model and the embedder are the platform's own and are shared.
+- `check_grants` checks every tenant. `index_knowledge` indexes every tenant,
+  or one with `--tenant <tenant_id>`; schedules are kept per tenant.
+- A single file keeps working exactly as before.
 
 ## Model provider
 

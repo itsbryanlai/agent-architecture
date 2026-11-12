@@ -16,6 +16,7 @@ from agentos.stores import (
     InMemoryTaskLinkStore,
     InMemoryToolOutputStore,
 )
+from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, TENANT
 
 
@@ -36,13 +37,13 @@ class NotionStatusError(Exception):
 def make_activities(agents, llm):
     return AgentActivities(
         settings=Settings(),
-        agents=agents,
+        registry=TenantRegistry(
+            {agents.tenant_id: runtime_for(agents, FakeSlack(), FakeNotionAPI())}
+        ),
         history=InMemoryHistoryStore(),
         idem=InMemoryIdempotencyStore(),
         links=InMemoryTaskLinkStore(),
         llm=llm,
-        slack=FakeSlack(),
-        notion_api=FakeNotionAPI(),
         tool_outputs=InMemoryToolOutputStore(),
     )
 

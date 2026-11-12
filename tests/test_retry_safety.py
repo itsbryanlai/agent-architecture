@@ -136,7 +136,7 @@ async def test_post_once_logs_possible_duplicate(agents, caplog):
     with caplog.at_level(logging.WARNING, logger="agentos.activities"):
         ts = await acts._post_once(TENANT, "k1", "C1", "secret message text", "1.1")
 
-    assert len(acts.slack.posts()) == 1
+    assert len(acts.registry.get(TENANT).slack.posts()) == 1
     assert (await acts.idem.get(TENANT, "k1"))["ts"] == ts
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
@@ -152,4 +152,4 @@ async def test_post_once_returns_recorded_ts_without_posting(agents):
     ts = await acts._post_once(TENANT, "k1", "C1", "text", None)
 
     assert ts == "9.9"
-    assert acts.slack.posts() == []
+    assert acts.registry.get(TENANT).slack.posts() == []

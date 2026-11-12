@@ -225,7 +225,7 @@ class ConversationWorkflow:
     ) -> None:
         agent: AgentVersion = await workflow.execute_activity_method(
             AgentActivities.load_agent,
-            ref.agent_id,
+            args=[ref.tenant_id, ref.agent_id],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

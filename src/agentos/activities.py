@@ -2,6 +2,10 @@
 
 Rules kept here:
 
+* Every activity works for exactly one tenant, named by its arguments: the
+  ``TurnContext`` / ``TaskSpec`` tenant, or an explicit ``tenant_id``. It uses
+  only that tenant's Slack and Notion clients, and an unknown tenant is a
+  non-retryable failure, never a fallback to some other tenant.
 * The agent uses its own access. Notion calls go through a ``NotionConnector``
   built from that agent's grants, which checks every call before it is sent.
 * The requester comes from ``TurnContext`` / ``TaskSpec``, which the runtime
@@ -30,11 +34,10 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from agentos import ids
-from agentos.config import AgentsConfig, AgentVersion, Settings
+from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
     ConnectorError,
-    NotionAPI,
     NotionConnector,
     normalize_id,
 )
@@ -59,9 +62,9 @@ from agentos.models import (
     ToolResult,
     TurnContext,
 )
-from agentos.slack_client import SlackPoster
 from agentos.slack_format import to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
+from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
 
 log = logging.getLogger("agentos.activities")
 
@@ -91,36 +94,27 @@ class AgentActivities:
     def __init__(
         self,
         settings: Settings,
-        agents: AgentsConfig,
+        registry: TenantRegistry,
         history: HistoryStore,
         idem: IdempotencyStore,
         links: TaskLinkStore,
         llm: LLMClient,
-        slack: SlackPoster,
-        notion_api: NotionAPI,
         tool_outputs: ToolOutputStore,
         knowledge: KnowledgeStore | None = None,
         embedder: Embedder | None = None,
     ):
         self.settings = settings
-        self.notion_api = notion_api
+        self.registry = registry
         self.knowledge = knowledge
         self.embedder = embedder
         self.knowledge_tool = load_manifest(MANIFEST_DIR / "knowledge.yaml").tools[
             "search_knowledge"
         ]
-        self.agents = agents
         self.history = history
         self.tool_outputs = tool_outputs
         self.idem = idem
         self.links = links
         self.llm = llm
-        self.slack = slack
-        # One connector per agent, each limited to that agent's own grants.
-        self.connectors = {
-            agent_id: NotionConnector(notion_api, agent.grants.notion_databases)
-            for agent_id, agent in agents.agents.items()
-        }
 
     def all(self) -> list:
         return [
@@ -158,17 +152,28 @@ class AgentActivities:
             fields,
         )
 
-    def _agent(self, agent_id: str) -> AgentVersion:
-        agent = self.agents.agents.get(agent_id)
+    def _runtime(self, tenant_id: str) -> TenantRuntime:
+        """The clients and config of the tenant an activity works for.
+
+        An unknown tenant fails the activity for good; it is never answered
+        with another tenant's runtime.
+        """
+        try:
+            return self.registry.get(tenant_id)
+        except UnknownTenant as err:
+            raise _non_retryable(err) from err
+
+    def _agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
+        agent = self._runtime(tenant_id).config.agents.get(agent_id)
         if agent is None:
             raise ApplicationError(
                 f"unknown agent '{agent_id}'", type="ValueError", non_retryable=True
             )
         return agent
 
-    def _connector(self, agent_id: str) -> NotionConnector:
-        self._agent(agent_id)
-        return self.connectors[agent_id]
+    def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
+        self._agent(tenant_id, agent_id)
+        return self._runtime(tenant_id).connectors[agent_id]
 
     async def _post_once(
         self,
@@ -195,16 +200,40 @@ class AgentActivities:
                 "possible duplicate Slack post tenant_id=%s idem_key=%s", tenant_id, idem_key
             )
         await self.idem.put_if_absent(tenant_id, pending_key, {"channel": channel})
-        ts = await self.slack.post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
+        slack = self._runtime(tenant_id).slack
+        ts = await slack.post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
         stored = await self.idem.put_if_absent(tenant_id, idem_key, {"channel": channel, "ts": ts})
         return stored["ts"]
 
     # --- conversation ------------------------------------------------------------
 
     @activity.defn(name="load_agent")
-    async def load_agent(self, agent_id: str) -> AgentVersion:
-        self._log("load_agent", self.agents.tenant_id, agent_id)
-        return self._agent(agent_id)
+    async def load_agent(self, tenant_or_agent: str, agent_id: str | None = None) -> AgentVersion:
+        """Return the agent's current definition for the named tenant.
+
+        Called as ``load_agent(tenant_id, agent_id)``.
+
+        Replay compatibility: workflows that were already running when the
+        tenant argument was added call this with one argument, the agent ID. A
+        one-argument call is read that way, and the tenant is the registry's
+        only tenant; with several tenants it fails for good, because the
+        tenant cannot be known. Remove this fallback in a later cleanup, once
+        no workflow that started before the change is still running.
+        """
+        if agent_id is None:
+            agent_id = tenant_or_agent
+            tenant_id = self.registry.only_tenant()
+            if tenant_id is None:
+                raise ApplicationError(
+                    "load_agent was called without a tenant, and more than one tenant is "
+                    "configured",
+                    type="UnknownTenant",
+                    non_retryable=True,
+                )
+        else:
+            tenant_id = tenant_or_agent
+        self._log("load_agent", tenant_id, agent_id)
+        return self._agent(tenant_id, agent_id)
 
     @activity.defn(name="append_history")
     async def append_history(
@@ -268,9 +297,9 @@ class AgentActivities:
     @activity.defn(name="call_llm")
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
-        agent = self._agent(ctx.agent_id)
+        agent = self._agent(ctx.tenant_id, ctx.agent_id)
         messages = await self.history.load(ctx.tenant_id, conversation_id)
-        tools = self._connector(ctx.agent_id).tools_for_llm()
+        tools = self._connector(ctx.tenant_id, ctx.agent_id).tools_for_llm()
         system = agent.system_prompt
         if agent.grants.notion_pages:
             # Search is offered only to an agent that was granted pages, and
@@ -321,20 +350,22 @@ class AgentActivities:
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
         footer = await self._sources_footer(ctx, text, citations or [])
-        await self.slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
+        slack = self._runtime(ctx.tenant_id).slack
+        await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:
             return ""
-        scopes = self._granted_scopes(ctx.agent_id)
+        scopes = self._granted_scopes(ctx.tenant_id, ctx.agent_id)
         cited = [c for c in cited_markers(text, citations) if c.scope in scopes]
         if not cited:
             return ""
         meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in cited])
         return sources_footer(cited, meta)
 
-    def _granted_scopes(self, agent_id: str) -> list[str]:
-        return [ids.knowledge_scope(g.id) for g in self._agent(agent_id).grants.notion_pages]
+    def _granted_scopes(self, tenant_id: str, agent_id: str) -> list[str]:
+        agent = self._agent(tenant_id, agent_id)
+        return [ids.knowledge_scope(g.id) for g in agent.grants.notion_pages]
 
     @activity.defn(name="run_read_tool")
     async def run_read_tool(
@@ -365,7 +396,7 @@ class AgentActivities:
         model. The numbered passages are stored as the tool output; only the
         citation numbers and page IDs go back to the workflow.
         """
-        agent = self._agent(ctx.agent_id)
+        agent = self._agent(ctx.tenant_id, ctx.agent_id)
         roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
         if not roots or self.knowledge is None or self.embedder is None:
             return "This agent has no documents to search.", True, []
@@ -381,7 +412,7 @@ class AgentActivities:
         hits = await self.knowledge.search(
             ctx.tenant_id, list(roots), vector, limit=SEARCH_CANDIDATES
         )
-        checker = PageChecker(self.notion_api)
+        checker = PageChecker(self._runtime(ctx.tenant_id).notion_api)
         live: dict[tuple[str, str], bool] = {}
         kept = []
         for hit in hits:
@@ -399,7 +430,7 @@ class AgentActivities:
 
     async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""
-        connector = self._connector(ctx.agent_id)
+        connector = self._connector(ctx.tenant_id, ctx.agent_id)
         try:
             if call.name == "search_items":
                 query = call.input.get("query")
@@ -409,7 +440,7 @@ class AgentActivities:
             elif call.name == "my_items":
                 # The person is always the requester from the runtime; any
                 # person field in the LLM's input is ignored.
-                email = await self.slack.user_email(ctx.requester_user_id)
+                email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
                 if not email:
                     return "I couldn't read your Slack email, so I can't find your items.", True
                 items = await connector.my_items(email)
@@ -429,9 +460,9 @@ class AgentActivities:
         existing = await self.idem.get(ctx.tenant_id, key)
         if existing is not None:
             return existing["ts"]
-        agent = self._agent(ctx.agent_id)
-        grant = self._connector(ctx.agent_id).grant_for(spec.payload["database_id"])
-        dm = await self.slack.open_dm(ctx.requester_user_id)
+        agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        grant = self._connector(ctx.tenant_id, ctx.agent_id).grant_for(spec.payload["database_id"])
+        dm = await self._runtime(ctx.tenant_id).slack.open_dm(ctx.requester_user_id)
         blocks = approval_card_blocks(spec, task_id, agent.name, grant.name)
         text = _card_text(spec, grant.name)
         return await self._post_once(ctx.tenant_id, key, dm, text, None, blocks)
@@ -441,10 +472,11 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("update_card", ctx.tenant_id, ctx.agent_id)
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
-        channel = record["channel"] if record else await self.slack.open_dm(ctx.requester_user_id)
+        slack = self._runtime(ctx.tenant_id).slack
+        channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
         line = f"{text}: {_subject(spec)}"
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": line}}]
-        await self.slack.update_message(channel, card_ts, line, blocks=blocks)
+        await slack.update_message(channel, card_ts, line, blocks=blocks)
 
     @activity.defn(name="refresh_card")
     async def refresh_card(self, spec: TaskSpec, task_id: str, card_ts: str) -> None:
@@ -456,13 +488,12 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("refresh_card", ctx.tenant_id, ctx.agent_id)
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
-        channel = record["channel"] if record else await self.slack.open_dm(ctx.requester_user_id)
-        agent = self._agent(ctx.agent_id)
-        grant = self._connector(ctx.agent_id).grant_for(spec.payload["database_id"])
+        slack = self._runtime(ctx.tenant_id).slack
+        channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
+        agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        grant = self._connector(ctx.tenant_id, ctx.agent_id).grant_for(spec.payload["database_id"])
         blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, edited=True)
-        await self.slack.update_message(
-            channel, card_ts, _card_text(spec, grant.name), blocks=blocks
-        )
+        await slack.update_message(channel, card_ts, _card_text(spec, grant.name), blocks=blocks)
 
     @activity.defn(name="prepare_comment")
     async def prepare_comment(self, spec: TaskSpec) -> dict:
@@ -474,7 +505,9 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
         try:
-            item = await self._connector(ctx.agent_id).resolve_item(spec.payload["item"])
+            item = await self._connector(ctx.tenant_id, ctx.agent_id).resolve_item(
+                spec.payload["item"]
+            )
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -493,9 +526,9 @@ class AgentActivities:
     async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
         ctx = spec.ctx
         self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
-        agent = self._agent(ctx.agent_id)
+        agent = self._agent(ctx.tenant_id, ctx.agent_id)
         try:
-            return await self._connector(ctx.agent_id).add_comment(
+            return await self._connector(ctx.tenant_id, ctx.agent_id).add_comment(
                 spec.payload["page_id"],
                 spec.payload["comment"],
                 f"{task_id}:comment",
@@ -512,8 +545,8 @@ class AgentActivities:
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         ctx = spec.ctx
         self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
-        connector = self._connector(ctx.agent_id)
-        email = await self.slack.user_email(ctx.requester_user_id)
+        connector = self._connector(ctx.tenant_id, ctx.agent_id)
+        email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
         try:
             item = await connector.create_item(
                 database_id=spec.payload["database_id"],
@@ -536,7 +569,7 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("get_notion_item", ctx.tenant_id, ctx.agent_id)
         try:
-            return await self._connector(ctx.agent_id).get_item(page_id)
+            return await self._connector(ctx.tenant_id, ctx.agent_id).get_item(page_id)
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:

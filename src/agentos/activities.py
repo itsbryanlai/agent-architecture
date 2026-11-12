@@ -133,6 +133,9 @@ class AgentActivities:
             self.run_read_tool,
             self.post_approval_card,
             self.update_card,
+            self.refresh_card,
+            self.prepare_comment,
+            self.add_notion_comment,
             self.create_notion_item,
             self.get_notion_item,
             self.post_in_thread,
@@ -430,7 +433,7 @@ class AgentActivities:
         grant = self._connector(ctx.agent_id).grant_for(spec.payload["database_id"])
         dm = await self.slack.open_dm(ctx.requester_user_id)
         blocks = approval_card_blocks(spec, task_id, agent.name, grant.name)
-        text = f"Approve new item in {grant.name}: {spec.payload['title']}"
+        text = _card_text(spec, grant.name)
         return await self._post_once(ctx.tenant_id, key, dm, text, None, blocks)
 
     @activity.defn(name="update_card")
@@ -439,9 +442,71 @@ class AgentActivities:
         self._log("update_card", ctx.tenant_id, ctx.agent_id)
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         channel = record["channel"] if record else await self.slack.open_dm(ctx.requester_user_id)
-        line = f"{text}: {spec.payload['title']}"
+        line = f"{text}: {_subject(spec)}"
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": line}}]
         await self.slack.update_message(channel, card_ts, line, blocks=blocks)
+
+    @activity.defn(name="refresh_card")
+    async def refresh_card(self, spec: TaskSpec, task_id: str, card_ts: str) -> None:
+        """Redraw the approval card in place after an edit.
+
+        It shows the edited draft and buttons carrying the new nonce, so a
+        click on an older version of the card no longer matches.
+        """
+        ctx = spec.ctx
+        self._log("refresh_card", ctx.tenant_id, ctx.agent_id)
+        record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
+        channel = record["channel"] if record else await self.slack.open_dm(ctx.requester_user_id)
+        agent = self._agent(ctx.agent_id)
+        grant = self._connector(ctx.agent_id).grant_for(spec.payload["database_id"])
+        blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, edited=True)
+        await self.slack.update_message(
+            channel, card_ts, _card_text(spec, grant.name), blocks=blocks
+        )
+
+    @activity.defn(name="prepare_comment")
+    async def prepare_comment(self, spec: TaskSpec) -> dict:
+        """Resolve the item to comment on and return the payload to freeze.
+
+        The page's database must be one this agent was granted; otherwise this
+        fails before any card is posted or anything is written.
+        """
+        ctx = spec.ctx
+        self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
+        try:
+            item = await self._connector(ctx.agent_id).resolve_item(spec.payload["item"])
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            raise
+        return {
+            "page_id": item.page_id,
+            "database_id": item.database_id,
+            "item_title": item.title,
+            "item_url": item.url,
+            "comment": spec.payload["comment"],
+        }
+
+    @activity.defn(name="add_notion_comment")
+    async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
+        ctx = spec.ctx
+        self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
+        agent = self._agent(ctx.agent_id)
+        try:
+            return await self._connector(ctx.agent_id).add_comment(
+                spec.payload["page_id"],
+                spec.payload["comment"],
+                f"{task_id}:comment",
+                agent.name,
+            )
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            raise
 
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
@@ -496,40 +561,68 @@ def _format_items(items: list[NotionItem]) -> str:
     return "\n".join(lines)
 
 
-def approval_card_blocks(spec: TaskSpec, task_id: str, agent_name: str, db_name: str) -> list:
-    """The approval card: the frozen payload, who it runs as, Submit / Cancel.
+def _subject(spec: TaskSpec) -> str:
+    """The short name of what a task is about, for card and thread lines."""
+    if spec.tool_name == "add_comment":
+        return spec.payload["item_title"]
+    return spec.payload["title"]
+
+
+def _card_text(spec: TaskSpec, db_name: str) -> str:
+    """The plain-text fallback of the approval card."""
+    if spec.tool_name == "add_comment":
+        return f"Approve comment on {spec.payload['item_title']}"
+    return f"Approve new item in {db_name}: {spec.payload['title']}"
+
+
+def approval_card_blocks(
+    spec: TaskSpec, task_id: str, agent_name: str, db_name: str, edited: bool = False
+) -> list:
+    """The approval card: the frozen payload, who it runs as, Submit / Edit / Cancel.
 
     The button value carries the task workflow ID and the approval nonce. The
-    task workflow accepts the click only if the nonce matches and the clicker
-    is the requester.
+    task workflow accepts a click only if the nonce matches the current draft
+    and the clicker is the requester. An edit issues a new nonce, so buttons on
+    an older version of the card stop working.
     """
     value = json.dumps({"task_id": task_id, "nonce": spec.approval_nonce})
     payload = spec.payload
-    return [
-        {
+    if spec.tool_name == "add_comment":
+        head = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{agent_name}* wants to comment on *{payload['item_title']}*",
+            },
+        }
+        body = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Comment*\n{payload['comment']}"},
+        }
+        note = "Nothing is posted until you click Submit."
+    else:
+        head = {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": f"*{agent_name}* wants to add an item to *{db_name}* in Notion.",
             },
-        },
-        {
+        }
+        body = {
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Title*\n{payload['title']}"},
                 {"type": "mrkdwn", "text": f"*Details*\n{payload['details']}"},
             ],
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"Will run as the {agent_name} agent. Nothing is filed until you "
-                    "click Submit.",
-                }
-            ],
-        },
+        }
+        note = "Nothing is filed until you click Submit."
+    context = [{"type": "mrkdwn", "text": f"Will run as the {agent_name} agent. {note}"}]
+    if edited:
+        context.append({"type": "mrkdwn", "text": "Edited — review and approve again"})
+    return [
+        head,
+        body,
+        {"type": "context", "elements": context},
         {
             "type": "actions",
             "elements": [
@@ -538,6 +631,12 @@ def approval_card_blocks(spec: TaskSpec, task_id: str, agent_name: str, db_name:
                     "action_id": "task_approve",
                     "text": {"type": "plain_text", "text": "Submit"},
                     "style": "primary",
+                    "value": value,
+                },
+                {
+                    "type": "button",
+                    "action_id": "task_edit",
+                    "text": {"type": "plain_text", "text": "Edit"},
                     "value": value,
                 },
                 {

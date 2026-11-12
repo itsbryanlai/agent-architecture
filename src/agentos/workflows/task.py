@@ -5,17 +5,26 @@ Rules this workflow keeps:
 * Writes never run without approval. Only the requester can approve, and the
   approval nonce on the click must match the one on the card. Anything else is
   ignored and the workflow keeps waiting.
-* What was approved is exactly what runs: the payload in ``TaskSpec`` was frozen
-  before the card was posted and is never changed here.
+* What was approved is exactly what runs: the payload in ``TaskSpec`` is frozen
+  before the card is posted. The only thing that changes it is an edit by the
+  requester, which replaces the draft, issues a new nonce (so a click on an
+  older version of the card no longer matches) and needs a fresh approval. At
+  most ``MAX_EDITS`` edits are accepted per task, and the expiry and reminder
+  window starts again from each edit.
+* A comment may only target a page in a database the agent was granted. That
+  is checked before the card is posted and again before the comment is made.
 * Exactly once. The item is created with the idempotency key
-  ``{task_id}:create``; the connector looks for that key before creating, so a
-  retried activity finds the item it already made.
+  ``{task_id}:create`` (a comment with ``{task_id}:comment``); the connector
+  looks for that key before writing, so a retried activity finds what it
+  already made.
+* Logs carry IDs only, never the comment, the title or the details.
 * History stays small: after creation the workflow keeps only the item's page
   ID, title, URL and last status.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 from temporalio import workflow
@@ -25,8 +34,18 @@ with workflow.unsafe.imports_passed_through():
     from agentos.activities import AgentActivities
     from agentos.config import AgentVersion
     from agentos.connectors.notion import normalize_id
-    from agentos.models import ApprovalDecision, ExternalUpdate, NotionItem, TaskSpec
+    from agentos.models import (
+        EDITABLE_FIELDS,
+        ApprovalDecision,
+        DraftView,
+        EditRequest,
+        ExternalUpdate,
+        NotionItem,
+        TaskSpec,
+    )
     from agentos.workflows import ACTIVITY_TIMEOUT, RETRY
+
+MAX_EDITS = 5
 
 STATES = ("awaiting_approval", "executing", "watching", "done", "cancelled", "expired", "failed")
 
@@ -40,6 +59,59 @@ class TaskWorkflow:
         self._decision: ApprovalDecision | None = None
         self._page_key: str | None = None
         self._poked = False
+        self._edits = 0
+        self._refresh_due = False
+
+    @workflow.query(name="draft")
+    def draft(self) -> DraftView:
+        spec = self._spec
+        return DraftView(
+            tool_name=spec.tool_name,
+            fields={k: spec.payload[k] for k in EDITABLE_FIELDS.get(spec.tool_name, {})},
+            nonce=spec.approval_nonce,
+            requester_user_id=spec.ctx.requester_user_id,
+            editable=self._can_edit(),
+        )
+
+    def _can_edit(self) -> bool:
+        return (
+            self._state == "awaiting_approval"
+            and self._decision is None
+            and self._edits < MAX_EDITS
+        )
+
+    @workflow.signal(name="edit")
+    def edit(self, e: EditRequest) -> None:
+        """Replace the draft with the requester's edit and issue a new nonce."""
+        spec = self._spec
+        if not self._can_edit():
+            workflow.logger.warning("ignored edit: the draft can no longer be edited")
+            return
+        if e.nonce != spec.approval_nonce:
+            workflow.logger.warning("ignored edit: nonce does not match")
+            return
+        if e.user_id != spec.ctx.requester_user_id:
+            workflow.logger.warning("ignored edit: sender is not the requester")
+            return
+        limits = EDITABLE_FIELDS.get(spec.tool_name, {})
+        fields = e.fields if isinstance(e.fields, dict) else {}
+        if set(fields) != set(limits):
+            workflow.logger.warning("ignored edit: fields are not the editable ones")
+            return
+        clean: dict = {}
+        for key, value in fields.items():
+            text = value.strip() if isinstance(value, str) else ""
+            if not text or len(text) > limits[key]:
+                workflow.logger.warning("ignored edit: invalid value for a field")
+                return
+            clean[key] = text
+        self._spec = dataclasses.replace(
+            spec,
+            payload={**spec.payload, **clean},
+            approval_nonce=str(workflow.uuid4()),
+        )
+        self._edits += 1
+        self._refresh_due = True
 
     @workflow.query(name="state")
     def state(self) -> str:
@@ -68,10 +140,24 @@ class TaskWorkflow:
     async def run(self, spec: TaskSpec) -> str:
         task_id = workflow.info().workflow_id
         ctx = spec.ctx
-        title = spec.payload["title"]
 
         agent: AgentVersion = await self._act(AgentActivities.load_agent, ctx.agent_id)
-        card_ts: str = await self._act(AgentActivities.post_approval_card, spec, task_id)
+        if spec.tool_name == "add_comment":
+            # Resolve the item and check its database is granted before any card.
+            try:
+                payload: dict = await self._act(AgentActivities.prepare_comment, spec)
+            except ActivityError:
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't comment on that item: I couldn't find it, or it isn't in a "
+                    "database I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                return self._state
+            self._spec = dataclasses.replace(spec, payload=payload)
+        card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
 
         # --- wait for a valid decision, with one reminder, until expiry ---------
@@ -79,14 +165,25 @@ class TaskWorkflow:
         remind = timedelta(hours=agent.approval.reminder_after_hours)
         started = workflow.now()
         reminded = remind >= expires
+        reminder_key = f"{task_id}:reminder"
         while self._decision is None:
+            if self._refresh_due:
+                # An edit was accepted: redraw the card with the new nonce and
+                # restart the expiry and reminder window from now.
+                self._refresh_due = False
+                await self._act(AgentActivities.refresh_card, self._spec, task_id, card_ts)
+                started = workflow.now()
+                reminded = remind >= expires
+                reminder_key = f"{task_id}:reminder:{self._edits}"
+                continue
             elapsed = workflow.now() - started
             if elapsed >= expires:
                 break
             next_stop = expires if reminded else remind
             try:
                 await workflow.wait_condition(
-                    lambda: self._decision is not None, timeout=next_stop - elapsed
+                    lambda: self._decision is not None or self._refresh_due,
+                    timeout=next_stop - elapsed,
                 )
             except TimeoutError:
                 if not reminded and workflow.now() - started >= remind:
@@ -94,11 +191,12 @@ class TaskWorkflow:
                     await self._act(
                         AgentActivities.post_in_thread,
                         ctx,
-                        f"Reminder: <@{ctx.requester_user_id}>, the request '{title}' is "
-                        "waiting for your approval in your DMs.",
-                        f"{task_id}:reminder",
+                        f"Reminder: <@{ctx.requester_user_id}>, the request "
+                        f"'{_subject(self._spec)}' is waiting for your approval in your DMs.",
+                        reminder_key,
                     )
 
+        spec = self._spec
         if self._decision is None:
             await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Expired")
             await self._act(
@@ -114,6 +212,11 @@ class TaskWorkflow:
             await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
             self._state = "cancelled"
             return self._state
+
+        if spec.tool_name == "add_comment":
+            return await self._run_comment(spec, task_id, card_ts)
+
+        title = spec.payload["title"]
 
         # --- execute exactly once ------------------------------------------------
         self._state = "executing"
@@ -200,6 +303,36 @@ class TaskWorkflow:
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
 
+    async def _run_comment(self, spec: TaskSpec, task_id: str, card_ts: str) -> str:
+        """Post the approved comment once. There is nothing to watch afterwards."""
+        ctx = spec.ctx
+        self._state = "executing"
+        title = spec.payload["item_title"]
+        try:
+            await self._act(AgentActivities.add_notion_comment, spec, task_id)
+        except ActivityError as err:
+            reason = _reason(err)
+            await self._act(
+                AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+            )
+            await self._act(
+                AgentActivities.post_in_thread,
+                ctx,
+                f"I couldn't comment on '{title}': {reason}",
+                f"{task_id}:failed",
+            )
+            self._state = "failed"
+            return self._state
+        await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
+        await self._act(
+            AgentActivities.post_in_thread,
+            ctx,
+            f"Commented on {title} ({spec.payload['item_url']}).",
+            f"{task_id}:commented",
+        )
+        self._state = "done"
+        return self._state
+
     async def _act(self, method, *args):
         return await workflow.execute_activity_method(
             method,
@@ -207,6 +340,12 @@ class TaskWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+
+
+def _subject(spec: TaskSpec) -> str:
+    if spec.tool_name == "add_comment":
+        return spec.payload["item_title"]
+    return spec.payload["title"]
 
 
 def _reason(err: ActivityError) -> str:

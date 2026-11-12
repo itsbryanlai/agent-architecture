@@ -18,6 +18,8 @@ item it already made instead of making a second one.
 from __future__ import annotations
 
 import copy
+import hashlib
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -26,7 +28,7 @@ from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
 from agentos.models import NotionItem
 
-LLM_TOOLS = ("search_items", "my_items", "create_item")
+LLM_TOOLS = ("search_items", "my_items", "create_item", "add_comment")
 
 
 class ConnectorError(Exception):
@@ -39,6 +41,25 @@ class GrantDenied(ConnectorError):
 
 class UnknownRequester(ConnectorError):
     """The requester's email matches no user in the target system."""
+
+
+class UnknownItem(ConnectorError):
+    """The link or ID does not name a Notion page the agent can open."""
+
+
+_DASHED_ID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_PLAIN_ID = re.compile(
+    r"(?<![0-9a-zA-Z])[0-9a-fA-F]{32}(?![0-9a-zA-Z])|(?<=-)[0-9a-fA-F]{32}(?![0-9a-zA-Z])"
+)
+
+
+def _page_id_from_ref(ref: str) -> str | None:
+    """A page ID from a Notion page URL or a bare ID (dashed or not)."""
+    path = (ref or "").strip().split("?")[0].split("#")[0]
+    found = _DASHED_ID.findall(path) or _PLAIN_ID.findall(path)
+    return normalize_id(found[-1]) if found else None
 
 
 def normalize_id(notion_id: str) -> str:
@@ -78,6 +99,15 @@ class NotionAPI(Protocol):
         ...
 
     async def list_users(self) -> list[dict]: ...
+
+    async def create_comment(self, page_id: str, text: str) -> dict:
+        """Add a comment to a page (needs the "Insert comments" capability)."""
+        ...
+
+    async def list_comments(self, page_id: str) -> list[dict]:
+        """Every unresolved comment on a page, following all pages of results
+        (needs the "Read comments" capability)."""
+        ...
 
     async def retrieve_schema(self, database_id: str) -> dict[str, dict]:
         """Return ``{property name: {"id", "type", "options"}}`` for a database.
@@ -176,6 +206,25 @@ class RealNotionAPI:
             schema[name] = {"id": prop.get("id", ""), "type": ptype, "options": options}
         return schema
 
+    async def create_comment(self, page_id: str, text: str) -> dict:
+        return await self._client.comments.create(
+            parent={"page_id": page_id}, rich_text=[{"type": "text", "text": {"content": text}}]
+        )
+
+    async def list_comments(self, page_id: str) -> list[dict]:
+        comments: list[dict] = []
+        cursor = None
+        while True:
+            kwargs: dict = {"block_id": page_id}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            resp = await self._client.comments.list(**kwargs)
+            comments.extend(resp.get("results", []))
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        return comments
+
     async def list_users(self) -> list[dict]:
         users: list[dict] = []
         cursor = None
@@ -213,6 +262,8 @@ class FakeNotionAPI:
         self.children: dict[str, list[dict]] = {}
         self.blocks: dict[str, dict] = {}
         self._fail_next_create = False
+        self._fail_next_comment = False
+        self.comments: dict[str, list[dict]] = {}
         self._fail_next_query: Exception | None = None
 
     # Test hooks.
@@ -224,6 +275,10 @@ class FakeNotionAPI:
     def fail_next_create_after_write(self) -> None:
         """Make the next create store the page, then raise a timeout."""
         self._fail_next_create = True
+
+    def fail_next_comment_after_write(self) -> None:
+        """Make the next comment be stored, then raise a timeout."""
+        self._fail_next_comment = True
 
     def add_database(self, database_id: str) -> None:
         self.databases.setdefault(normalize_id(database_id), {})
@@ -242,7 +297,11 @@ class FakeNotionAPI:
             "object": "page",
             "id": page_id,
             "url": f"https://www.notion.so/{page_id.replace('-', '')}",
-            "parent": {"type": "database_id", "database_id": database_id},
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": f"ds-{db_key}",
+                "database_id": database_id,
+            },
             "properties": self._to_response_properties(db_key, properties),
         }
         self.databases.setdefault(db_key, {})[page_id] = page
@@ -369,8 +428,9 @@ class FakeNotionAPI:
     async def retrieve_page(self, page_id: str) -> dict:
         self.calls.append(("retrieve_page", {"page_id": page_id}))
         for pages in self.databases.values():
-            if page_id in pages:
-                return copy.deepcopy(pages[page_id])
+            for stored_id, page in pages.items():
+                if normalize_id(stored_id) == normalize_id(page_id):
+                    return copy.deepcopy(page)
         if normalize_id(page_id) in self.free_pages:
             return copy.deepcopy(self.free_pages[normalize_id(page_id)])
         raise FakeNotFound(page_id)
@@ -388,6 +448,23 @@ class FakeNotionAPI:
         if key not in self.free_pages and key not in self.blocks:
             raise FakeNotFound(block_id)
         return copy.deepcopy(self.children.get(key, []))
+
+    async def create_comment(self, page_id: str, text: str) -> dict:
+        self.calls.append(("create_comment", {"page_id": page_id}))
+        comment = {
+            "object": "comment",
+            "id": str(uuid.uuid4()),
+            "rich_text": [_rich({"text": {"content": text}})],
+        }
+        self.comments.setdefault(normalize_id(page_id), []).append(comment)
+        if self._fail_next_comment:
+            self._fail_next_comment = False
+            raise TimeoutError("simulated lost response after the comment was created")
+        return copy.deepcopy(comment)
+
+    async def list_comments(self, page_id: str) -> list[dict]:
+        self.calls.append(("list_comments", {"page_id": page_id}))
+        return copy.deepcopy(self.comments.get(normalize_id(page_id), []))
 
     async def list_users(self) -> list[dict]:
         self.calls.append(("list_users", {}))
@@ -727,6 +804,43 @@ class NotionConnector:
         parent_db = (page.get("parent") or {}).get("database_id") or ""
         grant = self.grant_for(parent_db)
         return self._to_item(grant, page)
+
+    async def resolve_item(self, item_ref: str) -> NotionItem:
+        """Find the page a link or ID names, and check its database is granted.
+
+        The grant is checked from the page's own parent database before the
+        caller may write anything. A page outside the granted databases (or one
+        that is not in a database at all) raises ``GrantDenied``.
+        """
+        page_id = _page_id_from_ref(item_ref)
+        if page_id is None:
+            raise UnknownItem("I couldn't find a Notion page in that link or ID.")
+        try:
+            page = await self._api.retrieve_page(page_id)
+        except Exception as err:
+            if is_unreachable(err):
+                raise UnknownItem("I couldn't open that Notion page.") from err
+            raise
+        parent_db = (page.get("parent") or {}).get("database_id") or ""
+        grant = self.grant_for(parent_db)
+        item = self._to_item(grant, page)
+        item.database_id = grant.id
+        return item
+
+    async def add_comment(self, page_id: str, text: str, idem_key: str, agent_name: str) -> str:
+        """Comment on a granted page exactly once; return the comment ID.
+
+        The comment ends with a short ref derived from ``idem_key``. Before
+        posting, the page's comments are searched for that ref, so a retry after
+        a lost response finds the comment it already made.
+        """
+        await self.resolve_item(page_id)
+        ref = "ref " + hashlib.sha256(idem_key.encode()).hexdigest()[:8]
+        for comment in await self._api.list_comments(page_id):
+            if ref in _plain(comment.get("rich_text", [])):
+                return comment["id"]
+        created = await self._api.create_comment(page_id, f"{text}\n\n— {agent_name}, {ref}")
+        return created["id"]
 
     async def _notion_user_id(self, email: str | None) -> str | None:
         if not email:

@@ -16,7 +16,7 @@ Rules this workflow keeps:
   means the same page.
 * Identity comes from the runtime. The requester is the Slack user who sent the
   message, put into ``TurnContext`` here, never anything the LLM said.
-* Writes never run here. A ``create_item`` call from the LLM starts a separate
+* Writes never run here. A ``create_item`` or ``add_comment`` call from the LLM starts a separate
   TaskWorkflow, which asks the requester to approve before anything is created.
   The task is abandoned (not cancelled) when this conversation closes, because
   the work outlives the conversation.
@@ -344,7 +344,7 @@ class ConversationWorkflow:
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
-        if call.name == "create_item":
+        if call.name in ("create_item", "add_comment"):
             return await self._start_task(ctx, agent, call)
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
@@ -352,23 +352,45 @@ class ConversationWorkflow:
     async def _start_task(
         self, ctx: TurnContext, agent: AgentVersion, call: ToolCall
     ) -> ToolResult:
-        title = call.input.get("title")
-        details = call.input.get("details")
-        if not isinstance(title, str) or not title.strip():
-            return ToolResult(call.id, "create_item needs a non-empty 'title'.", is_error=True)
-        if not isinstance(details, str) or not details.strip():
-            return ToolResult(call.id, "create_item needs a non-empty 'details'.", is_error=True)
-        if not agent.grants.notion_databases:
-            return ToolResult(
-                call.id, "This agent has no Notion database to create items in.", is_error=True
+        if call.name == "add_comment":
+            item = call.input.get("item")
+            comment = call.input.get("comment")
+            if not isinstance(item, str) or not item.strip():
+                return ToolResult(call.id, "add_comment needs a non-empty 'item'.", is_error=True)
+            if not isinstance(comment, str) or not comment.strip():
+                return ToolResult(
+                    call.id, "add_comment needs a non-empty 'comment'.", is_error=True
+                )
+            # The task resolves the item and checks the grant before any card.
+            payload = {"item": item.strip(), "comment": comment.strip()}
+            drafted = (
+                f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
+                "Nothing is posted until they click Submit."
             )
-        # The payload is reduced to exactly the fields that will be created, and
-        # frozen here: the approval card shows it and the task runs it as is.
-        payload = {
-            "title": title.strip(),
-            "details": details.strip(),
-            "database_id": agent.grants.notion_databases[0].id,
-        }
+        else:
+            title = call.input.get("title")
+            details = call.input.get("details")
+            if not isinstance(title, str) or not title.strip():
+                return ToolResult(call.id, "create_item needs a non-empty 'title'.", is_error=True)
+            if not isinstance(details, str) or not details.strip():
+                return ToolResult(
+                    call.id, "create_item needs a non-empty 'details'.", is_error=True
+                )
+            if not agent.grants.notion_databases:
+                return ToolResult(
+                    call.id, "This agent has no Notion database to create items in.", is_error=True
+                )
+            # The payload is reduced to exactly the fields that will be created, and
+            # frozen here: the approval card shows it and the task runs it as is.
+            payload = {
+                "title": title.strip(),
+                "details": details.strip(),
+                "database_id": agent.grants.notion_databases[0].id,
+            }
+            drafted = (
+                f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
+                "Nothing is filed until they click Submit."
+            )
         spec = TaskSpec(
             ctx=ctx,
             tool_name=call.name,
@@ -381,11 +403,7 @@ class ConversationWorkflow:
             id=ids.task_id(ctx.tenant_id, str(workflow.uuid4())),
             parent_close_policy=ParentClosePolicy.ABANDON,
         )
-        return ToolResult(
-            call.id,
-            f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
-            "Nothing is filed until they click Submit.",
-        )
+        return ToolResult(call.id, drafted)
 
 
 def _typed(tp, value):

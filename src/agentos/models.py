@@ -120,3 +120,32 @@ class NotionItem:
     url: str
     title: str
     status: str | None
+    database_id: str = ""  # the granted database the page sits in, when known
+
+
+# The fields a requester may edit on an approval card, per tool, with the
+# longest value each may hold.
+EDITABLE_FIELDS = {
+    "create_item": {"title": 150, "details": 3000},
+    "add_comment": {"comment": 2000},
+}
+
+
+@dataclass
+class EditRequest:
+    """A saved edit from the Edit form on an approval card."""
+
+    nonce: str  # the nonce of the draft being edited
+    user_id: str  # Slack user ID of whoever submitted the form
+    fields: dict  # str -> str; keys are the tool's editable fields
+
+
+@dataclass
+class DraftView:
+    """What the task's "draft" query returns: the current draft and its nonce."""
+
+    tool_name: str
+    fields: dict  # current editable values
+    nonce: str
+    requester_user_id: str
+    editable: bool  # True only while awaiting approval and under the edit limit

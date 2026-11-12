@@ -35,7 +35,7 @@ class FakeTemporalClient:
         self.signals: list[tuple] = []
         self.missing: set[str] = set()
 
-    async def start_workflow(self, workflow, arg, **kwargs):
+    async def start_workflow(self, workflow, arg=None, **kwargs):
         self.signal_with_starts.append({"workflow": workflow, "arg": arg, **kwargs})
 
     def get_workflow_handle(self, workflow_id):

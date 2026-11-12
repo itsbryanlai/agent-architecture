@@ -207,8 +207,11 @@ def create_app(
             return Response(status_code=400)
         if not isinstance(payload, dict):
             return Response(status_code=400)
-        if "verification_token" in payload and signature is None:
-            # One-time subscription handshake: the token goes to an owner-only
+        if isinstance(payload.get("verification_token"), str) and "type" not in payload:
+            # One-time subscription handshake, recognised by its body (a token
+            # and no event type), whatever its headers. Notion's handshake can
+            # carry a signature header, but it cannot be verified: its key is
+            # the very token being delivered. The token goes to an owner-only
             # file, never to a log, and the operator pastes it into Notion.
             # Once a token is configured the handshake is closed, so nobody can
             # overwrite the file with a value of their own.

@@ -71,6 +71,21 @@ def test_handshake_writes_token_file_and_does_not_log_it(agents, temporal, links
     assert TOKEN not in caplog.text
 
 
+def test_handshake_with_signature_header_writes_token_file(agents, temporal, links, tmp_path):
+    client = make_client(agents, temporal, links, tmp_path, token=None)
+    body = json.dumps({"verification_token": TOKEN}).encode()
+    resp = post(client, {"verification_token": TOKEN}, sign(body))
+    assert resp.status_code == 200
+    assert (tmp_path / "sub" / "token").read_text() == TOKEN
+
+
+def test_event_with_type_and_token_field_is_not_a_handshake(agents, temporal, links, tmp_path):
+    client = make_client(agents, temporal, links, tmp_path, token=None)
+    payload = {**page_event(), "verification_token": "x"}
+    assert post(client, payload, None).status_code == 503
+    assert not (tmp_path / "sub" / "token").exists()
+
+
 def test_handshake_overwrites_an_existing_file(agents, temporal, links, tmp_path):
     client = make_client(agents, temporal, links, tmp_path, token=None)
     post(client, {"verification_token": "old"}, None)

@@ -116,6 +116,8 @@ signature it cannot check, so set it up in this order:
    subscribing, then `export NOTION_WEBHOOK_VERIFICATION_TOKEN='<token>'` and
    restart the gateway.
 
+The setup message is accepted only while no token is configured.
+
 Once the token is exported, the gateway refuses further handshakes (409) so the
 file cannot be overwritten; to re-subscribe, unset
 `NOTION_WEBHOOK_VERIFICATION_TOKEN` and restart the gateway first.

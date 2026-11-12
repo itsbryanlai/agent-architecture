@@ -10,7 +10,12 @@ from agentos.connectors.notion import FakeNotionAPI
 from agentos.llm import ScriptedLLMClient
 from agentos.models import TurnContext
 from agentos.slack_client import FakeSlack
-from agentos.stores import InMemoryHistoryStore, InMemoryIdempotencyStore, InMemoryTaskLinkStore
+from agentos.stores import (
+    InMemoryHistoryStore,
+    InMemoryIdempotencyStore,
+    InMemoryTaskLinkStore,
+    InMemoryToolOutputStore,
+)
 from tests.conftest import ALICE, TENANT
 
 
@@ -38,6 +43,7 @@ def make_activities(agents, llm):
         llm=llm,
         slack=FakeSlack(),
         notion_api=FakeNotionAPI(),
+        tool_outputs=InMemoryToolOutputStore(),
     )
 
 

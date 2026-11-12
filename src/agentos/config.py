@@ -28,6 +28,9 @@ DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 DEFAULT_DATABASE_URL = "postgresql://agentos:agentos@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
+DEFAULT_EMBED_MODEL = "text-embedding-v4"
+# Must match the vector(1024) column in the knowledge_chunks table.
+EMBED_DIMENSIONS = 1024
 
 TASK_QUEUE = "agentos-main"
 
@@ -63,6 +66,8 @@ class Settings:
     # Qwen thinking is off by default: thinking output counts toward the
     # response token limit and makes each turn slower.
     qwen_thinking: bool = False
+    # The embedding model served by the same OpenAI-compatible endpoint.
+    embed_model: str = DEFAULT_EMBED_MODEL
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
@@ -107,6 +112,7 @@ def load_settings() -> Settings:
         model=env.get("AGENTOS_MODEL") or DEFAULT_MODELS[provider],
         qwen_base_url=env.get("QWEN_BASE_URL") or None,
         qwen_thinking=_parse_flag(env.get("AGENTOS_QWEN_THINKING")),
+        embed_model=env.get("AGENTOS_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
@@ -156,8 +162,21 @@ class NotionDatabaseGrant:
 
 
 @dataclass
+class NotionPageGrant:
+    """A Notion page the agent may read, with everything under it.
+
+    Everything under the page becomes the agent's knowledge. The page is one
+    scope that searches are filtered by.
+    """
+
+    id: str
+    name: str
+
+
+@dataclass
 class Grants:
     notion_databases: list[NotionDatabaseGrant] = field(default_factory=list)
+    notion_pages: list[NotionPageGrant] = field(default_factory=list)
 
 
 @dataclass
@@ -260,11 +279,19 @@ def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseG
     )
 
 
+def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
+    where = f"agent '{agent_id}' notion page grant"
+    return NotionPageGrant(
+        id=str(_require(raw, "id", where)), name=str(_require(raw, "name", where))
+    )
+
+
 def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
     where = f"agent '{agent_id}'"
     grants_raw = raw.get("grants") or {}
-    notion_raw = (grants_raw.get("notion") or {}).get("databases") or []
-    databases = [_parse_database_grant(agent_id, db) for db in notion_raw]
+    notion = grants_raw.get("notion") or {}
+    databases = [_parse_database_grant(agent_id, db) for db in notion.get("databases") or []]
+    pages = [_parse_page_grant(agent_id, pg) for pg in notion.get("pages") or []]
     follow = raw.get("follow_up") or {}
     approval = raw.get("approval") or {}
     return AgentVersion(
@@ -273,7 +300,7 @@ def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
         name=str(_require(raw, "name", where)),
         system_prompt=str(_require(raw, "system_prompt", where)),
         max_steps=int(_require(raw, "max_steps", where)),
-        grants=Grants(notion_databases=databases),
+        grants=Grants(notion_databases=databases, notion_pages=pages),
         follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
         approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
     )

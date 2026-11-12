@@ -16,6 +16,7 @@ from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
 from agentos.config import (
+    EMBED_DIMENSIONS,
     PROVIDER_QWEN,
     TASK_QUEUE,
     AgentsConfig,
@@ -23,10 +24,16 @@ from agentos.config import (
     load_agents_config,
     load_settings,
 )
-from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant
+from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.knowledge.embedder import Embedder, QwenEmbedder
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.slack_client import RealSlackPoster
-from agentos.stores import PostgresHistoryStore, PostgresIdempotencyStore, PostgresTaskLinkStore
+from agentos.stores import (
+    PostgresHistoryStore,
+    PostgresIdempotencyStore,
+    PostgresTaskLinkStore,
+    PostgresToolOutputStore,
+)
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 
@@ -45,6 +52,22 @@ def build_llm(settings: Settings) -> LLMClient:
             settings.qwen_thinking,
         )
     return AnthropicLLMClient(settings.require("anthropic_api_key"), settings.model)
+
+
+def build_embedder(settings: Settings, agents: AgentsConfig) -> Embedder | None:
+    """Build the embedder, only when some agent has a Notion page grant.
+
+    Agents without knowledge need no Qwen settings, so the Anthropic provider
+    keeps working without them. Returns None when no agent has a page grant.
+    """
+    if not any(agent.grants.notion_pages for agent in agents.agents.values()):
+        return None
+    return QwenEmbedder(
+        settings.require("qwen_api_key"),
+        settings.require("qwen_base_url"),
+        settings.embed_model,
+        EMBED_DIMENSIONS,
+    )
 
 
 async def check_grants_at_startup(
@@ -83,6 +106,17 @@ async def check_grants_at_startup(
                 )
             failed += bool(check.problems)
             missing_ids = missing_ids or bool(grant.missing_property_ids())
+        for page_grant in agent.grants.notion_pages:
+            problems = await check_page_grant(api, page_grant)
+            for problem in problems:
+                log.error(
+                    "tenant_id=%s agent=%s grant=%s: %s",
+                    agents.tenant_id,
+                    agent.agent_id,
+                    page_grant.name,
+                    problem,
+                )
+            failed += bool(problems)
     if not failed:
         return None
     summary = f"{failed} Notion grant(s) have problems; the worker will not start."
@@ -100,12 +134,15 @@ async def main() -> None:
     settings = load_settings()
     agents = load_agents_config(settings.config_path)
     llm = build_llm(settings)
+    embedder = build_embedder(settings, agents)
     notion_api = RealNotionAPI(settings.require("notion_token"))
     failure = await check_grants_at_startup(notion_api, agents, log)
     if failure:
         raise SystemExit(failure)
     # Provider and model name only; never a key.
     log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
+    if embedder is not None:
+        log.info("embedder model=%s dimensions=%d", embedder.model, embedder.dimensions)
 
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
@@ -119,6 +156,7 @@ async def main() -> None:
             llm=llm,
             slack=RealSlackPoster(settings.require("slack_bot_token")),
             notion_api=notion_api,
+            tool_outputs=PostgresToolOutputStore(pool),
         )
         client = await Client.connect(settings.temporal_address)
         worker = Worker(

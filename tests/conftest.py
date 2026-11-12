@@ -15,7 +15,12 @@ from agentos.config import TASK_QUEUE, AgentsConfig, Settings, parse_agents_conf
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.llm import ScriptedLLMClient
 from agentos.slack_client import FakeSlack
-from agentos.stores import InMemoryHistoryStore, InMemoryIdempotencyStore, InMemoryTaskLinkStore
+from agentos.stores import (
+    InMemoryHistoryStore,
+    InMemoryIdempotencyStore,
+    InMemoryTaskLinkStore,
+    InMemoryToolOutputStore,
+)
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 
@@ -128,6 +133,7 @@ class Harness:
     history: InMemoryHistoryStore
     idem: InMemoryIdempotencyStore
     links: InMemoryTaskLinkStore
+    tool_outputs: InMemoryToolOutputStore
 
     @property
     def client(self):
@@ -146,6 +152,7 @@ async def harness(agents):
         history=InMemoryHistoryStore(),
         idem=InMemoryIdempotencyStore(),
         links=InMemoryTaskLinkStore(),
+        tool_outputs=InMemoryToolOutputStore(),
     )
     acts = AgentActivities(
         settings=Settings(),
@@ -156,6 +163,7 @@ async def harness(agents):
         llm=h.llm,
         slack=h.slack,
         notion_api=h.notion,
+        tool_outputs=h.tool_outputs,
     )
     worker = Worker(
         wf_env.client,

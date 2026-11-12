@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from agentos.config import ConfigError, NotionDatabaseGrant
+from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
 from agentos.models import NotionItem
 
@@ -172,6 +172,8 @@ class FakeNotionAPI:
         self.schemas: dict[str, dict[str, dict]] = {}
         self.users: list[dict] = list(users or [])
         self.calls: list[tuple[str, dict]] = []
+        # Pages outside any database, by normalized ID (page grants and trees).
+        self.free_pages: dict[str, dict] = {}
         self._fail_next_create = False
         self._fail_next_query: Exception | None = None
 
@@ -207,6 +209,26 @@ class FakeNotionAPI:
         }
         self.databases.setdefault(db_key, {})[page_id] = page
         return copy.deepcopy(page)
+
+    def add_free_page(
+        self, page_id: str, title: str = "Page", parent: dict | None = None, in_trash: bool = False
+    ) -> None:
+        """Store a page that is not in a database, such as a granted root page."""
+        self.free_pages[normalize_id(page_id)] = {
+            "object": "page",
+            "id": page_id,
+            "url": f"https://www.notion.so/{normalize_id(page_id)}",
+            "in_trash": in_trash,
+            "last_edited_time": "2026-01-01T00:00:00.000Z",
+            "parent": parent or {"type": "workspace", "workspace": True},
+            "properties": {
+                "title": {
+                    "id": "title",
+                    "type": "title",
+                    "title": [_rich({"text": {"content": title}})],
+                }
+            },
+        }
 
     def set_status(self, page_id: str, prop: str, status: str) -> None:
         for db_key, pages in self.databases.items():
@@ -254,6 +276,8 @@ class FakeNotionAPI:
         for pages in self.databases.values():
             if page_id in pages:
                 return copy.deepcopy(pages[page_id])
+        if normalize_id(page_id) in self.free_pages:
+            return copy.deepcopy(self.free_pages[normalize_id(page_id)])
         raise KeyError(page_id)
 
     async def list_users(self) -> list[dict]:
@@ -443,6 +467,21 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
                         f"status: done value '{done}' is not an option of property '{name}'"
                     )
     return result
+
+
+async def check_page_grant(api: NotionAPI, grant: NotionPageGrant) -> list[str]:
+    """Problems with a page grant: the page must be readable and not trashed.
+
+    A read only, with the agent's own token. Returns an empty list when the
+    page is fine. Error details are limited to the error type, never page text.
+    """
+    try:
+        page = await api.retrieve_page(grant.id)
+    except Exception as err:  # noqa: BLE001 - any failure to read means the grant is unusable
+        return [f"page '{grant.name}' cannot be read with this token ({type(err).__name__})"]
+    if page.get("in_trash") or page.get("archived"):
+        return [f"page '{grant.name}' is in the trash or archived"]
+    return []
 
 
 # --- Connector ----------------------------------------------------------------

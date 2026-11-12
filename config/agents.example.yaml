@@ -26,6 +26,12 @@ agents:
               status: "<status property id>"
               requested_by: "<requested-by property id>"
               request_id: "<request id property id>"
+        # Everything under each page below becomes this agent's knowledge, so
+        # grant only pages the agent should answer from. The page must be shared
+        # with the Notion integration.
+        pages:
+          - id: "00000000000000000000000000000000"
+            name: IT knowledge base
     follow_up:
       poll_interval_minutes: 15
       stale_after_days: 3

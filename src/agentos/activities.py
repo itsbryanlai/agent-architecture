@@ -10,6 +10,9 @@ Rules kept here:
 * Connector errors that a retry cannot fix become non-retryable failures.
 * Slack posts are idempotent: the posted ``ts`` is stored under an idempotency
   key, and a repeat call with the same key returns it without posting again.
+* Tool output text is stored by the activity that ran the tool and is put into
+  chat history by ``append_tool_results``. Workflow history carries only a
+  reference (``ToolResult.stored``), never the text a tool read.
 * Log lines carry tenant, agent and workflow IDs only, never message text,
   document content or secrets.
 """
@@ -32,7 +35,7 @@ from agentos.connectors.notion import (
 from agentos.llm import LLMClient
 from agentos.models import LLMResponse, NotionItem, TaskSpec, ToolCall, ToolResult, TurnContext
 from agentos.slack_client import SlackPoster
-from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore
+from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 
 log = logging.getLogger("agentos.activities")
 
@@ -69,10 +72,12 @@ class AgentActivities:
         llm: LLMClient,
         slack: SlackPoster,
         notion_api: NotionAPI,
+        tool_outputs: ToolOutputStore,
     ):
         self.settings = settings
         self.agents = agents
         self.history = history
+        self.tool_outputs = tool_outputs
         self.idem = idem
         self.links = links
         self.llm = llm
@@ -87,6 +92,7 @@ class AgentActivities:
         return [
             self.load_agent,
             self.append_history,
+            self.append_tool_results,
             self.call_llm,
             self.post_placeholder,
             self.finalize_reply,
@@ -179,6 +185,49 @@ class AgentActivities:
             raise ValueError(f"invalid role {role!r}")
         return await self.history.append(tenant_id, conversation_id, step_key, role, content)
 
+    @activity.defn(name="append_tool_results")
+    async def append_tool_results(
+        self,
+        tenant_id: str,
+        conversation_id: str,
+        step_key: str,
+        results: list[ToolResult],
+    ) -> int:
+        """Append the one user message of tool_result blocks, in the order given.
+
+        A stored result is resolved from the tool output store here, so the
+        text goes from the store into history without passing through the
+        workflow. Appending under the step key keeps a retry from storing the
+        message twice.
+        """
+        self._log("append_tool_results", tenant_id, "-", step_key=step_key)
+        if not isinstance(step_key, str) or not step_key:
+            raise ValueError("step_key must be a non-empty string")
+        stored = await self.tool_outputs.get_many(
+            tenant_id, conversation_id, [r.tool_use_id for r in results if r.stored]
+        )
+        blocks: list[dict] = []
+        for r in results:
+            if r.stored:
+                if r.tool_use_id not in stored:
+                    raise ApplicationError(
+                        "stored tool output is missing",
+                        type="ValueError",
+                        non_retryable=True,
+                    )
+                content, is_error = stored[r.tool_use_id]
+            else:
+                content, is_error = r.content or "", r.is_error
+            blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": r.tool_use_id,
+                    "content": content,
+                    "is_error": is_error,
+                }
+            )
+        return await self.history.append(tenant_id, conversation_id, step_key, "user", blocks)
+
     @activity.defn(name="call_llm")
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
@@ -213,31 +262,40 @@ class AgentActivities:
         await self.slack.update_message(ctx.channel, placeholder_ts, text)
 
     @activity.defn(name="run_read_tool")
-    async def run_read_tool(self, ctx: TurnContext, call: ToolCall) -> ToolResult:
+    async def run_read_tool(
+        self, ctx: TurnContext, conversation_id: str, call: ToolCall, first_marker: int
+    ) -> ToolResult:
+        """Run a read tool and store its output text; return only a reference.
+
+        ``first_marker`` is the first citation number this call may use. No
+        tool uses it yet.
+        """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
+        text, is_error = await self._read_tool_output(ctx, call)
+        await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
+        return ToolResult(call.id, stored=True, is_error=is_error, citations=[])
+
+    async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
+        """The tool's output text and whether it is an error."""
         connector = self._connector(ctx.agent_id)
         try:
             if call.name == "search_items":
                 query = call.input.get("query")
                 if not isinstance(query, str) or not query.strip():
-                    return ToolResult(call.id, "search_items needs a non-empty 'query'.", True)
+                    return "search_items needs a non-empty 'query'.", True
                 items = await connector.search_items(query.strip())
             elif call.name == "my_items":
                 # The person is always the requester from the runtime; any
                 # person field in the LLM's input is ignored.
                 email = await self.slack.user_email(ctx.requester_user_id)
                 if not email:
-                    return ToolResult(
-                        call.id,
-                        "I couldn't read your Slack email, so I can't find your items.",
-                        True,
-                    )
+                    return "I couldn't read your Slack email, so I can't find your items.", True
                 items = await connector.my_items(email)
             else:
-                return ToolResult(call.id, f"Unknown tool '{call.name}'.", True)
+                return f"Unknown tool '{call.name}'.", True
         except ConnectorError as err:
-            return ToolResult(call.id, str(err), True)
-        return ToolResult(call.id, _format_items(items))
+            return str(err), True
+        return _format_items(items), False
 
     # --- task ------------------------------------------------------------------------
 

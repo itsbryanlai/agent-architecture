@@ -8,6 +8,9 @@ first. There is no global tenant state.
 
 A history append is named by a step key, so a retried append never stores a
 message twice.
+
+Tool output text is kept here too (``ToolOutputStore``): workflow history
+carries only the reference, never the text a tool read.
 """
 
 from __future__ import annotations
@@ -40,6 +43,20 @@ class IdempotencyStore(Protocol):
 
     async def put_if_absent(self, tenant_id: str, key: str, value: dict) -> dict:
         """Store ``value`` unless the key exists; return whichever value is stored."""
+        ...
+
+
+class ToolOutputStore(Protocol):
+    async def put(
+        self, tenant_id: str, conversation_id: str, tool_use_id: str, content: str, is_error: bool
+    ) -> None:
+        """Store a tool's output text. The first write for a tool_use_id wins."""
+        ...
+
+    async def get_many(
+        self, tenant_id: str, conversation_id: str, tool_use_ids: list[str]
+    ) -> dict[str, tuple[str, bool]]:
+        """Return ``{tool_use_id: (content, is_error)}`` for those that are stored."""
         ...
 
 
@@ -137,6 +154,40 @@ class PostgresIdempotencyStore:
             return row[0]
 
 
+class PostgresToolOutputStore:
+    def __init__(self, pool: AsyncConnectionPool):
+        self._pool = pool
+
+    async def put(
+        self, tenant_id: str, conversation_id: str, tool_use_id: str, content: str, is_error: bool
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO tool_outputs (tenant_id, conversation_id, tool_use_id, content, is_error)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (tenant_id, conversation_id, tool_use_id) DO NOTHING
+                """,
+                (tenant_id, conversation_id, tool_use_id, content, is_error),
+            )
+
+    async def get_many(
+        self, tenant_id: str, conversation_id: str, tool_use_ids: list[str]
+    ) -> dict[str, tuple[str, bool]]:
+        if not tool_use_ids:
+            return {}
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT tool_use_id, content, is_error FROM tool_outputs
+                WHERE tenant_id = %s AND conversation_id = %s AND tool_use_id = ANY(%s)
+                """,
+                (tenant_id, conversation_id, list(tool_use_ids)),
+            )
+            rows = await cur.fetchall()
+            return {tid: (content, is_error) for tid, content, is_error in rows}
+
+
 class PostgresTaskLinkStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
@@ -207,6 +258,26 @@ class InMemoryIdempotencyStore:
     async def put_if_absent(self, tenant_id: str, key: str, value: dict) -> dict:
         stored = self.records.setdefault((tenant_id, key), copy.deepcopy(value))
         return copy.deepcopy(stored)
+
+
+class InMemoryToolOutputStore:
+    def __init__(self) -> None:
+        self.outputs: dict[tuple[str, str, str], tuple[str, bool]] = {}
+
+    async def put(
+        self, tenant_id: str, conversation_id: str, tool_use_id: str, content: str, is_error: bool
+    ) -> None:
+        self.outputs.setdefault((tenant_id, conversation_id, tool_use_id), (content, is_error))
+
+    async def get_many(
+        self, tenant_id: str, conversation_id: str, tool_use_ids: list[str]
+    ) -> dict[str, tuple[str, bool]]:
+        found = {}
+        for tid in tool_use_ids:
+            value = self.outputs.get((tenant_id, conversation_id, tid))
+            if value is not None:
+                found[tid] = value
+        return found
 
 
 class InMemoryTaskLinkStore:

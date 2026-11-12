@@ -5,6 +5,9 @@ Rules this workflow keeps:
 * History stays small and free of content. Chat history lives in Postgres; the
   workflow carries the conversation reference, an inbox of pending messages and
   the recently seen event IDs. Each turn reloads history inside an activity.
+  Tool output text is stored by the activity that ran the tool, and the
+  workflow carries only references to it; the append activity puts the text
+  into history.
 * Identity comes from the runtime. The requester is the Slack user who sent the
   message, put into ``TurnContext`` here, never anything the LLM said.
 * Writes never run here. A ``create_item`` call from the LLM starts a separate
@@ -252,27 +255,18 @@ class ConversationWorkflow:
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
             outcomes = await asyncio.gather(
-                *[self._dispatch(ctx, agent, call) for call in resp.tool_calls],
+                *[self._dispatch(ctx, agent, conv_id, call) for call in resp.tool_calls],
                 return_exceptions=True,
             )
             for outcome in outcomes:
                 if isinstance(outcome, BaseException):
                     raise outcome
             results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
-            await self._append(
-                ctx,
-                conv_id,
-                f"{m.event_id}:s{step}:results",
-                "user",
-                [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": r.tool_use_id,
-                        "content": r.content,
-                        "is_error": r.is_error,
-                    }
-                    for r in results
-                ],
+            await workflow.execute_activity_method(
+                AgentActivities.append_tool_results,
+                args=[ctx.tenant_id, conv_id, f"{m.event_id}:s{step}:results", results],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
             )
             state.pending_tool_ids = []
 
@@ -293,11 +287,13 @@ class ConversationWorkflow:
             retry_policy=RETRY,
         )
 
-    async def _dispatch(self, ctx: TurnContext, agent: AgentVersion, call: ToolCall) -> ToolResult:
+    async def _dispatch(
+        self, ctx: TurnContext, agent: AgentVersion, conv_id: str, call: ToolCall
+    ) -> ToolResult:
         if call.name in READ_TOOLS:
             return await workflow.execute_activity_method(
                 AgentActivities.run_read_tool,
-                args=[ctx, call],
+                args=[ctx, conv_id, call, 1],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )

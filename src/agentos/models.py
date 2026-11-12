@@ -67,10 +67,29 @@ class ToolCall:
 
 
 @dataclass
+class Citation:
+    """One numbered source the model may cite, like "[3]"."""
+
+    marker: int  # the number the model writes
+    scope: str  # e.g. "notion:page:<32-hex root id>"
+    page_id: str  # normalized 32-hex Notion page id
+
+
+@dataclass
 class ToolResult:
+    """What a tool call returned, without any document content.
+
+    ``content`` holds inline text only for results the runtime itself made
+    (drafting text, validation errors). Output from a tool that read data is
+    kept in the tool output store and marked ``stored``, so workflow history
+    carries a reference and never the text.
+    """
+
     tool_use_id: str
-    content: str
+    content: str | None = None
     is_error: bool = False
+    stored: bool = False  # True: the text is in the tool output store
+    citations: list[Citation] = field(default_factory=list)
 
 
 @dataclass

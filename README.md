@@ -80,6 +80,13 @@ Compose, which publishes Postgres on host port 55432) and `AGENTOS_CONFIG`
 If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
 export the `AGENTOS_` names instead: the old ones are now ignored.
 
+Knowledge settings, used only when an agent has a Notion page grant:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTOS_EMBED_MODEL` | `text-embedding-v4` | Embedding model on the Qwen OpenAI-compatible endpoint. Output is 1024 dimensions, fixed to match the database column |
+| `QWEN_API_KEY`, `QWEN_BASE_URL` | none | Needed for embeddings whenever any agent has a page grant, whichever model provider is in use |
+
 ## Model provider
 
 The worker talks to Claude by default. For testing, it can use Qwen instead,
@@ -118,6 +125,16 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 
 This is needed only for a database created before this change; a fresh
 `docker compose up` gets the column from `scripts/init_db.sql`.
+
+Tool outputs and knowledge need two more migrations, and Compose now uses a
+Postgres 16 image with pgvector. Recreate the container on the new image (the
+data volume carries over), then apply `002` and `003` the same way as `001`:
+
+```bash
+docker compose up -d postgres
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/002_tool_outputs.sql
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/003_knowledge.sql
+```
 
 ## Run
 

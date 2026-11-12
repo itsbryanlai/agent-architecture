@@ -60,6 +60,7 @@ from agentos.models import (
     TurnContext,
 )
 from agentos.slack_client import SlackPoster
+from agentos.slack_format import to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 
 log = logging.getLogger("agentos.activities")
@@ -310,10 +311,14 @@ class AgentActivities:
         granted to the agent, looks up each page's title and link in the
         store, and appends them. The model never writes a link. Chat history
         keeps the model's text without the Sources line.
+
+        The model writes Markdown; what is posted is converted to Slack
+        mrkdwn. The footer is built from the unconverted text and is already
+        mrkdwn.
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
         footer = await self._sources_footer(ctx, text, citations or [])
-        await self.slack.update_message(ctx.channel, placeholder_ts, text + footer)
+        await self.slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:

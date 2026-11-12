@@ -13,6 +13,10 @@ Rules kept here:
 * Tool output text is stored by the activity that ran the tool and is put into
   chat history by ``append_tool_results``. Workflow history carries only a
   reference (``ToolResult.stored``), never the text a tool read.
+* Retrieved document text is untrusted data. It is wrapped in ``<source>`` tags
+  and the system prompt tells the model never to follow instructions in it.
+  Knowledge comes only from the agent's own granted pages, and each page is
+  re-checked with Notion before the model sees it.
 * Log lines carry tenant, agent and workflow IDs only, never message text,
   document content or secrets.
 """
@@ -25,21 +29,42 @@ import logging
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from agentos import ids
 from agentos.config import AgentsConfig, AgentVersion, Settings
+from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
     ConnectorError,
     NotionAPI,
     NotionConnector,
     normalize_id,
 )
+from agentos.knowledge.embedder import Embedder
+from agentos.knowledge.search import (
+    KNOWLEDGE_RULES,
+    SEARCH_CANDIDATES,
+    SEARCH_RESULTS,
+    PageChecker,
+    cited_markers,
+    format_sources,
+    sources_footer,
+)
+from agentos.knowledge.store import KnowledgeStore
 from agentos.llm import LLMClient
-from agentos.models import LLMResponse, NotionItem, TaskSpec, ToolCall, ToolResult, TurnContext
+from agentos.models import (
+    Citation,
+    LLMResponse,
+    NotionItem,
+    TaskSpec,
+    ToolCall,
+    ToolResult,
+    TurnContext,
+)
 from agentos.slack_client import SlackPoster
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 
 log = logging.getLogger("agentos.activities")
 
-READ_TOOLS = ("search_items", "my_items")
+READ_TOOLS = ("search_items", "my_items", "search_knowledge")
 MAX_LISTED_ITEMS = 20
 
 
@@ -73,8 +98,16 @@ class AgentActivities:
         slack: SlackPoster,
         notion_api: NotionAPI,
         tool_outputs: ToolOutputStore,
+        knowledge: KnowledgeStore | None = None,
+        embedder: Embedder | None = None,
     ):
         self.settings = settings
+        self.notion_api = notion_api
+        self.knowledge = knowledge
+        self.embedder = embedder
+        self.knowledge_tool = load_manifest(MANIFEST_DIR / "knowledge.yaml").tools[
+            "search_knowledge"
+        ]
         self.agents = agents
         self.history = history
         self.tool_outputs = tool_outputs
@@ -234,8 +267,14 @@ class AgentActivities:
         agent = self._agent(ctx.agent_id)
         messages = await self.history.load(ctx.tenant_id, conversation_id)
         tools = self._connector(ctx.agent_id).tools_for_llm()
+        system = agent.system_prompt
+        if agent.grants.notion_pages:
+            # Search is offered only to an agent that was granted pages, and
+            # the model is told to treat what it returns as data.
+            tools = tools + [self.knowledge_tool.llm_definition()]
+            system = f"{agent.system_prompt}\n\n{KNOWLEDGE_RULES}"
         try:
-            return await self.llm.complete(agent.system_prompt, messages, tools)
+            return await self.llm.complete(system, messages, tools)
         except Exception as err:
             if _is_client_error(err):
                 # The provider rejected the request (bad key, bad request):
@@ -257,9 +296,37 @@ class AgentActivities:
         )
 
     @activity.defn(name="finalize_reply")
-    async def finalize_reply(self, ctx: TurnContext, placeholder_ts: str, text: str) -> None:
+    async def finalize_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        text: str,
+        citations: list[Citation] | None = None,
+    ) -> None:
+        """Post the final reply, with a Sources line when the answer cites pages.
+
+        The model writes only numbers like ``[2]``. The runtime keeps the
+        numbers that match a citation of this turn and whose scope is still
+        granted to the agent, looks up each page's title and link in the
+        store, and appends them. The model never writes a link. Chat history
+        keeps the model's text without the Sources line.
+        """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
-        await self.slack.update_message(ctx.channel, placeholder_ts, text)
+        footer = await self._sources_footer(ctx, text, citations or [])
+        await self.slack.update_message(ctx.channel, placeholder_ts, text + footer)
+
+    async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
+        if not citations or self.knowledge is None:
+            return ""
+        scopes = self._granted_scopes(ctx.agent_id)
+        cited = [c for c in cited_markers(text, citations) if c.scope in scopes]
+        if not cited:
+            return ""
+        meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in cited])
+        return sources_footer(cited, meta)
+
+    def _granted_scopes(self, agent_id: str) -> list[str]:
+        return [ids.knowledge_scope(g.id) for g in self._agent(agent_id).grants.notion_pages]
 
     @activity.defn(name="run_read_tool")
     async def run_read_tool(
@@ -267,13 +334,60 @@ class AgentActivities:
     ) -> ToolResult:
         """Run a read tool and store its output text; return only a reference.
 
-        ``first_marker`` is the first citation number this call may use. No
-        tool uses it yet.
+        ``first_marker`` is the first citation number this call may use; only
+        ``search_knowledge`` uses it, and it returns the citations it numbered.
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
-        text, is_error = await self._read_tool_output(ctx, call)
+        citations: list[Citation] = []
+        if call.name == "search_knowledge":
+            text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
+        else:
+            text, is_error = await self._read_tool_output(ctx, call)
         await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
-        return ToolResult(call.id, stored=True, is_error=is_error, citations=[])
+        return ToolResult(call.id, stored=True, is_error=is_error, citations=citations)
+
+    async def _search_knowledge(
+        self, ctx: TurnContext, call: ToolCall, first_marker: int
+    ) -> tuple[str, bool, list[Citation]]:
+        """Search the agent's own granted pages and number the passages found.
+
+        The scopes come from this agent's page grants, and the store filters by
+        them inside its query. Each page found is then re-checked with Notion
+        (not trashed, still under its granted root) before it can reach the
+        model. The numbered passages are stored as the tool output; only the
+        citation numbers and page IDs go back to the workflow.
+        """
+        agent = self._agent(ctx.agent_id)
+        roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
+        if not roots or self.knowledge is None or self.embedder is None:
+            return "This agent has no documents to search.", True, []
+        query = call.input.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return "search_knowledge needs a non-empty 'query'.", True, []
+        try:
+            [vector] = await self.embedder.embed([query.strip()])
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            raise
+        hits = await self.knowledge.search(
+            ctx.tenant_id, list(roots), vector, limit=SEARCH_CANDIDATES
+        )
+        checker = PageChecker(self.notion_api)
+        live: dict[tuple[str, str], bool] = {}
+        kept = []
+        for hit in hits:
+            key = (hit.scope, hit.page_id)
+            if key not in live:
+                live[key] = await checker.under_root(hit.page_id, roots[hit.scope])
+            if live[key]:
+                kept.append(hit)
+        kept = kept[:SEARCH_RESULTS]
+        citations = [
+            Citation(first_marker + i, hit.scope, hit.page_id) for i, hit in enumerate(kept)
+        ]
+        passages = [(c.marker, hit.title, hit.text) for c, hit in zip(citations, kept)]
+        return format_sources(passages), False, citations
 
     async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""

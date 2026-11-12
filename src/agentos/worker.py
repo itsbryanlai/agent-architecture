@@ -26,6 +26,8 @@ from agentos.config import (
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
 from agentos.knowledge.embedder import Embedder, QwenEmbedder
+from agentos.knowledge.indexing import IndexActivities
+from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
@@ -35,6 +37,7 @@ from agentos.stores import (
     PostgresToolOutputStore,
 )
 from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.task import TaskWorkflow
 
 
@@ -147,6 +150,7 @@ async def main() -> None:
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     try:
+        knowledge = PostgresKnowledgeStore(pool)
         activities = AgentActivities(
             settings=settings,
             agents=agents,
@@ -157,13 +161,21 @@ async def main() -> None:
             slack=RealSlackPoster(settings.require("slack_bot_token")),
             notion_api=notion_api,
             tool_outputs=PostgresToolOutputStore(pool),
+            knowledge=knowledge,
+            embedder=embedder,
         )
+        workflows: list = [ConversationWorkflow, TaskWorkflow]
+        all_activities = activities.all()
+        if embedder is not None:
+            # Indexing runs only where some agent has a page grant.
+            workflows.append(IndexingWorkflow)
+            all_activities += IndexActivities(notion_api, knowledge, embedder).all()
         client = await Client.connect(settings.temporal_address)
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[ConversationWorkflow, TaskWorkflow],
-            activities=activities.all(),
+            workflows=workflows,
+            activities=all_activities,
         )
         log.info("tenant_id=%s worker started on %s", agents.tenant_id, TASK_QUEUE)
         await worker.run()

@@ -8,6 +8,12 @@ Rules this workflow keeps:
   Tool output text is stored by the activity that ran the tool, and the
   workflow carries only references to it; the append activity puts the text
   into history.
+* Links are never written by the model. The model cites sources by number;
+  the workflow carries only the numbers and page IDs (citations), and the
+  reply activity builds the Sources line from stored page metadata.
+  Citation numbers are unique for the life of the thread (they carry over
+  turns and continue-as-new), so a number cited from an earlier turn still
+  means the same page.
 * Identity comes from the runtime. The requester is the Slack user who sent the
   message, put into ``TurnContext`` here, never anything the LLM said.
 * Writes never run here. A ``create_item`` call from the LLM starts a separate
@@ -33,7 +39,9 @@ with workflow.unsafe.imports_passed_through():
     from agentos import ids
     from agentos.activities import READ_TOOLS, AgentActivities
     from agentos.config import AgentVersion
+    from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
+        Citation,
         ConversationRef,
         InboundMessage,
         LLMResponse,
@@ -47,6 +55,7 @@ with workflow.unsafe.imports_passed_through():
 
 IDLE_TIMEOUT = timedelta(days=7)
 SEEN_LIMIT = 500
+MAX_CITATIONS = 200
 OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
 TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
@@ -71,6 +80,14 @@ class ConversationWorkflow:
     def __init__(self) -> None:
         self.inbox: deque[InboundMessage] = deque()
         self.seen: deque[str] = deque(maxlen=SEEN_LIMIT)
+        # Citation numbers are unique for the life of the thread, so a number
+        # the model cites from an earlier turn still means the same page. Each
+        # search_knowledge call gets its own block of SEARCH_RESULTS numbers
+        # before any call starts, so parallel searches never collide. Only
+        # references are kept (number, scope, page ID), the latest
+        # MAX_CITATIONS of them.
+        self.next_marker = 1
+        self.citations: list[Citation] = []
 
     @workflow.signal(name="message")
     def message(self, m: InboundMessage) -> None:
@@ -86,12 +103,18 @@ class ConversationWorkflow:
         ref: ConversationRef,
         inbox: list[InboundMessage] | None = None,
         seen: list[str] | None = None,
+        next_marker: int = 1,
+        citations: list[Citation] | None = None,
     ) -> None:
         # Temporal applies these type hints only when every parameter was sent.
         # The gateway starts the workflow with ``ref`` alone, so convert here.
-        ref = value_to_type(ConversationRef, ref)
-        inbox = value_to_type(list[InboundMessage], inbox) if inbox else None
-        seen = value_to_type(list[str], seen) if seen else None
+        ref = _typed(ConversationRef, ref)
+        inbox = _typed(list[InboundMessage], inbox) if inbox else None
+        seen = _typed(list[str], seen) if seen else None
+        citations = _typed(list[Citation], citations) if citations else None
+        self.next_marker = max(self.next_marker, next_marker)
+        if citations:
+            self.citations = (citations + self.citations)[-MAX_CITATIONS:]
 
         # State carried over a continue-as-new comes first; anything signalled
         # since then was appended after it.
@@ -116,7 +139,15 @@ class ConversationWorkflow:
 
             if workflow.info().is_continue_as_new_suggested():
                 await workflow.wait_condition(workflow.all_handlers_finished)
-                workflow.continue_as_new(args=[ref, list(self.inbox), list(self.seen)])
+                workflow.continue_as_new(
+                    args=[
+                        ref,
+                        list(self.inbox),
+                        list(self.seen),
+                        self.next_marker,
+                        list(self.citations),
+                    ]
+                )
 
     async def _turn(self, ref: ConversationRef, m: InboundMessage) -> None:
         """Run one turn. A failed activity is reported, never raised."""
@@ -182,7 +213,7 @@ class ConversationWorkflow:
         try:
             await workflow.execute_activity_method(
                 AgentActivities.finalize_reply,
-                args=[ctx, placeholder_ts, TURN_FAILED],
+                args=[ctx, placeholder_ts, TURN_FAILED, []],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
@@ -238,7 +269,7 @@ class ConversationWorkflow:
                 state.reply_stored = True
                 await workflow.execute_activity_method(
                     AgentActivities.finalize_reply,
-                    args=[ctx, placeholder_ts, text],
+                    args=[ctx, placeholder_ts, text, list(self.citations)],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
                 )
@@ -254,14 +285,25 @@ class ConversationWorkflow:
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
+            first_markers: list[int] = []
+            for call in resp.tool_calls:
+                first_markers.append(self.next_marker)
+                if call.name == "search_knowledge":
+                    self.next_marker += SEARCH_RESULTS
             outcomes = await asyncio.gather(
-                *[self._dispatch(ctx, agent, conv_id, call) for call in resp.tool_calls],
+                *[
+                    self._dispatch(ctx, agent, conv_id, call, first_marker)
+                    for call, first_marker in zip(resp.tool_calls, first_markers)
+                ],
                 return_exceptions=True,
             )
             for outcome in outcomes:
                 if isinstance(outcome, BaseException):
                     raise outcome
             results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
+            for result in results:
+                self.citations.extend(result.citations)
+            del self.citations[:-MAX_CITATIONS]
             await workflow.execute_activity_method(
                 AgentActivities.append_tool_results,
                 args=[ctx.tenant_id, conv_id, f"{m.event_id}:s{step}:results", results],
@@ -272,7 +314,7 @@ class ConversationWorkflow:
 
         await workflow.execute_activity_method(
             AgentActivities.finalize_reply,
-            args=[ctx, placeholder_ts, OUT_OF_STEPS],
+            args=[ctx, placeholder_ts, OUT_OF_STEPS, []],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
@@ -288,12 +330,17 @@ class ConversationWorkflow:
         )
 
     async def _dispatch(
-        self, ctx: TurnContext, agent: AgentVersion, conv_id: str, call: ToolCall
+        self,
+        ctx: TurnContext,
+        agent: AgentVersion,
+        conv_id: str,
+        call: ToolCall,
+        first_marker: int,
     ) -> ToolResult:
         if call.name in READ_TOOLS:
             return await workflow.execute_activity_method(
                 AgentActivities.run_read_tool,
-                args=[ctx, conv_id, call, 1],
+                args=[ctx, conv_id, call, first_marker],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
@@ -339,6 +386,18 @@ class ConversationWorkflow:
             f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
             "Nothing is filed until they click Submit.",
         )
+
+
+def _typed(tp, value):
+    """Convert plain dicts to ``tp``; leave a value that already has the type alone.
+
+    A continue-as-new sends every parameter, so Temporal has already applied
+    the type hints and the values are dataclasses, not dicts.
+    """
+    try:
+        return value_to_type(tp, value)
+    except TypeError:
+        return value
 
 
 def _assistant_blocks(resp: LLMResponse) -> list[dict]:

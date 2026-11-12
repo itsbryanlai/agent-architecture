@@ -46,6 +46,15 @@ def normalize_id(notion_id: str) -> str:
     return notion_id.replace("-", "").lower()
 
 
+def is_unreachable(err: Exception) -> bool:
+    """True when Notion says the page or block is gone or not shared (404 or 403).
+
+    Such a page is left out rather than failing the whole call; any other error
+    (a rate limit, a server error) is not this and is retried.
+    """
+    return getattr(err, "status", None) in (403, 404)
+
+
 # --- Notion API surface -------------------------------------------------------
 
 
@@ -59,6 +68,14 @@ class NotionAPI(Protocol):
     ) -> dict: ...
 
     async def retrieve_page(self, page_id: str) -> dict: ...
+
+    async def retrieve_block(self, block_id: str) -> dict:
+        """One block, for its ``parent`` (a page can sit under a block)."""
+        ...
+
+    async def list_child_blocks(self, block_id: str) -> list[dict]:
+        """Every child block of a page or block, following all pages of results."""
+        ...
 
     async def list_users(self) -> list[dict]: ...
 
@@ -123,6 +140,23 @@ class RealNotionAPI:
     async def retrieve_page(self, page_id: str) -> dict:
         return await self._client.pages.retrieve(page_id=page_id)
 
+    async def retrieve_block(self, block_id: str) -> dict:
+        return await self._client.blocks.retrieve(block_id=block_id)
+
+    async def list_child_blocks(self, block_id: str) -> list[dict]:
+        blocks: list[dict] = []
+        cursor = None
+        while True:
+            kwargs: dict = {"block_id": block_id}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            resp = await self._client.blocks.children.list(**kwargs)
+            blocks.extend(resp.get("results", []))
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        return blocks
+
     async def retrieve_schema(self, database_id: str) -> dict[str, dict]:
         """Read the property schema from the database's first data source.
 
@@ -174,6 +208,10 @@ class FakeNotionAPI:
         self.calls: list[tuple[str, dict]] = []
         # Pages outside any database, by normalized ID (page grants and trees).
         self.free_pages: dict[str, dict] = {}
+        # Child blocks by normalized parent ID (a page or a block), and every
+        # block by normalized ID, for parent walks.
+        self.children: dict[str, list[dict]] = {}
+        self.blocks: dict[str, dict] = {}
         self._fail_next_create = False
         self._fail_next_query: Exception | None = None
 
@@ -230,6 +268,63 @@ class FakeNotionAPI:
             },
         }
 
+    def set_blocks(self, parent_id: str, blocks: list[dict]) -> None:
+        """Replace a page's or block's child blocks (see ``text_block``)."""
+        key = normalize_id(parent_id)
+        self.children[key] = []
+        for block in blocks:
+            self._attach_block(key, copy.deepcopy(block))
+
+    def _attach_block(self, parent_key: str, block: dict) -> None:
+        parent_type = "page_id" if parent_key in self.free_pages else "block_id"
+        block["parent"] = {"type": parent_type, parent_type: parent_key}
+        block.setdefault("in_trash", False)
+        nested = block.pop("_children", [])
+        self.blocks[normalize_id(block["id"])] = block
+        self.children.setdefault(parent_key, []).append(block)
+        for child in nested:
+            self._attach_block(normalize_id(block["id"]), copy.deepcopy(child))
+
+    def add_page_tree(self, page_id: str, tree: dict, parent: dict | None = None) -> None:
+        """Add a page and everything under it.
+
+        ``tree`` is ``{"title": str, "blocks": [text_block(...)], "children":
+        [{"id": str, ...tree of the child page}]}``. Each child page is added
+        with a ``child_page`` block in its parent, after the parent's text.
+        """
+        self.add_free_page(page_id, tree.get("title", "Page"), parent=parent)
+        self.set_blocks(page_id, tree.get("blocks", []))
+        for child in tree.get("children", []):
+            self.add_page_tree(
+                child["id"], child, parent={"type": "page_id", "page_id": normalize_id(page_id)}
+            )
+            self._attach_block(
+                normalize_id(page_id),
+                {
+                    "id": child["id"],
+                    "type": "child_page",
+                    "has_children": False,
+                    "child_page": {"title": child.get("title", "Page")},
+                },
+            )
+
+    def move_page(self, page_id: str, parent: dict) -> None:
+        """Re-parent a page, as a person moving it in Notion would."""
+        self.free_pages[normalize_id(page_id)]["parent"] = parent
+
+    def trash_page(self, page_id: str) -> None:
+        self.free_pages[normalize_id(page_id)]["in_trash"] = True
+
+    def remove_child_page(self, parent_id: str, page_id: str) -> None:
+        """Drop a page's ``child_page`` block from its parent and delete the page."""
+        key = normalize_id(parent_id)
+        self.children[key] = [
+            b
+            for b in self.children.get(key, [])
+            if not (b["type"] == "child_page" and normalize_id(b["id"]) == normalize_id(page_id))
+        ]
+        self.free_pages.pop(normalize_id(page_id), None)
+
     def set_status(self, page_id: str, prop: str, status: str) -> None:
         for db_key, pages in self.databases.items():
             if page_id in pages:
@@ -278,7 +373,21 @@ class FakeNotionAPI:
                 return copy.deepcopy(pages[page_id])
         if normalize_id(page_id) in self.free_pages:
             return copy.deepcopy(self.free_pages[normalize_id(page_id)])
-        raise KeyError(page_id)
+        raise FakeNotFound(page_id)
+
+    async def retrieve_block(self, block_id: str) -> dict:
+        self.calls.append(("retrieve_block", {"block_id": block_id}))
+        block = self.blocks.get(normalize_id(block_id))
+        if block is None:
+            raise FakeNotFound(block_id)
+        return copy.deepcopy(block)
+
+    async def list_child_blocks(self, block_id: str) -> list[dict]:
+        self.calls.append(("list_child_blocks", {"block_id": block_id}))
+        key = normalize_id(block_id)
+        if key not in self.free_pages and key not in self.blocks:
+            raise FakeNotFound(block_id)
+        return copy.deepcopy(self.children.get(key, []))
 
     async def list_users(self) -> list[dict]:
         self.calls.append(("list_users", {}))
@@ -327,6 +436,39 @@ class FakeNotionAPI:
                 shaped = copy.deepcopy(value)
             out[name] = {"id": prop_id, **shaped}
         return out
+
+
+class FakeNotFound(KeyError):
+    """A missing page or block, carrying the HTTP status Notion would send."""
+
+    status = 404
+
+
+def text_block(
+    kind: str,
+    text: str = "",
+    block_id: str | None = None,
+    children: list[dict] | None = None,
+    cells: list[str] | None = None,
+) -> dict:
+    """A Notion block in response shape, for the fake. ``kind`` is the block type.
+
+    A ``table_row`` takes ``cells`` instead of ``text``. Nested ``children`` are
+    attached by ``FakeNotionAPI.set_blocks`` when the block is a child of a page.
+    """
+    block_id = block_id or str(uuid.uuid4())
+    if kind == "table_row":
+        body: dict = {"cells": [[_rich({"text": {"content": c}})] for c in (cells or [])]}
+    else:
+        body = {"rich_text": [_rich({"text": {"content": text}})]}
+    return {
+        "object": "block",
+        "id": block_id,
+        "type": kind,
+        kind: body,
+        "has_children": bool(children),
+        "_children": children or [],
+    }
 
 
 def _rich(t: dict) -> dict:

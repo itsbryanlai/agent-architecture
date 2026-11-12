@@ -7,6 +7,8 @@ from temporalio.common import RetryPolicy
 # Activity timeouts: every activity call passes one of these explicitly.
 ACTIVITY_TIMEOUT = timedelta(seconds=30)
 LLM_TIMEOUT = timedelta(seconds=90)
+# Reading, chunking, embedding and storing one page.
+INDEX_TIMEOUT = timedelta(minutes=5)
 
 # Errors a retry cannot fix (policy denials, unknown requester, bad input) fail
 # at once; everything else is retried with backoff.

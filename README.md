@@ -160,6 +160,33 @@ uv run pytest tests/test_ids.py tests/test_config.py tests/test_notion_connector
 uv run ruff check . && uv run ruff format --check .
 ```
 
+## Knowledge: indexing and search
+
+An agent with a Notion page grant (`grants.notion.pages`) can answer from every
+page under that page. Index the pages first, with the worker running (the
+worker does the reading and embedding; the command only asks Temporal to start
+it):
+
+```bash
+uv run python -m agentos.index_knowledge             # one run per granted page, now
+uv run python -m agentos.index_knowledge --wait      # ... and print a summary per run
+uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
+```
+
+Indexing calls the embeddings endpoint, so it **spends embedding credit**;
+pages whose content has not changed since the last run are not embedded again.
+Two agents granted the same page share one run. `--schedule` creates or updates
+one schedule per granted page and deletes the schedules of pages that are no
+longer granted. Pages removed from the tree, trashed or unreachable are removed
+from the index on the next run.
+
+The agent's `search_knowledge` tool searches only its own granted pages. Every
+page found is re-checked with Notion before the model sees it (not trashed, still
+under the granted page), so a page moved or deleted since the last run is
+left out. Passages reach the model wrapped in `<source>` tags as data, numbered
+like `[1]`. When the answer cites a number, the runtime adds a Sources line
+with the page's title and link; the model never writes a link.
+
 ## Restart demo: exactly once, and follow-up that survives a crash
 
 This is the end-to-end proof that the work outlives the process.
@@ -187,6 +214,8 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/workflows/` | `ConversationWorkflow` (turn loop) and `TaskWorkflow` (approval, create, follow-up) |
 | `src/agentos/activities.py` | All I/O the workflows do |
 | `src/agentos/connectors/` | Connector manifest and the Notion connector, with grant checks |
+| `src/agentos/knowledge/` | Embedder, knowledge store, Notion text extraction and chunking, indexing and search helpers |
+| `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

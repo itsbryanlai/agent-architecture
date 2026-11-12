@@ -1,0 +1,16 @@
+# Knowledge search manifest. The tool is offered only to an agent that has
+# Notion page grants; what it can find is limited to those pages.
+connector: knowledge
+tools:
+  search_knowledge:
+    risk: read
+    description: >-
+      Search the documents this agent was given access to. Returns numbered
+      passages with their page titles; cite a passage by its number, like [2].
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: What to look for, in plain words.
+      required: [query]

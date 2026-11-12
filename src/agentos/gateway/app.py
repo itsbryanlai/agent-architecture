@@ -463,18 +463,22 @@ async def _real_lifespan(app: FastAPI):
     """Build the real dependencies when the server starts, not at import."""
     from psycopg_pool import AsyncConnectionPool
     from slack_sdk.signature import SignatureVerifier
-    from temporalio.client import Client
 
     from agentos.config import load_settings, load_tenants_config
+    from agentos.crypto_keys import LocalKeyStore, startup_key_failure
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
+    from agentos.temporal_client import build_temporal_client
     from agentos.tenants import build_slack_clients
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
     tenants = load_tenants_config(settings.config_path)
+    key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
+    if key_failure:
+        raise SystemExit(key_failure)
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
-    client = await Client.connect(settings.temporal_address)
+    client = await build_temporal_client(settings)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     slack_clients = build_slack_clients(tenants, RealSlackPoster)

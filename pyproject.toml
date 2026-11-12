@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.14.5",
     "anthropic>=2.6.0",
+    "cryptography>=50.0.2",
     "fastapi>=0.162.2",
     "httpx>=0.28.1",
     "notion-client>=3.1.0",

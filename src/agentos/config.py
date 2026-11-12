@@ -35,6 +35,8 @@ DEFAULT_DATABASE_URL = "postgresql://agentos_app:agentos_app@localhost:55432/age
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
 # The directory where the gateway writes each tenant's Notion verification token.
 DEFAULT_NOTION_TOKEN_DIR = "~/.agentos"
+# The directory of per-tenant payload encryption key files, <tenant_id>.key.
+DEFAULT_KEY_DIR = "~/.agentos/keys"
 # The variable names a tenant without a ``secrets`` block uses. Only one tenant
 # may use them.
 DEFAULT_SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -78,6 +80,9 @@ class Settings:
     # handshake delivers, one file per tenant. A leading "~" is expanded when
     # the file is used, not when settings load.
     notion_token_dir: str = DEFAULT_NOTION_TOKEN_DIR
+    # Where each tenant's payload encryption key file lives. A leading "~" is
+    # expanded when the key is read. Holds a directory name, never a key.
+    key_dir: str = DEFAULT_KEY_DIR
     anthropic_api_key: str | None = field(default=None, repr=False)
     qwen_api_key: str | None = field(default=None, repr=False)
     llm_provider: str = DEFAULT_LLM_PROVIDER
@@ -130,6 +135,7 @@ def load_settings() -> Settings:
     return Settings(
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token_dir=env.get("AGENTOS_NOTION_TOKEN_DIR") or DEFAULT_NOTION_TOKEN_DIR,
+        key_dir=env.get("AGENTOS_KEY_DIR") or DEFAULT_KEY_DIR,
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         qwen_api_key=env.get("QWEN_API_KEY"),
         llm_provider=provider,

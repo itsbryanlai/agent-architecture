@@ -40,6 +40,7 @@ from temporalio.common import WorkflowIDConflictPolicy
 
 from agentos import ids
 from agentos.config import TASK_QUEUE, AgentsConfig, load_settings, load_tenants_config
+from agentos.temporal_client import build_temporal_client
 from agentos.tenants import granted_roots
 from agentos.workflows.indexing import IndexingWorkflow
 
@@ -131,7 +132,7 @@ async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
     if not any(granted_roots(a) for a in selected):
         print("No agent has a Notion page grant, so there is nothing to index.")
         return
-    client = await Client.connect(settings.temporal_address)
+    client = await build_temporal_client(settings)
     if schedule:
         # Every selected tenant is planned, including one with no grants left
         # while another has some, so its stale schedules are deleted.

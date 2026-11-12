@@ -13,7 +13,6 @@ import logging
 from urllib.parse import urlparse
 
 from psycopg_pool import AsyncConnectionPool
-from temporalio.client import Client
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
@@ -28,6 +27,7 @@ from agentos.config import (
     load_tenants_config,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.crypto_keys import LocalKeyStore, startup_key_failure
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -39,6 +39,7 @@ from agentos.stores import (
     PostgresTaskLinkStore,
     PostgresToolOutputStore,
 )
+from agentos.temporal_client import build_temporal_client
 from agentos.tenants import build_registry
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
@@ -155,6 +156,9 @@ async def main() -> None:
     log = logging.getLogger("agentos.worker")
     settings = load_settings()
     tenants = load_tenants_config(settings.config_path)
+    key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
+    if key_failure:
+        raise SystemExit(key_failure)
     llm = build_llm(settings)
     embedder = build_embedder(settings, tenants)
     registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
@@ -199,7 +203,7 @@ async def main() -> None:
             # Indexing runs only where some agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
             all_activities += IndexActivities(registry, knowledge, embedder).all()
-        client = await Client.connect(settings.temporal_address)
+        client = await build_temporal_client(settings)
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,

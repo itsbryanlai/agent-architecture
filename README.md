@@ -186,6 +186,44 @@ export AGENTOS_CONFIG=config/tenants
   or one with `--tenant <tenant_id>`; schedules are kept per tenant.
 - A single file keeps working exactly as before.
 
+## Encrypted workflow data
+
+Every payload the platform writes to Temporal (workflow inputs and results,
+signals, queries, activity inputs and results) is encrypted with the key of the
+tenant it belongs to (AES-256-GCM). The tenant comes from the workflow ID, which
+always starts with the tenant ID; a payload with no tenant is never sent.
+
+**Create a key for each tenant before starting the worker or the gateway:**
+
+```bash
+uv run python -m agentos.tenant_keys create <tenant_id>
+```
+
+This writes `<tenant_id>.key` (256 random bits, base64) with mode `0600` in a
+`0700` directory and prints the path. It never overwrites an existing key. The
+directory is `AGENTOS_KEY_DIR` (default `~/.agentos/keys`). A key file that is
+missing, or readable by anyone but its owner, is refused. Keep the keys outside
+the repo and back them up: **if a key is lost, that tenant's in-flight workflow
+data cannot be read again.**
+
+The worker and the gateway check every configured tenant's key before they
+connect, and refuse to start with a one-line summary naming each missing or
+unsafe key file and the command that creates it. Errors and failure messages in
+the history are encrypted too.
+
+Workflows that started before encryption was turned on still read: payloads
+without the encrypted tag pass through unchanged. New payloads are always
+encrypted.
+
+The Temporal web UI shows these payloads as encrypted until a codec server is
+added (a later change). Every process that connects to Temporal (worker,
+gateway, `index_knowledge`) goes through `agentos.temporal_client.build_temporal_client`,
+so each needs the keys it will use.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTOS_KEY_DIR` | `~/.agentos/keys` | Directory of per-tenant key files, `<tenant_id>.key` |
+
 ## Model provider
 
 The worker talks to Claude by default. For testing, it can use Qwen instead,

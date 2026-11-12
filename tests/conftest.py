@@ -14,6 +14,7 @@ from temporalio.worker import Worker
 from agentos.activities import AgentActivities
 from agentos.config import TASK_QUEUE, AgentsConfig, Settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI, text_block
+from agentos.index_knowledge import granted_roots
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -27,6 +28,7 @@ from agentos.stores import (
 )
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
+from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
 
 TENANT = "acme"
@@ -298,11 +300,11 @@ async def kharness():
         knowledge=h.knowledge,
         embedder=h.embedder,
     )
-    index_acts = IndexActivities(notion, h.knowledge, h.embedder)
+    index_acts = IndexActivities(notion, h.knowledge, h.embedder, granted_roots(cfg))
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,
-        workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow],
+        workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
         activities=h.acts.all() + index_acts.all(),
     )
     async with worker:

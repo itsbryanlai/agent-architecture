@@ -89,6 +89,34 @@ Knowledge settings, used only when an agent has a Notion page grant:
 | `EMBED_API_KEY` | none | Key for that endpoint (secret; export it, never save it). A local Ollama needs none |
 | `QWEN_API_KEY`, `QWEN_BASE_URL` | none | Needed for embeddings, when any agent has a page grant, only if `AGENTOS_EMBED_BASE_URL` is unset |
 
+## Notion webhook (optional)
+
+The webhook makes a task notice a finished Notion item sooner than the 15-minute
+poll. Notion signs every event, and the gateway refuses any event whose
+signature it cannot check, so set it up in this order:
+
+1. In the Notion integration, add a webhook subscription that points at
+   `POST /notion/webhook` on the gateway.
+2. Notion sends a one-time handshake. The gateway writes the verification token
+   to a file readable only by you, and logs the path (never the token). The path
+   is `~/.agentos/notion-webhook-verification-token` unless you set
+   `AGENTOS_NOTION_TOKEN_FILE`.
+3. Paste the token from that file into the Notion integration to finish
+   subscribing, then `export NOTION_WEBHOOK_VERIFICATION_TOKEN='<token>'` and
+   restart the gateway.
+
+Once the token is exported, the gateway refuses further handshakes (409) so the
+file cannot be overwritten; to re-subscribe, unset
+`NOTION_WEBHOOK_VERIFICATION_TOKEN` and restart the gateway first.
+
+Until the token is exported, events get a 503. Events with a missing or wrong
+signature get a 401. Neither reaches a workflow.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token (secret; export it, never save it in a dotenv file). Without it every webhook event is refused |
+| `AGENTOS_NOTION_TOKEN_FILE` | `~/.agentos/notion-webhook-verification-token` | Where the gateway writes the token it receives at subscription time (mode `0600`) |
+
 ## Model provider
 
 The worker talks to Claude by default. For testing, it can use Qwen instead,
@@ -210,6 +238,16 @@ Two agents granted the same page share one run. `--schedule` creates or updates
 one schedule per granted page and deletes the schedules of pages that are no
 longer granted. Pages removed from the tree, trashed or unreachable are removed
 from the index on the next run.
+
+### Keeping the index fresh
+
+With the Notion webhook set up (see above), a signed page event (content or
+properties updated, created, moved, deleted or restored) refreshes that single
+page within about 30 seconds of the last edit: bursts of edits are coalesced
+into one refresh. An edited page is re-embedded, a trashed page or one moved out
+of every granted page is removed, and a new page under a granted page is
+indexed. Sub-pages added under a new page wait for the nightly run, which
+remains the backstop for anything the webhook misses.
 
 ### Local embeddings with Ollama
 

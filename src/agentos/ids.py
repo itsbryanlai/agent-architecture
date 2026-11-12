@@ -26,3 +26,8 @@ def index_workflow_id(tenant: str, scope: str) -> str:
 
 def index_schedule_id(tenant: str, scope: str) -> str:
     return f"{tenant}:index-schedule:{scope}"
+
+
+def page_refresh_id(tenant: str, page_id: str) -> str:
+    """One refresh workflow per page, so a burst of events lands in one run."""
+    return f"{tenant}:page-refresh:{normalize_id(page_id)}"

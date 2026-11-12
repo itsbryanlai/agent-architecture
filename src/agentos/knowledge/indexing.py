@@ -22,6 +22,7 @@ from agentos.config import EMBED_DIMENSIONS
 from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.notion_text import PageUnavailable, chunk, page_text
+from agentos.knowledge.search import PageChecker
 from agentos.knowledge.store import KnowledgeStore
 
 log = logging.getLogger("agentos.indexing")
@@ -33,6 +34,14 @@ class SyncResult:
     changed: bool = False
     chunks: int = 0
     skipped: bool = False
+
+
+@dataclass
+class RefreshResult:
+    """Scopes only, never page text: indexed scopes and scopes the page left."""
+
+    indexed: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
 
 
 def content_hash(model: str, title: str, chunks: list[str]) -> str:
@@ -49,13 +58,21 @@ def content_hash(model: str, title: str, chunks: list[str]) -> str:
 
 
 class IndexActivities:
-    def __init__(self, notion_api: NotionAPI, store: KnowledgeStore, embedder: Embedder):
+    def __init__(
+        self,
+        notion_api: NotionAPI,
+        store: KnowledgeStore,
+        embedder: Embedder,
+        roots: dict[str, str] | None = None,
+    ):
         self.api = notion_api
         self.store = store
         self.embedder = embedder
+        # Scope to root page ID, for every page granted to any agent.
+        self.roots = roots or {}
 
     def all(self) -> list:
-        return [self.sync_page, self.prune_scope]
+        return [self.sync_page, self.prune_scope, self.refresh_page]
 
     @activity.defn(name="sync_page")
     async def sync_page(self, tenant_id: str, scope: str, page_id: str) -> SyncResult:
@@ -102,6 +119,33 @@ class IndexActivities:
                 )
                 raise _non_retryable(err) from err
             raise
+
+    @activity.defn(name="refresh_page")
+    async def refresh_page(self, tenant_id: str, page_id: str) -> RefreshResult:
+        """Bring one page up to date in every granted scope, after a Notion event.
+
+        For each granted root: a page that is live and still under the root is
+        re-read and re-embedded if its content changed (this also indexes a
+        newly created page, or one moved in from outside); a page that is no
+        longer under the root, or is trashed, is removed from that scope.
+        Only this one page is synced: sub-pages of a newly created or moved-in
+        page wait for the next full indexing run. Notion lookups are cached
+        for the call by one page checker. The result and the logs hold scope
+        and page IDs only, never page text.
+        """
+        page_id = normalize_id(page_id)
+        checker = PageChecker(self.api)
+        result = RefreshResult()
+        for scope, root in self.roots.items():
+            if await checker.under_root(page_id, root):
+                synced = await self.sync_page(tenant_id, scope, page_id)
+                if not synced.skipped:
+                    result.indexed.append(scope)
+            elif page_id in await self.store.page_hashes(tenant_id, scope):
+                await self.store.delete_pages(tenant_id, scope, [page_id])
+                result.removed.append(scope)
+                log.info("page removed tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
+        return result
 
     async def _index(self, tenant_id: str, scope: str, page_id: str, content) -> SyncResult:
         chunks = chunk(content.title, content.blocks)

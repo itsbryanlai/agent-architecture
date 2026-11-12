@@ -39,6 +39,7 @@ TASK_QUEUE = "agentos-main"
 # Which model provider the worker uses. Anthropic is the default; Qwen is a
 # second provider selectable for testing.
 PROVIDER_ANTHROPIC = "anthropic"
+DEFAULT_NOTION_TOKEN_FILE = "~/.agentos/notion-webhook-verification-token"
 PROVIDER_QWEN = "qwen"
 LLM_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_QWEN)
 DEFAULT_LLM_PROVIDER = PROVIDER_ANTHROPIC
@@ -59,6 +60,12 @@ class Settings:
     slack_bot_token: str | None = field(default=None, repr=False)
     slack_signing_secret: str | None = field(default=None, repr=False)
     notion_token: str | None = field(default=None, repr=False)
+    # Notion signs every webhook event with this token (shown once, at
+    # subscription time). Unset means webhook events are refused.
+    notion_webhook_token: str | None = field(default=None, repr=False)
+    # Where the gateway writes the token it receives at subscription time.
+    # A leading "~" is expanded when the file is used, not when settings load.
+    notion_token_file: str = DEFAULT_NOTION_TOKEN_FILE
     anthropic_api_key: str | None = field(default=None, repr=False)
     qwen_api_key: str | None = field(default=None, repr=False)
     llm_provider: str = DEFAULT_LLM_PROVIDER
@@ -112,6 +119,8 @@ def load_settings() -> Settings:
         slack_bot_token=env.get("SLACK_BOT_TOKEN"),
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token=env.get("NOTION_TOKEN"),
+        notion_webhook_token=env.get("NOTION_WEBHOOK_VERIFICATION_TOKEN") or None,
+        notion_token_file=env.get("AGENTOS_NOTION_TOKEN_FILE") or DEFAULT_NOTION_TOKEN_FILE,
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         qwen_api_key=env.get("QWEN_API_KEY"),
         llm_provider=provider,

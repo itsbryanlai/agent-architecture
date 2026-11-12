@@ -10,6 +10,8 @@ It acknowledges every request quickly and hands the work to Temporal:
   task workflow decides whether that person may approve.
 * ``POST /notion/webhook``: a page update becomes an ``external_update`` signal
   to the task watching that page. Polling covers anything the webhook misses.
+  Events must carry a valid ``X-Notion-Signature``; the subscription
+  handshake's verification token is written to an owner-only file, never logged.
 
 Every Slack request must carry a valid Slack signature. Events from any Slack
 workspace other than the configured one are dropped. The tenant comes from
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,6 +35,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from agentos import ids
 from agentos.config import TASK_QUEUE, AgentsConfig, Settings
 from agentos.connectors.notion import normalize_id
+from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import ApprovalDecision, ConversationRef, ExternalUpdate, InboundMessage
 from agentos.stores import TaskLinkStore
 
@@ -39,7 +43,16 @@ log = logging.getLogger("agentos.gateway")
 
 LEADING_MENTION = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 APPROVAL_ACTIONS = {"task_approve": True, "task_cancel": False}
-NOTION_PAGE_EVENTS = {"page.properties_updated"}
+# Page events that can change what a task or the knowledge index should see.
+# Locking and unlocking a page change neither.
+NOTION_PAGE_EVENTS = {
+    "page.properties_updated",
+    "page.content_updated",
+    "page.created",
+    "page.deleted",
+    "page.undeleted",
+    "page.moved",
+}
 
 
 @dataclass
@@ -165,19 +178,50 @@ def create_app(
     async def notion_webhook(request: Request) -> Response:
         d = deps(request)
         tenant = d.agents.tenant_id
+        body = await request.body()
+        signature = request.headers.get("X-Notion-Signature")
         try:
-            payload = await request.json()
+            payload = json.loads(body)
         except ValueError:
             return Response(status_code=400)
-        if "verification_token" in payload:
-            # One-time subscription handshake: Notion sends a token that the
-            # operator pastes back into the Notion integration settings.
+        if not isinstance(payload, dict):
+            return Response(status_code=400)
+        if "verification_token" in payload and signature is None:
+            # One-time subscription handshake: the token goes to an owner-only
+            # file, never to a log, and the operator pastes it into Notion.
+            # Once a token is configured the handshake is closed, so nobody can
+            # overwrite the file with a value of their own.
+            if d.settings.notion_webhook_token:
+                log.warning(
+                    "tenant_id=%s Notion webhook handshake refused: a verification token is "
+                    "already configured; unset NOTION_WEBHOOK_VERIFICATION_TOKEN and restart "
+                    "the gateway to accept a new subscription",
+                    tenant,
+                )
+                return Response(status_code=409)
+            path = _write_token_file(
+                d.settings.notion_token_file, str(payload["verification_token"])
+            )
             log.warning(
-                "tenant_id=%s Notion webhook verification token received: %s",
+                "tenant_id=%s Notion webhook verification token written to %s; "
+                "paste it into the Notion integration and export it as "
+                "NOTION_WEBHOOK_VERIFICATION_TOKEN",
                 tenant,
-                payload["verification_token"],
+                path,
             )
             return Response(status_code=200)
+        token = d.settings.notion_webhook_token
+        if not token:
+            log.warning(
+                "tenant_id=%s Notion webhook event refused: NOTION_WEBHOOK_VERIFICATION_TOKEN "
+                "is not set",
+                tenant,
+            )
+            return Response(status_code=503)
+        if not verify_notion_signature(body, signature, token):
+            reason = "missing" if signature is None else "invalid"
+            log.warning("tenant_id=%s Notion webhook event refused: %s signature", tenant, reason)
+            return Response(status_code=401)
         if payload.get("type") in NOTION_PAGE_EVENTS:
             entity = payload.get("entity") or {}
             page_id = entity.get("id")
@@ -191,9 +235,39 @@ def create_app(
                         "external_update",
                         ExternalUpdate(page_id=page_id, source="notion_webhook"),
                     )
+                if any(a.grants.notion_pages for a in d.agents.agents.values()):
+                    # Signal-with-start: a burst of events for one page lands in
+                    # the one running refresh workflow.
+                    refresh_id = ids.page_refresh_id(tenant, page_id)
+                    await d.temporal_client.start_workflow(
+                        "PageRefreshWorkflow",
+                        args=[tenant, normalize_id(page_id)],
+                        id=refresh_id,
+                        task_queue=TASK_QUEUE,
+                        start_signal="changed",
+                    )
+                    log.info(
+                        "tenant_id=%s workflow_id=%s signalled changed event_type=%s",
+                        tenant,
+                        refresh_id,
+                        payload.get("type"),
+                    )
         return Response(status_code=200)
 
     return app
+
+
+def _write_token_file(configured: str, token: str) -> str:
+    """Write the verification token to an owner-only file; return its path."""
+    path = os.path.expanduser(configured)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+    os.chmod(path, 0o600)
+    return path
 
 
 async def _signal(d: GatewayDeps, tenant: str, workflow_id: str, name: str, arg: Any) -> None:

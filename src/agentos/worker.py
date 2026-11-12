@@ -26,6 +26,7 @@ from agentos.config import (
     load_settings,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.index_knowledge import granted_roots
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -39,6 +40,7 @@ from agentos.stores import (
 )
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
+from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
 
 
@@ -185,8 +187,10 @@ async def main() -> None:
         all_activities = activities.all()
         if embedder is not None:
             # Indexing runs only where some agent has a page grant.
-            workflows.append(IndexingWorkflow)
-            all_activities += IndexActivities(notion_api, knowledge, embedder).all()
+            workflows += [IndexingWorkflow, PageRefreshWorkflow]
+            all_activities += IndexActivities(
+                notion_api, knowledge, embedder, granted_roots(agents)
+            ).all()
         client = await Client.connect(settings.temporal_address)
         worker = Worker(
             client,

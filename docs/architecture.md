@@ -16,11 +16,11 @@ flowchart LR
   CX --> V[Credential vault]
   CX --> SaaS[Notion / Confluence / Drive]
   W --> KB[Knowledge service]
-  KB --> VDB[(Vector index + permission data)]
+  KB --> VDB[(Vector index, by tenant and scope)]
   W --> DB[(Postgres: tenants, agents, history, audit)]
   W -->|post / update message| Slack
   Admin[Admin and creator console] --> API[Control-plane API] --> DB
-  Sync[Ingestion and permission sync] --> VDB
+  Sync[Indexing workflows] --> VDB
 ```
 
 | Component | Responsibility |
@@ -30,8 +30,8 @@ flowchart LR
 | LLM gateway | Hides which model provider is used, applies per-tenant model allowlists, budgets, and rate limits, and records token cost per agent and team |
 | Connector runtime | Runs tool calls inside Activities, enforces the agent's grants and the action policy, injects credentials, and attaches idempotency keys |
 | Credential vault | Tenant connector credentials (app installs, service accounts), plus per-user tokens only for systems that can't filter by person (D-17); encrypted with a per-tenant key |
-| Knowledge service | Permission-aware retrieval across indexed sources |
-| Ingestion and permission sync | Pulls documents, their access lists, and group membership from each source on a schedule and via webhooks |
+| Knowledge service | Retrieval limited to the agent's granted scopes, re-checked against the source, with citations (§6) |
+| Indexing | Reads the documents under each granted scope, nightly and on demand (webhooks later), and keeps the index in step with the source (§6). Access is the agent's grant, so no per-user access lists or group membership are synced |
 | Control plane | Tenants, agents and their versions, creator roles, policies, audit log queries |
 
 ## 2. Multi-tenancy
@@ -59,7 +59,7 @@ Conversations and tasks are separate workflows, because **a conversation ends bu
 |---|---|---|---|
 | `ConversationWorkflow` | `{tenant}:conv:{slack_channel}:{thread_ts}` | Until the thread is idle for 7 days, then closes. Uses continue-as-new periodically | Turn loop: receive message → LLM → tools → reply. Starts tasks |
 | `TaskWorkflow` | `{tenant}:task:{uuid}` | Until the task completes, fails, or expires (days to weeks) | One unit of real work: draft → approval → execute (exactly once) → watch → follow up |
-| `ConnectorSyncWorkflow` | `{tenant}:sync:{connector}` | Runs on a schedule | Ingests documents and access lists for knowledge |
+| `IndexingWorkflow` | `{tenant}:index:{scope}` | One run per refresh: started nightly by a Temporal schedule, or on demand | Indexes one granted knowledge scope (§6): reads every page under it, re-embeds what changed, removes what left |
 
 The conversation starts a task as a **child workflow with `ABANDON` as its parent-close policy**, so the task keeps running after the conversation closes. The task posts back to the original thread through activities, and reopens the conversation with signal-with-start if the user replies.
 
@@ -68,7 +68,7 @@ The conversation starts a task as a **child workflow with `ABANDON` as its paren
 Rules that apply to every turn:
 - Messages arrive through a signal handler into an inbox, with duplicates dropped by Slack event ID.
 - Agent config is loaded at the start of each turn and pinned to an agent *version*. Edits apply from the next turn onward, and the audit log records which version answered.
-- Chat history lives in Postgres. The workflow only carries a reference to it and a turn counter, which keeps Temporal history small and keeps document content out of it.
+- Chat history lives in Postgres. The workflow only carries a reference to it and a turn counter, which keeps Temporal history small and keeps document content out of it. Tool output text is written to Postgres by the activity that ran the tool; the workflow passes only a reference, and an activity puts the text into history. Each history append carries a key built from the Slack event ID and the turn step, so a retried append never stores a message twice.
 - Each turn has a maximum number of steps and a token budget.
 - Multiple tool calls from one LLM response run in parallel and are matched back to the model by their tool-call IDs.
 - Every activity has explicit timeouts and a retry policy. Errors like 4xx, auth failures, and policy denials are non-retryable.
@@ -200,13 +200,24 @@ Some questions are about the requester's own records ("my open requests", "my PT
 
 ## 6. Knowledge retrieval
 
-**Filter by the agent's grants.**
-1. Ingestion uses the tenant connector credential and tags each chunk with its source scope (space, folder, project). This happens incrementally through webhooks and fully every night.
-2. Each query is filtered *inside* the vector search to the scopes in the agent's grants. Because grants are per agent rather than per user, the filter is small and cacheable, and we don't need to track every employee's group membership.
-3. Before the top results go to the LLM, they are checked against the source again to drop anything deleted or moved out of a granted scope since the last sync.
-4. Retrieved text is wrapped as *untrusted data* in the prompt (see §8).
+Agents answer from documents their creator granted, and every answer cites its sources.
 
-The company-wide knowledge base is a set of scopes the admin makes available to every agent, such as the all-staff handbook space.
+**Scopes.** A grant names a root, and everything under it is one *scope*. In v1 the root is a Notion page: the page and every sub-page beneath it, at any depth, including sub-pages inside toggles or columns. Confluence spaces and Drive folders become scopes the same way. The company-wide knowledge base is a set of scopes the admin makes available to every agent, such as the all-staff handbook.
+
+**Ingestion.**
+1. One `IndexingWorkflow` per (tenant, scope) walks the tree from the root with the tenant's connector credential, a couple of pages at a time to stay under the source's rate limits. Workflow history carries only page IDs and counts; each page is fetched, split into chunks, embedded and stored inside one activity.
+2. Each page's content hash includes the embedding model, so unchanged pages are skipped, and changing the model re-embeds everything on the next run.
+3. Pages that left the tree, were trashed or can no longer be read are removed from the index.
+4. A Temporal schedule refreshes every granted scope nightly, and an operator command starts a refresh on demand. Updates driven by source webhooks come later.
+
+**Embeddings** sit behind one interface that calls any OpenAI-compatible embeddings endpoint: a hosted provider in production, or a local model for development. The vector size is fixed by the index column (1024), so every model must produce that size.
+
+**Query.**
+1. Each query is filtered *inside* the vector search to the tenant and the scopes in the agent's grants. Because grants are per agent rather than per user, the filter is small and cacheable, and we don't need to track every employee's group membership.
+2. Before the top results go to the LLM, each page is checked against the source again: it must still exist, not be trashed, and still sit under the granted root. The check walks up the page's parents (pages, and blocks such as toggles); any parent it can't follow drops the page. A page deleted or moved out of a granted scope since the last refresh never reaches the model.
+3. Retrieved text is wrapped as *untrusted data* in the prompt (see §8), and the system prompt tells the model never to follow instructions inside it.
+
+**Citations.** Each passage reaches the model with a number. The model cites by number only, like `[2]`; it never writes a link. When the reply is posted, the runtime looks up each cited page's title and link in the index and adds a Sources line. Numbers are unique for the life of a thread, including across continue-as-new, so a number cited in a later turn still means the page it meant when it was first shown. A number that matches nothing gets no link.
 
 ## 7. Connectors
 
@@ -270,9 +281,9 @@ So adding a new system usually means writing and testing a manifest, not a whole
 | Data | Store | Notes |
 |---|---|---|
 | Tenants, agents, agent versions, policies | Postgres | Agent versions are immutable once published |
-| Conversation history | Postgres (blob storage for large tool outputs) | Retention configurable per tenant |
+| Conversation history | Postgres (blob storage for large tool outputs) | Retention configurable per tenant. Tool output text is stored next to it, keyed by tool-call ID, and never passes through Temporal |
 | Audit log | Append-only table, exportable to the tenant's security monitoring system | Who, agent version, identity used, tool, inputs, outputs (or a hash of them), approver |
-| Embeddings + permission data | Vector index partitioned by tenant | pgvector is enough for v1 |
+| Indexed knowledge | pgvector in the cell's Postgres: one row per page (title, link, content hash) and one per chunk (text, embedding), keyed by tenant, scope and page | Searches filter by tenant and granted scope inside the query |
 | OAuth tokens | Vault | Per-tenant key |
 | Temporal history | Temporal | Encrypted with the tenant key; holds only references and small values |
 

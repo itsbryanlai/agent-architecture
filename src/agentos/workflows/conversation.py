@@ -57,6 +57,10 @@ class _TurnState:
         self.ctx: TurnContext | None = None
         self.placeholder_ts: str | None = None
         self.pending_tool_ids: list[str] = []
+        self.event_id: str = ""
+        # True once the final reply is in history; recovery then stores no
+        # second assistant turn.
+        self.reply_stored = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -147,6 +151,7 @@ class ConversationWorkflow:
                 await self._append(
                     ctx,
                     conv_id,
+                    f"{state.event_id}:recover:results",
                     "user",
                     [
                         {
@@ -160,10 +165,17 @@ class ConversationWorkflow:
                 )
         except ActivityError as err:
             self._log_failure(ref, err, "recovery")
-        try:
-            await self._append(ctx, conv_id, "assistant", [{"type": "text", "text": TURN_FAILED}])
-        except ActivityError as err:
-            self._log_failure(ref, err, "recovery")
+        if not state.reply_stored:
+            try:
+                await self._append(
+                    ctx,
+                    conv_id,
+                    f"{state.event_id}:recover:assistant",
+                    "assistant",
+                    [{"type": "text", "text": TURN_FAILED}],
+                )
+            except ActivityError as err:
+                self._log_failure(ref, err, "recovery")
         try:
             await workflow.execute_activity_method(
                 AgentActivities.finalize_reply,
@@ -192,7 +204,10 @@ class ConversationWorkflow:
             thread_ts=ref.thread_ts,
             channel_kind=m.channel_kind,
         )
-        await self._append(ctx, conv_id, "user", [{"type": "text", "text": m.text}])
+        state.event_id = m.event_id
+        await self._append(
+            ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]
+        )
         placeholder_ts: str = await workflow.execute_activity_method(
             AgentActivities.post_placeholder,
             args=[ctx, f"{m.event_id}:ph"],
@@ -202,7 +217,7 @@ class ConversationWorkflow:
         state.ctx = ctx
         state.placeholder_ts = placeholder_ts
 
-        for _ in range(agent.max_steps):
+        for step in range(agent.max_steps):
             resp: LLMResponse = await workflow.execute_activity_method(
                 AgentActivities.call_llm,
                 args=[ctx, conv_id],
@@ -214,7 +229,10 @@ class ConversationWorkflow:
                 content = list(resp.content) or [{"type": "text", "text": text}]
                 if not any(b.get("type") == "text" for b in content):
                     content.append({"type": "text", "text": text})
-                await self._append(ctx, conv_id, "assistant", content)
+                await self._append(
+                    ctx, conv_id, f"{m.event_id}:s{step}:assistant", "assistant", content
+                )
+                state.reply_stored = True
                 await workflow.execute_activity_method(
                     AgentActivities.finalize_reply,
                     args=[ctx, placeholder_ts, text],
@@ -223,7 +241,13 @@ class ConversationWorkflow:
                 )
                 return
 
-            await self._append(ctx, conv_id, "assistant", _assistant_blocks(resp))
+            await self._append(
+                ctx,
+                conv_id,
+                f"{m.event_id}:s{step}:assistant",
+                "assistant",
+                _assistant_blocks(resp),
+            )
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
@@ -238,6 +262,7 @@ class ConversationWorkflow:
             await self._append(
                 ctx,
                 conv_id,
+                f"{m.event_id}:s{step}:results",
                 "user",
                 [
                     {
@@ -258,10 +283,12 @@ class ConversationWorkflow:
             retry_policy=RETRY,
         )
 
-    async def _append(self, ctx: TurnContext, conv_id: str, role: str, content: list) -> int:
+    async def _append(
+        self, ctx: TurnContext, conv_id: str, step_key: str, role: str, content: list
+    ) -> int:
         return await workflow.execute_activity_method(
             AgentActivities.append_history,
-            args=[ctx.tenant_id, conv_id, role, content],
+            args=[ctx.tenant_id, conv_id, step_key, role, content],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

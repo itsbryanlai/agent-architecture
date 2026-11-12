@@ -5,6 +5,9 @@ carries a conversation ID and small values and never document or chat content.
 
 Every method takes ``tenant_id`` explicitly and every table is keyed by it
 first. There is no global tenant state.
+
+A history append is named by a step key, so a retried append never stores a
+message twice.
 """
 
 from __future__ import annotations
@@ -18,9 +21,13 @@ from psycopg_pool import AsyncConnectionPool
 
 class HistoryStore(Protocol):
     async def append(
-        self, tenant_id: str, conversation_id: str, role: str, content: list[dict]
+        self, tenant_id: str, conversation_id: str, step_key: str, role: str, content: list[dict]
     ) -> int:
-        """Append one message and return its sequence number."""
+        """Append one message under step_key and return its seq.
+
+        A repeat with the same (tenant_id, conversation_id, step_key) stores nothing
+        and returns the seq of the message already stored.
+        """
         ...
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
@@ -50,20 +57,39 @@ class PostgresHistoryStore:
         self._pool = pool
 
     async def append(
-        self, tenant_id: str, conversation_id: str, role: str, content: list[dict]
+        self, tenant_id: str, conversation_id: str, step_key: str, role: str, content: list[dict]
     ) -> int:
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 """
-                INSERT INTO conversation_messages (tenant_id, conversation_id, seq, role, content)
-                SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s
+                INSERT INTO conversation_messages (tenant_id, conversation_id, seq, step_key, role, content)
+                SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s
                 FROM conversation_messages
                 WHERE tenant_id = %s AND conversation_id = %s
+                ON CONFLICT (tenant_id, conversation_id, step_key) DO NOTHING
                 RETURNING seq
                 """,
-                (tenant_id, conversation_id, role, Jsonb(content), tenant_id, conversation_id),
+                (
+                    tenant_id,
+                    conversation_id,
+                    step_key,
+                    role,
+                    Jsonb(content),
+                    tenant_id,
+                    conversation_id,
+                ),
             )
             row = await cur.fetchone()
+            if row is None:
+                # The step was already stored by an earlier attempt.
+                cur = await conn.execute(
+                    """
+                    SELECT seq FROM conversation_messages
+                    WHERE tenant_id = %s AND conversation_id = %s AND step_key = %s
+                    """,
+                    (tenant_id, conversation_id, step_key),
+                )
+                row = await cur.fetchone()
             return int(row[0])
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
@@ -142,13 +168,29 @@ class PostgresTaskLinkStore:
 class InMemoryHistoryStore:
     def __init__(self) -> None:
         self.messages: dict[tuple[str, str], list[dict]] = {}
+        self.step_keys: dict[tuple[str, str], dict[str, int]] = {}
+        self._fail_next_append = False
+
+    # Test hooks.
+
+    def fail_next_append_after_write(self) -> None:
+        """Make the next append store the message, then raise a retryable error once."""
+        self._fail_next_append = True
 
     async def append(
-        self, tenant_id: str, conversation_id: str, role: str, content: list[dict]
+        self, tenant_id: str, conversation_id: str, step_key: str, role: str, content: list[dict]
     ) -> int:
-        msgs = self.messages.setdefault((tenant_id, conversation_id), [])
-        msgs.append({"role": role, "content": copy.deepcopy(content)})
-        return len(msgs)
+        key = (tenant_id, conversation_id)
+        keys = self.step_keys.setdefault(key, {})
+        seq = keys.get(step_key)
+        if seq is None:
+            msgs = self.messages.setdefault(key, [])
+            msgs.append({"role": role, "content": copy.deepcopy(content)})
+            seq = keys[step_key] = len(msgs)
+        if self._fail_next_append:
+            self._fail_next_append = False
+            raise RuntimeError("simulated lost result after the message was stored")
+        return seq
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
         return copy.deepcopy(self.messages.get((tenant_id, conversation_id), []))

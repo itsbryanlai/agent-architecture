@@ -136,9 +136,22 @@ class AgentActivities:
         thread_ts: str | None,
         blocks: list[dict] | None = None,
     ) -> str:
+        """Post once per ``idem_key`` and return the message ts.
+
+        Delivery is at least once. A crash between Slack accepting the post and
+        the ts being recorded can repeat the post, because Slack has no
+        idempotency key. A "pending" marker is written before posting, so a
+        call that finds the marker without a ts logs a possible duplicate.
+        """
         existing = await self.idem.get(tenant_id, idem_key)
         if existing is not None:
             return existing["ts"]
+        pending_key = f"{idem_key}:pending"
+        if await self.idem.get(tenant_id, pending_key) is not None:
+            log.warning(
+                "possible duplicate Slack post tenant_id=%s idem_key=%s", tenant_id, idem_key
+            )
+        await self.idem.put_if_absent(tenant_id, pending_key, {"channel": channel})
         ts = await self.slack.post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
         stored = await self.idem.put_if_absent(tenant_id, idem_key, {"channel": channel, "ts": ts})
         return stored["ts"]
@@ -152,12 +165,19 @@ class AgentActivities:
 
     @activity.defn(name="append_history")
     async def append_history(
-        self, tenant_id: str, conversation_id: str, role: str, content: list[dict]
+        self,
+        tenant_id: str,
+        conversation_id: str,
+        step_key: str,
+        role: str,
+        content: list[dict],
     ) -> int:
-        self._log("append_history", tenant_id, "-", role=role)
+        self._log("append_history", tenant_id, "-", role=role, step_key=step_key)
+        if not isinstance(step_key, str) or not step_key:
+            raise ValueError("step_key must be a non-empty string")
         if role not in ("user", "assistant"):
             raise ValueError(f"invalid role {role!r}")
-        return await self.history.append(tenant_id, conversation_id, role, content)
+        return await self.history.append(tenant_id, conversation_id, step_key, role, content)
 
     @activity.defn(name="call_llm")
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:

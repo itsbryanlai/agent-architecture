@@ -107,6 +107,18 @@ export QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
 export QWEN_API_KEY='<paste here>'
 ```
 
+## Upgrading an existing local database
+
+Chat history appends are now idempotent by a per-step key. A database created
+before this change needs one migration, `scripts/migrations/001_history_step_key.sql`:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/001_history_step_key.sql
+```
+
+This is needed only for a database created before this change; a fresh
+`docker compose up` gets the column from `scripts/init_db.sql`.
+
 ## Run
 
 ```bash

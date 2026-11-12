@@ -5,10 +5,12 @@ CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
   conversation_id text        NOT NULL,
   seq             integer     NOT NULL,
+  step_key        text,                   -- names the append; repeats are ignored
   role            text        NOT NULL,   -- 'user' | 'assistant'
   content         jsonb       NOT NULL,   -- Anthropic content blocks
   created_at      timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, conversation_id, seq)
+  PRIMARY KEY (tenant_id, conversation_id, seq),
+  UNIQUE (tenant_id, conversation_id, step_key)
 );
 
 CREATE TABLE idempotency_records (

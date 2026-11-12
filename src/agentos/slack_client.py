@@ -71,6 +71,11 @@ class FakeSlack:
         self.calls: list[tuple[str, dict]] = []
         self.emails = dict(emails or {})
         self._ts = 0
+        self._fail_next_update: Exception | None = None
+
+    def fail_next_update(self, error: Exception) -> None:
+        """Make the next update_message raise ``error`` once."""
+        self._fail_next_update = error
 
     def _next_ts(self) -> str:
         self._ts += 1
@@ -93,6 +98,9 @@ class FakeSlack:
         return ts
 
     async def update_message(self, channel, ts, text, blocks=None) -> None:
+        if self._fail_next_update is not None:
+            error, self._fail_next_update = self._fail_next_update, None
+            raise error
         self.calls.append(
             ("update_message", {"channel": channel, "ts": ts, "text": text, "blocks": blocks})
         )

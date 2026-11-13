@@ -33,6 +33,10 @@ from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant, grante
 log = logging.getLogger("agentos.indexing")
 
 
+class ScopeNotGranted(Exception):
+    """The scope's grant was removed from the tenant's config."""
+
+
 @dataclass
 class SyncResult:
     child_page_ids: list[str] = field(default_factory=list)
@@ -80,6 +84,19 @@ class IndexActivities:
         except UnknownTenant as err:
             raise _non_retryable(err) from err
 
+    def _require_granted(self, tenant_id: str, scope: str) -> TenantRuntime:
+        """The tenant's runtime, only while some agent of it still has the scope granted.
+
+        A scope is derived from its root page ID, so a scope still granted
+        always has the root it was started with. A schedule left over from a
+        removed grant fails here, before any Notion or embedding call.
+        """
+        runtime = self._runtime(tenant_id)
+        if scope not in granted_roots(runtime.config):
+            log.warning("scope not granted tenant_id=%s scope=%s", tenant_id, scope)
+            raise _non_retryable(ScopeNotGranted(f"scope {scope} is no longer granted"))
+        return runtime
+
     def all(self) -> list:
         return [self.sync_page, self.prune_scope, self.refresh_page]
 
@@ -93,8 +110,9 @@ class IndexActivities:
         hash differs from the stored one.
         """
         page_id = normalize_id(page_id)
+        runtime = self._require_granted(tenant_id, scope)
         try:
-            content = await page_text(self._runtime(tenant_id).notion_api, page_id)
+            content = await page_text(runtime.notion_api, page_id)
         except PageUnavailable:
             log.info("page skipped tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
             return SyncResult(skipped=True)
@@ -185,6 +203,7 @@ class IndexActivities:
     @activity.defn(name="prune_scope")
     async def prune_scope(self, tenant_id: str, scope: str, seen_page_ids: list[str]) -> int:
         """Delete stored pages of the scope that are not in ``seen_page_ids``."""
+        self._require_granted(tenant_id, scope)
         seen = set(seen_page_ids)
         stored = await self.store.page_hashes(tenant_id, scope)
         gone = [page_id for page_id in stored if page_id not in seen]

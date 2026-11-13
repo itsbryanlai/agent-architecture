@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
+from psycopg_pool import AsyncConnectionPool
 from temporalio.client import (
     Client,
     Schedule,
@@ -39,7 +42,14 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, AgentsConfig, load_settings, load_tenants_config
+from agentos.config import (
+    TASK_QUEUE,
+    AgentsConfig,
+    Settings,
+    load_settings,
+    load_tenants_config,
+)
+from agentos.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenants import granted_roots
 from agentos.workflows.indexing import IndexingWorkflow
@@ -70,6 +80,7 @@ class SchedulePlan:
     create: list[str] = field(default_factory=list)
     update: list[str] = field(default_factory=list)
     delete: list[str] = field(default_factory=list)
+    purged: list[str] = field(default_factory=list)  # scopes whose stored rows were deleted
 
 
 def plan_schedules(agents: AgentsConfig, existing_ids: list[str]) -> SchedulePlan:
@@ -105,8 +116,14 @@ def _schedule(agents: AgentsConfig, scope: str, root: str) -> Schedule:
     )
 
 
-async def apply_schedules(client: Client, agents: AgentsConfig) -> SchedulePlan:
-    """Create or update one nightly schedule per granted scope and delete stale ones."""
+async def apply_schedules(
+    client: Client, agents: AgentsConfig, store: KnowledgeStore | None = None
+) -> SchedulePlan:
+    """Create or update one nightly schedule per granted scope and delete stale ones.
+
+    With a ``store``, the stored pages of every scope of this tenant that is
+    no longer granted are deleted too, so a revoked grant leaves no rows.
+    """
     existing = [s.id async for s in await client.list_schedules()]
     plan = plan_schedules(agents, existing)
     for scope, root in granted_roots(agents).items():
@@ -120,7 +137,24 @@ async def apply_schedules(client: Client, agents: AgentsConfig) -> SchedulePlan:
             )
     for schedule_id in plan.delete:
         await client.get_schedule_handle(schedule_id).delete()
+    if store is not None:
+        granted = granted_roots(agents)
+        for scope in await store.scopes(agents.tenant_id):
+            if scope not in granted:
+                await store.delete_scope(agents.tenant_id, scope)
+                plan.purged.append(scope)
     return plan
+
+
+@asynccontextmanager
+async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
+    """The knowledge store, over the same database the worker uses."""
+    pool = AsyncConnectionPool(settings.database_url, open=False)
+    await pool.open()
+    try:
+        yield PostgresKnowledgeStore(pool)
+    finally:
+        await pool.close()
 
 
 async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
@@ -129,22 +163,24 @@ async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
     if tenant is not None and tenant not in tenants.tenants:
         raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
     selected = [tenants.tenants[tenant]] if tenant else list(tenants.tenants.values())
-    if not any(granted_roots(a) for a in selected):
+    if not schedule and not any(granted_roots(a) for a in selected):
         print("No agent has a Notion page grant, so there is nothing to index.")
         return
     client = await build_temporal_client(settings)
     if schedule:
-        # Every selected tenant is planned, including one with no grants left
-        # while another has some, so its stale schedules are deleted.
-        for agents in selected:
-            plan = await apply_schedules(client, agents)
-            for label, items in (
-                ("created", plan.create),
-                ("updated", plan.update),
-                ("deleted", plan.delete),
-            ):
-                for schedule_id in items:
-                    print(f"{label} schedule {schedule_id}")
+        # Every selected tenant is planned, including one with no grants left,
+        # so its stale schedules and stored pages are deleted.
+        async with open_store(settings) as store:
+            for agents in selected:
+                plan = await apply_schedules(client, agents, store)
+                for label, items in (
+                    ("created schedule", plan.create),
+                    ("updated schedule", plan.update),
+                    ("deleted schedule", plan.delete),
+                    ("deleted stored pages of", plan.purged),
+                ):
+                    for item in items:
+                        print(f"{label} {item}")
         return
     started = []
     for agents in selected:

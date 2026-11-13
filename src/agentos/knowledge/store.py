@@ -56,6 +56,14 @@ class KnowledgeStore(Protocol):
         """Delete pages (and their chunks); return how many pages were deleted."""
         ...
 
+    async def scopes(self, tenant_id: str) -> list[str]:
+        """Every scope that has stored pages for the tenant."""
+        ...
+
+    async def delete_scope(self, tenant_id: str, scope: str) -> int:
+        """Delete every page (and chunk) of one scope; return how many pages."""
+        ...
+
     async def search(
         self, tenant_id: str, scopes: list[str], query_embedding: list[float], limit: int
     ) -> list[ChunkHit]:
@@ -130,6 +138,22 @@ class PostgresKnowledgeStore:
                 "DELETE FROM knowledge_pages"
                 " WHERE tenant_id = %s AND scope = %s AND page_id = ANY(%s)",
                 (tenant_id, scope, list(page_ids)),
+            )
+            return cur.rowcount
+
+    async def scopes(self, tenant_id: str) -> list[str]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                "SELECT DISTINCT scope FROM knowledge_pages WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            return [scope for (scope,) in await cur.fetchall()]
+
+    async def delete_scope(self, tenant_id: str, scope: str) -> int:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                "DELETE FROM knowledge_pages WHERE tenant_id = %s AND scope = %s",
+                (tenant_id, scope),
             )
             return cur.rowcount
 
@@ -214,6 +238,16 @@ class InMemoryKnowledgeStore:
                 deleted += 1
             self.chunks.pop(key, None)
         return deleted
+
+    async def scopes(self, tenant_id: str) -> list[str]:
+        return sorted({sc for (tenant, sc, _) in self.pages if tenant == tenant_id})
+
+    async def delete_scope(self, tenant_id: str, scope: str) -> int:
+        return await self.delete_pages(
+            tenant_id,
+            scope,
+            [p for (t, sc, p) in list(self.pages) if (t, sc) == (tenant_id, scope)],
+        )
 
     async def search(
         self, tenant_id: str, scopes: list[str], query_embedding: list[float], limit: int

@@ -79,7 +79,12 @@ def _without_results(message: dict) -> dict:
 
 
 def _starts_a_turn(message: dict) -> bool:
-    return message["role"] == "user" and bool(_blocks(message, "text"))
+    """A user message with text and no tool results, so nothing before it is needed."""
+    return (
+        message["role"] == "user"
+        and bool(_blocks(message, "text"))
+        and not _blocks(message, "tool_result")
+    )
 
 
 def window(messages: list[dict], budget: int = HISTORY_BUDGET_CHARS) -> list[dict]:

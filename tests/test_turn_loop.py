@@ -163,7 +163,7 @@ async def test_early_failure_notice_is_posted_once(harness):
     assert len(h.slack.posts()) == 1
 
 
-async def test_message_that_arrives_with_the_idle_timeout_is_answered():
+async def test_message_signalled_with_the_idle_timeout_is_not_dropped():
     """The idle timer and a new message land in the same workflow task.
 
     No worker runs while the clock is moved past the idle timeout and the
@@ -190,6 +190,8 @@ async def test_message_that_arrives_with_the_idle_timeout_is_answered():
                 task_queue=TASK_QUEUE,
                 workflows=[ConversationWorkflow, TaskWorkflow],
                 activities=acts.all(),
+                # No sticky queue: the task must not wait for a stopped worker.
+                max_cached_workflows=0,
             )
 
         llm.queue(

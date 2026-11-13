@@ -60,6 +60,12 @@ OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
 TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
 TOOL_NOT_COMPLETED = "The tool call did not complete."
+STEP_LIMIT_REACHED = "step limit reached"
+# workflow.patched IDs: each guards a change to the commands a turn issues, so
+# a conversation that is replayed past an older turn still matches its history.
+PATCH_PARTIAL_TOOL_RESULTS = "close-only-failed-tool-calls"
+PATCH_STEP_LIMIT = "no-tools-on-last-step"
+PATCH_EARLY_FAILURE_NOTICE = "early-failure-notice"
 
 
 class _TurnState:
@@ -158,9 +164,34 @@ class ConversationWorkflow:
         except ActivityError as err:
             self._log_failure(ref, err)
             if state.ctx is None or state.placeholder_ts is None:
-                # Nothing was posted yet, so there is nothing to replace.
+                # No placeholder to replace, so the user would get no reply at
+                # all: post the failure notice as a new message instead.
+                if workflow.patched(PATCH_EARLY_FAILURE_NOTICE):
+                    await self._notify_early_failure(ref, m)
                 return
             await self._recover(ref, conv_id, state)
+
+    async def _notify_early_failure(self, ref: ConversationRef, m: InboundMessage) -> None:
+        # The agent may be gone from the config, so there may be no agent
+        # version; the activity only needs the tenant, channel and thread.
+        ctx = TurnContext(
+            tenant_id=ref.tenant_id,
+            agent_id=ref.agent_id,
+            agent_version=0,
+            requester_user_id=m.user_id,
+            channel=ref.channel,
+            thread_ts=ref.thread_ts,
+            channel_kind=m.channel_kind,
+        )
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.post_in_thread,
+                args=[ctx, TURN_FAILED, f"{m.event_id}:err"],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        except ActivityError as err:
+            self._log_failure(ref, err, "failure notice")
 
     def _log_failure(self, ref: ConversationRef, err: ActivityError, step: str = "turn") -> None:
         # IDs and the activity type only; never message text.
@@ -285,6 +316,39 @@ class ConversationWorkflow:
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
+            if step == agent.max_steps - 1 and workflow.patched(PATCH_STEP_LIMIT):
+                # No step is left to use the results, so nothing runs: a write
+                # tool started now would act with nobody to report it.
+                await workflow.execute_activity_method(
+                    AgentActivities.append_tool_results,
+                    args=[
+                        ctx.tenant_id,
+                        conv_id,
+                        f"{m.event_id}:s{step}:results",
+                        [
+                            ToolResult(call.id, STEP_LIMIT_REACHED, is_error=True)
+                            for call in resp.tool_calls
+                        ],
+                    ],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                state.pending_tool_ids = []
+                await self._append(
+                    ctx,
+                    conv_id,
+                    f"{m.event_id}:s{step}:out-of-steps",
+                    "assistant",
+                    [{"type": "text", "text": OUT_OF_STEPS}],
+                )
+                state.reply_stored = True
+                await workflow.execute_activity_method(
+                    AgentActivities.finalize_reply,
+                    args=[ctx, placeholder_ts, OUT_OF_STEPS, []],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                return
             first_markers: list[int] = []
             for call in resp.tool_calls:
                 first_markers.append(self.next_marker)
@@ -297,9 +361,30 @@ class ConversationWorkflow:
                 ],
                 return_exceptions=True,
             )
-            for outcome in outcomes:
-                if isinstance(outcome, BaseException):
-                    raise outcome
+            failed = [o for o in outcomes if isinstance(o, BaseException)]
+            if failed:
+                if workflow.patched(PATCH_PARTIAL_TOOL_RESULTS):
+                    # A call that succeeded may already have had an effect (a
+                    # write task started, a card sent): keep its result and
+                    # close only the calls that failed.
+                    await workflow.execute_activity_method(
+                        AgentActivities.append_tool_results,
+                        args=[
+                            ctx.tenant_id,
+                            conv_id,
+                            f"{m.event_id}:s{step}:results",
+                            [
+                                ToolResult(call.id, TOOL_NOT_COMPLETED, is_error=True)
+                                if isinstance(outcome, BaseException)
+                                else outcome
+                                for call, outcome in zip(resp.tool_calls, outcomes)
+                            ],
+                        ],
+                        start_to_close_timeout=ACTIVITY_TIMEOUT,
+                        retry_policy=RETRY,
+                    )
+                    state.pending_tool_ids = []
+                raise failed[0]
             results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
             for result in results:
                 self.citations.extend(result.citations)

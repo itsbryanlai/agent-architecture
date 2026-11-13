@@ -42,7 +42,9 @@ with workflow.unsafe.imports_passed_through():
         ExternalUpdate,
         NotionItem,
         TaskSpec,
+        check_field,
     )
+    from agentos.slack_format import escape_slack
     from agentos.workflows import ACTIVITY_TIMEOUT, RETRY
 
 MAX_EDITS = 5
@@ -101,7 +103,7 @@ class TaskWorkflow:
         clean: dict = {}
         for key, value in fields.items():
             text = value.strip() if isinstance(value, str) else ""
-            if not text or len(text) > limits[key]:
+            if not text or check_field(spec.tool_name, key, text):
                 workflow.logger.warning("ignored edit: invalid value for a field")
                 return
             clean[key] = text
@@ -138,6 +140,26 @@ class TaskWorkflow:
 
     @workflow.run
     async def run(self, spec: TaskSpec) -> str:
+        try:
+            return await self._run(spec)
+        except ActivityError:
+            # Before approval nothing has been written, so a terminal failure
+            # ends the task with one line. After it, the failure paths below
+            # decide what to say, and anything else is raised.
+            if self._state not in ("drafted", "awaiting_approval"):
+                raise
+            task_id = workflow.info().workflow_id
+            await self._try(
+                AgentActivities.post_in_thread,
+                spec.ctx,
+                f"I couldn't carry on with '{escape_slack(_subject(self._spec))}': "
+                "something went wrong on my side. Please ask me again.",
+                f"{task_id}:failed",
+            )
+            self._state = "failed"
+            return self._state
+
+    async def _run(self, spec: TaskSpec) -> str:
         task_id = workflow.info().workflow_id
         ctx = spec.ctx
 
@@ -190,18 +212,18 @@ class TaskWorkflow:
             except TimeoutError:
                 if not reminded and workflow.now() - started >= remind:
                     reminded = True
-                    await self._act(
+                    await self._try(
                         AgentActivities.post_in_thread,
                         ctx,
                         f"Reminder: <@{ctx.requester_user_id}>, the request "
-                        f"'{_subject(self._spec)}' is waiting for your approval in your DMs.",
+                        f"'{escape_slack(_subject(self._spec))}' is waiting for your approval in your DMs.",
                         reminder_key,
                     )
 
         spec = self._spec
         if self._decision is None:
-            await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Expired")
-            await self._act(
+            await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Expired")
+            await self._try(
                 AgentActivities.post_in_thread,
                 ctx,
                 "The request expired without approval.",
@@ -211,7 +233,7 @@ class TaskWorkflow:
             return self._state
 
         if not self._decision.approved:
-            await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
+            await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
             self._state = "cancelled"
             return self._state
 
@@ -226,23 +248,23 @@ class TaskWorkflow:
             item: NotionItem = await self._act(AgentActivities.create_notion_item, spec, task_id)
         except ActivityError as err:
             reason = _reason(err)
-            await self._act(
+            await self._try(
                 AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
             )
-            await self._act(
+            await self._try(
                 AgentActivities.post_in_thread,
                 ctx,
-                f"I couldn't file '{title}': {reason}",
+                f"I couldn't file '{escape_slack(title)}': {escape_slack(reason)}",
                 f"{task_id}:failed",
             )
             self._state = "failed"
             return self._state
 
-        await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Submitted")
-        await self._act(
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Submitted")
+        await self._try(
             AgentActivities.post_in_thread,
             ctx,
-            f"Filed: {item.title} ({item.url}). I'll tell you here when it's done.",
+            f"Filed: {escape_slack(item.title)} ({item.url}). I'll tell you here when it's done.",
             f"{task_id}:filed",
         )
 
@@ -261,10 +283,10 @@ class TaskWorkflow:
         while True:
             elapsed = workflow.now() - watch_start
             if elapsed >= max_watch:
-                await self._act(
+                await self._try(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"I've stopped watching '{item.title}'.",
+                    f"I've stopped watching '{escape_slack(item.title)}'.",
                     f"{task_id}:stopped",
                 )
                 self._state = "done"
@@ -277,14 +299,30 @@ class TaskWorkflow:
                 pass
             self._poked = False
 
-            current: NotionItem = await self._act(
-                AgentActivities.get_notion_item, spec, item.page_id
-            )
+            try:
+                current: NotionItem = await self._act(
+                    AgentActivities.get_notion_item, ctx.tenant_id, ctx.agent_id, item.page_id
+                )
+            except ActivityError as err:
+                if _is_permanent(err):
+                    await self._try(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        f"I've stopped watching '{escape_slack(item.title)}': I can no longer "
+                        "read it. It may have been deleted or moved out of the databases "
+                        "I can access.",
+                        f"{task_id}:stopped",
+                    )
+                    self._state = "done"
+                    return self._state
+                workflow.logger.warning("watch poll failed after retries; still watching")
+                continue
             if current.status in done_values:
-                await self._act(
+                await self._try(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"Your request '{current.title}' was marked {current.status}.",
+                    f"Your request '{escape_slack(current.title)}' was marked "
+                    f"{escape_slack(current.status or '')}.",
                     f"{task_id}:done",
                 )
                 self._state = "done"
@@ -295,10 +333,11 @@ class TaskWorkflow:
                 last_change = now
             elif not stale_sent and now - last_change >= stale_after:
                 stale_sent = True
-                await self._act(
+                await self._try(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"No movement on '{current.title}' in {agent.follow_up.stale_after_days} days.",
+                    f"No movement on '{escape_slack(current.title)}' in "
+                    f"{agent.follow_up.stale_after_days} days.",
                     f"{task_id}:stale",
                 )
             item = NotionItem(
@@ -314,26 +353,33 @@ class TaskWorkflow:
             await self._act(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
             reason = _reason(err)
-            await self._act(
+            await self._try(
                 AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
             )
-            await self._act(
+            await self._try(
                 AgentActivities.post_in_thread,
                 ctx,
-                f"I couldn't comment on '{title}': {reason}",
+                f"I couldn't comment on '{escape_slack(title)}': {escape_slack(reason)}",
                 f"{task_id}:failed",
             )
             self._state = "failed"
             return self._state
-        await self._act(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
-        await self._act(
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
+        await self._try(
             AgentActivities.post_in_thread,
             ctx,
-            f"Commented on {title} ({spec.payload['item_url']}).",
+            f"Commented on {escape_slack(title)} ({spec.payload['item_url']}).",
             f"{task_id}:commented",
         )
         self._state = "done"
         return self._state
+
+    async def _try(self, method, *args) -> None:
+        """Run an activity whose failure must not end the task (a card redraw, a notice)."""
+        try:
+            await self._act(method, *args)
+        except ActivityError:
+            workflow.logger.warning("activity %s failed after retries; continuing", method.__name__)
 
     async def _act(self, method, *args):
         return await workflow.execute_activity_method(
@@ -348,6 +394,12 @@ def _subject(spec: TaskSpec) -> str:
     if spec.tool_name == "add_comment":
         return spec.payload["item_title"]
     return spec.payload["title"]
+
+
+def _is_permanent(err: ActivityError) -> bool:
+    """True when a retry cannot help: the activity said so, rather than running out of tries."""
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.non_retryable
 
 
 def _reason(err: ActivityError) -> str:

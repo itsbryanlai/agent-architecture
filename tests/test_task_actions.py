@@ -295,7 +295,7 @@ def test_edit_click_opens_prefilled_modal(agents):
     assert inputs["title"]["initial_value"] == "New monitor"
     assert inputs["title"]["max_length"] == 150
     assert inputs["details"]["initial_value"] == "Mine flickers."
-    assert inputs["details"]["max_length"] == 3000
+    assert inputs["details"]["max_length"] == 1900
 
 
 def test_edit_click_by_someone_else_is_ignored(agents):

@@ -62,7 +62,7 @@ from agentos.models import (
     ToolResult,
     TurnContext,
 )
-from agentos.slack_format import to_slack_mrkdwn
+from agentos.slack_format import escape_slack, to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
 
@@ -474,7 +474,7 @@ class AgentActivities:
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         slack = self._runtime(ctx.tenant_id).slack
         channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
-        line = f"{text}: {_subject(spec)}"
+        line = escape_slack(f"{text}: {_subject(spec)}")
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": line}}]
         await slack.update_message(channel, card_ts, line, blocks=blocks)
 
@@ -565,11 +565,11 @@ class AgentActivities:
         return item
 
     @activity.defn(name="get_notion_item")
-    async def get_notion_item(self, spec: TaskSpec, page_id: str) -> NotionItem:
-        ctx = spec.ctx
-        self._log("get_notion_item", ctx.tenant_id, ctx.agent_id)
+    async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
+        """Read one item. Takes IDs only: the watch polls this thousands of times."""
+        self._log("get_notion_item", tenant_id, agent_id)
         try:
-            return await self._connector(ctx.tenant_id, ctx.agent_id).get_item(page_id)
+            return await self._connector(tenant_id, agent_id).get_item(page_id)
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -597,15 +597,15 @@ def _format_items(items: list[NotionItem]) -> str:
 def _subject(spec: TaskSpec) -> str:
     """The short name of what a task is about, for card and thread lines."""
     if spec.tool_name == "add_comment":
-        return spec.payload["item_title"]
+        return spec.payload.get("item_title") or spec.payload["item"]
     return spec.payload["title"]
 
 
 def _card_text(spec: TaskSpec, db_name: str) -> str:
     """The plain-text fallback of the approval card."""
     if spec.tool_name == "add_comment":
-        return f"Approve comment on {spec.payload['item_title']}"
-    return f"Approve new item in {db_name}: {spec.payload['title']}"
+        return escape_slack(f"Approve comment on {spec.payload['item_title']}")
+    return escape_slack(f"Approve new item in {db_name}: {spec.payload['title']}")
 
 
 def approval_card_blocks(
@@ -619,7 +619,13 @@ def approval_card_blocks(
     an older version of the card stop working.
     """
     value = json.dumps({"task_id": task_id, "nonce": spec.approval_nonce})
-    payload = spec.payload
+    shown = dict(spec.payload)
+    if "item_title" in shown:
+        # A Notion title can be 2000 characters; the card's head is not the approved text.
+        shown["item_title"] = shown["item_title"][:200]
+    payload = {k: escape_slack(v) if isinstance(v, str) else v for k, v in shown.items()}
+    agent_name = escape_slack(agent_name)
+    db_name = escape_slack(db_name)
     if spec.tool_name == "add_comment":
         head = {
             "type": "section",

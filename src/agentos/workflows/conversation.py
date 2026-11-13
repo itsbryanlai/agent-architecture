@@ -49,6 +49,7 @@ with workflow.unsafe.imports_passed_through():
         ToolCall,
         ToolResult,
         TurnContext,
+        check_field,
     )
     from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY
     from agentos.workflows.task import TaskWorkflow
@@ -361,6 +362,8 @@ class ConversationWorkflow:
                 return ToolResult(
                     call.id, "add_comment needs a non-empty 'comment'.", is_error=True
                 )
+            if error := check_field("add_comment", "comment", comment.strip()):
+                return ToolResult(call.id, error, is_error=True)
             # The task resolves the item and checks the grant before any card.
             payload = {"item": item.strip(), "comment": comment.strip()}
             drafted = (
@@ -380,6 +383,9 @@ class ConversationWorkflow:
                 return ToolResult(
                     call.id, "This agent has no Notion database to create items in.", is_error=True
                 )
+            for name, value in (("title", title), ("details", details)):
+                if error := check_field("create_item", name, value.strip()):
+                    return ToolResult(call.id, error, is_error=True)
             # The payload is reduced to exactly the fields that will be created, and
             # frozen here: the approval card shows it and the task runs it as is.
             payload = {

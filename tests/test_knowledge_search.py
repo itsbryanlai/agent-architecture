@@ -9,7 +9,7 @@ from agentos import ids
 from agentos.config import TASK_QUEUE, parse_agents_config
 from agentos.connectors.notion import text_block
 from agentos.index_knowledge import apply_schedules, plan_schedules
-from agentos.knowledge.search import KNOWLEDGE_RULES, SEARCH_RESULTS
+from agentos.knowledge.search import KNOWLEDGE_RULES, SEARCH_RESULTS, sources_footer
 from agentos.models import (
     Citation,
     ConversationRef,
@@ -434,3 +434,25 @@ async def test_apply_schedules_creates_updates_and_deletes():
     calendar = schedule.spec.calendars[0]
     assert (calendar.hour[0].start, calendar.minute[0].start) == (3, 0)
     assert schedule.action.id == ids.index_workflow_id(TENANT, SCOPE_B)
+
+
+def _cite(marker: int, page_id: str) -> Citation:
+    return Citation(marker=marker, scope=SCOPE_A, page_id=page_id)
+
+
+FOOTER_META = {"P": ("P", "uP"), "Q": ("Q", "uQ")}
+
+
+def test_footer_lists_every_number_of_a_page():
+    cited = [_cite(1, "P"), _cite(3, "Q"), _cite(6, "Q")]
+    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [1] <uP|P> · [3, 6] <uQ|Q>"
+
+
+def test_footer_orders_pages_by_lowest_number():
+    cited = [_cite(6, "Q"), _cite(2, "P"), _cite(4, "Q")]
+    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [2] <uP|P> · [4, 6] <uQ|Q>"
+
+
+def test_footer_skips_numbers_without_metadata():
+    cited = [_cite(1, "P"), _cite(2, "GONE"), _cite(3, "Q")]
+    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [1] <uP|P> · [3] <uQ|Q>"

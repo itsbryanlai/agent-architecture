@@ -122,18 +122,22 @@ def cited_markers(text: str, citations: list[Citation]) -> list[Citation]:
 def sources_footer(cited: list[Citation], meta: dict[str, tuple[str, str]]) -> str:
     """The Sources line, built from stored page metadata, or "" when nothing maps.
 
-    A page cited by several markers is listed once, with its first marker.
+    One entry per page, ordered by the page's lowest cited number. An entry
+    lists every cited number of that page, ascending, in one bracket
+    (`[3, 6] <url|title>`); a page cited once reads `[3] <url|title>`. Numbers
+    whose page is not in `meta` are left out.
     """
-    parts: list[str] = []
-    listed: set[str] = set()
+    numbers: dict[str, list[int]] = {}
     for c in cited:
-        if c.page_id in listed or c.page_id not in meta:
-            continue
-        listed.add(c.page_id)
-        title, url = meta[c.page_id]
+        if c.page_id in meta:
+            numbers.setdefault(c.page_id, []).append(c.marker)
+    entries = sorted((sorted(set(ms)), pid) for pid, ms in numbers.items())
+    parts: list[str] = []
+    for ms, page_id in entries:
+        title, url = meta[page_id]
         for ch in "|<>":
             title = title.replace(ch, " ")
-        parts.append(f"[{c.marker}] <{url}|{title}>")
+        parts.append(f"[{', '.join(str(m) for m in ms)}] <{url}|{title}>")
     if not parts:
         return ""
     return "\n\nSources: " + " · ".join(parts)

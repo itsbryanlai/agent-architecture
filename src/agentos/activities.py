@@ -41,6 +41,7 @@ from agentos.connectors.notion import (
     NotionConnector,
     normalize_id,
 )
+from agentos.history_view import prepare_for_model
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
     KNOWLEDGE_RULES,
@@ -298,7 +299,7 @@ class AgentActivities:
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
         agent = self._agent(ctx.tenant_id, ctx.agent_id)
-        messages = await self.history.load(ctx.tenant_id, conversation_id)
+        messages = prepare_for_model(await self.history.load(ctx.tenant_id, conversation_id))
         tools = self._connector(ctx.tenant_id, ctx.agent_id).tools_for_llm()
         system = agent.system_prompt
         if agent.grants.notion_pages:

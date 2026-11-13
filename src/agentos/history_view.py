@@ -29,28 +29,33 @@ def _blocks(message: dict, kind: str) -> list[dict]:
 
 
 def close_open_tool_uses(messages: list[dict]) -> list[dict]:
-    """Give every tool_use a tool_result in the message right after it.
+    """Make every tool_use answered by the message right after it, and only so.
 
     A missing result is added as an error result: to the user message that
-    follows when there is one, otherwise as a new user message. A thread that
-    holds a tool_use with no tool_result is rejected by the model for good,
-    whatever the cause of the gap.
+    follows when there is one, otherwise as a new user message. A tool_result
+    that answers no tool_use of the message before it is dropped. The model
+    rejects a thread with either gap, for good, whatever caused it.
     """
     fixed: list[dict] = []
     for i, message in enumerate(messages):
-        if message["role"] == "user" and i > 0 and _blocks(messages[i - 1], "tool_use"):
-            # Handled together with the assistant message before it.
-            continue
+        previous = messages[i - 1] if i > 0 else None
+        if message["role"] == "user" and previous is not None and _blocks(previous, "tool_use"):
+            continue  # handled together with the assistant message before it
+        if message["role"] == "user":
+            message = _without_results(message)
+            if not message["content"]:
+                continue
         fixed.append(message)
-        if message["role"] != "assistant":
-            continue
         uses = [b["id"] for b in _blocks(message, "tool_use")]
-        if not uses:
+        if message["role"] != "assistant" or not uses:
             continue
         following = messages[i + 1] if i + 1 < len(messages) else None
-        answered: set[str] = set()
         if following is not None and following["role"] == "user":
-            answered = {b["tool_use_id"] for b in _blocks(following, "tool_result")}
+            results = [b for b in _blocks(following, "tool_result") if b["tool_use_id"] in uses]
+            rest = _without_results(following)["content"]
+        else:
+            results, rest = [], []
+        answered = {b["tool_use_id"] for b in results}
         missing = [
             {
                 "type": "tool_result",
@@ -61,17 +66,16 @@ def close_open_tool_uses(messages: list[dict]) -> list[dict]:
             for use in uses
             if use not in answered
         ]
-        if following is not None and following["role"] == "user":
-            if missing:
-                content = following["content"]
-                content = content if isinstance(content, list) else []
-                results = [b for b in content if b.get("type") == "tool_result"]
-                rest = [b for b in content if b.get("type") != "tool_result"]
-                following = {**following, "content": missing + results + rest}
-            fixed.append(following)
-        elif missing:
-            fixed.append({"role": "user", "content": missing})
+        fixed.append({"role": "user", "content": missing + results + rest})
     return fixed
+
+
+def _without_results(message: dict) -> dict:
+    content = message["content"]
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    kept = [b for b in content if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+    return {**message, "content": kept}
 
 
 def _starts_a_turn(message: dict) -> bool:

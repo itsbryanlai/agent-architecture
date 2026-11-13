@@ -1,7 +1,7 @@
 """History sent to the model is repaired and bounded on every turn."""
 
 from agentos import ids
-from agentos.history_view import HISTORY_BUDGET_CHARS
+from agentos.history_view import HISTORY_BUDGET_CHARS, prepare_for_model
 from agentos.models import LLMResponse
 from agentos.workflows.conversation import ConversationWorkflow
 from tests.conftest import TENANT, eventually
@@ -145,3 +145,21 @@ async def test_later_message_still_answered(harness):
     await handle.signal(ConversationWorkflow.message, inbound("Ev2", "again"))
     await eventually(lambda: len(h.slack.updates()) >= 2)
     assert_tool_pairs_valid(h.llm.calls[1]["messages"])
+
+
+def test_result_that_answers_no_tool_use_is_dropped():
+    twice = [
+        {"role": "user", "content": [{"type": "text", "text": "q"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "a", "name": "t", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "1"}]},
+        # A second copy, as a retried recovery could leave.
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "2"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    ]
+    prepared = prepare_for_model(twice)
+    assert_tool_pairs_valid(prepared)
+    assert [m["role"] for m in prepared] == ["user", "assistant", "user", "assistant"]
+    assert prepared[2]["content"][0]["content"] == "1"

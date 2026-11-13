@@ -163,3 +163,23 @@ def test_result_that_answers_no_tool_use_is_dropped():
     assert_tool_pairs_valid(prepared)
     assert [m["role"] for m in prepared] == ["user", "assistant", "user", "assistant"]
     assert prepared[2]["content"][0]["content"] == "1"
+
+
+def test_window_never_starts_on_a_message_carrying_tool_results():
+    # An unanswered tool_use followed by the next turn's question: the repair
+    # puts the missing result and the question in one user message. Cutting
+    # in front of that message would leave its result with no tool_use.
+    big = "x" * (HISTORY_BUDGET_CHARS // 2)
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "q0 " + big}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "search_items", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "q1 " + big}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+        {"role": "user", "content": [{"type": "text", "text": "q2"}]},
+    ]
+    sent = prepare_for_model(messages)
+    assert_tool_pairs_valid(sent)
+    assert sent[-1]["content"][0]["text"] == "q2"

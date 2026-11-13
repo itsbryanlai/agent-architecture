@@ -419,6 +419,12 @@ class FakeNotionAPI:
         db_key = normalize_id(database_id)
         for key in properties:
             self._name_for_id(db_key, key)
+        for value in properties.values():
+            for item in value.get("title", []) + value.get("rich_text", []):
+                _check_text_length(item["text"]["content"])
+        for child in children:
+            for item in child[child["type"]]["rich_text"]:
+                _check_text_length(item["text"]["content"])
         page = self.add_page(database_id, properties)
         if self._fail_next_create:
             self._fail_next_create = False
@@ -451,6 +457,7 @@ class FakeNotionAPI:
 
     async def create_comment(self, page_id: str, text: str) -> dict:
         self.calls.append(("create_comment", {"page_id": page_id}))
+        _check_text_length(text)
         comment = {
             "object": "comment",
             "id": str(uuid.uuid4()),
@@ -519,6 +526,20 @@ class FakeNotFound(KeyError):
     """A missing page or block, carrying the HTTP status Notion would send."""
 
     status = 404
+
+
+class FakeBadRequest(ValueError):
+    """What Notion answers to a request it rejects, with its HTTP status."""
+
+    status = 400
+
+
+NOTION_TEXT_MAX = 2000  # characters in one rich-text item, as Notion enforces
+
+
+def _check_text_length(text: str) -> None:
+    if len(text) > NOTION_TEXT_MAX:
+        raise FakeBadRequest(f"text is {len(text)} characters; Notion allows {NOTION_TEXT_MAX}")
 
 
 def text_block(

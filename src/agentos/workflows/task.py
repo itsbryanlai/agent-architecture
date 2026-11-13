@@ -42,6 +42,7 @@ with workflow.unsafe.imports_passed_through():
         ExternalUpdate,
         NotionItem,
         TaskSpec,
+        check_field,
     )
     from agentos.slack_format import escape_slack
     from agentos.workflows import ACTIVITY_TIMEOUT, RETRY
@@ -102,7 +103,7 @@ class TaskWorkflow:
         clean: dict = {}
         for key, value in fields.items():
             text = value.strip() if isinstance(value, str) else ""
-            if not text or len(text) > limits[key]:
+            if not text or check_field(spec.tool_name, key, text):
                 workflow.logger.warning("ignored edit: invalid value for a field")
                 return
             clean[key] = text

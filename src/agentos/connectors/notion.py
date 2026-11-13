@@ -26,7 +26,7 @@ from typing import Protocol
 
 from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
-from agentos.models import NotionItem
+from agentos.models import NOTION_TEXT_MAX, SIGNATURE_NAME_MAX, NotionItem
 
 LLM_TOOLS = ("search_items", "my_items", "create_item", "add_comment")
 
@@ -534,9 +534,6 @@ class FakeBadRequest(ValueError):
     status = 400
 
 
-NOTION_TEXT_MAX = 2000  # characters in one rich-text item, as Notion enforces
-
-
 def _check_text_length(text: str) -> None:
     if len(text) > NOTION_TEXT_MAX:
         raise FakeBadRequest(f"text is {len(text)} characters; Notion allows {NOTION_TEXT_MAX}")
@@ -797,6 +794,8 @@ class NotionConnector:
         idem_key: str,
     ) -> NotionItem:
         grant = self.grant_for(database_id)
+        if max(len(title), len(details)) > NOTION_TEXT_MAX:
+            raise ConnectorError(f"The title or details are over Notion's {NOTION_TEXT_MAX}.")
         existing = await self._api.query_database(
             grant.id, {"property": grant.request_id_prop_id, "rich_text": {"equals": idem_key}}
         )
@@ -860,7 +859,13 @@ class NotionConnector:
         for comment in await self._api.list_comments(page_id):
             if ref in _plain(comment.get("rich_text", [])):
                 return comment["id"]
-        created = await self._api.create_comment(page_id, f"{text}\n\n— {agent_name}, {ref}")
+        body = f"{text}\n\n— {agent_name[:SIGNATURE_NAME_MAX]}, {ref}"
+        if len(body) > NOTION_TEXT_MAX:
+            raise ConnectorError(
+                f"The comment is {len(body)} characters with its signature; "
+                f"Notion allows {NOTION_TEXT_MAX}."
+            )
+        created = await self._api.create_comment(page_id, body)
         return created["id"]
 
     async def _notion_user_id(self, email: str | None) -> str | None:

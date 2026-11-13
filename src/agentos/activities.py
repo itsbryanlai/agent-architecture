@@ -619,7 +619,11 @@ def approval_card_blocks(
     an older version of the card stop working.
     """
     value = json.dumps({"task_id": task_id, "nonce": spec.approval_nonce})
-    payload = {k: escape_slack(v) if isinstance(v, str) else v for k, v in spec.payload.items()}
+    shown = dict(spec.payload)
+    if "item_title" in shown:
+        # A Notion title can be 2000 characters; the card's head is not the approved text.
+        shown["item_title"] = shown["item_title"][:200]
+    payload = {k: escape_slack(v) if isinstance(v, str) else v for k, v in shown.items()}
     agent_name = escape_slack(agent_name)
     db_name = escape_slack(db_name)
     if spec.tool_name == "add_comment":

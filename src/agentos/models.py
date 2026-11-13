@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from agentos.slack_format import escape_slack
+
 
 @dataclass
 class InboundMessage:
@@ -123,12 +125,46 @@ class NotionItem:
     database_id: str = ""  # the granted database the page sits in, when known
 
 
+# Limits of the places a task's text goes: Notion takes 2000 characters per text
+# item; the approval card shows a field in a section field (2000) or a section's
+# text (3000) behind a bold label, with ``&``, ``<`` and ``>`` encoded.
+NOTION_TEXT_MAX = 2000
+# What a comment's signature ("— <agent name>, ref <8 hex>") may add.
+COMMENT_SIGNATURE_MAX = 100
+SIGNATURE_NAME_MAX = 60
+
 # The fields a requester may edit on an approval card, per tool, with the
-# longest value each may hold.
+# longest value each may hold. Every path that accepts a value (the model's
+# first draft, an edit) checks ``check_field``, so an accepted value always fits
+# Notion and the card.
 EDITABLE_FIELDS = {
-    "create_item": {"title": 150, "details": 3000},
-    "add_comment": {"comment": 2000},
+    "create_item": {"title": 150, "details": NOTION_TEXT_MAX - 100},
+    "add_comment": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX},
 }
+
+# Room on the card for the escaped value, after the bold label above it.
+_CARD_ROOM = {
+    "title": 2000 - len("*Title*\n"),
+    "details": 2000 - len("*Details*\n"),
+    "comment": 3000 - len("*Comment*\n"),
+}
+
+
+def check_field(tool_name: str, name: str, value: str) -> str | None:
+    """Why ``value`` may not be this field of ``tool_name``, or None if it fits."""
+    limit = EDITABLE_FIELDS[tool_name][name]
+    if len(value) > limit:
+        return (
+            f"'{name}' is {len(value)} characters; the limit is {limit}. "
+            "Shorten it and call the tool again."
+        )
+    if len(escape_slack(value)) > _CARD_ROOM[name]:
+        return (
+            f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "
+            f"approval card and the result is over its {_CARD_ROOM[name]}-character room. "
+            "Shorten it or use fewer of them, and call the tool again."
+        )
+    return None
 
 
 @dataclass

@@ -565,11 +565,11 @@ class AgentActivities:
         return item
 
     @activity.defn(name="get_notion_item")
-    async def get_notion_item(self, spec: TaskSpec, page_id: str) -> NotionItem:
-        ctx = spec.ctx
-        self._log("get_notion_item", ctx.tenant_id, ctx.agent_id)
+    async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
+        """Read one item. Takes IDs only: the watch polls this thousands of times."""
+        self._log("get_notion_item", tenant_id, agent_id)
         try:
-            return await self._connector(ctx.tenant_id, ctx.agent_id).get_item(page_id)
+            return await self._connector(tenant_id, agent_id).get_item(page_id)
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -597,7 +597,7 @@ def _format_items(items: list[NotionItem]) -> str:
 def _subject(spec: TaskSpec) -> str:
     """The short name of what a task is about, for card and thread lines."""
     if spec.tool_name == "add_comment":
-        return spec.payload["item_title"]
+        return spec.payload.get("item_title") or spec.payload["item"]
     return spec.payload["title"]
 
 

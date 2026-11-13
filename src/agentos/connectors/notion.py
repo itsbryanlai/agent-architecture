@@ -821,6 +821,8 @@ class NotionConnector:
 
     async def get_item(self, page_id: str) -> NotionItem:
         page = await self._api.retrieve_page(page_id)
+        if page.get("in_trash") or page.get("archived"):
+            raise UnknownItem("The item was moved to the trash.")
         parent_db = (page.get("parent") or {}).get("database_id") or ""
         grant = self.grant_for(parent_db)
         return self._to_item(grant, page)

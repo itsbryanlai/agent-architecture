@@ -19,6 +19,7 @@ import re
 
 from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
 from agentos.models import Citation
+from agentos.slack_format import escape_slack
 
 SEARCH_CANDIDATES = 16
 SEARCH_RESULTS = 6
@@ -135,8 +136,7 @@ def sources_footer(cited: list[Citation], meta: dict[str, tuple[str, str]]) -> s
     parts: list[str] = []
     for ms, page_id in entries:
         title, url = meta[page_id]
-        for ch in "|<>":
-            title = title.replace(ch, " ")
+        title = escape_slack(title.replace("|", " "))
         parts.append(f"[{', '.join(str(m) for m in ms)}] <{url}|{title}>")
     if not parts:
         return ""

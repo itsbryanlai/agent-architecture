@@ -43,6 +43,7 @@ with workflow.unsafe.imports_passed_through():
         NotionItem,
         TaskSpec,
     )
+    from agentos.slack_format import escape_slack
     from agentos.workflows import ACTIVITY_TIMEOUT, RETRY
 
 MAX_EDITS = 5
@@ -194,7 +195,7 @@ class TaskWorkflow:
                         AgentActivities.post_in_thread,
                         ctx,
                         f"Reminder: <@{ctx.requester_user_id}>, the request "
-                        f"'{_subject(self._spec)}' is waiting for your approval in your DMs.",
+                        f"'{escape_slack(_subject(self._spec))}' is waiting for your approval in your DMs.",
                         reminder_key,
                     )
 
@@ -232,7 +233,7 @@ class TaskWorkflow:
             await self._act(
                 AgentActivities.post_in_thread,
                 ctx,
-                f"I couldn't file '{title}': {reason}",
+                f"I couldn't file '{escape_slack(title)}': {escape_slack(reason)}",
                 f"{task_id}:failed",
             )
             self._state = "failed"
@@ -242,7 +243,7 @@ class TaskWorkflow:
         await self._act(
             AgentActivities.post_in_thread,
             ctx,
-            f"Filed: {item.title} ({item.url}). I'll tell you here when it's done.",
+            f"Filed: {escape_slack(item.title)} ({item.url}). I'll tell you here when it's done.",
             f"{task_id}:filed",
         )
 
@@ -264,7 +265,7 @@ class TaskWorkflow:
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"I've stopped watching '{item.title}'.",
+                    f"I've stopped watching '{escape_slack(item.title)}'.",
                     f"{task_id}:stopped",
                 )
                 self._state = "done"
@@ -284,7 +285,8 @@ class TaskWorkflow:
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"Your request '{current.title}' was marked {current.status}.",
+                    f"Your request '{escape_slack(current.title)}' was marked "
+                    f"{escape_slack(current.status or '')}.",
                     f"{task_id}:done",
                 )
                 self._state = "done"
@@ -298,7 +300,8 @@ class TaskWorkflow:
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
-                    f"No movement on '{current.title}' in {agent.follow_up.stale_after_days} days.",
+                    f"No movement on '{escape_slack(current.title)}' in "
+                    f"{agent.follow_up.stale_after_days} days.",
                     f"{task_id}:stale",
                 )
             item = NotionItem(
@@ -320,7 +323,7 @@ class TaskWorkflow:
             await self._act(
                 AgentActivities.post_in_thread,
                 ctx,
-                f"I couldn't comment on '{title}': {reason}",
+                f"I couldn't comment on '{escape_slack(title)}': {escape_slack(reason)}",
                 f"{task_id}:failed",
             )
             self._state = "failed"
@@ -329,7 +332,7 @@ class TaskWorkflow:
         await self._act(
             AgentActivities.post_in_thread,
             ctx,
-            f"Commented on {title} ({spec.payload['item_url']}).",
+            f"Commented on {escape_slack(title)} ({spec.payload['item_url']}).",
             f"{task_id}:commented",
         )
         self._state = "done"

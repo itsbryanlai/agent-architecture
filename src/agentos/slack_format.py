@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 
+_QUOTE_PREFIX = re.compile(r"^(\s*(?:>\s?)+)")
 _HEADING = re.compile(r"^#{1,6} +(.*?)\s*$")
 _BULLET = re.compile(r"^(\s*)[*-] +")
 _CODE_SPAN = re.compile(r"`[^`\n]*`")
@@ -36,16 +37,27 @@ _BOLD = ""
 _SLOT = re.compile("(\\d+)")
 
 
+def escape_slack(text: str) -> str:
+    """Encode ``&``, ``<`` and ``>`` so Slack shows text instead of reading control syntax.
+
+    Slack treats ``<!channel>``, ``<@U1>`` and ``<url|label>`` as pings and
+    links. Apply this to every string the runtime did not write itself (the
+    model's, the requester's, Notion's) before it goes into message text or a
+    mrkdwn block. It is not idempotent: apply it once, at the point of use.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def to_slack_mrkdwn(text: str) -> str:
-    """Convert Markdown emphasis, headings and bullets to Slack mrkdwn."""
+    """Convert Markdown emphasis, headings and bullets to Slack mrkdwn, escaped."""
     out: list[str] = []
     in_fence = False
     for line in text.split("\n"):
         if line.startswith("```"):
             in_fence = not in_fence
-            out.append(line)
+            out.append(escape_slack(line))
         elif in_fence:
-            out.append(line)
+            out.append(escape_slack(line))
         else:
             out.append(_convert_line(line))
     return "\n".join(out)
@@ -55,10 +67,14 @@ def _convert_line(line: str) -> str:
     kept: list[str] = []
 
     def protect(m: re.Match[str]) -> str:
-        kept.append(m.group(0))
+        kept.append(escape_slack(m.group(0)))
         return f"{len(kept) - 1}"
 
     line = _LINK.sub(protect, _CODE_SPAN.sub(protect, line))
+    # A leading ">" is Slack's quote marker; it stays, the rest is escaped.
+    quote = _QUOTE_PREFIX.match(line)
+    prefix = quote.group(1) if quote else ""
+    line = prefix + escape_slack(line[len(prefix) :])
 
     heading = _HEADING.match(line)
     if heading:

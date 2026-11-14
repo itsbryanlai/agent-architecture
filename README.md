@@ -358,6 +358,9 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 uv run python -m agentos.agent_store import
 ```
 
+Members and roles need `007`, applied the same way (see
+[Members and roles](#members-and-roles)).
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -459,8 +462,9 @@ nothing. A published version never changes; an edit starts a new draft. A
 database trigger enforces this for every role: the definition changes only
 while a version is a draft, and the only moves are draft to pending, pending to
 draft (withdrawn or rejected), pending to published and published to
-superseded. Every publish records the approver. Who may approve is not checked
-yet.
+superseded. Every publish records the approver. Publishing a version lower
+than the published one is refused; to roll back, make a new draft from the old
+version, then submit and publish it.
 
 A definition has the shape of one agent block in the YAML file and is parsed by
 the same code, so it is validated the same way. The front-door rules (a
@@ -488,6 +492,35 @@ grant gets no index schedule and no startup grant check until the worker
 restarts, and a worker started with no page grants has no embedder until it
 restarts. Run `uv run python -m agentos.index_knowledge --schedule` after such a
 publish.
+
+## Members and roles
+
+A tenant has two roles. An **admin** approves every publish (so a wider grant
+reaches users only when an admin publishes it), rejects pending versions,
+manages members and reads the audit log. A **creator** creates agents and
+drafts, edits, submits and withdraws the versions of agents they created; an
+admin can do the same for any agent.
+
+The first admins come from the tenant YAML file:
+
+```yaml
+admins: [U0123ABCD]   # Slack user IDs
+```
+
+An admin listed there is always an admin, and nobody can remove or demote them
+through the app. Other admins and the creators are added by an admin and stored
+in `members`; the app role can delete rows there, and the audit log keeps the
+record. **A tenant with no `admins` can publish nothing**, because only an admin
+can publish. An admin may approve their own submission, so a tenant with one
+admin works; the audit event records both IDs. The last admin cannot remove or
+demote themself.
+
+`agentos.control.ControlPlane` checks the role for every change and writes one
+audit event for it (`agent_create`, `agent_draft`, `agent_submit`,
+`agent_withdraw`, `agent_reject`, `agent_publish`, `member_add`, `member_remove`,
+`member_role`). Events hold IDs and a hash of the definition, never the
+definition. A refused action is not audited yet. Apply
+`scripts/migrations/007_members.sql` to an existing database.
 
 ## Audit log
 

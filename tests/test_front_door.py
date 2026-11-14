@@ -47,6 +47,7 @@ CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
 ANNOUNCEMENT = "IT helper here, picking this up."
+NOT_RUN = "Not run: the conversation was handed to a specialist."
 
 
 def front_door_dict(concierge_steps: int = 4) -> dict:
@@ -188,6 +189,10 @@ def _nested_front_door(raw):
     raw["agents"]["unlisted"]["description"] = "Something."
 
 
+def _duplicate_specialist(raw):
+    raw["agents"]["concierge"]["specialists"] = ["it-helper", "it-helper"]
+
+
 def _undefined_channel_agent(raw):
     raw["channels"] = {"C0123456789": "ghost"}
 
@@ -199,6 +204,7 @@ def _undefined_channel_agent(raw):
         (_own_specialist, ["agent 'concierge'", "its own specialist"]),
         (_no_description, ["agent 'concierge'", "'it-helper'", "non-empty 'description'"]),
         (_nested_front_door, ["agent 'concierge'", "specialist 'it-helper'", "front door"]),
+        (_duplicate_specialist, ["agent 'concierge'", "'it-helper'", "more than once"]),
         (_undefined_channel_agent, ["channel 'C0123456789'", "'ghost'", "not defined"]),
     ],
 )
@@ -251,15 +257,16 @@ async def test_hand_off_specialist_answers_same_message(fd):
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
-    placeholder = [p for p in h.slack.posts() if p["text"] == "Thinking…"]
-    assert len(placeholder) == 1
-    assert [u["text"] for u in h.slack.updates()] == ["Report it to IT."]
-    assert h.slack.updates()[0]["ts"] == placeholder[0]["ts"]
-    posted = announcements(h)
-    assert [p["text"] for p in posted] == [ANNOUNCEMENT]
-    assert posted[0]["thread_ts"] == THREAD
+    # The front door's placeholder becomes the announcement, and the specialist
+    # answers in a placeholder of its own below it.
+    placeholders = [p for p in h.slack.posts() if p["text"] == "Thinking…"]
+    assert len(placeholders) == 2
+    assert all(p["thread_ts"] == THREAD for p in placeholders)
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Report it to IT."]
+    assert [u["ts"] for u in h.slack.updates()] == [p["ts"] for p in placeholders]
+    assert announcements(h) == []
     assert h.llm.calls[0]["system"] == "You answer general questions."
     assert h.llm.calls[1]["system"] == "You help employees with IT requests."
     # The specialist sees the hand-off in history, but is not offered the tool.
@@ -274,17 +281,16 @@ async def test_next_message_goes_to_specialist(fd):
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("First."), answer("Second."))
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: len(h.slack.updates()) >= 1)
+    await eventually(lambda: len(h.slack.updates()) >= 2)
     await h.client.get_workflow_handle(CONV_ID).signal(
         ConversationWorkflow.message, message("Ev2", "and my VPN?")
     )
-    await eventually(lambda: len(h.slack.updates()) >= 2)
+    await eventually(lambda: len(h.slack.updates()) >= 3)
 
     third = h.llm.calls[2]
     assert third["system"] == "You help employees with IT requests."
     assert "hand_off" not in tool_names(third)
-    assert [u["text"] for u in h.slack.updates()] == ["First.", "Second."]
-    assert len(announcements(h)) == 1
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "First.", "Second."]
 
 
 async def test_hand_off_to_unlisted_agent_refused(fd):
@@ -314,13 +320,15 @@ async def test_second_hand_off_in_one_response_refused(fd):
     )
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
     results = {b["tool_use_id"]: b for b in h.llm.calls[1]["messages"][-1]["content"]}
     assert results["tu_bad"]["is_error"] is True
     assert "is_error" not in results["tu_a"] or results["tu_a"]["is_error"] is False
-    assert results["tu_b"]["content"] == "Only one hand-off is allowed per response."
-    assert len(announcements(h)) == 1
+    for call_id in ("tu_bad", "tu_b"):
+        assert results[call_id]["is_error"] is True
+        assert results[call_id]["content"] == NOT_RUN
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Done."]
     assert h.llm.calls[1]["system"] == "You help employees with IT requests."
 
 
@@ -329,7 +337,7 @@ async def test_hand_off_step_keys_unique(fd):
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
 
     await converse(h, "concierge", message("Ev1", "battery"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
     stored = await h.history.load(TENANT, CONV_ID)
     assert [m["role"] for m in stored] == ["user", "assistant", "user", "assistant"]
@@ -345,25 +353,26 @@ async def test_hand_off_step_keys_unique(fd):
     }
 
 
-async def test_hand_off_announcement_posted_once_on_retry(fd):
+async def test_hand_off_announcement_survives_a_slack_retry(fd):
     h = fd
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
-    post_message = h.slack.post_message
+    update_message = h.slack.update_message
     failures = []
 
-    async def flaky(channel, text, thread_ts=None, blocks=None):
+    async def flaky(channel, ts, text, blocks=None):
         if "picking this up" in text and not failures:
             failures.append(text)
             raise RuntimeError("slack is down")
-        return await post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
+        return await update_message(channel, ts, text, blocks=blocks)
 
-    h.slack.post_message = flaky
+    h.slack.update_message = flaky
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
     assert len(failures) == 1
-    assert [p["text"] for p in announcements(h)] == [ANNOUNCEMENT]
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Report it to IT."]
+    assert len([p for p in h.slack.posts() if p["text"] == "Thinking…"]) == 2
 
 
 async def test_hand_off_on_last_step_still_hands_off(fd_one_step):
@@ -371,10 +380,9 @@ async def test_hand_off_on_last_step_still_hands_off(fd_one_step):
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
-    assert [u["text"] for u in h.slack.updates()] == ["Report it to IT."]
-    assert len(announcements(h)) == 1
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Report it to IT."]
     results = h.llm.calls[1]["messages"][-1]["content"]
     assert results[0]["content"] == "Handed to it-helper. They will answer now."
 
@@ -401,7 +409,7 @@ async def test_specialist_survives_continue_as_new(fd):
 
     assert h.llm.calls[0]["system"] == "You help employees with IT requests."
     assert "hand_off" not in tool_names(h.llm.calls[0])
-    assert announcements(h) == []
+    assert [u["text"] for u in h.slack.updates()] == ["As the specialist."]
 
 
 async def test_specialist_failure_recovers_as_specialist(fd, caplog):
@@ -414,23 +422,27 @@ async def test_specialist_failure_recovers_as_specialist(fd, caplog):
     )
 
     await converse(h, "concierge", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
     placeholder = [p for p in h.slack.posts() if p["text"] == "Thinking…"]
-    assert [u["text"] for u in h.slack.updates()] == [TURN_FAILED]
-    assert h.slack.updates()[0]["ts"] == placeholder[0]["ts"]
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, TURN_FAILED]
+    assert h.slack.updates()[1]["ts"] == placeholder[1]["ts"]
     finalized = [
         r.getMessage() for r in caplog.records if "activity=finalize_reply" in r.getMessage()
     ]
-    assert finalized and all("agent_id=it-helper" in line for line in finalized)
+    # The first finalize is the announcement, by the front door; the failure
+    # notice is the second, and it is sent as the specialist.
+    assert len(finalized) == 2
+    assert "agent_id=concierge" in finalized[0]
+    assert "agent_id=it-helper" in finalized[1]
 
     await h.client.get_workflow_handle(CONV_ID).signal(
         ConversationWorkflow.message, message("Ev2", "are you there?")
     )
-    await eventually(lambda: len(h.slack.updates()) >= 2)
+    await eventually(lambda: len(h.slack.updates()) >= 3)
 
     assert h.llm.calls[2]["system"] == "You help employees with IT requests."
-    assert len(announcements(h)) == 1
+    assert h.slack.updates()[2]["text"] == "Back again."
 
 
 async def test_task_after_hand_off_carries_specialist(fd):
@@ -447,7 +459,7 @@ async def test_task_after_hand_off_carries_specialist(fd):
     )
 
     await converse(h, "concierge", message("Ev1", "please order me a monitor"))
-    await eventually(lambda: h.slack.updates())
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
     card = (await eventually(lambda: [p for p in h.slack.posts() if p["blocks"]]))[0]
     actions = next(b for b in card["blocks"] if b["type"] == "actions")
@@ -461,6 +473,109 @@ async def test_task_after_hand_off_carries_specialist(fd):
     spec = json.loads(started.input.payloads[0].data)
     assert spec["ctx"]["agent_id"] == "it-helper"
     assert spec["ctx"]["requester_user_id"] == ALICE
+
+
+async def test_specialist_load_failure_keeps_the_thread_with_the_front_door(fd, caplog):
+    h = fd
+    caplog.set_level(logging.INFO)
+    h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Still me."))
+    complete = h.llm.complete
+
+    async def complete_then_drop_specialist(system, messages, tools):
+        response = await complete(system, messages, tools)
+        # The specialist disappears from the config after the front door chose it.
+        h.agents.agents.pop("it-helper", None)
+        return response
+
+    h.llm.complete = complete_then_drop_specialist
+
+    await converse(h, "concierge", message("Ev1"))
+    await eventually(lambda: h.slack.updates())
+
+    assert [u["text"] for u in h.slack.updates()] == [TURN_FAILED]
+    assert len([p for p in h.slack.posts() if p["text"] == "Thinking…"]) == 1
+    stored = await h.history.load(TENANT, CONV_ID)
+    assert [m["role"] for m in stored] == ["user", "assistant", "user", "assistant"]
+    closed = stored[2]["content"][0]
+    assert closed["tool_use_id"] == "tu_h"
+    assert closed["content"] == "The tool call did not complete."
+    assert closed["is_error"] is True
+    assert all(
+        "agent_id=concierge" in r.getMessage()
+        for r in caplog.records
+        if "turn failed" in r.getMessage()
+    )
+
+    h.agents.agents["it-helper"] = parse_agents_config(front_door_dict()).agents["it-helper"]
+    await h.client.get_workflow_handle(CONV_ID).signal(
+        ConversationWorkflow.message, message("Ev2", "hello?")
+    )
+    await eventually(lambda: len(h.slack.updates()) >= 2)
+
+    assert h.llm.calls[-1]["system"] == "You answer general questions."
+
+
+async def test_other_calls_beside_a_hand_off_are_not_run(fd):
+    h = fd
+    create = ToolCall(
+        id="tu_c", name="create_item", input={"title": "Monitor", "details": "Flickers."}
+    )
+    read = ToolCall(id="tu_r", name="search_items", input={"query": "vpn"})
+    h.llm.queue(tool_turn(create, hand_off_to("it-helper"), read), answer("Report it to IT."))
+
+    await converse(h, "concierge", message("Ev1"))
+    await eventually(lambda: len(h.slack.updates()) >= 2)
+
+    assert [p for p in h.slack.posts() if p["blocks"]] == []
+    results = {b["tool_use_id"]: b for b in h.llm.calls[1]["messages"][-1]["content"]}
+    for call_id in ("tu_c", "tu_r"):
+        assert results[call_id]["is_error"] is True
+        assert results[call_id]["content"] == NOT_RUN
+    assert results["tu_h"]["content"] == "Handed to it-helper. They will answer now."
+    assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Report it to IT."]
+
+
+async def test_second_hand_off_in_a_turn_refused_even_if_specialist_lists_specialists():
+    raw = front_door_dict()
+    # Config validation rejects this, so build the config and add it afterwards.
+    config_raw = copy.deepcopy(raw)
+    async with running(config_raw) as h:
+        h.agents.agents["it-helper"].specialists.append("unlisted")
+        h.llm.queue(
+            tool_turn(hand_off_to("it-helper")),
+            tool_turn(hand_off_to("unlisted", "tu_h2")),
+            answer("Staying here."),
+        )
+
+        await converse(h, "concierge", message("Ev1"))
+        await eventually(lambda: len(h.slack.updates()) >= 2)
+
+        result = h.llm.calls[2]["messages"][-1]["content"][0]
+        assert result["tool_use_id"] == "tu_h2"
+        assert result["is_error"] is True
+        assert result["content"] == "Only one hand-off is allowed per turn."
+        assert h.llm.calls[2]["system"] == "You help employees with IT requests."
+        assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Staying here."]
+
+
+async def test_specialist_out_of_steps_uses_its_own_keys_and_placeholder():
+    raw = front_door_dict()
+    raw["agents"]["it-helper"]["max_steps"] = 1
+    async with running(raw) as h:
+        h.llm.queue(
+            tool_turn(hand_off_to("it-helper")),
+            tool_turn(ToolCall(id="tu_r", name="search_items", input={"query": "vpn"})),
+        )
+
+        await converse(h, "concierge", message("Ev1"))
+        await eventually(lambda: len(h.slack.updates()) >= 2)
+
+        placeholders = [p for p in h.slack.posts() if p["text"] == "Thinking…"]
+        assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, OUT_OF_STEPS]
+        assert h.slack.updates()[1]["ts"] == placeholders[1]["ts"]
+        keys = h.history.step_keys[(TENANT, CONV_ID)]
+        assert "Ev1:h1:s0:out-of-steps" in keys
+        assert "Ev1:h1:s0:results" in keys
 
 
 # --- where messages land -------------------------------------------------------

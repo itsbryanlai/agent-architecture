@@ -835,3 +835,102 @@ async def test_the_allowed_port_is_a_parameter(h):
     ) as c:
         assert (await c.get(t("/me"))).status_code == 200
         assert (await c.get(t("/me"), headers={"Host": "127.0.0.1:8100"})).status_code == 421
+
+
+# --- page grants --------------------------------------------------------------------
+
+PAGE_ID = "99999999-8888-7777-6666-555555555555"
+
+
+def with_page_grant() -> dict:
+    definition = helper_block()
+    definition["grants"]["notion"]["pages"] = [{"id": PAGE_ID, "name": "IT wiki"}]
+    return definition
+
+
+async def pending_with_page(h):
+    h.as_user(OWNER)
+    async with h.client() as c:
+        await c.post(t("/agents"), json={"agent_id": "it-helper", "definition": with_page_grant()})
+        await c.post(t("/agents/it-helper/versions/1/submit"))
+    h.as_user(ROOT)
+
+
+class FailingPages:
+    """A Notion whose page reads fail with the given error; databases read normally."""
+
+    def __init__(self, inner, error):
+        self._inner, self._error = inner, error
+
+    async def retrieve_page(self, page_id):
+        raise self._error
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class Status(Exception):
+    def __init__(self, status):
+        super().__init__("notion error")
+        self.status = status
+
+
+async def test_check_grants_lists_page_grants_after_the_databases(h):
+    h.notion.add_free_page(PAGE_ID, "IT wiki")
+    await pending_with_page(h)
+    async with h.client() as c:
+        response = await c.post(t("/agents/it-helper/versions/1/check-grants"))
+    body = response.json()
+    assert body["ok"] is True
+    assert [(g["kind"], g["grant"]) for g in body["grants"]] == [
+        ("database", "IT requests"),
+        ("page", "IT wiki"),
+    ]
+    assert body["grants"][1]["database_id"] == PAGE_ID
+
+
+async def test_a_clean_page_grant_publishes(h):
+    h.notion.add_free_page(PAGE_ID, "IT wiki")
+    await pending_with_page(h)
+    async with h.client() as c:
+        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+    assert response.status_code == 200
+
+
+async def test_a_trashed_page_grant_refuses_publish(h):
+    h.notion.add_free_page(PAGE_ID, "IT wiki", in_trash=True)
+    await pending_with_page(h)
+    async with h.client() as c:
+        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        assert response.status_code == 409
+        [bad] = [g for g in response.json()["grants"] if g["problems"]]
+        assert bad["kind"] == "page" and "trash" in bad["problems"][0]
+        status = await c.get(t("/agents/it-helper/versions/1"))
+    assert status.json()["status"] == "pending"
+    assert "agent_publish" not in kinds(h)
+
+
+@pytest.mark.parametrize("code", [403, 404, 400])
+async def test_an_unreadable_page_refuses_publish(h, code):
+    await pending_with_page(h)
+    h.notion = FailingPages(h.notion, Status(code))
+    async with h.client() as c:
+        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        assert response.status_code == 409
+        assert "cannot be read" in str(response.json()["grants"])
+        status = await c.get(t("/agents/it-helper/versions/1"))
+    assert status.json()["status"] == "pending"
+
+
+@pytest.mark.parametrize("error", [Status(503), Status(429), Status(500), TimeoutError("slow")])
+async def test_a_transient_page_failure_is_502_and_does_not_publish(h, error):
+    await pending_with_page(h)
+    h.notion = FailingPages(h.notion, error)
+    async with h.client() as c:
+        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        assert response.status_code == 502
+        check = await c.post(t("/agents/it-helper/versions/1/check-grants"))
+        assert check.status_code == 502
+        status = await c.get(t("/agents/it-helper/versions/1"))
+    assert status.json()["status"] == "pending"
+    assert "agent_publish" not in kinds(h)

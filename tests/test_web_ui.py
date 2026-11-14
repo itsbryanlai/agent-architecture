@@ -5,6 +5,7 @@ Everything is in memory: the stores, a fake Notion and a fake Slack sign-in.
 
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -676,7 +677,14 @@ async def test_the_origin_check_uses_the_console_origin(h):
         assert ok.status_code == 303
 
 
-async def test_slack_may_send_the_browser_back_from_another_site_to_the_callback_only(h):
+FROM_SLACK = {
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+}
+
+
+async def test_slack_may_send_the_browser_back_from_another_site_to_the_callback(h):
     async with h.client() as c:
         login = await c.get("/login")
         arriving = await c.get(
@@ -684,12 +692,77 @@ async def test_slack_may_send_the_browser_back_from_another_site_to_the_callback
             params={"code": "x", "state": "wrong"},
             headers={"Sec-Fetch-Site": "cross-site"},
         )
-        assert arriving.status_code == 400  # reached the callback, which checked the state
         assert login.status_code == 303
-        other = await c.get(f"{UI}/agents", headers={"Sec-Fetch-Site": "cross-site"})
-        assert other.status_code == 403
-        login_page = await c.get("/login", headers={"Sec-Fetch-Site": "cross-site"})
-        assert login_page.status_code == 403
+        assert arriving.status_code == 400  # reached the callback, which checked the state
+
+
+async def test_the_redirect_after_sign_in_lands_on_the_console_although_the_browser_calls_it_cross_site(
+    h,
+):
+    async with h.client() as c:
+        login = await c.get("/login")
+        query = parse_qs(urlsplit(login.headers["location"]).query)
+        h.slack.nonce = query["nonce"][0]
+        callback = await c.get(
+            "/auth/slack/callback",
+            params={"code": "made-up-code", "state": query["state"][0]},
+            headers=FROM_SLACK,
+        )
+        assert callback.status_code == 303
+        landing = await c.get(callback.headers["location"], headers=FROM_SLACK)
+        assert landing.status_code == 200 and "New agent" in landing.text
+
+
+async def test_a_link_from_another_site_opens_the_console_pages(h):
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        for site in ("cross-site", "same-site"):
+            headers = {**FROM_SLACK, "Sec-Fetch-Site": site}
+            agents = await c.get(f"{UI}/agents", headers=headers)
+            assert agents.status_code == 200 and "New agent" in agents.text, site
+            assert (await c.head(f"{UI}/agents", headers=headers)).status_code == 200, site
+            assert (await c.get("/", headers=headers)).status_code == 303, site
+            assert (await c.get("/login", headers=headers)).status_code == 303, site
+
+
+async def test_a_cross_site_page_get_that_is_not_a_top_level_navigation_is_refused(h):
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        refused = [
+            {**FROM_SLACK, "Sec-Fetch-Dest": "iframe"},
+            {**FROM_SLACK, "Sec-Fetch-Dest": "frame"},
+            {**FROM_SLACK, "Sec-Fetch-Dest": "object"},
+            {**FROM_SLACK, "Sec-Fetch-Dest": "embed"},
+            {**FROM_SLACK, "Sec-Fetch-Dest": "empty"},
+            {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "document"},
+            {**FROM_SLACK, "Sec-Fetch-Mode": "no-cors"},
+            {**FROM_SLACK, "Sec-Fetch-Mode": "cors"},
+        ]
+        for headers in refused:
+            for path in (f"{UI}/agents", "/login", "/"):
+                response = await c.get(path, headers=headers)
+                assert response.status_code == 403, (path, headers)
+                assert "agents" not in response.text and "New agent" not in response.text
+
+
+async def test_only_pages_are_open_to_a_cross_site_navigation(h):
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        token = await csrf_token(c)
+        fields = f"user_id=U_NEW&role=creator&csrf={token}"
+        form = {"Content-Type": "application/x-www-form-urlencoded", "Origin": CONSOLE_URL}
+        posted = await c.post(f"{UI}/members", content=fields, headers={**form, **FROM_SLACK})
+        assert posted.status_code == 403
+        logout = await c.post("/logout", content=f"csrf={token}", headers={**form, **FROM_SLACK})
+        assert logout.status_code == 403
+        assert await h.members.get_member(TENANT, "U_NEW") is None
+        for path in (f"/tenants/{TENANT}/agents", f"/tenants/{TENANT}/me"):
+            response = await c.get(path, headers=FROM_SLACK)
+            assert response.status_code == 403, path
+        elsewhere = await c.get("/auth/slack/other", headers=FROM_SLACK)
+        assert elsewhere.status_code == 403
 
 
 async def test_other_tenants_data_is_not_reachable_through_a_session(h):

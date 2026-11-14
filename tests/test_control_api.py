@@ -816,6 +816,11 @@ async def test_a_foreign_origin_or_cross_site_fetch_is_refused(h):
         for site in ["cross-site", "same-site"]:
             response = await c.get(t("/audit"), headers={"Sec-Fetch-Site": site})
             assert response.status_code == 403, site
+        navigation = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+        for site in ["cross-site", "same-site"]:
+            for method in (c.get, c.head):
+                response = await method(t("/audit"), headers={"Sec-Fetch-Site": site, **navigation})
+                assert response.status_code == 403, site
         for site in ["same-origin", "none"]:
             assert (await c.get(t("/audit"), headers={"Sec-Fetch-Site": site})).status_code == 200
         ok = await c.get(t("/audit"), headers={"Origin": "http://localhost:8100"})

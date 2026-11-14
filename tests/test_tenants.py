@@ -426,3 +426,26 @@ async def test_load_agent_one_argument_compat():
         await several.load_agent("it-helper")
     assert caught.value.non_retryable is True
     assert (await several.load_agent(GLOBEX, "it-helper")).agent_id == "it-helper"
+
+
+def test_the_console_refuses_to_start_when_a_tenants_notion_key_is_unset(monkeypatch):
+    from agentos.tenants import notion_key_failure
+
+    tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
+    monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
+    monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
+
+    message = notion_key_failure(tenants)
+
+    assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
+    assert "NOTION_TOKEN_ACME" not in message
+
+
+def test_the_console_starts_when_every_tenants_notion_key_is_set(monkeypatch):
+    from agentos.tenants import notion_key_failure
+
+    tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
+    monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
+    monkeypatch.setenv("NOTION_TOKEN_GLOBEX", token_source.token_hex(8))
+
+    assert notion_key_failure(tenants) is None

@@ -56,6 +56,12 @@ class StandIn:
         return self.user
 
 
+def quiet_client(app) -> httpx.AsyncClient:
+    """Like ``Harness.client`` but an unhandled error is the 500 a caller would see."""
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    return httpx.AsyncClient(transport=transport, base_url=BASE, headers=JSON)
+
+
 class Harness:
     def __init__(self):
         self.agents = InMemoryAgentStore()
@@ -208,7 +214,7 @@ async def test_the_agent_lifecycle_through_the_api(h):
 
     assert kinds(h) == [
         "agent_create",
-        "agent_draft",
+        "agent_edit",
         "agent_submit",
         "agent_withdraw",
         "agent_submit",
@@ -939,3 +945,34 @@ async def test_a_transient_page_failure_is_502_and_does_not_publish(h, error):
         status = await c.get(t("/agents/it-helper/versions/1"))
     assert status.json()["status"] == "pending"
     assert "agent_publish" not in kinds(h)
+
+
+# --- a bug is not a Notion outage ---------------------------------------------------
+
+
+async def test_an_unexpected_error_is_a_plain_500_and_nothing_is_published(h):
+    await create_pending(h)
+
+    class Buggy:
+        async def retrieve_schema(self, database_id):
+            raise RuntimeError("secret detail inside")
+
+    h.notion = Buggy()
+    async with quiet_client(h.app) as c:
+        h.as_user(ROOT)
+        for path in ("publish", "check-grants"):
+            response = await c.post(t(f"/agents/it-helper/versions/1/{path}"))
+            assert response.status_code == 500
+            assert response.json() == {"error": "internal error"}
+            assert "secret" not in response.text
+        status = await c.get(t("/agents/it-helper/versions/1"))
+    assert status.json()["status"] == "pending"
+    assert "agent_publish" not in kinds(h)
+
+
+async def test_a_bug_while_reading_a_page_is_a_500(h):
+    await pending_with_page(h)
+    h.notion = FailingPages(h.notion, RuntimeError("secret detail inside"))
+    async with quiet_client(h.app) as c:
+        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+    assert response.status_code == 500 and "secret" not in response.text

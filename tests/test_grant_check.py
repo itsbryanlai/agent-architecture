@@ -1,10 +1,13 @@
 import logging
 from dataclasses import replace
 
+import httpx
 import pytest
+from notion_client.errors import RequestTimeoutError
 
 from agentos.config import ConfigError, NotionDatabaseGrant, parse_agents_config
 from agentos.connectors.notion import NotionConnector, check_grant
+from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker, is_transient
 from agentos.worker import check_grants_at_startup
 from tests.conftest import DB_ID, agents_dict, default_schema, make_fake_notion
 
@@ -170,3 +173,88 @@ async def test_check_command_prints_ids_for_names_only_config(agents):
 def test_connector_rejects_grant_without_ids(agents):
     with pytest.raises(ConfigError):
         NotionConnector(make_fake_notion(), [names_only(agents)])
+
+
+# --- what counts as Notion being unavailable ------------------------------------------
+
+
+class Status(Exception):
+    def __init__(self, status):
+        super().__init__("notion error")
+        self.status = status
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ReadTimeout("slow"),
+        RequestTimeoutError(),
+        TimeoutError("slow"),
+        ConnectionResetError("reset"),
+        Status(429),
+        Status(500),
+        Status(503),
+    ],
+)
+def test_network_errors_rate_limits_and_server_errors_are_transient(error):
+    assert is_transient(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Status(400),
+        Status(403),
+        Status(404),
+        RuntimeError("a bug"),
+        ValueError("bad value"),
+        KeyError("missing"),
+        ConfigError("tenant 'acme': environment variable X is not set"),
+    ],
+)
+def test_anything_else_is_not_transient(error):
+    assert not is_transient(error)
+
+
+async def test_a_failure_building_the_client_is_not_a_notion_outage(agents):
+    def no_client(tenant_id):
+        raise ConfigError("tenant 'acme': environment variable NOTION_TOKEN is not set")
+
+    checker = NotionGrantChecker(no_client)
+
+    with pytest.raises(ConfigError, match="NOTION_TOKEN"):
+        await checker.check("acme", agents.agents["it-helper"])
+
+
+async def test_an_unexpected_error_while_checking_propagates_as_itself(agents):
+    class Broken:
+        async def retrieve_schema(self, database_id):
+            raise RuntimeError("a bug")
+
+    with pytest.raises(RuntimeError, match="a bug"):
+        await NotionGrantChecker(lambda t: Broken()).check("acme", agents.agents["it-helper"])
+
+
+async def test_a_transient_error_is_unavailable_and_keeps_its_cause(agents):
+    class Down:
+        async def retrieve_schema(self, database_id):
+            raise httpx.ConnectError("refused")
+
+    with pytest.raises(GrantCheckUnavailable) as err:
+        await NotionGrantChecker(lambda t: Down()).check("acme", agents.agents["it-helper"])
+    assert isinstance(err.value.__cause__, httpx.ConnectError)
+
+
+@pytest.mark.parametrize("code", [403, 404])
+async def test_a_database_notion_will_not_show_is_a_grant_problem(agents, code):
+    class Hidden:
+        async def retrieve_schema(self, database_id):
+            raise Status(code)
+
+    [report] = await NotionGrantChecker(lambda t: Hidden()).check(
+        "acme", agents.agents["it-helper"]
+    )
+
+    assert len(report.problems) == 1 and "IT requests" in report.problems[0]
+    assert "Status" in report.problems[0]

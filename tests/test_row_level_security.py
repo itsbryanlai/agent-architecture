@@ -45,6 +45,7 @@ AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_t
 AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
 MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
 SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read_text()
+AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "009_audit_kinds.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -345,3 +346,50 @@ async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash()
     assert hashlib.sha256(issued.token.encode()).hexdigest() in inserted[2]
     selected = next(e for e in sql if e[1].startswith("SELECT"))
     assert "expires_at > %s" in selected[1]
+
+
+@pytest.mark.parametrize("sql", [AUDIT_KINDS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+def test_every_audit_kind_the_code_can_write_is_allowed_by_the_sql(sql):
+    from agentos.models import AUDIT_KINDS
+
+    assert "agent_edit" in AUDIT_KINDS and "agent_import" in AUDIT_KINDS
+    for kind in AUDIT_KINDS:
+        assert f"'{kind}'" in sql, kind
+
+
+def test_the_audit_kinds_migration_only_widens_the_check_and_is_rerunnable():
+    sql = AUDIT_KINDS_MIGRATION
+    assert "ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_kind_check" in sql
+    assert "ADD CONSTRAINT audit_events_kind_check CHECK (kind IN (" in sql
+    # The new kinds name an agent, so the existing rule already covers them.
+    assert "audit_events_agent_required" not in sql
+    assert "DROP NOT NULL" not in sql and "DROP TABLE" not in sql and "GRANT" not in sql
+    # Every kind migration 007 allowed is still allowed.
+    old = MEMBERS_MIGRATION[MEMBERS_MIGRATION.index("audit_events_kind_check") :]
+    old = old[: old.index("));")]
+    for kind in re.findall(r"'(\w+)'", old):
+        assert f"'{kind}'" in sql, kind
+
+
+def test_init_db_has_the_same_audit_kinds_as_the_migration():
+    def kinds_in(sql: str, after: str) -> set[str]:
+        block = sql[sql.index(after) :]
+        return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
+
+    assert kinds_in(AUDIT_KINDS_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
+
+
+async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert():
+    pool = FakePool(AGENT_ROW)
+    store = PostgresAgentStore(pool)
+
+    await store.import_agents("acme", {"it-helper": SAMPLE_AGENT})
+
+    assert pool.taken == 1 and pool.events.count(("transaction",)) == 1
+    executed = [e for e in pool.events if e[0] == "execute"]
+    insert_version = next(i for i, e in enumerate(executed) if "INTO agent_versions" in e[1])
+    audit = next(e for e in executed if "INTO audit_events" in e[1])
+    assert executed.index(audit) > insert_version
+    assert "ON CONFLICT (tenant_id, event_key) DO NOTHING" in audit[1]
+    assert audit[2][:5] == ("acme", "acme:audit:import:it-helper", "agent_import", "it-helper", 1)
+    assert pool.events[-1] == ("commit",)

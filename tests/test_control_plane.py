@@ -336,7 +336,7 @@ async def test_each_action_writes_one_event_with_ids_and_a_hash_and_no_definitio
         ("agent_create", plane.add_agent(TENANT, OWNER, "it-helper", definition)),
         ("agent_submit", plane.submit_version(TENANT, OWNER, "it-helper", 1)),
         ("agent_withdraw", plane.withdraw_version(TENANT, OWNER, "it-helper", 1)),
-        ("agent_draft", plane.edit_draft(TENANT, OWNER, "it-helper", 1, definition)),
+        ("agent_edit", plane.edit_draft(TENANT, OWNER, "it-helper", 1, definition)),
         ("agent_submit", plane.submit_version(TENANT, OWNER, "it-helper", 1)),
         ("agent_reject", plane.reject_version(TENANT, ROOT, "it-helper", 1)),
         ("agent_submit", plane.submit_version(TENANT, OWNER, "it-helper", 1)),

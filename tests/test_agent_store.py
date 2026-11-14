@@ -7,6 +7,7 @@ import pytest
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
+from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import (
     ALLOWED_MOVES,
@@ -16,7 +17,7 @@ from agentos.agent_store import (
     seeded_agent_store,
     startup_agent_failure,
 )
-from agentos.audit import InMemoryAuditStore
+from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.config import (
     ConfigError,
     Settings,
@@ -451,6 +452,41 @@ async def test_import_checks_the_new_agents_against_those_already_published():
     await store.import_agents(TENANT, {"concierge": config.agents["concierge"]})
 
     assert set(await store.published_all(TENANT)) == {"it-helper", "concierge"}
+
+
+async def test_import_audits_each_imported_agent_once_and_a_rerun_writes_nothing():
+    config = parse_agents_config(front_door_dict())
+    audit = InMemoryAuditStore()
+    store = InMemoryAgentStore(audit=audit)
+
+    await store.import_agents(TENANT, config.agents)
+
+    assert sorted(e.agent_id for e in audit.events) == ["concierge", "it-helper", "unlisted"]
+    for event in audit.events:
+        assert (event.kind, event.agent_version, event.outcome) == ("agent_import", 1, "ok")
+        assert (event.requester_user_id, event.approver_user_id) == ("import:yaml", "import:yaml")
+        assert event.identity == "user:import:yaml"
+        assert event.tenant_id == TENANT
+        assert event.event_key == ids.audit_import_key(TENANT, event.agent_id)
+        [record] = await store.versions(TENANT, event.agent_id)
+        assert event.input_sha256 == canonical_sha256(record.definition)
+        assert "system_prompt" not in repr(event)
+
+    await store.import_agents(TENANT, config.agents)
+
+    assert len(audit.events) == 3
+
+
+async def test_a_refused_import_audits_nothing():
+    config = parse_agents_config(front_door_dict())
+    agents = dict(config.agents)
+    del agents["it-helper"]
+    audit = InMemoryAuditStore()
+
+    with pytest.raises(ConfigError):
+        await InMemoryAgentStore(audit=audit).import_agents(TENANT, agents)
+
+    assert audit.events == []
 
 
 async def test_tenants_are_kept_apart():

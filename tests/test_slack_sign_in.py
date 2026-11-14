@@ -151,7 +151,7 @@ async def test_a_nonce_that_does_not_match_is_refused(h):
         state = await start_login(h, c)
         h.slack.nonce = "some-other-nonce-value-that-is-long-enough"
         response = await c.get("/auth/slack/callback", params={"code": "x", "state": state})
-        await assert_no_session(h, c, response, 502)
+        await assert_no_session(h, c, response, 503)
 
 
 async def test_a_token_endpoint_error_is_refused_without_naming_it(h):
@@ -159,7 +159,7 @@ async def test_a_token_endpoint_error_is_refused_without_naming_it(h):
         state = await start_login(h, c)
         h.slack.error = "invalid_code with details"
         response = await c.get("/auth/slack/callback", params={"code": "x", "state": state})
-        await assert_no_session(h, c, response, 502)
+        await assert_no_session(h, c, response, 503)
         assert "invalid_code" not in response.text
 
 
@@ -180,7 +180,7 @@ async def test_an_id_token_that_fails_a_check_is_refused(h, overrides):
         state = await start_login(h, c)
         h.slack.overrides = overrides
         response = await c.get("/auth/slack/callback", params={"code": "x", "state": state})
-        await assert_no_session(h, c, response, 502)
+        await assert_no_session(h, c, response, 503)
 
 
 async def test_an_audience_list_that_holds_the_client_is_accepted(h):

@@ -3,6 +3,7 @@
 Everything is in memory: the stores, a fake Notion and a fake Slack sign-in.
 """
 
+import html
 import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -222,7 +223,7 @@ async def test_a_creator_creates_edits_and_submits_and_an_admin_publishes(h):
 
     record = await h.agents.get_version(TENANT, "it-helper", 1)
     assert record.status == "published" and record.approved_by == ADMIN2
-    assert kinds(h) == ["agent_create", "agent_draft", "agent_submit", "agent_publish"]
+    assert kinds(h) == ["agent_create", "agent_edit", "agent_submit", "agent_publish"]
     assert [e.identity for e in h.audit.events] == [
         f"user:{OWNER}",
         f"user:{OWNER}",
@@ -420,18 +421,67 @@ async def test_a_refused_publish_shows_the_grant_problems_and_changes_nothing(h)
     assert await status_of_version(h) == "published"
 
 
-async def test_notion_being_unreachable_is_a_502_page(h):
+NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
+
+
+class Down:
+    """A Notion that cannot be reached; the message must never reach the page."""
+
+    async def retrieve_schema(self, database_id):
+        raise TimeoutError("boom with a token inside")
+
+
+@pytest.mark.parametrize("path", ["publish", "check-grants"])
+async def test_notion_being_unreachable_is_a_503_page_with_a_message(h, path):
     await make_pending(h)
-
-    class Down:
-        async def retrieve_schema(self, database_id):
-            raise TimeoutError("boom with a token inside")
-
     h.notion = Down()
     c = await h.signed_in(ROOT)
     async with using(c):
-        response = await post(c, f"{VERSION}/publish", await csrf_token(c))
-    assert response.status_code == 502 and "token" not in response.text
+        response = await post(c, f"{VERSION}/{path}", await csrf_token(c))
+    assert response.status_code == 503
+    assert NOTION_DOWN in html.unescape(response.text)
+    assert "token" not in response.text and "boom" not in response.text
+    assert "<h1>it-helper version 1" in response.text  # the version page, not a bare message
+    assert await status_of_version(h) == "pending"
+    assert "agent_publish" not in kinds(h)
+
+
+async def test_the_grant_check_button_changes_nothing_when_notion_is_down(h):
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    before = await h.agents.get_version(TENANT, "it-helper", 1)
+    h.notion = Down()
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        response = await post(c, f"{VERSION}/check-grants", await csrf_token(c))
+    assert response.status_code == 503 and NOTION_DOWN in html.unescape(response.text)
+    assert await h.agents.get_version(TENANT, "it-helper", 1) == before
+    assert kinds(h) == ["agent_create"]
+
+
+async def test_a_console_page_is_never_a_502_or_a_504():
+    from agentos.control_errors import STATUS_BY_ERROR, page_status
+
+    for status in STATUS_BY_ERROR.values():
+        assert page_status(status) not in (502, 504)
+    assert page_status(502) == 503 and page_status(504) == 503
+    assert page_status(409) == 409 and page_status(404) == 404
+
+
+@pytest.mark.parametrize("path", ["publish", "check-grants"])
+async def test_an_unexpected_error_is_a_plain_500_page(h, path):
+    await make_pending(h)
+
+    class Buggy:
+        async def retrieve_schema(self, database_id):
+            raise RuntimeError("secret detail inside")
+
+    h.notion = Buggy()
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        response = await post(c, f"{VERSION}/{path}", await csrf_token(c))
+    assert response.status_code == 500
+    assert "Internal error." in response.text
+    assert "secret" not in response.text and "RuntimeError" not in response.text
     assert await status_of_version(h) == "pending"
 
 

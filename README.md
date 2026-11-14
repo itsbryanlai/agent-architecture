@@ -307,6 +307,43 @@ export QWEN_BASE_URL='<your Qwen OpenAI-compatible base URL>'
 export QWEN_API_KEY='<paste here>'
 ```
 
+## Usage and cost
+
+Every model call and every embedded page is recorded as a usage row: the tenant,
+the agent and agent version, the model the provider reported, the four token
+counts (input, output, cache read, cache write), the cost, the conversation ID
+for tracing and the time. A row never names the person who asked and never holds
+text. A call is priced when it is recorded, with the entry in effect that day,
+and the cost is stored on the row, so editing a price later never changes past
+months.
+
+Prices live in `config/prices.yaml` (override the path with `AGENTOS_PRICES`):
+US dollars per million input, output, cache-read and cache-write tokens for a
+model, with an `effective_from` date; a model can have several entries. The file
+ships empty, with a commented example, because prices come from your provider's
+pricing page. A model with no entry is recorded with its tokens and no cost, and
+the page shows "no price". The worker reads the file when it starts, so restart it
+after an edit, and refuses to start if the file is malformed.
+
+An agent may carry an optional `team: IT` label in its definition (up to 64
+characters). The usage page sums cost per team across its agents; agents without
+one show as "No team". The team of a call is the team of the agent version that
+made it.
+
+The usage rows need migration `011` (a new install gets the table from
+`scripts/init_db.sql`):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/011_usage.sql
+```
+
+The [web console](#web-console) has a **Usage** page: pick a UTC month and see the
+total, then tables by agent, by team and by model, and embedding usage as its own
+line (admins only). An admin sees every agent; a creator sees the agents they
+created. **Download CSV** exports the same aggregates. The JSON API serves them as
+`GET /tenants/<t>/usage?month=YYYY-MM`. There is no per-person view: nothing is
+grouped, filtered or exported by who asked.
+
 ## Upgrading an existing local database
 
 Chat history appends are now idempotent by a per-step key. A database created
@@ -598,6 +635,7 @@ version, adding an existing member), 422 for an invalid definition or request.
 | `POST .../versions/{v}/submit`, `withdraw`, `reject`, `publish` | lifecycle |
 | `POST .../versions/{v}/check-grants` | check the version's Notion database grants against Notion |
 | `GET`, `POST /tenants/{t}/members`; `PATCH`, `DELETE .../members/{user}` | members |
+| `GET /tenants/{t}/usage?month=YYYY-MM` | usage and cost by agent, team and model for a UTC month (default the current one); a creator sees only their agents |
 | `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
 
 `publish` runs the grant check first (with the tenant's Notion token) and is
@@ -612,7 +650,7 @@ audit event (the change itself is refused the second time, with 409).
 
 ## Web console
 
-The same process serves web pages for agents, versions, members and the audit log,
+The same process serves web pages for agents, versions, members, usage and the audit log,
 behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
 JSON API, so a user's role in the tenant decides what they can do in both. The
 console is off unless sign-in is configured.
@@ -712,5 +750,6 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
+| `src/agentos/usage.py` | Usage rows, model prices, pricing at record time and the usage report |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

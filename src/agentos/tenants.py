@@ -24,7 +24,7 @@ from agentos.config import (
     TenantsConfig,
     read_secret,
 )
-from agentos.connectors.notion import NotionAPI, NotionConnector, normalize_id
+from agentos.connectors.notion import NotionAPI, normalize_id
 from agentos.slack_client import SlackPoster
 
 
@@ -34,23 +34,21 @@ class UnknownTenant(Exception):
 
 @dataclass
 class TenantRuntime:
-    """One tenant's config and the clients that act for it, and only it."""
+    """One tenant's settings and the clients that act for it, and only it.
+
+    ``config.agents`` is the YAML section, the source of the one-time import.
+    The agents a turn runs are the published versions in the agent store.
+    """
 
     config: AgentsConfig
     # The clients hold tokens, so they stay out of repr.
     slack: SlackPoster = field(repr=False)
     notion_api: NotionAPI = field(repr=False)
-    # One connector per agent, each limited to that agent's own grants.
-    connectors: dict[str, NotionConnector] = field(default_factory=dict, repr=False)
 
 
 def runtime_for(config: AgentsConfig, slack: SlackPoster, notion_api: NotionAPI) -> TenantRuntime:
-    """Build a tenant's runtime, with one connector per agent."""
-    connectors = {
-        agent_id: NotionConnector(notion_api, agent.grants.notion_databases)
-        for agent_id, agent in config.agents.items()
-    }
-    return TenantRuntime(config, slack, notion_api, connectors)
+    """Build a tenant's runtime."""
+    return TenantRuntime(config, slack, notion_api)
 
 
 class TenantRegistry:
@@ -122,7 +120,11 @@ def build_slack_clients(
 
 
 def granted_roots(agents: AgentsConfig) -> dict[str, str]:
-    """Scope to root page ID, for every distinct page granted to any agent of a tenant."""
+    """Scope to root page ID, for every distinct page granted to any agent of a tenant.
+
+    Pass a config whose ``agents`` are the tenant's published set
+    (``agent_store.with_published_agents``).
+    """
     roots: dict[str, str] = {}
     for agent in agents.agents.values():
         for grant in agent.grants.notion_pages:

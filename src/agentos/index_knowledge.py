@@ -42,6 +42,7 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from agentos import ids
+from agentos.agent_store import AgentStore, PostgresAgentStore, with_published_agents
 from agentos.config import (
     TASK_QUEUE,
     AgentsConfig,
@@ -157,14 +158,36 @@ async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
         await pool.close()
 
 
+@asynccontextmanager
+async def open_agent_store(settings: Settings) -> AsyncIterator[AgentStore]:
+    """The agent store, over the same database the worker uses."""
+    pool = AsyncConnectionPool(settings.database_url, open=False)
+    await pool.open()
+    try:
+        yield PostgresAgentStore(pool)
+    finally:
+        await pool.close()
+
+
 async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
     settings = load_settings()
     tenants = load_tenants_config(settings.config_path)
     if tenant is not None and tenant not in tenants.tenants:
         raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
     selected = [tenants.tenants[tenant]] if tenant else list(tenants.tenants.values())
+    # Grants come from each tenant's published agents, not from the YAML file.
+    async with open_agent_store(settings) as agent_store:
+        selected = [await with_published_agents(agent_store, config) for config in selected]
+    empty = [config.tenant_id for config in selected if not config.agents]
+    if empty:
+        # An empty published set would read as "every grant revoked" and delete
+        # the tenant's schedules and stored pages.
+        raise SystemExit(
+            f"tenant(s) {', '.join(empty)} have no published agents. "
+            "Run `uv run python -m agentos.agent_store import` first."
+        )
     if not schedule and not any(granted_roots(a) for a in selected):
-        print("No agent has a Notion page grant, so there is nothing to index.")
+        print("No published agent has a Notion page grant, so there is nothing to index.")
         return
     client = await build_temporal_client(settings)
     if schedule:

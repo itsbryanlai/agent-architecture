@@ -16,6 +16,11 @@ from psycopg_pool import AsyncConnectionPool
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.agent_store import (
+    PostgresAgentStore,
+    published_tenants,
+    startup_agent_failure,
+)
 from agentos.audit import PostgresAuditStore
 from agentos.config import (
     EMBED_DIMENSIONS,
@@ -65,7 +70,9 @@ def build_llm(settings: Settings) -> LLMClient:
 
 
 def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | None:
-    """Build the embedder, only when some agent of any tenant has a Notion page grant.
+    """Build the embedder, only when some published agent of any tenant has a Notion page grant.
+
+    ``tenants`` carries each tenant's published agents (``published_tenants``).
 
     The embedder is the platform's own, shared by every tenant. Agents without
     knowledge need no embedding settings, so the Anthropic provider keeps
@@ -97,7 +104,9 @@ def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | Non
 async def check_grants_at_startup(
     api: NotionAPI, agents: AgentsConfig, log: logging.Logger
 ) -> str | None:
-    """Check every agent's Notion grants against the live schemas.
+    """Check every published agent's Notion grants against the live schemas.
+
+    ``agents`` carries the tenant's published agents (``with_published_agents``).
 
     Returns None when all is well, or a one-line failure summary when any grant
     has a problem (including a missing property ID); the caller must then exit
@@ -161,31 +170,37 @@ async def main() -> None:
     if key_failure:
         raise SystemExit(key_failure)
     llm = build_llm(settings)
-    embedder = build_embedder(settings, tenants)
-    registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
-    failures = []
-    for tenant_id in registry.tenants():
-        runtime = registry.get(tenant_id)
-        log.info("tenant_id=%s checking grants", tenant_id)
-        failure = await check_grants_at_startup(runtime.notion_api, runtime.config, log)
-        if failure:
-            failures.append(f"tenant '{tenant_id}': {failure}")
-    if failures:
-        raise SystemExit("\n".join(failures))
-    # Provider and model name only; never a key.
-    log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
-    if embedder is not None:
-        # Host and port only; never a key or a path.
-        log.info(
-            "embedder model=%s dimensions=%d host=%s",
-            embedder.model,
-            embedder.dimensions,
-            urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
-        )
-
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     try:
+        agent_store = PostgresAgentStore(pool)
+        agent_failure = await startup_agent_failure(agent_store, tenants)
+        if agent_failure:
+            raise SystemExit(agent_failure)
+        published = await published_tenants(agent_store, tenants)
+        embedder = build_embedder(settings, published)
+        registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
+        failures = []
+        for tenant_id in registry.tenants():
+            runtime = registry.get(tenant_id)
+            log.info("tenant_id=%s checking grants", tenant_id)
+            failure = await check_grants_at_startup(
+                runtime.notion_api, published.tenants[tenant_id], log
+            )
+            if failure:
+                failures.append(f"tenant '{tenant_id}': {failure}")
+        if failures:
+            raise SystemExit("\n".join(failures))
+        # Provider and model name only; never a key.
+        log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
+        if embedder is not None:
+            # Host and port only; never a key or a path.
+            log.info(
+                "embedder model=%s dimensions=%d host=%s",
+                embedder.model,
+                embedder.dimensions,
+                urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
+            )
         knowledge = PostgresKnowledgeStore(pool)
         activities = AgentActivities(
             settings=settings,
@@ -196,15 +211,16 @@ async def main() -> None:
             llm=llm,
             tool_outputs=PostgresToolOutputStore(pool),
             audit=PostgresAuditStore(pool),
+            agents=agent_store,
             knowledge=knowledge,
             embedder=embedder,
         )
         workflows: list = [ConversationWorkflow, TaskWorkflow]
         all_activities = activities.all()
         if embedder is not None:
-            # Indexing runs only where some agent has a page grant.
+            # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
-            all_activities += IndexActivities(registry, knowledge, embedder).all()
+            all_activities += IndexActivities(registry, knowledge, embedder, agent_store).all()
         client = await build_temporal_client(settings)
         worker = Worker(
             client,

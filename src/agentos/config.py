@@ -18,6 +18,7 @@ that project's database or server by accident.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from dataclasses import dataclass, field
@@ -358,7 +359,14 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
     )
 
 
-def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
+def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
+    """Parse and validate one agent block, from the YAML file or from the database.
+
+    Both sources go through this function, so an agent loaded from the
+    database is checked exactly like one read from YAML. ``version`` overrides
+    the block's own ``version`` field: the database assigns version numbers, so
+    a stored definition has none.
+    """
     where = f"agent '{agent_id}'"
     grants_raw = raw.get("grants") or {}
     notion = grants_raw.get("notion") or {}
@@ -368,7 +376,7 @@ def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
     approval = raw.get("approval") or {}
     return AgentVersion(
         agent_id=agent_id,
-        version=int(_require(raw, "version", where)),
+        version=int(version if version is not None else _require(raw, "version", where)),
         name=str(_require(raw, "name", where)),
         system_prompt=str(_require(raw, "system_prompt", where)),
         max_steps=int(_require(raw, "max_steps", where)),
@@ -380,6 +388,50 @@ def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
     )
 
 
+def agent_definition(agent: AgentVersion) -> dict[str, Any]:
+    """The agent as one YAML-shaped block, without ``version``.
+
+    The inverse of ``parse_agent``: ``parse_agent(id, agent_definition(a),
+    a.version) == a``. The database stores this shape.
+    """
+    databases = []
+    for db in agent.grants.notion_databases:
+        entry: dict[str, Any] = {
+            "id": db.id,
+            "name": db.name,
+            "properties": {
+                "title": db.title_prop,
+                "status": db.status_prop,
+                "done_values": list(db.done_values),
+                "requested_by": db.requested_by_prop,
+                "request_id": db.request_id_prop,
+            },
+        }
+        property_ids = {
+            role: getattr(db, attr)
+            for role, attr in _PROPERTY_ID_FIELDS.items()
+            if getattr(db, attr)
+        }
+        if property_ids:
+            entry["property_ids"] = property_ids
+        databases.append(entry)
+    return {
+        "name": agent.name,
+        "description": agent.description,
+        "system_prompt": agent.system_prompt,
+        "max_steps": agent.max_steps,
+        "grants": {
+            "notion": {
+                "databases": databases,
+                "pages": [{"id": pg.id, "name": pg.name} for pg in agent.grants.notion_pages],
+            }
+        },
+        "follow_up": dataclasses.asdict(agent.follow_up),
+        "approval": dataclasses.asdict(agent.approval),
+        "specialists": list(agent.specialists),
+    }
+
+
 def _parse_specialists(where: str, raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -388,7 +440,12 @@ def _parse_specialists(where: str, raw: Any) -> list[str]:
     return list(raw)
 
 
-def _check_front_doors(agents: dict[str, AgentVersion]) -> None:
+def check_front_doors(agents: dict[str, AgentVersion]) -> None:
+    """Check a set of agents: specialists exist, are not front doors, and are listed once.
+
+    Runs on the YAML agents when a file is read, and on a tenant's published
+    set whenever that set would change.
+    """
     for agent_id, agent in agents.items():
         for specialist_id in agent.specialists:
             where = f"agent '{agent_id}' specialist '{specialist_id}'"
@@ -423,7 +480,7 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
     if not isinstance(raw, dict):
         raise ConfigError("agents config: expected a mapping at the top level")
     agents_raw = _require(raw, "agents", "agents config")
-    agents = {aid: _parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
+    agents = {aid: parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
     default_agent = str(_require(raw, "default_agent", "agents config"))
     if default_agent not in agents:
         raise ConfigError(f"agents config: default_agent '{default_agent}' is not defined")
@@ -433,7 +490,7 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
             f"tenant_id {tenant_id!r} is invalid: use 1 to 63 lowercase letters, digits and "
             "hyphens, starting with a letter or digit"
         )
-    _check_front_doors(agents)
+    check_front_doors(agents)
     channels = _parse_channels(raw.get("channels"), agents)
     workspace = raw.get("notion_workspace_id")
     return AgentsConfig(

@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from agentos.agent_store import AgentNotFound
-from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
+from agentos.config import ConfigError, Settings, TenantsConfig, load_settings, load_tenants_config
 from agentos.control import ControlPlane
 from agentos.control_errors import STATUS_BY_ERROR
 from agentos.grant_checker import GrantProblems
@@ -54,6 +54,7 @@ from agentos.slack_signin import (
     SlackSession,
     sign_in_from_settings,
 )
+from agentos.tenants import notion_key_failure
 from agentos.web_ui import CONSOLE_FORM_PREFIXES, install_web_ui
 
 log = logging.getLogger("agentos.control_api")
@@ -471,7 +472,6 @@ async def _real_lifespan(app: FastAPI):
 
     from agentos.agent_store import PostgresAgentStore
     from agentos.audit import PostgresAuditStore
-    from agentos.config import load_tenants_config
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
     from agentos.members import PostgresMemberStore
@@ -546,7 +546,14 @@ def main() -> None:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
-    app = build_process_app(args.host, args.port, load_settings(), os.environ)
+    settings = load_settings()
+    try:
+        failure = notion_key_failure(load_tenants_config(settings.config_path))
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
+    if failure:
+        raise SystemExit(failure)
+    app = build_process_app(args.host, args.port, settings, os.environ)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

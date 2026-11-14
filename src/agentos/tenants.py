@@ -89,6 +89,22 @@ def require_tenant_secret(config: AgentsConfig, field_name: str) -> str:
     return value
 
 
+def notion_key_failure(tenants_config: TenantsConfig) -> str | None:
+    """Why the control plane may not start, or None.
+
+    Every tenant's agents can be granted Notion pages and databases, and the grant
+    check (also run inside every publish) reads them with that tenant's own
+    Notion key. A tenant whose variable is unset is named by variable, never value.
+    """
+    failures = []
+    for config in tenants_config.tenants.values():
+        try:
+            require_tenant_secret(config, "notion_token_env")
+        except ConfigError as err:
+            failures.append(str(err))
+    return "\n".join(failures) or None
+
+
 def build_registry(
     tenants_config: TenantsConfig,
     settings: Settings,

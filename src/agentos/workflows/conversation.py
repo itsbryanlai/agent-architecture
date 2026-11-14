@@ -24,7 +24,8 @@ Rules this workflow keeps:
   ``hand_off`` tool. Nothing outside the workflow runs for it. The specialist
   answers the same message, announces itself, and owns the rest of the thread:
   the thread's agent is workflow state (``self.ref``) and carries over
-  continue-as-new. A specialist cannot hand off.
+  continue-as-new. A specialist cannot hand off, and other tool calls in the
+  hand-off response are not run.
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
   workflow goes on to wait for the next message.
@@ -56,7 +57,6 @@ with workflow.unsafe.imports_passed_through():
         TurnContext,
         check_field,
     )
-    from agentos.slack_format import escape_slack
     from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY
     from agentos.workflows.task import TaskWorkflow
 
@@ -70,7 +70,8 @@ TOOL_NOT_COMPLETED = "The tool call did not complete."
 STEP_LIMIT_REACHED = "step limit reached"
 HAND_OFF_ACCEPTED = "Handed to {agent}. They will answer now."
 HAND_OFF_REFUSED = "{agent} is not one of this agent's specialists."
-HAND_OFF_EXTRA = "Only one hand-off is allowed per response."
+HAND_OFF_EXTRA = "Only one hand-off is allowed per turn."
+HAND_OFF_NOT_RUN = "Not run: the conversation was handed to a specialist."
 HAND_OFF_PREFIX = "h1:"
 # workflow.patched IDs: each guards a change to the commands a turn issues, so
 # a conversation that is replayed past an older turn still matches its history.
@@ -90,6 +91,8 @@ class _TurnState:
         # True once the final reply is in history; recovery then stores no
         # second assistant turn.
         self.reply_stored = False
+        # True once the thread has been handed to a specialist in this turn.
+        self.handed_off = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -324,7 +327,8 @@ class ConversationWorkflow:
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
-            hand_off = _accepted_hand_off(agent, resp.tool_calls)
+            # One hand-off per turn, whatever the loaded agent lists.
+            hand_off = None if state.handed_off else _accepted_hand_off(agent, resp.tool_calls)
             # A hand-off starts nothing outside the workflow and the specialist
             # has its own step budget, so the last step may still hand off.
             if (
@@ -364,6 +368,29 @@ class ConversationWorkflow:
                     retry_policy=RETRY,
                 )
                 return
+            if hand_off is not None:
+                # Another call beside the hand-off is not run: a write would
+                # start as the front door while the user is told a specialist
+                # took over. The specialist is loaded and announced before the
+                # results are stored, so a failure there leaves the thread with
+                # the front door and history that never claims a hand-off.
+                results = [
+                    ToolResult(call.id, HAND_OFF_ACCEPTED.format(agent=call.input["agent"]))
+                    if call is hand_off
+                    else ToolResult(call.id, HAND_OFF_NOT_RUN, is_error=True)
+                    for call in resp.tool_calls
+                ]
+                agent, ctx, placeholder_ts = await self._hand_off(m, state, hand_off)
+                await workflow.execute_activity_method(
+                    AgentActivities.append_tool_results,
+                    args=[ctx.tenant_id, conv_id, f"{key}:results", results],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                state.pending_tool_ids = []
+                key_prefix = HAND_OFF_PREFIX
+                step = 0
+                continue
             first_markers: list[int] = []
             for call in resp.tool_calls:
                 first_markers.append(self.next_marker)
@@ -371,7 +398,7 @@ class ConversationWorkflow:
                     self.next_marker += SEARCH_RESULTS
             outcomes = await asyncio.gather(
                 *[
-                    self._dispatch(ctx, agent, conv_id, call, first_marker, hand_off)
+                    self._dispatch(ctx, agent, conv_id, call, first_marker)
                     for call, first_marker in zip(resp.tool_calls, first_markers)
                 ],
                 return_exceptions=True,
@@ -411,12 +438,6 @@ class ConversationWorkflow:
                 retry_policy=RETRY,
             )
             state.pending_tool_ids = []
-
-            if hand_off is not None:
-                agent, ctx = await self._hand_off(m, state, hand_off)
-                key_prefix = HAND_OFF_PREFIX
-                step = 0
-                continue
             step += 1
 
         await workflow.execute_activity_method(
@@ -448,29 +469,38 @@ class ConversationWorkflow:
 
     async def _hand_off(
         self, m: InboundMessage, state: "_TurnState", call: ToolCall
-    ) -> tuple[AgentVersion, TurnContext]:
+    ) -> tuple[AgentVersion, TurnContext, str]:
         """Give the thread to the specialist the front door chose.
 
-        The specialist is loaded before anything is announced or switched, so
-        a specialist that cannot be loaded leaves the thread with the front
-        door. Once the announcement is posted the thread belongs to the
-        specialist: a failure from here on is recovered as the specialist.
+        The front door's placeholder becomes the announcement and the
+        specialist gets a placeholder of its own below it, so the thread reads
+        message, announcement, answer. Nothing is switched until the specialist
+        is loaded, the announcement is shown and its placeholder is posted, so
+        a failure before then leaves the thread with the front door.
         """
         ref = self._ref()
+        assert state.ctx is not None and state.placeholder_ts is not None
         target = call.input["agent"]
         specialist = await self._load_agent(ref.tenant_id, target)
         new_ref = ConversationRef(ref.tenant_id, target, ref.channel, ref.thread_ts)
         ctx = self._turn_context(new_ref, specialist, m)
-        announcement = escape_slack(f"{specialist.name} here, picking this up.")
         await workflow.execute_activity_method(
-            AgentActivities.post_in_thread,
-            args=[ctx, announcement, f"{m.event_id}:handoff"],
+            AgentActivities.finalize_reply,
+            args=[state.ctx, state.placeholder_ts, f"{specialist.name} here, picking this up.", []],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        placeholder_ts: str = await workflow.execute_activity_method(
+            AgentActivities.post_placeholder,
+            args=[ctx, f"{m.event_id}:{HAND_OFF_PREFIX}ph"],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
         self.ref = new_ref
         state.ctx = ctx
-        return specialist, ctx
+        state.placeholder_ts = placeholder_ts
+        state.handed_off = True
+        return specialist, ctx, placeholder_ts
 
     async def _append(
         self, ctx: TurnContext, conv_id: str, step_key: str, role: str, content: list
@@ -489,13 +519,9 @@ class ConversationWorkflow:
         conv_id: str,
         call: ToolCall,
         first_marker: int,
-        hand_off: ToolCall | None,
     ) -> ToolResult:
         if call.name == HAND_OFF_TOOL:
-            # Decided from the response alone: no activity, no state change.
-            # The turn loop switches agents once the results are stored.
-            if call is hand_off:
-                return ToolResult(call.id, HAND_OFF_ACCEPTED.format(agent=call.input["agent"]))
+            # An accepted hand-off never reaches here; this one is refused.
             if _hand_off_target(agent, call) is None:
                 return ToolResult(
                     call.id, HAND_OFF_REFUSED.format(agent=_target_text(call)), is_error=True

@@ -361,6 +361,12 @@ uv run python -m agentos.agent_store import
 Members and roles need `007`, applied the same way (see
 [Members and roles](#members-and-roles)).
 
+The web console's sign-in sessions need `008` (see [Web console](#web-console)):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
+```
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -557,12 +563,13 @@ The API refuses browser cross-site requests (a foreign `Origin` or
 `Sec-Fetch-Site`), any `Host` header but its own loopback address and port, and
 any write that is not `application/json`.
 
-**Never point a tunnel at this port**, and do not add it to
-`docker-compose.yml` (a container binds `0.0.0.0`). The process exits unless the
-host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It also exits
-without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts as that
-user, and nothing in a request (header, query or body) can change it. Sign-in
-with Slack will replace this. What the user may do comes from their role in the
+**Without sign-in configured, never point a tunnel at this port**, and do not add
+it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
+unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
+also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
+as that user, and nothing in a request (header, query or body) can change it. With
+[sign-in configured](#web-console) the process may bind more widely and every
+request acts as the signed-in user instead. What the user may do comes from their role in the
 tenant named in the path (`/tenants/<tenant id>/...`), decided by
 `ControlPlane`: 403 when the role does not allow it, 404 for an unknown tenant,
 agent, version or member, 409 for a wrong state (publishing a draft or a stale
@@ -590,6 +597,63 @@ the worker restarts. The audit log is paged by `seq`: pass the previous page's
 `next_before` as `before`; `limit` is capped at 200. A write may carry an
 `Idempotency-Key` header: a retry with the same key, path and body records one
 audit event (the change itself is refused the second time, with 409).
+
+## Web console
+
+The same process serves web pages for agents, versions, members and the audit log,
+behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
+JSON API, so a user's role in the tenant decides what they can do in both. The
+console is off unless sign-in is configured.
+
+**In the Slack app** (api.slack.com/apps, the app the gateway uses):
+
+1. OAuth & Permissions → Redirect URLs → add `<AGENTOS_CONSOLE_URL>/auth/slack/callback`
+   and save.
+2. Sign in with Slack uses the OpenID scopes `openid` and `profile`. The console
+   asks for them at sign-in; there is nothing to add under bot scopes.
+3. Basic Information → App Credentials: the Client ID and Client Secret.
+
+**In the shell that runs the process** (nothing is stored in a file):
+
+```bash
+export SLACK_CLIENT_ID=...                  # the Slack app's client ID
+export SLACK_CLIENT_SECRET=...              # its client secret
+export AGENTOS_CONSOLE_URL=https://console.example.com   # the public base URL
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
+uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
+```
+
+Sign-in counts as configured only when all three variables are set and the URL is
+`https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or
+`http://localhost:<port>`, where cookies are not `Secure` (a browser would not send
+them over plain http). A partial configuration, or any other URL, stops the process
+at start. A new install gets the `sessions` table from `scripts/init_db.sql`.
+
+To run it locally, set `AGENTOS_CONSOLE_URL=http://127.0.0.1:8100`, add the same
+address plus `/auth/slack/callback` as the Slack app's redirect URL (Slack may insist
+on https there; then use a tunnel), start the process with the default host, and open
+that URL.
+
+A **public URL (a tunnel, a reverse proxy) is allowed only once sign-in is
+configured.** Then the process may listen beyond loopback, the fixed operator
+(`AGENTOS_CONTROL_ACTOR`) is not used and nothing acts without a session, and the
+`Host` allowlist is the host of `AGENTOS_CONSOLE_URL` plus loopback. Point a tunnel
+at this port only in that mode.
+
+How it behaves:
+
+- The Slack user's workspace must be a tenant's `slack_team_id`, and the user must
+  have a role there (an admin in the tenant file, or a `members` row). A user with
+  no role sees a "no access" page and gets no session.
+- A session is a row in Postgres under the tenant's row-level security. The browser
+  holds a random 256-bit ID in an `HttpOnly`, `SameSite=Lax` cookie (`Secure` on
+  https) that expires after 8 hours; only the ID's SHA-256 is stored. **Sign out**
+  deletes the row.
+- Every form carries a per-session CSRF token and must come from the console's own
+  origin. Pages are served with a `Content-Security-Policy` that allows no script and
+  no outside asset.
+- The JSON API accepts the same session cookie. A session is valid only for its own
+  tenant's paths.
 
 ## Restart demo: exactly once, and follow-up that survives a crash
 

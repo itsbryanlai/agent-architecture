@@ -52,8 +52,7 @@ with workflow.unsafe.imports_passed_through():
     from agentos.audience import (
         UNAVAILABLE,
         AudienceDecision,
-        refusal_text,
-        unavailable_text,
+        decision_text,
     )
     from agentos.config import AgentVersion
     from agentos.knowledge.search import SEARCH_RESULTS
@@ -496,11 +495,7 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
-        text = (
-            unavailable_text(agent.name)
-            if decision.reason == UNAVAILABLE
-            else refusal_text(agent.name, decision.owner)
-        )
+        text = decision_text(agent.name, decision)
         await workflow.execute_activity_method(
             AgentActivities.post_in_thread,
             args=[ctx, text, ids.audience_refusal_key(m.event_id, ctx.agent_id)],

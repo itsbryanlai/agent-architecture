@@ -6,6 +6,7 @@ status and show its message, so the mapping lives here once.
 
 from agentos.agent_store import AgentNotFound, AgentStoreError
 from agentos.audience import AudienceCheckUnavailable, AudienceError
+from agentos.audience_pauses import NotPaused
 from agentos.budgets import BudgetError, BudgetNotFound, InvalidBudget
 from agentos.config import ConfigError
 from agentos.control import Forbidden
@@ -27,6 +28,7 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     GrantCheckUnavailable: 502,
     AudienceError: 409,
     AudienceCheckUnavailable: 502,
+    NotPaused: 409,
 }
 
 REFUSALS = tuple(STATUS_BY_ERROR)

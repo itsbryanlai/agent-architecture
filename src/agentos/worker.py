@@ -21,6 +21,8 @@ from agentos.agent_store import (
     published_tenants,
     startup_agent_failure,
 )
+from agentos.audience_pauses import PostgresPauseStore
+from agentos.audience_watch import AudienceWatchActivities
 from agentos.audit import PostgresAuditStore
 from agentos.budgets import BudgetGuard, PostgresBudgetStore
 from agentos.config import (
@@ -39,6 +41,7 @@ from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
+from agentos.members import PostgresMemberStore
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
     PostgresHistoryStore,
@@ -49,6 +52,7 @@ from agentos.stores import (
 from agentos.temporal_client import build_temporal_client
 from agentos.tenants import build_registry
 from agentos.usage import PostgresUsageStore, UsageRecorder, load_prices
+from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
@@ -207,23 +211,35 @@ async def main() -> None:
         knowledge = PostgresKnowledgeStore(pool)
         usage = UsageRecorder(PostgresUsageStore(pool), prices)
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
+        pauses = PostgresPauseStore(pool)
+        audit_store = PostgresAuditStore(pool)
+        idempotency = PostgresIdempotencyStore(pool)
         activities = AgentActivities(
             settings=settings,
             registry=registry,
             history=PostgresHistoryStore(pool),
-            idem=PostgresIdempotencyStore(pool),
+            idem=idempotency,
             links=PostgresTaskLinkStore(pool),
             llm=llm,
             tool_outputs=PostgresToolOutputStore(pool),
-            audit=PostgresAuditStore(pool),
+            audit=audit_store,
             agents=agent_store,
             knowledge=knowledge,
             embedder=embedder,
             usage=usage,
             budgets=BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool)),
+            pauses=pauses,
         )
-        workflows: list = [ConversationWorkflow, TaskWorkflow]
-        all_activities = activities.all()
+        watch = AudienceWatchActivities(
+            registry,
+            agent_store,
+            PostgresMemberStore(pool),
+            pauses,
+            audit_store,
+            idempotency,
+        )
+        workflows: list = [ConversationWorkflow, TaskWorkflow, AudienceWatchWorkflow]
+        all_activities = activities.all() + watch.all()
         if embedder is not None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]

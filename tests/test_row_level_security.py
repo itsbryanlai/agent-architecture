@@ -16,8 +16,18 @@ from urllib.parse import urlparse
 
 import pytest
 
-from agentos import agent_store, audit, budgets, members, sessions, stores, usage
+from agentos import (
+    agent_store,
+    audience_pauses,
+    audit,
+    budgets,
+    members,
+    sessions,
+    stores,
+    usage,
+)
 from agentos.agent_store import PostgresAgentStore
+from agentos.audience_pauses import PostgresPauseStore
 from agentos.audit import PostgresAuditStore
 from agentos.budgets import PostgresBudgetStore
 from agentos.config import (
@@ -51,6 +61,7 @@ SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read
 AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "010_audience.sql").read_text()
 USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text()
 BUDGETS_MIGRATION = (ROOT / "scripts" / "migrations" / "012_budgets.sql").read_text()
+WATCH_MIGRATION = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -64,6 +75,7 @@ POSTGRES_STORES = [
     PostgresSessionStore,
     PostgresUsageStore,
     PostgresBudgetStore,
+    PostgresPauseStore,
 ]
 
 
@@ -168,6 +180,7 @@ AGENT_ROW = (
 AGENT_RECORD_ROW = ("acme", "it-helper", "U1", None)
 MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
 BUDGET_ROW = ("acme", None, Decimal("5.00"), "U1", datetime(2026, 1, 1))
+PAUSE_ROW = ("acme", "it-helper", "C0AAAA111", "guest_joined", datetime(2026, 1, 1), None, None)
 SESSION_ROW = ("acme", "U1", "csrf-secret", datetime(2026, 1, 1), datetime(2026, 1, 2))
 
 
@@ -177,6 +190,8 @@ def row_for(cls, method_name):
         return MEMBER_ROW
     if cls is PostgresSessionStore:
         return SESSION_ROW
+    if cls is PostgresPauseStore:
+        return PAUSE_ROW
     if cls is PostgresUsageStore:
         return None
     if cls is PostgresBudgetStore:
@@ -197,7 +212,17 @@ def public_methods(cls):
 def test_store_classes_are_all_covered():
     # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store, audit, agent_store, members, sessions, usage, budgets):
+    for module in (
+        stores,
+        knowledge_store,
+        audit,
+        agent_store,
+        members,
+        sessions,
+        usage,
+        budgets,
+        audience_pauses,
+    ):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -282,6 +307,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(SESSIONS_MIGRATION)
         | rls_tables_forced(USAGE_MIGRATION)
         | rls_tables_forced(BUDGETS_MIGRATION)
+        | rls_tables_forced(WATCH_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
@@ -368,7 +394,7 @@ async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash()
     assert "expires_at > %s" in selected[1]
 
 
-@pytest.mark.parametrize("sql", [BUDGETS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+@pytest.mark.parametrize("sql", [WATCH_MIGRATION, INIT_DB], ids=["migration", "init_db"])
 def test_every_audit_kind_the_code_can_write_is_allowed_by_the_sql(sql):
     from agentos.models import AUDIT_KINDS
 
@@ -396,7 +422,7 @@ def test_init_db_has_the_same_audit_kinds_as_the_migration():
         block = sql[sql.index(after) :]
         return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
-    assert kinds_in(BUDGETS_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
+    assert kinds_in(WATCH_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
 
 
 async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert():

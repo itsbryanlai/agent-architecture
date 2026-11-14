@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 
 from agentos.agent_store import InMemoryAgentStore
+from agentos.audience_pauses import InMemoryPauseStore
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import InMemoryBudgetStore
 from agentos.config import TenantsConfig, parse_agents_config
@@ -97,6 +98,7 @@ class ConsoleHarness:
         self.audit = InMemoryAuditStore()
         self.usage = InMemoryUsageStore()
         self.budgets = InMemoryBudgetStore()
+        self.pauses = InMemoryPauseStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -117,6 +119,7 @@ class ConsoleHarness:
             usage=self.usage,
             budgets=self.budgets,
             clock=self.clock,
+            pauses=self.pauses,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

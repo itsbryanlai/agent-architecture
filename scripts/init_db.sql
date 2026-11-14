@@ -118,8 +118,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
       'agent_create', 'agent_draft', 'agent_edit', 'agent_import', 'agent_submit',
       'agent_withdraw', 'agent_reject', 'agent_publish',
       'member_add', 'member_remove', 'member_role',
-      'audience_refused', 'audience_confirm',
-      'budget_set')),
+      'audience_refused', 'audience_confirm', 'budget_set',
+      'audience_pause', 'audience_resume')),
   agent_id           text,                   -- null only for a membership event or a tenant-wide budget
   agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked
@@ -415,5 +415,42 @@ ALTER TABLE budgets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE budgets FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON budgets;
 CREATE POLICY tenant_isolation ON budgets
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Audience changes are watched: one row per pause of an agent in a channel. Same as migration 013.
+CREATE TABLE IF NOT EXISTS audience_pauses (
+  tenant_id   text        NOT NULL,
+  agent_id    text        NOT NULL,
+  channel     text        NOT NULL,
+  reason      text        NOT NULL CHECK (reason IN (
+    'guest_joined', 'external_joined', 'channel_shared', 'made_public', 'unverified')),
+  paused_at   timestamptz NOT NULL DEFAULT now(),
+  resumed_by  text,
+  resumed_at  timestamptz,
+  PRIMARY KEY (tenant_id, agent_id, channel, paused_at),
+  CONSTRAINT audience_pauses_resume_together CHECK (
+    (resumed_by IS NULL) = (resumed_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS audience_pauses_one_active
+  ON audience_pauses (tenant_id, agent_id, channel) WHERE resumed_at IS NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON audience_pauses FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON audience_pauses TO agentos_app;
+
+ALTER TABLE audience_pauses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audience_pauses FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON audience_pauses;
+CREATE POLICY tenant_isolation ON audience_pauses
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros.html" import post_button, budget_alerts %}
+{% from "macros.html" import post_button, budget_alerts, paused_channels %}
 {% block title %}{{ agent_id }}{% endblock %}
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a></p>
@@ -8,6 +8,7 @@
 {% if budget and budget.amount is not none %}
 <p class="muted">Monthly budget: {{ budget.spend | usd }} of {{ budget.amount | usd2 }} ({{ budget.percent }}%).</p>
 {% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
 <table>
   <tr><th>Version</th><th>Status</th><th>Created by</th><th>Submitted by</th><th>Approved by</th><th>Published</th></tr>
   {% for v in versions %}
@@ -21,6 +22,7 @@
   </tr>
   {% endfor %}
 </table>
+{{ paused_channels(paused, agent_url ~ "/channels", ctx.csrf) }}
 {% if can_edit %}
 <div class="actions">
   {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version") }}

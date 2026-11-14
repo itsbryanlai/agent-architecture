@@ -753,7 +753,9 @@ def test_migration_012_keeps_every_010_kind_and_adds_budget_set():
 
 
 def test_init_db_and_migration_012_allow_the_same_kinds_as_the_code():
-    assert kinds_in(MIGRATION_012) == kinds_in(INIT_DB) == set(AUDIT_KINDS)
+    # Later migrations add kinds of their own, so init_db is checked against the code, and
+    # migration 012's kinds must all remain allowed.
+    assert kinds_in(MIGRATION_012) <= kinds_in(INIT_DB) == set(AUDIT_KINDS)
 
 
 def test_a_budget_event_may_leave_out_the_agent_in_both_sql_files():

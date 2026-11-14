@@ -35,6 +35,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos.agent_store import PENDING, AgentNotFound
 from agentos.audience import AudienceError
+from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
 from agentos.control import ControlPlane
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -86,6 +87,7 @@ NOTICES = {
     "withdrawn": "Withdrawn; the version is a draft again.",
     "rejected": "Rejected; the version is a draft again.",
     "published": "Published.",
+    "resumed": "Resumed; the agent answers in that channel again.",
     "member-added": "Member added.",
     "member-role": "Role changed.",
     "member-removed": "Member removed.",
@@ -114,6 +116,7 @@ def _usd2(value: Decimal) -> str:
 
 
 _env.filters["stamp"] = _stamp
+_env.globals["pause_reason"] = lambda code: REASON_TEXT.get(code, code)
 _env.filters["usd"] = _usd
 _env.filters["usd2"] = _usd2
 
@@ -216,6 +219,7 @@ class WebUI:
         self.route("GET", base + "/agents", self.agents)
         self.route("POST", base + "/agents", self.add_agent)
         self.route("GET", agent, self.agent)
+        self.route("POST", agent + "/channels/{channel}/resume", self.resume_channel)
         self.route("POST", agent + "/drafts", self.new_draft)
         self.route("GET", version, self.version)
         self.route("POST", version + "/edit", self.edit_draft)
@@ -473,21 +477,58 @@ class WebUI:
         return url if done is None else f"{url}?done={done}"
 
     async def agent(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
+        return await self.agent_page(request, ctx, agent_id, notice=self.notice(request))
+
+    async def agent_page(
+        self,
+        request: Request,
+        ctx: Ctx,
+        agent_id: str,
+        status: int = 200,
+        error: str | None = None,
+        notice: str | None = None,
+    ) -> Response:
         versions = await ctx.plane.versions(ctx.tenant_id, ctx.user_id, agent_id)
         if not versions:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         owner = await self.owner_of(ctx, agent_id)
         budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
+        can_edit = self.can_edit(ctx, owner)
         return _page(
             "agent.html",
+            status,
             ctx=ctx,
             agent_id=agent_id,
             budget=budgets.line_of(agent_id),
             versions=versions,
-            can_edit=self.can_edit(ctx, owner),
-            notice=self.notice(request),
+            can_edit=can_edit,
+            paused=await self.paused_of(ctx, agent_id) if can_edit else [],
+            error=error,
+            notice=notice,
             base=self.base(ctx),
+            agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
         )
+
+    @staticmethod
+    async def paused_of(ctx: Ctx, agent_id: str):
+        return await ctx.plane.paused_channels(ctx.tenant_id, ctx.user_id, agent_id)
+
+    async def resume_channel(self, request: Request, ctx: Ctx, agent_id: str, channel: str):
+        try:
+            await ctx.plane.resume_channel(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                channel,
+                confirm_audience=_audience_confirmation(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.agent_page(request, ctx, agent_id, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}?done=resumed")
 
     async def owner_of(self, ctx: Ctx, agent_id: str) -> str | None:
         agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.user_id)
@@ -538,6 +579,7 @@ class WebUI:
             ctx=ctx,
             record=record,
             audience=audience,
+            paused=await self.paused_of(ctx, agent_id) if editor or ctx.is_admin else [],
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
             is_draft=record.status == "draft",

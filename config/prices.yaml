@@ -19,4 +19,21 @@
 #     output: 15.00
 #     cache_read: 0.30
 #     cache_write: 3.75
-prices: []
+prices:
+  # Qwen Cloud, region ap-southeast-1, list prices copied 2026-11-15 from
+  # qwencloud.com/models/qwen3.7-plus (input up to 256k tokens; a 20% discount was
+  # also shown, not used here). cache_read is the implicit-cache input price, the
+  # cache that applies automatically; cache_write is explicit cache creation.
+  - model: qwen3.7-plus
+    effective_from: 2026-11-15
+    input: 0.40
+    output: 1.60
+    cache_read: 0.08
+    cache_write: 0.50
+  # Local embeddings through the Ollama app cost nothing.
+  - model: bge-m3
+    effective_from: 2026-11-01
+    input: 0
+    output: 0
+    cache_read: 0
+    cache_write: 0

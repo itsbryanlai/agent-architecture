@@ -113,9 +113,12 @@ CREATE TABLE IF NOT EXISTS audit_events (
   event_key          text        NOT NULL,   -- names the event; repeats are ignored
   at                 timestamptz NOT NULL DEFAULT now(),
   kind               text        NOT NULL
-    CHECK (kind IN ('answer', 'tool_call', 'hand_off', 'approval', 'write')),
-  agent_id           text        NOT NULL,
-  agent_version      integer     NOT NULL,
+    CHECK (kind IN (
+      'answer', 'tool_call', 'hand_off', 'approval', 'write',
+      'agent_create', 'agent_draft', 'agent_submit', 'agent_withdraw', 'agent_reject',
+      'agent_publish', 'member_add', 'member_remove', 'member_role')),
+  agent_id           text,                   -- null only for a membership event
+  agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked
   identity           text        NOT NULL,   -- whose access was used, e.g. agent:it-helper
   conversation_id    text,
@@ -127,7 +130,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
   approver_user_id   text,
   outcome            text        NOT NULL CHECK (outcome IN ('ok', 'error')),
   PRIMARY KEY (tenant_id, event_key),
-  UNIQUE (seq)
+  UNIQUE (seq),
+  CONSTRAINT audit_events_agent_required CHECK (
+    kind IN ('member_add', 'member_remove', 'member_role')
+    OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS audit_events_by_time ON audit_events (tenant_id, at DESC, seq DESC);
@@ -275,5 +281,34 @@ ALTER TABLE agent_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_versions FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON agent_versions;
 CREATE POLICY tenant_isolation ON agent_versions
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Members and roles: the admins and creators added through the app. Same as migration 007.
+CREATE TABLE IF NOT EXISTS members (
+  tenant_id  text        NOT NULL,
+  user_id    text        NOT NULL,   -- Slack user ID
+  role       text        NOT NULL CHECK (role IN ('admin', 'creator')),
+  added_by   text        NOT NULL,
+  added_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON members FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON members TO agentos_app;
+
+ALTER TABLE members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE members FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON members;
+CREATE POLICY tenant_isolation ON members
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

@@ -141,7 +141,11 @@ async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(m
             return False
 
     monkeypatch.setattr(index_knowledge, "load_settings", lambda: Settings())
-    monkeypatch.setattr(index_knowledge, "load_tenants_config", lambda _path: TenantsConfig.of(cfg))
+
+    async def load_tenants(_database_url):
+        return TenantsConfig.of(cfg)
+
+    monkeypatch.setattr(index_knowledge, "load_stored_tenants", load_tenants)
     monkeypatch.setattr(index_knowledge, "build_temporal_client", build_client)
     monkeypatch.setattr(index_knowledge, "open_store", lambda _settings: OpenStore(store))
     monkeypatch.setattr(

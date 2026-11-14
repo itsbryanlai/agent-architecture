@@ -52,6 +52,7 @@ from agentos.config import (
     ConfigError,
     TenantsConfig,
     agent_definition,
+    channel_audience_problems,
     check_front_doors,
     parse_agent,
 )
@@ -824,11 +825,13 @@ async def published_tenants(store: AgentStore, tenants: TenantsConfig) -> Tenant
 
 
 async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> str | None:
-    """A message when a tenant's default agent or a channel's agent has no published version.
+    """A message when the tenant file routes to an agent that cannot answer there.
 
     ``default_agent`` and ``channels`` stay in the YAML file and name agents,
     so a process that would route a message to an unpublished agent must not
-    start. The message names the tenant and the agent.
+    start. Neither may it start when a channel is mapped to an agent whose published
+    audience leaves that channel out, because every mention there would be refused.
+    The message names the tenant and the agent.
     """
     problems = []
     for tenant_id, config in tenants.tenants.items():
@@ -842,6 +845,10 @@ async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> st
                     "published version. Run `uv run python -m agentos.agent_store import` "
                     "or publish it."
                 )
+        problems += [
+            f"tenant '{tenant_id}': {problem}"
+            for problem in channel_audience_problems(config.channels, published)
+        ]
     return "\n".join(problems) or None
 
 

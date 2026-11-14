@@ -374,6 +374,14 @@ the control plane saves an edit or the import runs, or the audit insert is refus
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/009_audit_kinds.sql
 ```
 
+Agent audiences add two audit event kinds, `audience_refused` and `audience_confirm`, and
+need `010` (run it before the worker starts a turn or an admin publishes, or the audit
+insert is refused):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/010_audience.sql
+```
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -610,6 +618,47 @@ the worker restarts. The audit log is paged by `seq`: pass the previous page's
 `Idempotency-Key` header: a retry with the same key, path and body records one
 audit event (the change itself is refused the second time, with 409).
 
+## Agent audiences
+
+An agent version can say who may use it and where:
+
+```yaml
+audience:
+  channels: [C0123ABCD]          # channels the agent may answer in
+  dm: everyone                   # or: {user_groups: [S0123ABCD]}
+  guests: false                  # true lets single and multi-channel guests in
+```
+
+Edit it in the console with the rest of the definition; a change is a new version that an
+admin publishes. A definition without `audience` keeps working: every full member by direct
+message, the channels the tenant file maps to the agent, no guests. People from other Slack
+workspaces (Slack Connect) and deactivated users are never let in.
+
+A channel that the tenant file's `channels:` maps to an agent must be in that agent's
+audience. Publishing, and starting the worker, refuse it otherwise.
+
+**What a refused user sees.** One reply in the thread: "<agent name> isn't available to you
+here. Ask <creator> for access." Nothing is read or run for them, and an `audience_refused`
+event is audited. If Slack can't be asked, the user sees "I couldn't check whether <agent
+name> is available to you just now. Try again in a few minutes." and the turn is refused.
+
+**Publishing.** The version page shows the audience and, live from Slack, how many people
+can reach the agent (total, guests, from other workspaces). Publishing needs the box "I
+confirm these people may see what this agent can access"; the API's publish takes
+`{"confirm_audience": {"total": 12, "guests": 1, "external": 0}}` and answers 409 when it is
+missing or the numbers have changed.
+
+**In the Slack app** (api.slack.com/apps), before the first run with audiences:
+
+1. OAuth & Permissions → Scopes → **Bot Token Scopes**: add `channels:read`, `groups:read`
+   and `usergroups:read`. `users:read` is already there.
+2. **Reinstall the app** to the workspace (adding a scope does not take effect until you do),
+   then export the new bot token to the worker and to the console process.
+
+The console process now also reads each tenant's Slack bot token (the variable
+`secrets.slack_bot_token_env` names, `SLACK_BOT_TOKEN` by default) to count the people; a
+tenant without it can't publish until it is set.
+
 ## Web console
 
 The same process serves web pages for agents, versions, members and the audit log,
@@ -623,7 +672,8 @@ console is off unless sign-in is configured.
    and save.
 2. Sign in with Slack uses the OpenID scopes `openid` and `profile`. Add them under
    OAuth & Permissions → Scopes → **User Token Scopes** (not Bot Token Scopes). The
-   bot scopes are unchanged.
+   bot scopes for sign-in are unchanged; agent audiences need three more, see
+   [Agent audiences](#agent-audiences).
 3. Basic Information → App Credentials: the Client ID and Client Secret.
 
 **In the shell that runs the process** (nothing is stored in a file):

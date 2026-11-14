@@ -243,6 +243,29 @@ class ApprovalPolicy:
     reminder_after_hours: int = 24
 
 
+# Slack IDs: C for a public channel, G for a private one, S for a user group.
+_CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
+_USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
+
+
+@dataclass
+class Audience:
+    """Who may use an agent and where, as the creator wrote it.
+
+    An agent answers in the listed channels, and in a direct message to everyone
+    (``dm_everyone``) or to members of the listed user groups. A guest (single or
+    multi-channel) is never let in unless ``guests`` is set, and a person from
+    another Slack workspace (Slack Connect) never is. A direct message is
+    allowed to nobody when neither ``dm_everyone`` nor a user group is set.
+    Only IDs, taken from the Slack event, are ever compared with these.
+    """
+
+    channels: list[str] = field(default_factory=list)
+    dm_everyone: bool = False
+    dm_user_groups: list[str] = field(default_factory=list)
+    guests: bool = False
+
+
 @dataclass
 class AgentVersion:
     agent_id: str
@@ -258,6 +281,10 @@ class AgentVersion:
     # Agents this one may hand a thread to. An agent with specialists is a
     # front door.
     specialists: list[str] = field(default_factory=list)
+    # None means the definition sets no audience: the legacy default applies (see
+    # ``agentos.audience.effective_audience``). Published versions never change,
+    # so an agent published before audiences existed keeps this.
+    audience: Audience | None = None
 
 
 @dataclass
@@ -397,6 +424,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
         description=str(raw.get("description") or "").strip(),
         specialists=_parse_specialists(where, raw.get("specialists")),
+        audience=_parse_audience(where, raw.get("audience")),
     )
 
 
@@ -427,7 +455,7 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         if property_ids:
             entry["property_ids"] = property_ids
         databases.append(entry)
-    return {
+    definition: dict[str, Any] = {
         "name": agent.name,
         "description": agent.description,
         "system_prompt": agent.system_prompt,
@@ -442,6 +470,95 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         "approval": dataclasses.asdict(agent.approval),
         "specialists": list(agent.specialists),
     }
+    if agent.audience is not None:
+        definition["audience"] = _audience_definition(agent.audience)
+    return definition
+
+
+def _audience_definition(audience: Audience) -> dict[str, Any]:
+    block: dict[str, Any] = {"channels": list(audience.channels)}
+    if audience.dm_everyone:
+        block["dm"] = "everyone"
+    elif audience.dm_user_groups:
+        block["dm"] = {"user_groups": list(audience.dm_user_groups)}
+    block["guests"] = audience.guests
+    return block
+
+
+def _id_list(where: str, key: str, raw: Any, pattern: re.Pattern[str], what: str) -> list[str]:
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: '{key}' must be a list of {what}s")
+    for item in raw:
+        if not isinstance(item, str) or not pattern.fullmatch(item):
+            raise ConfigError(f"{where}: {item!r} is not a {what}")
+    if len(set(raw)) != len(raw):
+        raise ConfigError(f"{where}: '{key}' lists an ID more than once")
+    return list(raw)
+
+
+def _parse_audience(agent_where: str, raw: Any) -> Audience | None:
+    """The ``audience`` block, or None when the definition has none."""
+    if raw is None:
+        return None
+    where = f"{agent_where} audience"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: expected a mapping with 'channels', 'dm' and 'guests'")
+    unknown = set(raw) - {"channels", "dm", "guests"}
+    if unknown:
+        raise ConfigError(f"{where}: unknown field '{min(unknown)}'")
+    channels = _id_list(
+        f"{where}", "channels", raw.get("channels", []), _CHANNEL_ID, "Slack channel ID"
+    )
+    dm = raw.get("dm")
+    dm_everyone = False
+    groups: list[str] = []
+    if dm == "everyone":
+        dm_everyone = True
+    elif isinstance(dm, dict):
+        extra = set(dm) - {"user_groups"}
+        if extra:
+            raise ConfigError(f"{where}: unknown field 'dm.{min(extra)}'")
+        groups = _id_list(
+            f"{where} dm",
+            "user_groups",
+            dm.get("user_groups"),
+            _USER_GROUP_ID,
+            "Slack user group ID",
+        )
+        if not groups:
+            raise ConfigError(f"{where}: dm 'user_groups' must list at least one user group")
+    elif dm is not None:
+        raise ConfigError(f"{where}: 'dm' must be 'everyone' or a mapping with 'user_groups'")
+    guests = raw.get("guests", False)
+    if not isinstance(guests, bool):
+        raise ConfigError(f"{where}: 'guests' must be true or false")
+    if not channels and not dm_everyone and not groups:
+        raise ConfigError(f"{where}: reaches nobody; list 'channels' or set 'dm'")
+    return Audience(channels, dm_everyone, groups, guests)
+
+
+def channel_audience_problems(
+    channels: dict[str, str], agents: dict[str, AgentVersion]
+) -> list[str]:
+    """Channels mapped to an agent whose audience leaves them out.
+
+    The tenant file routes a channel to an agent. If that agent's audience does not
+    list the channel, every mention there would be refused, so the set is refused
+    instead. An agent without an audience has the legacy default and is never listed.
+    """
+    problems = []
+    for channel, agent_id in channels.items():
+        agent = agents.get(agent_id)
+        if (
+            agent is not None
+            and agent.audience is not None
+            and channel not in agent.audience.channels
+        ):
+            problems.append(
+                f"channel '{channel}' is mapped to agent '{agent_id}', whose audience does "
+                "not include that channel"
+            )
+    return problems
 
 
 def _parse_specialists(where: str, raw: Any) -> list[str]:
@@ -521,6 +638,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
         )
     check_front_doors(agents)
     channels = _parse_channels(raw.get("channels"), agents)
+    if problems := channel_audience_problems(channels, agents):
+        raise ConfigError(f"agents config: {problems[0]}")
     workspace = raw.get("notion_workspace_id")
     return AgentsConfig(
         tenant_id=tenant_id,

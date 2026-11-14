@@ -41,6 +41,7 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.agent_store import AgentStore
+from agentos.audience import UNAVAILABLE, AudienceChecker, AudienceDecision
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
@@ -72,6 +73,7 @@ from agentos.models import (
     ToolResult,
     TurnContext,
 )
+from agentos.slack_client import SlackLookupError
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
@@ -132,9 +134,11 @@ class AgentActivities:
         agents: AgentStore,
         knowledge: KnowledgeStore | None = None,
         embedder: Embedder | None = None,
+        audience: AudienceChecker | None = None,
     ):
         self.settings = settings
         self.registry = registry
+        self.audience = audience or AudienceChecker(registry, agents)
         self.knowledge = knowledge
         self.embedder = embedder
         self.knowledge_tool = load_manifest(MANIFEST_DIR / "knowledge.yaml").tools[
@@ -166,6 +170,8 @@ class AgentActivities:
             self.get_notion_item,
             self.post_in_thread,
             self.record_hand_off,
+            self.check_audience,
+            self.record_audience_refusal,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -422,8 +428,17 @@ class AgentActivities:
             tools = tools + [self.knowledge_tool.llm_definition()]
             system = f"{agent.system_prompt}\n\n{KNOWLEDGE_RULES}"
         if agent.specialists:
-            specialists = [await self._agent(ctx.tenant_id, s) for s in agent.specialists]
-            tools = tools + [hand_off_tool(specialists)]
+            # Only specialists this asker may use here are offered; if none, the
+            # front door answers alone.
+            specialists = await self.audience.reachable(
+                ctx.tenant_id,
+                [await self._agent(ctx.tenant_id, s) for s in agent.specialists],
+                ctx.requester_user_id,
+                ctx.channel,
+                ctx.channel_kind,
+            )
+            if specialists:
+                tools = tools + [hand_off_tool(specialists)]
         try:
             return await self.llm.complete(system, messages, tools)
         except Exception as err:
@@ -743,6 +758,57 @@ class AgentActivities:
             ids.audit_hand_off_key(ctx.tenant_id, event_id),
             conversation_id=ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts),
             target=target_agent,
+        )
+
+    @activity.defn(name="check_audience")
+    async def check_audience(self, ctx: TurnContext) -> AudienceDecision:
+        """May the requester use this agent in this place? Read-only.
+
+        Asker, place and agent come from ``ctx``, which the runtime built from the Slack
+        event. A transient Slack failure is retried; any failure that survives the
+        retries reaches the workflow as an error, which refuses the turn. On a refusal the
+        decision carries the agent's creator, for the reply to name.
+        """
+        self._log("check_audience", ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        try:
+            decision = await self.audience.decide(
+                ctx.tenant_id, agent, ctx.requester_user_id, ctx.channel, ctx.channel_kind
+            )
+        except SlackLookupError as err:
+            log.warning(
+                "audience lookup failed tenant_id=%s agent_id=%s code=%s transient=%s",
+                ctx.tenant_id,
+                ctx.agent_id,
+                err.code,
+                err.transient,
+            )
+            if err.transient:
+                raise
+            raise ApplicationError(str(err), type="SlackLookupError", non_retryable=True) from err
+        if not decision.allowed:
+            record = await self.agents.get_agent(ctx.tenant_id, ctx.agent_id)
+            decision.owner = None if record is None else record.created_by
+        return decision
+
+    @activity.defn(name="record_audience_refusal")
+    async def record_audience_refusal(
+        self, ctx: TurnContext, event_id: str, reason: str, target: str | None = None
+    ) -> None:
+        """Audit a turn, or a hand-off to ``target``, refused by an audience.
+
+        ``ctx`` is the agent that was asked. The event holds IDs and the reason
+        code, never the message. A lookup failure is recorded as an error.
+        """
+        self._log("record_audience_refusal", ctx.tenant_id, ctx.agent_id, reason=reason)
+        await self._record(
+            ctx,
+            "audience_refused",
+            ids.audit_audience_refused_key(ctx.tenant_id, event_id, ctx.agent_id, target or ""),
+            outcome="error" if reason == UNAVAILABLE else "ok",
+            conversation_id=ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts),
+            tool=reason,
+            target=target,
         )
 
 

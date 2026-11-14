@@ -17,7 +17,16 @@
   {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw") }}{% endif %}
   {% if ctx.is_admin and is_pending %}
     {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject") }}
-    {{ post_button(version_url ~ "/publish", ctx.csrf, "Publish") }}
+    <form method="post" action="{{ version_url }}/publish">
+      <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+      {% if audience.summary %}
+      <input type="hidden" name="total" value="{{ audience.summary.total }}">
+      <input type="hidden" name="guests" value="{{ audience.summary.guests }}">
+      <input type="hidden" name="external" value="{{ audience.summary.external }}">
+      <label><input type="checkbox" name="confirm" value="yes"> I confirm these people may see what this agent can access</label>
+      {% endif %}
+      <button type="submit">Publish</button>
+    </form>
   {% endif %}
   {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
   {% if editor and not is_draft %}
@@ -41,6 +50,36 @@
 {% else %}
 <p class="muted">This version has no Notion grants.</p>
 {% endif %}
+{% endif %}
+
+<h2>Audience</h2>
+{% set eff = audience.effective %}
+{% if not eff.explicit %}<p class="muted">default (no audience set): every full member by direct message, the channels the tenant file maps to this agent, no guests.</p>{% endif %}
+<table>
+  <tr><th>Channels</th><td>
+    {% for c in eff.channels %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+    {% if not eff.channels and not eff.any_unmapped_channel %}none{% endif %}
+    {% if eff.any_unmapped_channel %}{% if eff.channels %}, and {% endif %}any channel the tenant file does not map (this is the default agent){% endif %}
+  </td></tr>
+  <tr><th>Direct messages</th><td>
+    {% if eff.dm_everyone %}Everyone (full members of the workspace)
+    {% elif eff.dm_user_groups %}Members of {% for g in eff.dm_user_groups %}<code>{{ g }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+    {% else %}Nobody{% endif %}
+  </td></tr>
+  <tr><th>Guests</th><td>{% if eff.guests %}allowed{% else %}not allowed{% endif %}. People from other Slack workspaces are never let in.</td></tr>
+</table>
+{% if audience.summary %}
+{% set sm = audience.summary %}
+<p><strong>{{ sm.total }} people</strong> can reach this agent: {{ sm.guests }} guest{{ "" if sm.guests == 1 else "s" }}, {{ sm.external }} from another workspace. Counted from Slack just now.</p>
+<table>
+  <tr><th>Where</th><th>People</th><th>Guests</th><th>From another workspace</th></tr>
+  {% for p in sm.places %}
+  <tr><td>{% if p.place == "dm" %}Direct messages{% else %}<code>{{ p.place }}</code>{% endif %}</td><td>{{ p.total }}</td><td>{{ p.guests }}</td><td>{{ p.external }}</td></tr>
+  {% endfor %}
+</table>
+<p class="muted">A person in several places counts once in the total. A guest in a channel is counted, though a guest is refused unless guests are allowed.</p>
+{% elif audience.problem %}
+<p class="error">Could not count the people who can reach this agent: {{ audience.problem }}.</p>
 {% endif %}
 
 <h2>Definition</h2>

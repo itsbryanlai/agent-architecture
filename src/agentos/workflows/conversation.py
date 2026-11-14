@@ -26,6 +26,11 @@ Rules this workflow keeps:
   the thread's agent is workflow state (``self.ref``) and carries over
   continue-as-new. A specialist cannot hand off, and other tool calls in the
   hand-off response are not run.
+* An asker outside the thread's agent's audience is told so and nothing else runs: a
+  turn starts by checking the asker and the place against the agent (behind a workflow
+  version marker), a refused turn stores no history and calls no model or tool, and a
+  check that cannot be completed refuses too. A hand-off is checked again before the
+  thread is switched, and a refused one leaves the thread with the front door.
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
   workflow goes on to wait for the next message.
@@ -44,6 +49,12 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from agentos import ids
     from agentos.activities import HAND_OFF_TOOL, READ_TOOLS, AgentActivities
+    from agentos.audience import (
+        UNAVAILABLE,
+        AudienceDecision,
+        refusal_text,
+        unavailable_text,
+    )
     from agentos.config import AgentVersion
     from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
@@ -73,12 +84,16 @@ HAND_OFF_ACCEPTED = "Handed to {agent}. They will answer now."
 HAND_OFF_REFUSED = "{agent} is not one of this agent's specialists."
 HAND_OFF_EXTRA = "Only one hand-off is allowed per turn."
 HAND_OFF_NOT_RUN = "Not run: the conversation was handed to a specialist."
+HAND_OFF_UNAVAILABLE = (
+    "{agent} is not available to this user here, so the thread was not handed over."
+)
 HAND_OFF_PREFIX = "h1:"
 # workflow.patched IDs: each guards a change to the commands a turn issues, so
 # a conversation that is replayed past an older turn still matches its history.
 PATCH_PARTIAL_TOOL_RESULTS = "close-only-failed-tool-calls"
 PATCH_STEP_LIMIT = "no-tools-on-last-step"
 PATCH_EARLY_FAILURE_NOTICE = "early-failure-notice"
+PATCH_AUDIENCE = "audience-check"
 
 
 class _TurnState:
@@ -283,6 +298,8 @@ class ConversationWorkflow:
         agent: AgentVersion = await self._load_agent(ref.tenant_id, ref.agent_id)
         ctx = self._turn_context(ref, agent, m)
         state.event_id = m.event_id
+        if workflow.patched(PATCH_AUDIENCE) and not await self._audience_allows(agent, ctx, m):
+            return
         await self._append(
             ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]
         )
@@ -330,6 +347,11 @@ class ConversationWorkflow:
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
             # One hand-off per turn, whatever the loaded agent lists.
             hand_off = None if state.handed_off else _accepted_hand_off(agent, resp.tool_calls)
+            unavailable: ToolResult | None = None
+            if hand_off is not None and workflow.patched(PATCH_AUDIENCE):
+                unavailable = await self._unreachable_hand_off(ctx, state, m, hand_off)
+                if unavailable is not None:
+                    hand_off = None
             # A hand-off starts nothing outside the workflow and the specialist
             # has its own step budget, so the last step may still hand off.
             if (
@@ -399,7 +421,7 @@ class ConversationWorkflow:
                     self.next_marker += SEARCH_RESULTS
             outcomes = await asyncio.gather(
                 *[
-                    self._dispatch(ctx, agent, conv_id, call, first_marker)
+                    self._dispatch(ctx, agent, conv_id, call, first_marker, unavailable)
                     for call, first_marker in zip(resp.tool_calls, first_markers)
                 ],
                 return_exceptions=True,
@@ -447,6 +469,79 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+
+    async def _audience_allows(
+        self, agent: AgentVersion, ctx: TurnContext, m: InboundMessage
+    ) -> bool:
+        """Whether the asker may use the thread's agent here; otherwise say so and stop the turn.
+
+        The turn then stores nothing and runs no model call or tool. A check that cannot
+        be completed refuses too, with its own reply.
+        """
+        try:
+            decision: AudienceDecision = await workflow.execute_activity_method(
+                AgentActivities.check_audience,
+                args=[ctx],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        except ActivityError as err:
+            self._log_failure(self._ref(), err, "audience check")
+            decision = AudienceDecision(False, UNAVAILABLE)
+        if decision.allowed:
+            return True
+        await workflow.execute_activity_method(
+            AgentActivities.record_audience_refusal,
+            args=[ctx, m.event_id, decision.reason, None],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        text = (
+            unavailable_text(agent.name)
+            if decision.reason == UNAVAILABLE
+            else refusal_text(agent.name, decision.owner)
+        )
+        await workflow.execute_activity_method(
+            AgentActivities.post_in_thread,
+            args=[ctx, text, ids.audience_refusal_key(m.event_id, ctx.agent_id)],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        return False
+
+    async def _unreachable_hand_off(
+        self, ctx: TurnContext, state: "_TurnState", m: InboundMessage, call: ToolCall
+    ) -> ToolResult | None:
+        """The tool error for a hand-off to a specialist the asker may not use, or None.
+
+        The model is only offered specialists the asker can reach, but a hand-off is
+        checked again here before the thread is switched. A refused hand-off leaves the
+        thread with the front door; the model is told the specialist is unavailable.
+        """
+        target = call.input["agent"]
+        specialist = await self._load_agent(ctx.tenant_id, target)
+        specialist_ctx = self._turn_context(
+            ConversationRef(ctx.tenant_id, target, ctx.channel, ctx.thread_ts), specialist, m
+        )
+        try:
+            decision: AudienceDecision = await workflow.execute_activity_method(
+                AgentActivities.check_audience,
+                args=[specialist_ctx],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        except ActivityError as err:
+            self._log_failure(self._ref(), err, "audience check")
+            decision = AudienceDecision(False, UNAVAILABLE)
+        if decision.allowed:
+            return None
+        await workflow.execute_activity_method(
+            AgentActivities.record_audience_refusal,
+            args=[ctx, m.event_id, decision.reason, target],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        return ToolResult(call.id, HAND_OFF_UNAVAILABLE.format(agent=target), is_error=True)
 
     async def _load_agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
         return await workflow.execute_activity_method(
@@ -534,7 +629,10 @@ class ConversationWorkflow:
         conv_id: str,
         call: ToolCall,
         first_marker: int,
+        unavailable: ToolResult | None = None,
     ) -> ToolResult:
+        if unavailable is not None and call.id == unavailable.tool_use_id:
+            return unavailable
         if call.name == HAND_OFF_TOOL:
             # An accepted hand-off never reaches here; this one is refused.
             if _hand_off_target(agent, call) is None:

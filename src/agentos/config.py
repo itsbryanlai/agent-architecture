@@ -243,6 +243,11 @@ class AgentVersion:
     grants: Grants
     follow_up: FollowUpPolicy
     approval: ApprovalPolicy
+    # What the agent is for, read by a front door when it picks a specialist.
+    description: str = ""
+    # Agents this one may hand a thread to. An agent with specialists is a
+    # front door.
+    specialists: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -275,6 +280,8 @@ class AgentsConfig:
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
+    # Slack channel ID to the agent that answers mentions there.
+    channels: dict[str, str] = field(default_factory=dict)
 
 
 _PROPERTY_FIELDS = {
@@ -368,7 +375,46 @@ def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
         grants=Grants(notion_databases=databases, notion_pages=pages),
         follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
         approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
+        description=str(raw.get("description") or "").strip(),
+        specialists=_parse_specialists(where, raw.get("specialists")),
     )
+
+
+def _parse_specialists(where: str, raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise ConfigError(f"{where}: 'specialists' must be a list of agent IDs")
+    return list(raw)
+
+
+def _check_front_doors(agents: dict[str, AgentVersion]) -> None:
+    for agent_id, agent in agents.items():
+        for specialist_id in agent.specialists:
+            where = f"agent '{agent_id}' specialist '{specialist_id}'"
+            specialist = agents.get(specialist_id)
+            if specialist is None:
+                raise ConfigError(f"{where}: is not a defined agent")
+            if specialist_id == agent_id:
+                raise ConfigError(f"{where}: an agent cannot be its own specialist")
+            if not specialist.description:
+                raise ConfigError(f"{where}: needs a non-empty 'description'")
+            if specialist.specialists:
+                raise ConfigError(
+                    f"{where}: is itself a front door, and a specialist cannot hand off"
+                )
+
+
+def _parse_channels(raw: Any, agents: dict[str, AgentVersion]) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("agents config: 'channels' must map a Slack channel ID to an agent ID")
+    channels = {str(channel): str(agent_id) for channel, agent_id in raw.items()}
+    for channel, agent_id in channels.items():
+        if agent_id not in agents:
+            raise ConfigError(f"channel '{channel}': agent '{agent_id}' is not defined")
+    return channels
 
 
 def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
@@ -385,6 +431,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
             f"tenant_id {tenant_id!r} is invalid: use 1 to 63 lowercase letters, digits and "
             "hyphens, starting with a letter or digit"
         )
+    _check_front_doors(agents)
+    channels = _parse_channels(raw.get("channels"), agents)
     workspace = raw.get("notion_workspace_id")
     return AgentsConfig(
         tenant_id=tenant_id,
@@ -393,6 +441,7 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
         default_agent=default_agent,
         notion_workspace_id=str(workspace) if workspace not in (None, "") else None,
         secrets=_parse_secrets(tenant_id, raw.get("secrets")),
+        channels=channels,
     )
 
 

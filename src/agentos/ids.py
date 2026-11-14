@@ -78,17 +78,26 @@ def audience_refusal_key(event_id: str, agent_id: str) -> str:
     return f"{event_id}:audience:{agent_id}"
 
 
-# Usage row keys. Each names one activity, so an activity that retries records
-# its usage once. Every key starts with the tenant ID.
+# Usage row keys. Each names one attempt of one activity: a retry that calls the
+# provider again is billed again, so it gets its own row, while the same attempt
+# recorded twice stores one. Every key starts with the tenant ID.
 
 
-def usage_call_key(tenant: str, workflow_id: str, run_id: str, activity_id: str) -> str:
-    """The model call made by one activity of one workflow run."""
-    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}"
+def usage_call_key(
+    tenant: str, workflow_id: str, run_id: str, activity_id: str, attempt: int
+) -> str:
+    """The model call made by one attempt of one activity of one workflow run."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{attempt}"
 
 
 def usage_embedding_key(
-    tenant: str, workflow_id: str, run_id: str, activity_id: str, scope: str, page_id: str
+    tenant: str,
+    workflow_id: str,
+    run_id: str,
+    activity_id: str,
+    attempt: int,
+    scope: str,
+    page_id: str,
 ) -> str:
-    """The embedding of one page. One activity can sync several pages and scopes."""
-    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{scope}:{page_id}"
+    """The embedding of one page by one attempt. One activity can sync several pages and scopes."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{attempt}:{scope}:{page_id}"

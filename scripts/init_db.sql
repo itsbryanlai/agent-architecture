@@ -348,7 +348,7 @@ CREATE POLICY tenant_isolation ON sessions
 -- Usage and cost: one row per model call or embedded page, never the requester. Same as migration 011.
 CREATE TABLE IF NOT EXISTS usage_events (
   tenant_id          text        NOT NULL,
-  usage_key          text        NOT NULL,   -- names the activity that made the call
+  usage_key          text        NOT NULL,   -- names the activity attempt that made the call
   kind               text        NOT NULL CHECK (kind IN ('llm', 'embedding')),
   agent_id           text,
   agent_version      integer,

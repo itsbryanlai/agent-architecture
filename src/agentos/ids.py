@@ -56,3 +56,8 @@ def audit_approval_key(task: str, nonce: str) -> str:
 def audit_write_key(idem_key: str, outcome: str) -> str:
     """``idem_key`` is the write's idempotency key, ``{task_id}:create`` or ``:comment``."""
     return f"{idem_key}:audit:write:{outcome}"
+
+
+def audit_control_key(tenant: str, kind: str, nonce: str) -> str:
+    """One agent-lifecycle or membership change made through the control plane."""
+    return f"{tenant}:audit:control:{kind}:{nonce}"

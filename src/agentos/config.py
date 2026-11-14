@@ -283,6 +283,9 @@ class AgentsConfig:
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
     # Slack channel ID to the agent that answers mentions there.
     channels: dict[str, str] = field(default_factory=dict)
+    # Slack user IDs of the tenant's admins. They come from this file only, so
+    # nobody can remove or demote one through the app.
+    admins: tuple[str, ...] = ()
 
 
 _PROPERTY_FIELDS = {
@@ -476,6 +479,23 @@ def _parse_channels(raw: Any, agents: dict[str, AgentVersion]) -> dict[str, str]
     return channels
 
 
+def _parse_admins(tenant_id: str, raw: Any) -> tuple[str, ...]:
+    """The ``admins`` list of Slack user IDs. Absent means the tenant has none."""
+    if raw is None:
+        return ()
+    where = f"tenant '{tenant_id}' admins"
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: expected a list of Slack user IDs")
+    admins: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            raise ConfigError(f"{where}: each entry must be a non-empty Slack user ID string")
+        if item in admins:
+            raise ConfigError(f"{where}: '{item}' is listed more than once")
+        admins.append(item)
+    return tuple(admins)
+
+
 def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
     if not isinstance(raw, dict):
         raise ConfigError("agents config: expected a mapping at the top level")
@@ -501,6 +521,7 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
         notion_workspace_id=str(workspace) if workspace not in (None, "") else None,
         secrets=_parse_secrets(tenant_id, raw.get("secrets")),
         channels=channels,
+        admins=_parse_admins(tenant_id, raw.get("admins")),
     )
 
 

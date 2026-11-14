@@ -195,7 +195,20 @@ class DraftView:
     editable: bool  # True only while awaiting approval and under the edit limit
 
 
-AUDIT_KINDS = ("answer", "tool_call", "hand_off", "approval", "write")
+AGENT_AUDIT_KINDS = (
+    "agent_create",
+    "agent_draft",
+    "agent_submit",
+    "agent_withdraw",
+    "agent_reject",
+    "agent_publish",
+)
+MEMBER_AUDIT_KINDS = ("member_add", "member_remove", "member_role")
+AUDIT_KINDS = (
+    ("answer", "tool_call", "hand_off", "approval", "write")
+    + AGENT_AUDIT_KINDS
+    + MEMBER_AUDIT_KINDS
+)
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -212,8 +225,8 @@ class AuditEvent:
     tenant_id: str
     event_key: str  # unique per tenant: a retried activity records once
     kind: str
-    agent_id: str
-    agent_version: int
+    agent_id: str | None  # None only for a membership event
+    agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
     outcome: str = "ok"
@@ -231,6 +244,10 @@ class AuditEvent:
             raise ValueError("an audit event needs a tenant_id and an event_key")
         if self.kind not in AUDIT_KINDS:
             raise ValueError(f"invalid audit kind {self.kind!r}")
+        if self.kind not in MEMBER_AUDIT_KINDS and (
+            not self.agent_id or self.agent_version is None
+        ):
+            raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")
         if self.outcome not in AUDIT_OUTCOMES:
             raise ValueError(f"invalid audit outcome {self.outcome!r}")
         for digest in (self.input_sha256, self.output_sha256):

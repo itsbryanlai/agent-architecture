@@ -18,8 +18,11 @@ front-door rules (``config.check_front_doors``) hold for a tenant's published
 set: a publish or import that would break them is refused.
 
 The store records who approved a publish and does not decide who may. The
-check for who is allowed to approve belongs in the one service layer that
-calls ``publish``; this module is below it.
+check for who is allowed to approve belongs in ``control.py``, the one service
+layer that calls the write methods; this module is below it. The store does
+refuse a publish of a version lower than the one already published, so no
+caller can roll an agent back by publishing an old version. A rollback is a new
+draft copied from the old version, then submitted and published.
 
 Tenant settings (``default_agent``, ``channels``, workspace, secrets) stay in
 the YAML file. The YAML ``agents`` section is only the source of a one-time
@@ -93,6 +96,16 @@ class AgentVersionRecord:
         return parse_agent(self.agent_id, self.definition, self.version)
 
 
+@dataclass(frozen=True)
+class AgentRecord:
+    """An agent as a whole: who created it. Its versions are ``AgentVersionRecord``."""
+
+    tenant_id: str
+    agent_id: str
+    created_by: str
+    created_at: datetime | None = None
+
+
 @dataclass
 class ImportResult:
     imported: list[str] = dataclasses.field(default_factory=list)
@@ -116,6 +129,12 @@ class AgentStore(Protocol):
 
     async def versions(self, tenant_id: str, agent_id: str) -> list[AgentVersionRecord]:
         """Every version of one agent, newest first."""
+        ...
+
+    async def get_agent(self, tenant_id: str, agent_id: str) -> AgentRecord | None: ...
+
+    async def list_agents(self, tenant_id: str) -> list[AgentRecord]:
+        """Every agent of the tenant, drafts included, by agent ID."""
         ...
 
     # --- writes --------------------------------------------------------------
@@ -153,8 +172,9 @@ class AgentStore(Protocol):
     ) -> AgentVersionRecord:
         """Pending to published; the agent's previous published version becomes superseded.
 
-        Refused with ``ConfigError`` when the tenant's published set would
-        break the front-door rules.
+        Refused with ``AgentStoreError`` when a higher version is already
+        published, and with ``ConfigError`` when the tenant's published set
+        would break the front-door rules.
         """
         ...
 
@@ -191,6 +211,13 @@ def _validated(agent_id: str, definition: dict[str, Any]) -> dict[str, Any]:
     return stored
 
 
+def _stale(agent_id: str, version: int, published: int) -> AgentStoreError:
+    return AgentStoreError(
+        f"agent '{agent_id}' version {version} is older than the published version "
+        f"{published}; copy it into a new draft to roll back"
+    )
+
+
 def _no_such(agent_id: str, version: int) -> AgentStoreError:
     return AgentStoreError(f"agent '{agent_id}' has no version {version}")
 
@@ -208,6 +235,7 @@ _COLUMNS = (
     "submitted_by, submitted_at, approved_by, published_at"
 )
 _COLUMN_NAMES = [c.strip() for c in _COLUMNS.split(",")]
+_AGENT_COLUMNS = "tenant_id, agent_id, created_by, created_at"
 
 
 def _record(row) -> AgentVersionRecord:
@@ -276,6 +304,23 @@ class PostgresAgentStore:
                 (tenant_id, agent_id),
             )
             return [_record(row) for row in await cur.fetchall()]
+
+    async def get_agent(self, tenant_id: str, agent_id: str) -> AgentRecord | None:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                f"SELECT {_AGENT_COLUMNS} FROM agents WHERE tenant_id = %s AND agent_id = %s",
+                (tenant_id, agent_id),
+            )
+            row = await cur.fetchone()
+        return None if row is None else AgentRecord(*row)
+
+    async def list_agents(self, tenant_id: str) -> list[AgentRecord]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                f"SELECT {_AGENT_COLUMNS} FROM agents WHERE tenant_id = %s ORDER BY agent_id",
+                (tenant_id,),
+            )
+            return [AgentRecord(*row) for row in await cur.fetchall()]
 
     async def create_agent(
         self, tenant_id: str, agent_id: str, definition: dict[str, Any], created_by: str
@@ -393,6 +438,16 @@ class PostgresAgentStore:
                 raise _no_such(agent_id, version)
             if target.status != PENDING:
                 raise _wrong_status(agent_id, version, target.status, PENDING)
+            cur = await conn.execute(
+                f"""
+                SELECT {_COLUMNS} FROM agent_versions
+                WHERE tenant_id = %s AND agent_id = %s AND status = 'published'
+                """,
+                (tenant_id, agent_id),
+            )
+            current = await cur.fetchone()
+            if current is not None and version < _record(current).version:
+                raise _stale(agent_id, version, _record(current).version)
             check_publish(await self._published_set(conn, tenant_id), target.agent())
             await conn.execute(
                 """
@@ -585,6 +640,18 @@ class InMemoryAgentStore:
     async def versions(self, tenant_id: str, agent_id: str) -> list[AgentVersionRecord]:
         return sorted(self._rows(tenant_id, agent_id), key=lambda r: -r.version)
 
+    async def get_agent(self, tenant_id: str, agent_id: str) -> AgentRecord | None:
+        rows = self._rows(tenant_id, agent_id)
+        if not rows:
+            return None
+        # The agent's creator is the creator of its first version, as in the database.
+        first = min(rows, key=lambda r: r.version)
+        return AgentRecord(tenant_id, agent_id, first.created_by, first.created_at)
+
+    async def list_agents(self, tenant_id: str) -> list[AgentRecord]:
+        found = [await self.get_agent(t, a) for t, a in sorted(self._agents) if t == tenant_id]
+        return [record for record in found if record is not None]
+
     # writes
 
     def _add(
@@ -655,6 +722,9 @@ class InMemoryAgentStore:
         row = self._find(tenant_id, agent_id, version)
         if row.status != PENDING:
             raise _wrong_status(agent_id, version, row.status, PENDING)
+        for other in self._rows(tenant_id, agent_id):
+            if other.status == PUBLISHED and row.version < other.version:
+                raise _stale(agent_id, row.version, other.version)
         check_publish(await self.published_all(tenant_id), row.agent())
         for other in self._rows(tenant_id, agent_id):
             if other.status == PUBLISHED:

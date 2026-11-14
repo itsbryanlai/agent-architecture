@@ -65,6 +65,7 @@ from agentos.models import (
 )
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
+from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
 
 log = logging.getLogger("agentos.gateway")
 
@@ -100,6 +101,8 @@ class GatewayDeps:
     # published agent of the tenant is granted pages. Unset in tests that never
     # send a page event.
     agents: AgentStore | None = None
+    # The kill switches, read afresh at every Submit. None means none is ever off.
+    switches: SwitchStore | None = None
 
 
 def create_app(
@@ -111,12 +114,13 @@ def create_app(
     lifespan: Any = None,
     slack_for: Callable[[str], Any] | None = None,
     agents: AgentStore | None = None,
+    switches: SwitchStore | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
         app.state.deps = GatewayDeps(
-            settings, tenants, temporal_client, links, verifier, slack_for, agents
+            settings, tenants, temporal_client, links, verifier, slack_for, agents, switches
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -235,6 +239,11 @@ def create_app(
                 continue
             if not task_id.startswith(f"{tenant}:"):
                 log.warning("tenant_id=%s ignored approval click for another tenant", tenant)
+                continue
+            if approved and await _writes_off(d, tenant):
+                # Refused before the workflow hears of the click: the card stays as it
+                # is, so the requester can Submit again once writes are back on.
+                await _tell_writes_off(d, tenant, payload)
                 continue
             await _signal(
                 d, tenant, task_id, "decision", ApprovalDecision(nonce, clicker, approved)
@@ -530,6 +539,30 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
     return Response(status_code=200)
 
 
+async def _writes_off(d: GatewayDeps, tenant: str) -> bool:
+    """Has an admin turned writes off for the tenant? Read now; a failed read fails the click."""
+    if d.switches is None:
+        return False
+    return (await read_state(d.switches, tenant)).writes_off
+
+
+async def _tell_writes_off(d: GatewayDeps, tenant: str, payload: dict) -> None:
+    """Answer a refused Submit in the card's conversation. IDs only in the log."""
+    log.info("tenant_id=%s submit refused: writes are turned off", tenant)
+    channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get(
+        "channel_id"
+    )
+    thread_ts = (payload.get("message") or {}).get("ts")
+    if d.slack_for is None or not channel:
+        return
+    try:
+        await d.slack_for(tenant).post_message(channel, WRITES_OFF_TEXT, thread_ts=thread_ts)
+    except Exception as err:  # noqa: BLE001 - the refusal stands even if the notice fails
+        log.warning(
+            "tenant_id=%s writes-off notice not posted error_type=%s", tenant, type(err).__name__
+        )
+
+
 async def _signal(d: GatewayDeps, tenant: str, workflow_id: str, name: str, arg: Any) -> None:
     handle = d.temporal_client.get_workflow_handle(workflow_id)
     try:
@@ -556,6 +589,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.crypto_keys import LocalKeyStore, startup_key_failure
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
+    from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
     from agentos.tenants import build_slack_clients
 
@@ -583,6 +617,7 @@ async def _real_lifespan(app: FastAPI):
             verifier,
             slack_clients.__getitem__,
             agent_store,
+            switches=PostgresSwitchStore(pool),
         )
         yield
     finally:

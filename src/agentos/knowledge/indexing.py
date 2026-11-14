@@ -10,6 +10,10 @@ Rules kept here:
   failure, never a fallback to another tenant.
 * The agent uses its own access: pages are read with the same Notion token the
   agents use, and only under a root page an agent was granted.
+* While an admin has Notion turned off for the tenant (see ``agentos.switches``) nothing
+  is read from Notion: a page event is dropped (the nightly run catches up), and a page
+  or prune step of a full run fails for good, so the run ends without pruning anything.
+  The switch is read afresh at every step.
 * Log lines carry the tenant, scope and page ID only.
 """
 
@@ -30,6 +34,14 @@ from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.notion_text import PageUnavailable, chunk, page_text
 from agentos.knowledge.search import PageChecker
 from agentos.knowledge.store import KnowledgeStore
+from agentos.switches import (
+    NOTION,
+    ConnectorOff,
+    InMemorySwitchStore,
+    SwitchStore,
+    connector_off_text,
+    read_state,
+)
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant, granted_roots
 from agentos.usage import UsageRecorder
 
@@ -77,7 +89,9 @@ class IndexActivities:
         embedder: Embedder,
         agents: AgentStore,
         usage: UsageRecorder | None = None,
+        switches: SwitchStore | None = None,
     ):
+        self.switches = switches or InMemorySwitchStore()
         self.usage = usage
         self.registry = registry
         self.agents = agents
@@ -90,6 +104,15 @@ class IndexActivities:
             return self.registry.get(tenant_id)
         except UnknownTenant as err:
             raise _non_retryable(err) from err
+
+    async def _notion_off(self, tenant_id: str) -> bool:
+        return (await read_state(self.switches, tenant_id)).connector_off(NOTION)
+
+    async def _require_notion(self, tenant_id: str, scope: str) -> None:
+        """Fail a step of a full run for good while Notion is turned off for the tenant."""
+        if await self._notion_off(tenant_id):
+            log.info("indexing stopped tenant_id=%s scope=%s connector=notion", tenant_id, scope)
+            raise _non_retryable(ConnectorOff(connector_off_text("notion")))
 
     async def _granted(self, runtime: TenantRuntime) -> dict[str, str]:
         """Scope to root page for the pages granted by the tenant's published agents."""
@@ -121,6 +144,7 @@ class IndexActivities:
         hash differs from the stored one.
         """
         page_id = normalize_id(page_id)
+        await self._require_notion(tenant_id, scope)
         runtime = await self._require_granted(tenant_id, scope)
         try:
             content = await page_text(runtime.notion_api, page_id)
@@ -173,8 +197,11 @@ class IndexActivities:
         """
         page_id = normalize_id(page_id)
         runtime = self._runtime(tenant_id)
-        checker = PageChecker(runtime.notion_api)
         result = RefreshResult()
+        if await self._notion_off(tenant_id):
+            log.info("page refresh skipped tenant_id=%s connector=notion", tenant_id)
+            return result
+        checker = PageChecker(runtime.notion_api)
         for scope, root in (await self._granted(runtime)).items():
             if await checker.under_root(page_id, root):
                 synced = await self.sync_page(tenant_id, scope, page_id)
@@ -223,6 +250,7 @@ class IndexActivities:
     @activity.defn(name="prune_scope")
     async def prune_scope(self, tenant_id: str, scope: str, seen_page_ids: list[str]) -> int:
         """Delete stored pages of the scope that are not in ``seen_page_ids``."""
+        await self._require_notion(tenant_id, scope)
         await self._require_granted(tenant_id, scope)
         seen = set(seen_page_ids)
         stored = await self.store.page_hashes(tenant_id, scope)

@@ -89,6 +89,8 @@ NOTICES = {
     "member-added": "Member added.",
     "member-role": "Role changed.",
     "member-removed": "Member removed.",
+    "budget-set": "Budget saved.",
+    "budget-removed": "Budget removed.",
 }
 
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -107,8 +109,13 @@ def _usd(value: Decimal) -> str:
     return f"${value:,.4f}"
 
 
+def _usd2(value: Decimal) -> str:
+    return f"${value:,.2f}"
+
+
 _env.filters["stamp"] = _stamp
 _env.filters["usd"] = _usd
+_env.filters["usd2"] = _usd2
 
 
 def recent_months(now: datetime, count: int = 12) -> list[str]:
@@ -221,6 +228,8 @@ class WebUI:
         self.route("GET", base + "/audit", self.audit)
         self.route("GET", base + "/usage", self.usage)
         self.route("GET", base + "/usage.csv", self.usage_csv)
+        self.route("POST", base + "/budgets", self.set_budget)
+        self.route("POST", base + "/budgets/remove", self.remove_budget)
 
     # --- plumbing ---------------------------------------------------------------------
 
@@ -468,10 +477,12 @@ class WebUI:
         if not versions:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         owner = await self.owner_of(ctx, agent_id)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
         return _page(
             "agent.html",
             ctx=ctx,
             agent_id=agent_id,
+            budget=budgets.line_of(agent_id),
             versions=versions,
             can_edit=self.can_edit(ctx, owner),
             notice=self.notice(request),
@@ -636,14 +647,28 @@ class WebUI:
     async def usage(self, request: Request, ctx: Ctx) -> Response:
         month = request.query_params.get("month") or None
         report = await ctx.plane.usage_report(ctx.tenant_id, ctx.user_id, month)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
         return _page(
             "usage.html",
             ctx=ctx,
             report=report,
+            budgets=budgets,
+            notice=self.notice(request),
             months=recent_months(ctx.now),
             no_team=NO_TEAM,
             base=self.base(ctx),
         )
+
+    async def set_budget(self, request: Request, ctx: Ctx) -> Response:
+        """An empty agent field is the tenant-wide budget."""
+        agent_id = ctx.get("agent_id").strip() or None
+        await ctx.plane.set_budget(ctx.tenant_id, ctx.user_id, agent_id, ctx.get("amount"))
+        return _redirect(self.base(ctx) + "/usage?done=budget-set")
+
+    async def remove_budget(self, request: Request, ctx: Ctx) -> Response:
+        agent_id = ctx.get("agent_id").strip() or None
+        await ctx.plane.remove_budget(ctx.tenant_id, ctx.user_id, agent_id)
+        return _redirect(self.base(ctx) + "/usage?done=budget-removed")
 
     async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
         """The page's aggregates as a download. It only reads, so it is a GET."""

@@ -1,4 +1,4 @@
-"""The control-plane API: agents, versions, members, usage and the audit log, as JSON.
+"""The control-plane API: agents, versions, members, usage, budgets and the audit log, as JSON.
 
 This is a separate app and process from the gateway. The gateway is reachable
 from the internet; this API is not, and must not be. Without sign-in with Slack
@@ -32,6 +32,7 @@ import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlsplit
 
@@ -155,6 +156,10 @@ class Publish(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
     confirm_audience: AudienceCounts | None = None
+
+
+class BudgetAmount(_Body):
+    amount: Decimal
 
 
 class NewMember(_Body):
@@ -480,6 +485,39 @@ def create_app(
         """Usage and cost for ``month`` (YYYY-MM, default the current UTC month)."""
         return out((await deps.plane.usage_report(tenant_id, actor, month)).as_dict())
 
+    # --- budgets ---
+
+    @app.get("/tenants/{tenant_id}/budgets")
+    async def budgets(tenant_id: Tenant, actor: Actor) -> JSONResponse:
+        """Budgets against the current UTC month's spend: the tenant line (admins) and agents."""
+        return out((await deps.plane.budgets(tenant_id, actor)).as_dict())
+
+    @app.put("/tenants/{tenant_id}/budget")
+    async def set_tenant_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, body: BudgetAmount
+    ) -> JSONResponse:
+        row = await deps.plane.set_budget(tenant_id, actor, None, body.amount, rid)
+        return out({"agent_id": None, "amount": format(row.amount, "f")})
+
+    @app.delete("/tenants/{tenant_id}/budget")
+    async def remove_tenant_budget(tenant_id: Tenant, actor: Actor, rid: RequestId) -> JSONResponse:
+        await deps.plane.remove_budget(tenant_id, actor, None, rid)
+        return out({"agent_id": None, "removed": True})
+
+    @app.put("/tenants/{tenant_id}/agents/{agent_id}/budget")
+    async def set_agent_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str, body: BudgetAmount
+    ) -> JSONResponse:
+        row = await deps.plane.set_budget(tenant_id, actor, agent_id, body.amount, rid)
+        return out({"agent_id": agent_id, "amount": format(row.amount, "f")})
+
+    @app.delete("/tenants/{tenant_id}/agents/{agent_id}/budget")
+    async def remove_agent_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str
+    ) -> JSONResponse:
+        await deps.plane.remove_budget(tenant_id, actor, agent_id, rid)
+        return out({"agent_id": agent_id, "removed": True})
+
     # --- audit ---
 
     @app.get("/tenants/{tenant_id}/audit")
@@ -512,6 +550,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_store import PostgresAgentStore
     from agentos.audience import SlackAudienceInspector
     from agentos.audit import PostgresAuditStore
+    from agentos.budgets import PostgresBudgetStore
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
     from agentos.members import PostgresMemberStore
@@ -558,6 +597,7 @@ async def _real_lifespan(app: FastAPI):
             NotionGrantChecker(notion_for),
             SlackAudienceInspector(slack_for, team_for),
             usage=PostgresUsageStore(pool),
+            budgets=PostgresBudgetStore(pool),
         )
         app.state.deps.tenants = tenants
         yield

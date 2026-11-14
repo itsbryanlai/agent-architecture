@@ -18,6 +18,7 @@ from agentos.audit import (
 from agentos.config import TASK_QUEUE
 from agentos.connectors.notion import FakeNotFound
 from agentos.models import (
+    TURN_FAILED,
     ApprovalDecision,
     AuditEvent,
     ConversationRef,
@@ -134,6 +135,17 @@ async def test_failure_notice_is_not_an_answer(harness):
     await eventually(lambda: h.slack.updates(), timeout=60)
 
     assert await events(h, "answer") == []
+
+
+async def test_model_answer_equal_to_a_notice_is_still_an_answer(harness):
+    h = harness
+    h.llm.queue(answer(TURN_FAILED))
+
+    await converse(h, "it-helper", inbound("Ev1"))
+    await eventually(lambda: h.slack.updates())
+
+    [answer_event] = await events(h, "answer")
+    assert answer_event.output_sha256 == canonical_sha256(TURN_FAILED)
 
 
 async def test_step_limit_notice_is_not_an_answer(harness):

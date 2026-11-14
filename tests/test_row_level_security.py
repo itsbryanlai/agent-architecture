@@ -5,17 +5,21 @@ The policies themselves are checked against a real Postgres outside this suite.
 
 import inspect
 import re
+import types
 import typing
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
 
-from agentos import stores
+from agentos import audit, stores
+from agentos.audit import PostgresAuditStore
 from agentos.config import DEFAULT_DATABASE_URL
 from agentos.knowledge import store as knowledge_store
 from agentos.knowledge.store import PostgresKnowledgeStore
+from agentos.models import AuditEvent
 from agentos.stores import (
     PostgresHistoryStore,
     PostgresIdempotencyStore,
@@ -27,6 +31,7 @@ from agentos.stores import (
 ROOT = Path(__file__).resolve().parent.parent
 INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
 MIGRATION = (ROOT / "scripts" / "migrations" / "004_row_level_security.sql").read_text()
+AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -34,6 +39,7 @@ POSTGRES_STORES = [
     PostgresToolOutputStore,
     PostgresTaskLinkStore,
     PostgresKnowledgeStore,
+    PostgresAuditStore,
 ]
 
 
@@ -84,6 +90,12 @@ def sample_value(hint):
         return False
     if hint is dict:
         return {"k": "v"}
+    if hint is datetime:
+        return datetime(2026, 1, 1)
+    if typing.get_origin(hint) is types.UnionType:
+        return sample_value(next(a for a in typing.get_args(hint) if a is not type(None)))
+    if hint is AuditEvent:
+        return AuditEvent("acme", "k1", "answer", "a", 1, "U1", "agent:a")
     origin = typing.get_origin(hint)
     args = typing.get_args(hint)
     if origin is list:
@@ -102,9 +114,9 @@ def public_methods(cls):
 
 
 def test_store_classes_are_all_covered():
-    # A new Postgres store in either module must be added to POSTGRES_STORES.
+    # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store):
+    for module in (stores, knowledge_store, audit):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -121,9 +133,11 @@ async def test_every_postgres_store_method_sets_tenant_first():
             kwargs = {
                 p: sample_value(hints[p])
                 for p in inspect.signature(method).parameters
-                if p != "tenant_id"
+                if p != "tenant_id" and p in hints
             }
-            await method(tenant_id="acme", **kwargs)
+            if "tenant_id" in inspect.signature(method).parameters:
+                kwargs["tenant_id"] = "acme"
+            await method(**kwargs)
 
             label = f"{cls.__name__}.{name}"
             assert pool.taken == 1, label
@@ -166,14 +180,22 @@ def rls_tables(sql: str) -> set[str]:
     return set(re.findall(r"'(\w+)'", match.group(1)))
 
 
+def rls_tables_forced(sql: str) -> set[str]:
+    return set(re.findall(r"ALTER TABLE (\w+) FORCE ROW LEVEL SECURITY", sql))
+
+
 def test_migration_and_init_db_cover_every_tenant_table():
     tables = tenant_tables(INIT_DB)
     assert len(tables) >= 6
-    assert tables <= rls_tables(MIGRATION)
+    assert tables <= rls_tables(MIGRATION) | rls_tables_forced(AUDIT_MIGRATION)
     # init_db.sql carries the same block, after the tables it protects.
-    assert tables <= rls_tables(INIT_DB)
+    assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
+    for table in rls_tables_forced(INIT_DB):
+        assert INIT_DB.index(f"CREATE TABLE IF NOT EXISTS {table}") < INIT_DB.index(
+            f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"
+        ), table
     block_start = INIT_DB.index("FOREACH t IN ARRAY")
-    for table in tables:
+    for table in tables & rls_tables(INIT_DB):
         created = re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\b", INIT_DB)
         assert created and created.start() < block_start, table
     assert "FORCE ROW LEVEL SECURITY" in INIT_DB

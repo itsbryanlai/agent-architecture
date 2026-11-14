@@ -582,8 +582,10 @@ version, adding an existing member), 422 for an invalid definition or request.
 | `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
 
 `publish` runs the grant check first (with the tenant's Notion token) and is
-refused with 409 and the problems while any database grant has one. Page grants
-are not part of this check. A new page grant still gets no index schedule until
+refused with 409 and the problems while any database or page grant has one (a
+page must be readable and not in the trash). If Notion cannot be read right now
+(a network error, a rate limit, a server error) the answer is 502 and nothing is
+published. A new page grant still gets no index schedule until
 the worker restarts. The audit log is paged by `seq`: pass the previous page's
 `next_before` as `before`; `limit` is capped at 200. A write may carry an
 `Idempotency-Key` header: a retry with the same key, path and body records one

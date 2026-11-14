@@ -2,7 +2,7 @@
 
 Status values: **Decided** (agreed by the product owner), **Proposed** (recommended, awaiting confirmation), **Open** (needs input).
 
-Last reviewed 2026-11-08.
+Last reviewed 2026-11-14.
 
 | ID | Decision | Status |
 |---|---|---|
@@ -23,6 +23,8 @@ Last reviewed 2026-11-08.
 | D-15 | Connectors are defined by a manifest (risk class, idempotency, attribution, watch, indexing) on top of MCP or OpenAPI. Two tiers: certified (by us, exactly-once guaranteed) and custom (by tenant admins, conservative defaults) | Proposed |
 | D-16 | Connector self-repair (roadmap): connector failures go into a Temporal remediation workflow (one per failure signature) with a circuit breaker; a sandboxed coding agent proposes fixes; humans approve deploys; failed writes are never replayed automatically | Proposed |
 | D-17 | Requester-scoped tools: the runtime fills in the requester's identity (the LLM can't set it) and answers where the question was asked, since the audience rule (D-07) covers visibility. The requester's own account is used only for systems whose API can't filter by person, and those answers go only to a DM | Decided |
+| D-18 | Agents, versions and members live in Postgres behind one service layer that holds every role check and audits every change. A tenant's first admins come from its config file; an admin may approve their own submission, and the audit records it | Decided |
+| D-19 | The control plane is a separate process from the Slack gateway. It listens on loopback with a fixed operator until Sign in with Slack is configured; then it may be public, with server-side sessions, CSRF tokens and a browser guard that lets only page navigations in from other sites | Decided |
 
 ## Context for the main decisions
 

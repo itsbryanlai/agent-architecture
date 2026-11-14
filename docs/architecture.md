@@ -1,6 +1,6 @@
 # Architecture
 
-Status: draft · Last updated 2026-11-06 · Product context: [product.md](product.md) · Decisions: [decisions.md](decisions.md)
+Status: draft · Last updated 2026-11-14 · Product context: [product.md](product.md) · Decisions: [decisions.md](decisions.md)
 
 Design target: **multi-tenant agents that do work.** They take actions, wait for approvals and external events, and follow up over days. Each agent acts within access its creator granted it.
 
@@ -182,6 +182,22 @@ Creators can make a policy stricter but never looser than the admin's ceiling.
 - **No escalation:** a creator can only grant scopes they can access themselves. This is checked against the creator's own identity when the grant is made, and re-checked every night. If the creator loses access or leaves the company, the grant is suspended and the agent's owner and the admin are notified.
 - Publishing an agent, or widening its grants, needs admin approval.
 
+### Agent versions, roles and publishing
+- Agents live in Postgres as **versions**: `draft` → `pending` (submitted) → `published`, and the version it replaces becomes `superseded`. A pending version can be withdrawn or rejected back to `draft`. A database trigger keeps a published version immutable, and only one version per agent is published. Workers read the current published version on every call, so a publish takes effect on the next message without a restart.
+- A tenant starts from its YAML file once: the import copies each agent in as published version 1 and records an `agent_import` audit event. After that the database is the source of truth for agents; the YAML file keeps only tenant settings.
+- **Roles.** A tenant's first admins are listed in its config file (`admins:`) and can't be removed or demoted through the app. Admins add other admins and creators, who are stored per tenant. Creators create agents and edit and submit their drafts; only an admin publishes or rejects. An admin may approve their own submission, and the audit event records both the requester and the approver. The last admin can't remove or demote themself.
+- **Grant check.** Before any publish, the control plane reads every database and page the version grants, with the tenant's Notion credential. A grant that is gone, trashed or not shared is a problem and the publish is refused with the list. A network error, rate limit or Notion server error only means "try again": nothing is judged or changed. Anything else, such as a missing tenant key, is a setup error and shows as one.
+- One service layer (`ControlPlane`) holds every role check and writes one audit event per change (`agent_create`, `agent_draft`, `agent_edit`, `agent_submit`, `agent_withdraw`, `agent_reject`, `agent_publish`, `member_add`, `member_remove`, `member_role`). The API and the console call it; nothing else writes agents or members.
+- Not built yet: the no-escalation check against the creator's own access (above), and the audience settings. Today the grant check proves the tenant credential can reach each grant.
+
+### Control plane and console
+- The control plane is **its own process**, never mounted on the Slack gateway, because the gateway is reachable from the internet. It serves a JSON API and server-rendered console pages from the same role layer.
+- **Without sign-in configured** it listens on loopback only and acts as one fixed operator named at start. No request can name or change the actor. It refuses a non-loopback bind.
+- **With Sign in with Slack configured** (Slack's OpenID Connect; client ID, client secret and the console's public URL) it may listen publicly. The signed-in user's Slack team must map to a tenant, and the session's tenant must equal the tenant in the path. Sessions live in Postgres: a 256-bit ID of which only the SHA-256 is stored, 8-hour expiry, a cookie that is `HttpOnly`, `Secure` and `SameSite=Lax`.
+- **Browser guard.** Requests must carry an allowed `Host` and, when present, an allowed `Origin`. A cross-site request is refused, with two exceptions: Slack's redirect to the sign-in callback, and a top-level page navigation (GET, `navigate`, `document`) to a console page, so the redirect after sign-in and links from Slack or email work. Every console GET only reads, pages can't be framed, and the Lax cookie is sent on such navigations anyway. API writes must be JSON; console form posts need the session's CSRF token and the console's own origin.
+- Pages never answer 502 or 504, because a proxy such as Cloudflare replaces those with its own page and the message is lost; "Notion couldn't be reached" is a 503 page that says nothing changed.
+- The process needs each tenant's Notion key (for the grant check) and refuses to start without it.
+
 ### Credentials
 - Agents use **tenant-level connector credentials**: an app install or service account per connector, which the tenant admin sets up once. An agent's grants are a subset of what that credential can reach.
 - Credentials are never tied to the creator's personal token, so an agent keeps working when its creator goes on leave.
@@ -292,7 +308,8 @@ So adding a new system usually means writing and testing a manifest, not a whole
 |---|---|---|
 | Tenants, agents, agent versions, policies | Postgres | Agent versions are immutable once published |
 | Conversation history | Postgres (blob storage for large tool outputs) | Retention configurable per tenant. Tool output text is stored next to it, keyed by tool-call ID, and never passes through Temporal |
-| Audit log | Append-only table, exportable to the tenant's security monitoring system | Who, agent version, identity used, tool, inputs, outputs (or a hash of them), approver |
+| Audit log | Append-only table (no update, delete or truncate), exportable to the tenant's security monitoring system | Who, agent version, identity used, tool, inputs, outputs (or a hash of them), approver. Conversation events hold only hashes, never message or document text. Paged by sequence number, which may have gaps |
+| Members and console sessions | Postgres, row-level security like every other table | Members: role per Slack user per tenant (config-file admins are not stored). Sessions: only the hash of the session ID |
 | Indexed knowledge | pgvector in the cell's Postgres: one row per page (title, link, content hash) and one per chunk (text, embedding), keyed by tenant, scope and page | Searches filter by tenant and granted scope inside the query |
 | OAuth tokens | Vault | Per-tenant key |
 | Temporal history | Temporal | Encrypted with the tenant key; holds only references and small values |

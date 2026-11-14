@@ -139,6 +139,47 @@ other Notion workspace is ignored (200, no action).
 | `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token for a tenant that has no `secrets` block (secret; export it, never save it in a dotenv file). Without it every webhook event for that tenant is refused. Other tenants name their own variable |
 | `AGENTOS_NOTION_TOKEN_DIR` | `~/.agentos` | Directory where the gateway writes each tenant's token file, `notion-webhook-verification-token-<tenant_id>`, at subscription time (mode `0600`, directory `0700`) |
 
+## Front door and channels
+
+An agent whose config lists `specialists` is a **front door**. It answers what
+it can and hands a question that belongs to one of those agents over with the
+`hand_off` tool, which names only its own specialists. Each specialist needs a
+`description`, which the front door reads to choose.
+
+```yaml
+default_agent: concierge          # DMs and mentions in unmapped channels land here
+channels:                         # optional: Slack channel ID -> agent
+  C0123456789: it-helper
+agents:
+  concierge:
+    version: 1
+    name: Concierge
+    description: General questions about the company.
+    system_prompt: |
+      You answer general questions. Hand specialist questions to the right agent.
+    max_steps: 4
+    specialists: [it-helper]      # makes this agent a front door
+  it-helper:
+    version: 1
+    name: IT helper
+    description: Laptops, accounts, VPN, access and other IT requests.
+    # ... prompt, grants and the rest as before
+```
+
+- Where a message lands: a DM or a mention in an unmapped channel goes to
+  `default_agent`; a mention in a channel listed under `channels` goes straight
+  to that agent.
+- The specialist posts "<name> here, picking this up.", answers the same
+  message, and keeps the thread. A new thread starts back at the front door.
+- A specialist cannot hand off, and a thread is handed off at most once. The
+  specialist acts with its own grants, and any request it starts carries its
+  own agent.
+- A thread idle for seven days closes. A later message in it starts again at
+  `default_agent`, which can hand off again.
+- Config errors fail at load: an undefined specialist or channel agent, an
+  agent listing itself, a specialist without a `description`, or a specialist
+  that is itself a front door.
+
 ## Several tenants
 
 `AGENTOS_CONFIG` may name a **directory**. Every `*.yaml` directly inside it is

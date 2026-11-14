@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros.html" import post_button, budget_alerts %}
+{% from "macros.html" import post_button, budget_alerts, kind_split %}
 {% block title %}Usage{% endblock %}
 {% macro cost(t) -%}
   {%- if t.unpriced_calls and not t.cost %}no price
@@ -33,11 +33,11 @@
 </table>
 
 <h2>Budgets</h2>
-<p class="muted">Monthly limits in US dollars for {{ budgets.month }} (UTC), set by an admin. A warning shows from 80% and an agent stops answering at 100%. A cost with no price cannot be counted against a budget.</p>
+<p class="muted">Monthly limits in US dollars for {{ budgets.month }} (UTC), set by an admin. A warning shows from 80% and an agent stops answering at 100%. The organisation budget counts model calls and embeddings; an agent budget counts that agent's model calls. At 100% of the organisation budget, indexing pauses as well. A cost with no price cannot be counted against a budget.</p>
 {% macro budget_row(line, label, agent_id) %}
   <tr>
     <td>{{ label }}</td>
-    <td>{{ line.spend | usd }}</td>
+    <td>{{ line.spend | usd }}<br><span class="muted">{{ kind_split(line) }}</span></td>
     <td>{% if line.amount is none %}<span class="muted">no limit</span>{% else %}{{ line.amount | usd2 }}{% endif %}</td>
     <td>{% if line.percent is none %}{% else %}{{ line.percent }}%{% endif %}</td>
     {% if ctx.is_admin %}

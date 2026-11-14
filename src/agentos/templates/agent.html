@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros.html" import post_button, budget_alerts, paused_channels %}
+{% from "macros.html" import post_button, budget_alerts, kind_split, paused_channels %}
 {% block title %}{{ agent_id }}{% endblock %}
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a></p>
@@ -10,7 +10,7 @@
 {% if ctx.is_admin %}<p class="muted"><a href="{{ base }}/switches">Switches</a></p>{% endif %}
 {{ budget_alerts(budget, agent_id) }}
 {% if budget and budget.amount is not none %}
-<p class="muted">Monthly budget: {{ budget.spend | usd }} of {{ budget.amount | usd2 }} ({{ budget.percent }}%).</p>
+<p class="muted">Monthly budget: {{ budget.spend | usd }} of {{ budget.amount | usd2 }} ({{ budget.percent }}%). {{ kind_split(budget) }}.</p>
 {% endif %}
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <table>

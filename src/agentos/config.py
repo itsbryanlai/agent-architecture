@@ -18,6 +18,7 @@ that project's database or server by accident.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from dataclasses import dataclass, field
@@ -101,6 +102,12 @@ class Settings:
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
+    # Sign in with Slack for the web console: the Slack app's client ID and secret,
+    # and the public base URL the browser reaches the console at. The console is
+    # configured only when all three are set (see ``slack_signin``).
+    slack_client_id: str | None = None
+    slack_client_secret: str | None = field(default=None, repr=False)
+    console_url: str | None = None
 
     def require(self, name: str) -> str:
         """Return a required setting, or fail with a message naming the variable.
@@ -148,6 +155,9 @@ def load_settings() -> Settings:
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
+        slack_client_id=env.get("SLACK_CLIENT_ID") or None,
+        slack_client_secret=env.get("SLACK_CLIENT_SECRET") or None,
+        console_url=env.get("AGENTOS_CONSOLE_URL") or None,
     )
 
 
@@ -243,6 +253,11 @@ class AgentVersion:
     grants: Grants
     follow_up: FollowUpPolicy
     approval: ApprovalPolicy
+    # What the agent is for, read by a front door when it picks a specialist.
+    description: str = ""
+    # Agents this one may hand a thread to. An agent with specialists is a
+    # front door.
+    specialists: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -275,6 +290,11 @@ class AgentsConfig:
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
+    # Slack channel ID to the agent that answers mentions there.
+    channels: dict[str, str] = field(default_factory=dict)
+    # Slack user IDs of the tenant's admins. They come from this file only, so
+    # nobody can remove or demote one through the app.
+    admins: tuple[str, ...] = ()
 
 
 _PROPERTY_FIELDS = {
@@ -351,7 +371,14 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
     )
 
 
-def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
+def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
+    """Parse and validate one agent block, from the YAML file or from the database.
+
+    Both sources go through this function, so an agent loaded from the
+    database is checked exactly like one read from YAML. ``version`` overrides
+    the block's own ``version`` field: the database assigns version numbers, so
+    a stored definition has none.
+    """
     where = f"agent '{agent_id}'"
     grants_raw = raw.get("grants") or {}
     notion = grants_raw.get("notion") or {}
@@ -361,21 +388,128 @@ def _parse_agent(agent_id: str, raw: dict[str, Any]) -> AgentVersion:
     approval = raw.get("approval") or {}
     return AgentVersion(
         agent_id=agent_id,
-        version=int(_require(raw, "version", where)),
+        version=int(version if version is not None else _require(raw, "version", where)),
         name=str(_require(raw, "name", where)),
         system_prompt=str(_require(raw, "system_prompt", where)),
         max_steps=int(_require(raw, "max_steps", where)),
         grants=Grants(notion_databases=databases, notion_pages=pages),
         follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
         approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
+        description=str(raw.get("description") or "").strip(),
+        specialists=_parse_specialists(where, raw.get("specialists")),
     )
+
+
+def agent_definition(agent: AgentVersion) -> dict[str, Any]:
+    """The agent as one YAML-shaped block, without ``version``.
+
+    The inverse of ``parse_agent``: ``parse_agent(id, agent_definition(a),
+    a.version) == a``. The database stores this shape.
+    """
+    databases = []
+    for db in agent.grants.notion_databases:
+        entry: dict[str, Any] = {
+            "id": db.id,
+            "name": db.name,
+            "properties": {
+                "title": db.title_prop,
+                "status": db.status_prop,
+                "done_values": list(db.done_values),
+                "requested_by": db.requested_by_prop,
+                "request_id": db.request_id_prop,
+            },
+        }
+        property_ids = {
+            role: getattr(db, attr)
+            for role, attr in _PROPERTY_ID_FIELDS.items()
+            if getattr(db, attr)
+        }
+        if property_ids:
+            entry["property_ids"] = property_ids
+        databases.append(entry)
+    return {
+        "name": agent.name,
+        "description": agent.description,
+        "system_prompt": agent.system_prompt,
+        "max_steps": agent.max_steps,
+        "grants": {
+            "notion": {
+                "databases": databases,
+                "pages": [{"id": pg.id, "name": pg.name} for pg in agent.grants.notion_pages],
+            }
+        },
+        "follow_up": dataclasses.asdict(agent.follow_up),
+        "approval": dataclasses.asdict(agent.approval),
+        "specialists": list(agent.specialists),
+    }
+
+
+def _parse_specialists(where: str, raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise ConfigError(f"{where}: 'specialists' must be a list of agent IDs")
+    return list(raw)
+
+
+def check_front_doors(agents: dict[str, AgentVersion]) -> None:
+    """Check a set of agents: specialists exist, are not front doors, and are listed once.
+
+    Runs on the YAML agents when a file is read, and on a tenant's published
+    set whenever that set would change.
+    """
+    for agent_id, agent in agents.items():
+        for specialist_id in agent.specialists:
+            where = f"agent '{agent_id}' specialist '{specialist_id}'"
+            if agent.specialists.count(specialist_id) > 1:
+                raise ConfigError(f"{where}: listed more than once")
+            specialist = agents.get(specialist_id)
+            if specialist is None:
+                raise ConfigError(f"{where}: is not a defined agent")
+            if specialist_id == agent_id:
+                raise ConfigError(f"{where}: an agent cannot be its own specialist")
+            if not specialist.description:
+                raise ConfigError(f"{where}: needs a non-empty 'description'")
+            if specialist.specialists:
+                raise ConfigError(
+                    f"{where}: is itself a front door, and a specialist cannot hand off"
+                )
+
+
+def _parse_channels(raw: Any, agents: dict[str, AgentVersion]) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("agents config: 'channels' must map a Slack channel ID to an agent ID")
+    channels = {str(channel): str(agent_id) for channel, agent_id in raw.items()}
+    for channel, agent_id in channels.items():
+        if agent_id not in agents:
+            raise ConfigError(f"channel '{channel}': agent '{agent_id}' is not defined")
+    return channels
+
+
+def _parse_admins(tenant_id: str, raw: Any) -> tuple[str, ...]:
+    """The ``admins`` list of Slack user IDs. Absent means the tenant has none."""
+    if raw is None:
+        return ()
+    where = f"tenant '{tenant_id}' admins"
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: expected a list of Slack user IDs")
+    admins: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            raise ConfigError(f"{where}: each entry must be a non-empty Slack user ID string")
+        if item in admins:
+            raise ConfigError(f"{where}: '{item}' is listed more than once")
+        admins.append(item)
+    return tuple(admins)
 
 
 def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
     if not isinstance(raw, dict):
         raise ConfigError("agents config: expected a mapping at the top level")
     agents_raw = _require(raw, "agents", "agents config")
-    agents = {aid: _parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
+    agents = {aid: parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
     default_agent = str(_require(raw, "default_agent", "agents config"))
     if default_agent not in agents:
         raise ConfigError(f"agents config: default_agent '{default_agent}' is not defined")
@@ -385,6 +519,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
             f"tenant_id {tenant_id!r} is invalid: use 1 to 63 lowercase letters, digits and "
             "hyphens, starting with a letter or digit"
         )
+    check_front_doors(agents)
+    channels = _parse_channels(raw.get("channels"), agents)
     workspace = raw.get("notion_workspace_id")
     return AgentsConfig(
         tenant_id=tenant_id,
@@ -393,6 +529,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
         default_agent=default_agent,
         notion_workspace_id=str(workspace) if workspace not in (None, "") else None,
         secrets=_parse_secrets(tenant_id, raw.get("secrets")),
+        channels=channels,
+        admins=_parse_admins(tenant_id, raw.get("admins")),
     )
 
 

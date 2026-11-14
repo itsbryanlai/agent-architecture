@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Agents{% endblock %}
+{% block body %}
+<h1>Agents</h1>
+{% if agents %}
+<table>
+  <tr><th>Agent</th><th>Created by</th><th>Created</th></tr>
+  {% for a in agents %}
+  <tr>
+    <td><a href="{{ base }}/agents/{{ a.agent_id | urlencode }}">{{ a.agent_id }}</a></td>
+    <td>{{ a.created_by }}</td>
+    <td>{{ a.created_at | stamp }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">No agents yet.</p>
+{% endif %}
+
+<h2>New agent</h2>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="{{ base }}/agents">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <label for="agent_id">Agent ID</label>
+  <input type="text" id="agent_id" name="agent_id" value="{{ new_id }}" required>
+  <label for="definition">Definition (YAML)</label>
+  <textarea id="definition" name="definition" spellcheck="false">{{ new_text }}</textarea>
+  <p><button type="submit">Create draft</button></p>
+</form>
+{% endblock %}

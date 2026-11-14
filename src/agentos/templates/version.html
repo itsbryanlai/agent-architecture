@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% from "macros.html" import post_button %}
+{% block title %}{{ record.agent_id }} v{{ record.version }}{% endblock %}
+{% block body %}
+<p><a href="{{ base }}/agents">Agents</a> / <a href="{{ agent_url }}">{{ record.agent_id }}</a></p>
+<h1>{{ record.agent_id }} version {{ record.version }} <span class="status">{{ record.status }}</span></h1>
+<table>
+  <tr><th>Created by</th><td>{{ record.created_by }}</td><th>Created</th><td>{{ record.created_at | stamp }}</td></tr>
+  <tr><th>Submitted by</th><td>{{ record.submitted_by or "" }}</td><th>Submitted</th><td>{{ record.submitted_at | stamp }}</td></tr>
+  <tr><th>Approved by</th><td>{{ record.approved_by or "" }}</td><th>Published</th><td>{{ record.published_at | stamp }}</td></tr>
+</table>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<div class="actions">
+  {% if editor and is_draft %}{{ post_button(version_url ~ "/submit", ctx.csrf, "Submit for approval") }}{% endif %}
+  {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw") }}{% endif %}
+  {% if ctx.is_admin and is_pending %}
+    {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject") }}
+    {{ post_button(version_url ~ "/publish", ctx.csrf, "Publish") }}
+  {% endif %}
+  {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
+  {% if editor and not is_draft %}
+    {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version}) }}
+  {% endif %}
+</div>
+
+{% if reports is not none %}
+<h2>Grant check: {% if grants_ok %}no problems{% else %}problems found{% endif %}</h2>
+{% if reports %}
+<table>
+  <tr><th>Grant</th><th>Kind</th><th>Notion ID</th><th>Problems</th><th>Notes</th></tr>
+  {% for r in reports %}
+  <tr>
+    <td>{{ r.grant }}</td><td>{{ r.kind }}</td><td><code>{{ r.database_id }}</code></td>
+    <td>{% for p in r.problems %}<div class="error">{{ p }}</div>{% else %}none{% endfor %}</td>
+    <td>{% for n in r.notes %}<div class="muted">{{ n }}</div>{% else %}{% endfor %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">This version has no Notion grants.</p>
+{% endif %}
+{% endif %}
+
+<h2>Definition</h2>
+{% if editor and is_draft %}
+<form method="post" action="{{ version_url }}/edit">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <textarea name="definition" spellcheck="false">{{ definition }}</textarea>
+  <p><button type="submit">Save draft</button></p>
+</form>
+{% else %}
+<pre>{{ definition }}</pre>
+{% endif %}
+{% endblock %}

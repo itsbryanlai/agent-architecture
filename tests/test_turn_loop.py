@@ -8,6 +8,8 @@ from temporalio.worker import Worker
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_store import seeded_agent_store
+from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
 from agentos.llm import ScriptedLLMClient
 from agentos.models import ConversationRef, LLMResponse, ToolCall
@@ -182,6 +184,8 @@ async def test_message_signalled_with_the_idle_timeout_is_not_dropped():
             links=InMemoryTaskLinkStore(),
             llm=llm,
             tool_outputs=InMemoryToolOutputStore(),
+            audit=InMemoryAuditStore(),
+            agents=seeded_agent_store(agents),
         )
 
         def worker():

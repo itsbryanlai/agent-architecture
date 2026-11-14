@@ -18,6 +18,8 @@ from temporalio.worker import Worker
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_store import seeded_agent_store
+from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings
 from agentos.crypto_keys import (
     LocalKeyStore,
@@ -213,6 +215,8 @@ async def test_workflow_history_is_encrypted(tmp_path, agents):
         links=InMemoryTaskLinkStore(),
         llm=llm,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(agents),
     )
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
     try:
@@ -300,6 +304,8 @@ async def test_failure_messages_are_encrypted(tmp_path, agents):
         links=InMemoryTaskLinkStore(),
         llm=llm,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(agents),
     )
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
     try:

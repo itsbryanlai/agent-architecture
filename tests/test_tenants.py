@@ -13,6 +13,8 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_store import seeded_agent_store
+from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     ConfigError,
     Settings,
@@ -193,6 +195,7 @@ def two_tenant_gateway(temporal, links=None, slack_secret="x"):
         temporal,
         links or InMemoryTaskLinkStore(),
         SignatureVerifier(slack_secret),
+        agents=seeded_agent_store(*tenants.tenants.values()),
     )
     return TestClient(app)
 
@@ -306,7 +309,16 @@ def test_legacy_webhook_path_only_with_one_tenant(monkeypatch, webhook_tokens):
     temporal = FakeTemporalClient()
     links = InMemoryTaskLinkStore()
     links.links[(GLOBEX, PAGE_ID.replace("-", ""))] = f"{GLOBEX}:task:t1"
-    client = TestClient(create_app(Settings(), one, temporal, links, SignatureVerifier("x")))
+    client = TestClient(
+        create_app(
+            Settings(),
+            one,
+            temporal,
+            links,
+            SignatureVerifier("x"),
+            agents=seeded_agent_store(*one.tenants.values()),
+        )
+    )
 
     event = page_event("ws-g")
     assert (
@@ -354,9 +366,8 @@ async def test_turn_uses_its_tenants_clients_only(two_tenants):
 
 
 async def test_unknown_tenant_activity_fails_non_retryable():
-    registry = TenantRegistry(
-        {TENANT: runtime_for(parse_agents_config(agents_dict()), FakeSlack(), FakeNotionAPI())}
-    )
+    config = parse_agents_config(agents_dict())
+    registry = TenantRegistry({TENANT: runtime_for(config, FakeSlack(), FakeNotionAPI())})
     acts = AgentActivities(
         settings=Settings(),
         registry=registry,
@@ -365,6 +376,8 @@ async def test_unknown_tenant_activity_fails_non_retryable():
         links=InMemoryTaskLinkStore(),
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(config),
     )
     ctx = TurnContext(
         tenant_id="initech",
@@ -396,6 +409,8 @@ def make_acts(*configs):
         links=InMemoryTaskLinkStore(),
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(*configs),
     )
 
 
@@ -411,3 +426,26 @@ async def test_load_agent_one_argument_compat():
         await several.load_agent("it-helper")
     assert caught.value.non_retryable is True
     assert (await several.load_agent(GLOBEX, "it-helper")).agent_id == "it-helper"
+
+
+def test_the_console_refuses_to_start_when_a_tenants_notion_key_is_unset(monkeypatch):
+    from agentos.tenants import notion_key_failure
+
+    tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
+    monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
+    monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
+
+    message = notion_key_failure(tenants)
+
+    assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
+    assert "NOTION_TOKEN_ACME" not in message
+
+
+def test_the_console_starts_when_every_tenants_notion_key_is_set(monkeypatch):
+    from agentos.tenants import notion_key_failure
+
+    tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
+    monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
+    monkeypatch.setenv("NOTION_TOKEN_GLOBEX", token_source.token_hex(8))
+
+    assert notion_key_failure(tenants) is None

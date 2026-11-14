@@ -1,9 +1,23 @@
 tenant_id: acme
 slack_team_id: T00000000
 agents:
+  # A front door: listing specialists makes an agent one. It answers general
+  # questions and hands a specialist question to the right agent, which then
+  # keeps the thread.
+  concierge:
+    version: 1
+    name: Concierge
+    description: General questions about the company.
+    system_prompt: |
+      You answer general questions. Hand specialist questions to the right agent.
+    max_steps: 4
+    specialists: [it-helper]
   it-helper:
     version: 1
     name: IT helper
+    # A front door shows this to the model when it picks a specialist, so a
+    # specialist needs one.
+    description: Laptops, accounts, VPN, access and other IT requests.
     system_prompt: |
       You help employees with IT requests. Answer from the IT requests database and cite page links.
       When someone wants something done, use create_item; it will ask them to approve.
@@ -39,4 +53,8 @@ agents:
     approval:
       expires_after_hours: 72
       reminder_after_hours: 24
-default_agent: it-helper
+# DMs and mentions in channels not listed below land here.
+default_agent: concierge
+# Optional: a mention in one of these Slack channels goes straight to that agent.
+# channels:
+#   C0123456789: it-helper

@@ -7,7 +7,10 @@ Rules kept here:
   only that tenant's Slack and Notion clients, and an unknown tenant is a
   non-retryable failure, never a fallback to some other tenant.
 * The agent uses its own access. Notion calls go through a ``NotionConnector``
-  built from that agent's grants, which checks every call before it is sent.
+  built from the grants of the agent's current published version, read from
+  the agent store at call time, which checks every call before it is sent. A
+  grant removed by a new published version applies to the next call, also for
+  a write that was approved earlier.
 * The requester comes from ``TurnContext`` / ``TaskSpec``, which the runtime
   filled in from the Slack event. Requester-scoped tool fields (the person
   whose records are read) are filled in here, never by the LLM.
@@ -21,6 +24,9 @@ Rules kept here:
   and the system prompt tells the model never to follow instructions in it.
   Knowledge comes only from the agent's own granted pages, and each page is
   re-checked with Notion before the model sees it.
+* Every action is audited by the activity that does it (see ``agentos.audit``):
+  an audit write that fails fails the activity, so Temporal retries it and
+  nothing is done without a record. Events hold IDs and hashes, never text.
 * Log lines carry tenant, agent and workflow IDs only, never message text,
   document content or secrets.
 """
@@ -34,6 +40,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from agentos import ids
+from agentos.agent_store import AgentStore
+from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
@@ -55,6 +63,7 @@ from agentos.knowledge.search import (
 from agentos.knowledge.store import KnowledgeStore
 from agentos.llm import LLMClient
 from agentos.models import (
+    AuditEvent,
     Citation,
     LLMResponse,
     NotionItem,
@@ -71,6 +80,7 @@ log = logging.getLogger("agentos.activities")
 
 READ_TOOLS = ("search_items", "my_items", "search_knowledge")
 MAX_LISTED_ITEMS = 20
+HAND_OFF_TOOL = "hand_off"
 
 
 def _non_retryable(err: Exception) -> ApplicationError:
@@ -91,6 +101,23 @@ def _is_client_error(err: Exception) -> bool:
     return False
 
 
+def hand_off_tool(specialists: list[AgentVersion]) -> dict:
+    """The tool a front door uses to give the thread to one of its specialists."""
+    listing = "\n".join(f"- {s.agent_id}: {s.name}. {s.description}" for s in specialists)
+    return {
+        "name": HAND_OFF_TOOL,
+        "description": (
+            "Hand this conversation to a specialist agent, who answers the user's message "
+            f"and owns the rest of the thread. Specialists:\n{listing}"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": [s.agent_id for s in specialists]}},
+            "required": ["agent"],
+        },
+    }
+
+
 class AgentActivities:
     def __init__(
         self,
@@ -101,6 +128,8 @@ class AgentActivities:
         links: TaskLinkStore,
         llm: LLMClient,
         tool_outputs: ToolOutputStore,
+        audit: AuditStore,
+        agents: AgentStore,
         knowledge: KnowledgeStore | None = None,
         embedder: Embedder | None = None,
     ):
@@ -113,6 +142,8 @@ class AgentActivities:
         ]
         self.history = history
         self.tool_outputs = tool_outputs
+        self.audit = audit
+        self.agents = agents
         self.idem = idem
         self.links = links
         self.llm = llm
@@ -134,6 +165,7 @@ class AgentActivities:
             self.create_notion_item,
             self.get_notion_item,
             self.post_in_thread,
+            self.record_hand_off,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -164,17 +196,99 @@ class AgentActivities:
         except UnknownTenant as err:
             raise _non_retryable(err) from err
 
-    def _agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
-        agent = self._runtime(tenant_id).config.agents.get(agent_id)
+    async def _agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
+        """The agent's current published version, read from the store on every call."""
+        self._runtime(tenant_id)
+        agent = await self.agents.published(tenant_id, agent_id)
         if agent is None:
             raise ApplicationError(
                 f"unknown agent '{agent_id}'", type="ValueError", non_retryable=True
             )
         return agent
 
-    def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
-        self._agent(tenant_id, agent_id)
-        return self._runtime(tenant_id).connectors[agent_id]
+    def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
+        """A connector limited to the grants of this version of the agent."""
+        return NotionConnector(self._runtime(tenant_id).notion_api, agent.grants.notion_databases)
+
+    async def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
+        return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
+
+    async def _record(
+        self,
+        ctx: TurnContext,
+        kind: str,
+        event_key: str,
+        *,
+        outcome: str = "ok",
+        conversation_id: str | None = None,
+        task_id: str | None = None,
+        tool: str | None = None,
+        target: str | None = None,
+        input_sha256: str | None = None,
+        output_sha256: str | None = None,
+        approver_user_id: str | None = None,
+    ) -> None:
+        """Append one audit event for the agent and requester in ``ctx``."""
+        await self.audit.record(
+            AuditEvent(
+                tenant_id=ctx.tenant_id,
+                event_key=event_key,
+                kind=kind,
+                agent_id=ctx.agent_id,
+                agent_version=ctx.agent_version,
+                requester_user_id=ctx.requester_user_id,
+                identity=agent_identity(ctx.agent_id),
+                outcome=outcome,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                tool=tool,
+                target=target,
+                input_sha256=input_sha256,
+                output_sha256=output_sha256,
+                approver_user_id=approver_user_id,
+            )
+        )
+
+    async def _record_approval(self, spec: TaskSpec, task_id: str, target: str) -> None:
+        """Record that the requester approved exactly this payload, before it runs.
+
+        The task workflow accepts a decision only from the requester, so the
+        approver is the requester. Nothing reaches this activity until then.
+        """
+        ctx = spec.ctx
+        await self._record(
+            ctx,
+            "approval",
+            ids.audit_approval_key(task_id, spec.approval_nonce),
+            task_id=task_id,
+            tool=spec.tool_name,
+            target=target,
+            input_sha256=canonical_sha256(spec.payload),
+            approver_user_id=ctx.requester_user_id,
+        )
+
+    async def _record_write(
+        self,
+        spec: TaskSpec,
+        task_id: str,
+        idem_key: str,
+        target: str,
+        outcome: str,
+        output: object = None,
+    ) -> None:
+        ctx = spec.ctx
+        await self._record(
+            ctx,
+            "write",
+            ids.audit_write_key(idem_key, outcome),
+            outcome=outcome,
+            task_id=task_id,
+            tool=spec.tool_name,
+            target=target,
+            input_sha256=canonical_sha256(spec.payload),
+            output_sha256=None if output is None else canonical_sha256(output),
+            approver_user_id=ctx.requester_user_id,
+        )
 
     async def _post_once(
         self,
@@ -234,7 +348,7 @@ class AgentActivities:
         else:
             tenant_id = tenant_or_agent
         self._log("load_agent", tenant_id, agent_id)
-        return self._agent(tenant_id, agent_id)
+        return await self._agent(tenant_id, agent_id)
 
     @activity.defn(name="append_history")
     async def append_history(
@@ -298,15 +412,18 @@ class AgentActivities:
     @activity.defn(name="call_llm")
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
-        agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         messages = prepare_for_model(await self.history.load(ctx.tenant_id, conversation_id))
-        tools = self._connector(ctx.tenant_id, ctx.agent_id).tools_for_llm()
+        tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
         system = agent.system_prompt
         if agent.grants.notion_pages:
             # Search is offered only to an agent that was granted pages, and
             # the model is told to treat what it returns as data.
             tools = tools + [self.knowledge_tool.llm_definition()]
             system = f"{agent.system_prompt}\n\n{KNOWLEDGE_RULES}"
+        if agent.specialists:
+            specialists = [await self._agent(ctx.tenant_id, s) for s in agent.specialists]
+            tools = tools + [hand_off_tool(specialists)]
         try:
             return await self.llm.complete(system, messages, tools)
         except Exception as err:
@@ -336,6 +453,7 @@ class AgentActivities:
         placeholder_ts: str,
         text: str,
         citations: list[Citation] | None = None,
+        audit_answer: bool = False,
     ) -> None:
         """Post the final reply, with a Sources line when the answer cites pages.
 
@@ -348,24 +466,36 @@ class AgentActivities:
         The model writes Markdown; what is posted is converted to Slack
         mrkdwn. The footer is built from the unconverted text and is already
         mrkdwn.
+
+        ``audit_answer`` is set by the workflow only for a model answer, so
+        notices posted through this path are not recorded as answers.
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
         footer = await self._sources_footer(ctx, text, citations or [])
         slack = self._runtime(ctx.tenant_id).slack
         await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
+        if audit_answer:
+            conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+            await self._record(
+                ctx,
+                "answer",
+                ids.audit_answer_key(conversation_id, placeholder_ts),
+                conversation_id=conversation_id,
+                output_sha256=canonical_sha256(text),
+            )
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:
             return ""
-        scopes = self._granted_scopes(ctx.tenant_id, ctx.agent_id)
+        scopes = await self._granted_scopes(ctx.tenant_id, ctx.agent_id)
         cited = [c for c in cited_markers(text, citations) if c.scope in scopes]
         if not cited:
             return ""
         meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in cited])
         return sources_footer(cited, meta)
 
-    def _granted_scopes(self, tenant_id: str, agent_id: str) -> list[str]:
-        agent = self._agent(tenant_id, agent_id)
+    async def _granted_scopes(self, tenant_id: str, agent_id: str) -> list[str]:
+        agent = await self._agent(tenant_id, agent_id)
         return [ids.knowledge_scope(g.id) for g in agent.grants.notion_pages]
 
     @activity.defn(name="run_read_tool")
@@ -384,6 +514,16 @@ class AgentActivities:
         else:
             text, is_error = await self._read_tool_output(ctx, call)
         await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
+        await self._record(
+            ctx,
+            "tool_call",
+            ids.audit_tool_call_key(conversation_id, call.id),
+            outcome="error" if is_error else "ok",
+            conversation_id=conversation_id,
+            tool=call.name,
+            input_sha256=canonical_sha256(call.input),
+            output_sha256=canonical_sha256(text),
+        )
         return ToolResult(call.id, stored=True, is_error=is_error, citations=citations)
 
     async def _search_knowledge(
@@ -397,7 +537,7 @@ class AgentActivities:
         model. The numbered passages are stored as the tool output; only the
         citation numbers and page IDs go back to the workflow.
         """
-        agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
         if not roots or self.knowledge is None or self.embedder is None:
             return "This agent has no documents to search.", True, []
@@ -431,7 +571,7 @@ class AgentActivities:
 
     async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""
-        connector = self._connector(ctx.tenant_id, ctx.agent_id)
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         try:
             if call.name == "search_items":
                 query = call.input.get("query")
@@ -461,8 +601,8 @@ class AgentActivities:
         existing = await self.idem.get(ctx.tenant_id, key)
         if existing is not None:
             return existing["ts"]
-        agent = self._agent(ctx.tenant_id, ctx.agent_id)
-        grant = self._connector(ctx.tenant_id, ctx.agent_id).grant_for(spec.payload["database_id"])
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
         dm = await self._runtime(ctx.tenant_id).slack.open_dm(ctx.requester_user_id)
         blocks = approval_card_blocks(spec, task_id, agent.name, grant.name)
         text = _card_text(spec, grant.name)
@@ -491,8 +631,8 @@ class AgentActivities:
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         slack = self._runtime(ctx.tenant_id).slack
         channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
-        agent = self._agent(ctx.tenant_id, ctx.agent_id)
-        grant = self._connector(ctx.tenant_id, ctx.agent_id).grant_for(spec.payload["database_id"])
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
         blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, edited=True)
         await slack.update_message(channel, card_ts, _card_text(spec, grant.name), blocks=blocks)
 
@@ -506,9 +646,8 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
         try:
-            item = await self._connector(ctx.tenant_id, ctx.agent_id).resolve_item(
-                spec.payload["item"]
-            )
+            connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+            item = await connector.resolve_item(spec.payload["item"])
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -527,42 +666,48 @@ class AgentActivities:
     async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
         ctx = spec.ctx
         self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
-        agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        page_id = spec.payload["page_id"]
+        idem_key = f"{task_id}:comment"
+        await self._record_approval(spec, task_id, page_id)
         try:
-            return await self._connector(ctx.tenant_id, ctx.agent_id).add_comment(
-                spec.payload["page_id"],
-                spec.payload["comment"],
-                f"{task_id}:comment",
-                agent.name,
+            comment_id = await self._connector_for(ctx.tenant_id, agent).add_comment(
+                page_id, spec.payload["comment"], idem_key, agent.name
             )
-        except ConnectorError as err:
-            raise _non_retryable(err) from err
         except Exception as err:
-            if _is_client_error(err):
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, task_id, idem_key, page_id, "error")
                 raise _non_retryable(err) from err
             raise
+        await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
+        return comment_id
 
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         ctx = spec.ctx
         self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
-        connector = self._connector(ctx.tenant_id, ctx.agent_id)
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        database_id = spec.payload["database_id"]
+        idem_key = f"{task_id}:create"
+        await self._record_approval(spec, task_id, database_id)
         email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
         try:
             item = await connector.create_item(
-                database_id=spec.payload["database_id"],
+                database_id=database_id,
                 title=spec.payload["title"],
                 details=spec.payload["details"],
                 requester_email=email,
-                idem_key=f"{task_id}:create",
+                idem_key=idem_key,
             )
-        except ConnectorError as err:
-            raise _non_retryable(err) from err
         except Exception as err:
-            if _is_client_error(err):
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, task_id, idem_key, database_id, "error")
                 raise _non_retryable(err) from err
             raise
         await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
+        await self._record_write(
+            spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
+        )
         return item
 
     @activity.defn(name="get_notion_item")
@@ -570,7 +715,8 @@ class AgentActivities:
         """Read one item. Takes IDs only: the watch polls this thousands of times."""
         self._log("get_notion_item", tenant_id, agent_id)
         try:
-            return await self._connector(tenant_id, agent_id).get_item(page_id)
+            connector = await self._connector(tenant_id, agent_id)
+            return await connector.get_item(page_id)
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -582,6 +728,22 @@ class AgentActivities:
     async def post_in_thread(self, ctx: TurnContext, text: str, idem_key: str) -> str:
         self._log("post_in_thread", ctx.tenant_id, ctx.agent_id)
         return await self._post_once(ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts)
+
+    @activity.defn(name="record_hand_off")
+    async def record_hand_off(self, ctx: TurnContext, target_agent: str, event_id: str) -> None:
+        """Audit a front door handing the thread to one of its specialists.
+
+        ``ctx`` is the front door's; ``target_agent`` is the specialist.
+        """
+        self._log("record_hand_off", ctx.tenant_id, ctx.agent_id, target=target_agent)
+        await self._agent(ctx.tenant_id, target_agent)
+        await self._record(
+            ctx,
+            "hand_off",
+            ids.audit_hand_off_key(ctx.tenant_id, event_id),
+            conversation_id=ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts),
+            target=target_agent,
+        )
 
 
 def _format_items(items: list[NotionItem]) -> str:

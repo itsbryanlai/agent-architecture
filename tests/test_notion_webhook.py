@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
+from agentos.agent_store import seeded_agent_store
 from agentos.config import Settings, TenantsConfig
 from agentos.gateway.app import create_app
 from agentos.gateway.notion_signature import verify_notion_signature
@@ -53,7 +54,14 @@ def make_client(
         monkeypatch.setenv("NOTION_WEBHOOK_VERIFICATION_TOKEN", token)
     settings = Settings(notion_token_dir=str(tmp_path / "sub"))
     return TestClient(
-        create_app(settings, TenantsConfig.of(agents), temporal, links, SignatureVerifier("x"))
+        create_app(
+            settings,
+            TenantsConfig.of(agents),
+            temporal,
+            links,
+            SignatureVerifier("x"),
+            agents=seeded_agent_store(agents),
+        )
     )
 
 

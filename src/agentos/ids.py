@@ -31,3 +31,38 @@ def index_schedule_id(tenant: str, scope: str) -> str:
 def page_refresh_id(tenant: str, page_id: str) -> str:
     """One refresh workflow per page, so a burst of events lands in one run."""
     return f"{tenant}:page-refresh:{normalize_id(page_id)}"
+
+
+# Audit event keys. Each names one thing that happened, so an activity that
+# retries records it once. Every key starts with the tenant ID.
+
+
+def audit_tool_call_key(conversation_id: str, tool_use_id: str) -> str:
+    return f"{conversation_id}:audit:tool:{tool_use_id}"
+
+
+def audit_answer_key(conversation_id: str, placeholder_ts: str) -> str:
+    return f"{conversation_id}:audit:answer:{placeholder_ts}"
+
+
+def audit_hand_off_key(tenant: str, event_id: str) -> str:
+    return f"{tenant}:audit:hand-off:{event_id}"
+
+
+def audit_approval_key(task: str, nonce: str) -> str:
+    return f"{task}:audit:approval:{nonce}"
+
+
+def audit_write_key(idem_key: str, outcome: str) -> str:
+    """``idem_key`` is the write's idempotency key, ``{task_id}:create`` or ``:comment``."""
+    return f"{idem_key}:audit:write:{outcome}"
+
+
+def audit_control_key(tenant: str, kind: str, nonce: str) -> str:
+    """One agent-lifecycle or membership change made through the control plane."""
+    return f"{tenant}:audit:control:{kind}:{nonce}"
+
+
+def audit_import_key(tenant: str, agent_id: str) -> str:
+    """The audit event for an agent the one-time YAML import inserted: one per agent."""
+    return f"{tenant}:audit:import:{agent_id}"

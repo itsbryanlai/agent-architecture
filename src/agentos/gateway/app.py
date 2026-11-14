@@ -40,6 +40,7 @@ from fastapi import FastAPI, Request, Response
 from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
+from agentos.agent_store import AgentStore, startup_agent_failure
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
 from agentos.gateway.notion_signature import verify_notion_signature
@@ -85,6 +86,10 @@ class GatewayDeps:
     # A tenant's own SlackPoster, used to open the Edit form in that tenant's
     # workspace. Unset in tests that never open a form.
     slack_for: Callable[[str], Any] | None = None
+    # The published agents. A Notion page event is acted on only when some
+    # published agent of the tenant is granted pages. Unset in tests that never
+    # send a page event.
+    agents: AgentStore | None = None
 
 
 def create_app(
@@ -95,11 +100,14 @@ def create_app(
     verifier: Any,
     lifespan: Any = None,
     slack_for: Callable[[str], Any] | None = None,
+    agents: AgentStore | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
-        app.state.deps = GatewayDeps(settings, tenants, temporal_client, links, verifier, slack_for)
+        app.state.deps = GatewayDeps(
+            settings, tenants, temporal_client, links, verifier, slack_for, agents
+        )
 
     def deps(request: Request) -> GatewayDeps:
         return request.app.state.deps
@@ -158,15 +166,26 @@ def create_app(
             channel_kind=channel_kind,
         )
         workflow_id = ids.conversation_id(tenant, channel, thread_ts)
+        # A running thread keeps its own agent: the start argument is ignored
+        # when the workflow exists, and only the signal lands.
+        config = d.tenants.tenants[tenant]
+        agent_id = config.default_agent
+        if channel_kind == "channel":
+            agent_id = config.channels.get(channel, agent_id)
         await d.temporal_client.start_workflow(
             "ConversationWorkflow",
-            ConversationRef(tenant, d.tenants.tenants[tenant].default_agent, channel, thread_ts),
+            ConversationRef(tenant, agent_id, channel, thread_ts),
             id=workflow_id,
             task_queue=TASK_QUEUE,
             start_signal="message",
             start_signal_args=[msg],
         )
-        log.info("tenant_id=%s workflow_id=%s signalled message", tenant, workflow_id)
+        log.info(
+            "tenant_id=%s agent_id=%s workflow_id=%s signalled message",
+            tenant,
+            agent_id,
+            workflow_id,
+        )
         return Response(status_code=200)
 
     @app.post("/slack/interactivity")
@@ -302,7 +321,10 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
                     "external_update",
                     ExternalUpdate(page_id=page_id, source="notion_webhook"),
                 )
-            if any(a.grants.notion_pages for a in config.agents.values()):
+            if d.agents is None:
+                raise RuntimeError("the gateway has no agent store to read page grants from")
+            published = await d.agents.published_all(tenant)
+            if any(a.grants.notion_pages for a in published.values()):
                 # Signal-with-start: a burst of events for one page lands in
                 # the one running refresh workflow.
                 refresh_id = ids.page_refresh_id(tenant, page_id)
@@ -465,6 +487,7 @@ async def _real_lifespan(app: FastAPI):
     from psycopg_pool import AsyncConnectionPool
     from slack_sdk.signature import SignatureVerifier
 
+    from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings, load_tenants_config
     from agentos.crypto_keys import LocalKeyStore, startup_key_failure
     from agentos.slack_client import RealSlackPoster
@@ -482,11 +505,21 @@ async def _real_lifespan(app: FastAPI):
     client = await build_temporal_client(settings)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
-    slack_clients = build_slack_clients(tenants, RealSlackPoster)
-    app.state.deps = GatewayDeps(
-        settings, tenants, client, PostgresTaskLinkStore(pool), verifier, slack_clients.__getitem__
-    )
+    agent_store = PostgresAgentStore(pool)
     try:
+        agent_failure = await startup_agent_failure(agent_store, tenants)
+        if agent_failure:
+            raise SystemExit(agent_failure)
+        slack_clients = build_slack_clients(tenants, RealSlackPoster)
+        app.state.deps = GatewayDeps(
+            settings,
+            tenants,
+            client,
+            PostgresTaskLinkStore(pool),
+            verifier,
+            slack_clients.__getitem__,
+            agent_store,
+        )
         yield
     finally:
         await pool.close()

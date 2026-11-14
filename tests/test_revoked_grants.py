@@ -5,6 +5,7 @@ from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 
 from agentos import ids, index_knowledge
+from agentos.agent_store import seeded_agent_store
 from agentos.config import (
     TASK_QUEUE,
     Settings,
@@ -42,7 +43,7 @@ def activities(cfg, notion=None):
     store = InMemoryKnowledgeStore()
     notion = notion or make_fake_notion()
     registry = TenantRegistry({TENANT: runtime_for(cfg, None, notion)})
-    return IndexActivities(registry, store, FakeEmbedder()), store, notion
+    return IndexActivities(registry, store, FakeEmbedder(), seeded_agent_store(cfg)), store, notion
 
 
 async def seed(store, scope, page_id="p1"):
@@ -130,8 +131,11 @@ async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(m
         return client
 
     class OpenStore:
+        def __init__(self, opened):
+            self.opened = opened
+
         async def __aenter__(self):
-            return store
+            return self.opened
 
         async def __aexit__(self, *exc):
             return False
@@ -139,7 +143,12 @@ async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(m
     monkeypatch.setattr(index_knowledge, "load_settings", lambda: Settings())
     monkeypatch.setattr(index_knowledge, "load_tenants_config", lambda _path: TenantsConfig.of(cfg))
     monkeypatch.setattr(index_knowledge, "build_temporal_client", build_client)
-    monkeypatch.setattr(index_knowledge, "open_store", lambda _settings: OpenStore())
+    monkeypatch.setattr(index_knowledge, "open_store", lambda _settings: OpenStore(store))
+    monkeypatch.setattr(
+        index_knowledge,
+        "open_agent_store",
+        lambda _settings: OpenStore(seeded_agent_store(cfg)),
+    )
 
     await index_knowledge.run(wait=False, schedule=True)
 

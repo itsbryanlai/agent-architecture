@@ -24,7 +24,7 @@ from agentos.config import (
     TenantsConfig,
     read_secret,
 )
-from agentos.connectors.notion import NotionAPI, NotionConnector, normalize_id
+from agentos.connectors.notion import NotionAPI, normalize_id
 from agentos.slack_client import SlackPoster
 
 
@@ -34,23 +34,21 @@ class UnknownTenant(Exception):
 
 @dataclass
 class TenantRuntime:
-    """One tenant's config and the clients that act for it, and only it."""
+    """One tenant's settings and the clients that act for it, and only it.
+
+    ``config.agents`` is the YAML section, the source of the one-time import.
+    The agents a turn runs are the published versions in the agent store.
+    """
 
     config: AgentsConfig
     # The clients hold tokens, so they stay out of repr.
     slack: SlackPoster = field(repr=False)
     notion_api: NotionAPI = field(repr=False)
-    # One connector per agent, each limited to that agent's own grants.
-    connectors: dict[str, NotionConnector] = field(default_factory=dict, repr=False)
 
 
 def runtime_for(config: AgentsConfig, slack: SlackPoster, notion_api: NotionAPI) -> TenantRuntime:
-    """Build a tenant's runtime, with one connector per agent."""
-    connectors = {
-        agent_id: NotionConnector(notion_api, agent.grants.notion_databases)
-        for agent_id, agent in config.agents.items()
-    }
-    return TenantRuntime(config, slack, notion_api, connectors)
+    """Build a tenant's runtime."""
+    return TenantRuntime(config, slack, notion_api)
 
 
 class TenantRegistry:
@@ -91,6 +89,22 @@ def require_tenant_secret(config: AgentsConfig, field_name: str) -> str:
     return value
 
 
+def notion_key_failure(tenants_config: TenantsConfig) -> str | None:
+    """Why the control plane may not start, or None.
+
+    Every tenant's agents can be granted Notion pages and databases, and the grant
+    check (also run inside every publish) reads them with that tenant's own
+    Notion key. A tenant whose variable is unset is named by variable, never value.
+    """
+    failures = []
+    for config in tenants_config.tenants.values():
+        try:
+            require_tenant_secret(config, "notion_token_env")
+        except ConfigError as err:
+            failures.append(str(err))
+    return "\n".join(failures) or None
+
+
 def build_registry(
     tenants_config: TenantsConfig,
     settings: Settings,
@@ -122,7 +136,11 @@ def build_slack_clients(
 
 
 def granted_roots(agents: AgentsConfig) -> dict[str, str]:
-    """Scope to root page ID, for every distinct page granted to any agent of a tenant."""
+    """Scope to root page ID, for every distinct page granted to any agent of a tenant.
+
+    Pass a config whose ``agents`` are the tenant's published set
+    (``agent_store.with_published_agents``).
+    """
     roots: dict[str, str] = {}
     for agent in agents.agents.values():
         for grant in agent.grants.notion_pages:

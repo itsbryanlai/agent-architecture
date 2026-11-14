@@ -29,7 +29,9 @@ working). A request can be edited up to 5 times.
 
 One deployment can serve several tenants (see [Several tenants](#several-tenants)).
 A single tenant is set in `config/agents.yaml`. Every workflow ID, database
-row and log line carries the tenant ID.
+row and log line carries the tenant ID. Agents live in the database (see
+[Agents in the database](#agents-in-the-database)); the YAML file holds the
+tenant's settings and the agents to import once.
 
 ## Prerequisites
 
@@ -81,6 +83,17 @@ misnamed, mistyped or missing property, and prints a `property_ids` block. Paste
 that block into the grant in `config/agents.yaml`. The worker checks the same
 things at startup and refuses to start if anything is wrong or an ID is
 missing. The command exits 1 on any problem.
+
+Import the agents from the YAML file into the database, once, after the
+database has the `006` migration (a fresh `docker compose up` has it):
+
+```bash
+uv run python -m agentos.agent_store import
+```
+
+The worker and the gateway refuse to start while the tenant's `default_agent`
+or a channel's agent has no published version, so run this before them. See
+[Agents in the database](#agents-in-the-database).
 
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
@@ -138,6 +151,49 @@ other Notion workspace is ignored (200, no action).
 |---|---|---|
 | `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token for a tenant that has no `secrets` block (secret; export it, never save it in a dotenv file). Without it every webhook event for that tenant is refused. Other tenants name their own variable |
 | `AGENTOS_NOTION_TOKEN_DIR` | `~/.agentos` | Directory where the gateway writes each tenant's token file, `notion-webhook-verification-token-<tenant_id>`, at subscription time (mode `0600`, directory `0700`) |
+
+## Front door and channels
+
+An agent whose config lists `specialists` is a **front door**. It answers what
+it can and hands a question that belongs to one of those agents over with the
+`hand_off` tool, which names only its own specialists. Each specialist needs a
+`description`, which the front door reads to choose.
+
+```yaml
+default_agent: concierge          # DMs and mentions in unmapped channels land here
+channels:                         # optional: Slack channel ID -> agent
+  C0123456789: it-helper
+agents:
+  concierge:
+    version: 1
+    name: Concierge
+    description: General questions about the company.
+    system_prompt: |
+      You answer general questions. Hand specialist questions to the right agent.
+    max_steps: 4
+    specialists: [it-helper]      # makes this agent a front door
+  it-helper:
+    version: 1
+    name: IT helper
+    description: Laptops, accounts, VPN, access and other IT requests.
+    # ... prompt, grants and the rest as before
+```
+
+- Where a message lands: a DM or a mention in an unmapped channel goes to
+  `default_agent`; a mention in a channel listed under `channels` goes straight
+  to that agent.
+- The front door's "thinking" message becomes "<name> here, picking this up.",
+  and the specialist answers the same message below it and keeps the thread.
+  Anything else the front door asked for in that reply is not run. A new
+  thread starts back at the front door.
+- A specialist cannot hand off, and a thread is handed off at most once. The
+  specialist acts with its own grants, and any request it starts carries its
+  own agent.
+- A thread idle for seven days closes. A later message in it starts again at
+  `default_agent`, which can hand off again.
+- Config errors fail at load: an undefined specialist or channel agent, an
+  agent listing itself, a specialist listed twice, a specialist without a `description`, or a specialist
+  that is itself a front door.
 
 ## Several tenants
 
@@ -285,6 +341,39 @@ by default. The table owner and any superuser bypass row-level security, so the
 app must not connect as `agentos`; use `agentos` only to run migrations. If you
 set `AGENTOS_DATABASE_URL` yourself, point it at `agentos_app`.
 
+The audit log needs `005`, applied as the owner role the same way:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/005_audit_log.sql
+```
+
+It adds the append-only `audit_events` table (see "Audit log" below). A fresh
+`docker compose up` gets it from `scripts/init_db.sql`.
+
+Agents in the database need `006`, applied the same way, then the one-time
+import (see [Agents in the database](#agents-in-the-database)):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/006_agents.sql
+uv run python -m agentos.agent_store import
+```
+
+Members and roles need `007`, applied the same way (see
+[Members and roles](#members-and-roles)).
+
+The web console's sign-in sessions need `008` (see [Web console](#web-console)):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
+```
+
+Two more audit event kinds, `agent_edit` and `agent_import`, need `009` (run it before
+the control plane saves an edit or the import runs, or the audit insert is refused):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/009_audit_kinds.sql
+```
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -375,6 +464,221 @@ left out. Passages reach the model wrapped in `<source>` tags as data, numbered
 like `[1]`. When the answer cites a number, the runtime adds a Sources line
 with the page's title and link; the model never writes a link.
 
+## Agents in the database
+
+Each agent is stored in Postgres as numbered versions (`agents` and
+`agent_versions`). A version is a `draft` while it is edited, `pending` once it
+is submitted, `published` when an approver publishes it, and `superseded` when
+a later version is published. At most one version of an agent is published, and
+the worker loads that one on every turn, so a draft or a pending version changes
+nothing. A published version never changes; an edit starts a new draft. A
+database trigger enforces this for every role: the definition changes only
+while a version is a draft, and the only moves are draft to pending, pending to
+draft (withdrawn or rejected), pending to published and published to
+superseded. Every publish records the approver. Publishing a version lower
+than the published one is refused; to roll back, make a new draft from the old
+version, then submit and publish it.
+
+A definition has the shape of one agent block in the YAML file and is parsed by
+the same code, so it is validated the same way. The front-door rules (a
+specialist exists, is not a front door itself, is listed once) hold for a
+tenant's published set: a publish or import that would break them is refused.
+
+Grants are read from the published version when a tool runs, not when the
+worker starts. A grant removed by a new published version applies to the next
+call, including a write that was approved before.
+
+Tenant settings stay in the YAML file: `tenant_id`, `slack_team_id`,
+`default_agent`, `channels`, `notion_workspace_id` and `secrets`. The worker and
+the gateway refuse to start if `default_agent` or a channel names an agent with
+no published version.
+
+The import copies each YAML agent that has no row yet in as a published version
+1 (`import:yaml` is the creator and approver). Running it again skips each
+agent that exists and names it. **After the import, editing the `agents`
+section of the YAML file changes nothing**: the database is the source.
+`check_grants` still reads the YAML file, so run it before the import to get a
+grant's property IDs.
+
+Known gap: a version published after the worker started that adds a Notion page
+grant gets no index schedule and no startup grant check until the worker
+restarts, and a worker started with no page grants has no embedder until it
+restarts. Run `uv run python -m agentos.index_knowledge --schedule` after such a
+publish.
+
+## Members and roles
+
+A tenant has two roles. An **admin** approves every publish (so a wider grant
+reaches users only when an admin publishes it), rejects pending versions,
+manages members and reads the audit log. A **creator** creates agents and
+drafts, edits, submits and withdraws the versions of agents they created; an
+admin can do the same for any agent.
+
+The first admins come from the tenant YAML file:
+
+```yaml
+admins: [U0123ABCD]   # Slack user IDs
+```
+
+An admin listed there is always an admin, and nobody can remove or demote them
+through the app. Other admins and the creators are added by an admin and stored
+in `members`; the app role can delete rows there, and the audit log keeps the
+record. **A tenant with no `admins` can publish nothing**, because only an admin
+can publish. An admin may approve their own submission, so a tenant with one
+admin works; the audit event records both IDs. The last admin cannot remove or
+demote themself.
+
+`agentos.control.ControlPlane` checks the role for every change and writes one
+audit event for it (`agent_create`, `agent_draft` for a new draft, `agent_edit` for
+replacing a draft's definition, `agent_submit`, `agent_withdraw`, `agent_reject`,
+`agent_publish`, `member_add`, `member_remove`, `member_role`). The one-time YAML
+import writes an `agent_import` event for each agent it inserts, in the same
+transaction (a rerun that skips an agent writes none). Events hold IDs and a hash of the definition, never the
+definition. A refused action is not audited yet. Apply
+`scripts/migrations/007_members.sql` to an existing database.
+
+## Audit log
+
+Every tenant has an append-only record of what its agents did: who asked, which
+agent and version, whose access was used (`agent:<agent id>`), which tool, what
+was read or changed, and who approved. One row is written for each of: a read
+tool call, a model answer, an approval, a write to Notion (also a failed write),
+and a hand-off to a specialist. A row holds IDs and SHA-256 hashes of the
+canonical JSON of inputs and outputs, never chat text, document text or tool
+input or output. Each row has an event key, so a retried activity records once.
+
+The app role can only INSERT and SELECT on `audit_events`, and a trigger
+rejects UPDATE, DELETE and TRUNCATE for every role. If the database cannot be
+written, the activity fails and is retried, so nothing is done without a
+record. Retention (one year) is not enforced yet: rows are kept until someone
+removes them outside the app.
+
+Print a tenant's events, newest first, as JSON lines:
+
+```bash
+uv run python -m agentos.audit --tenant acme --limit 50
+```
+
+## Control-plane API
+
+A JSON API for agents, versions, members and the audit log, in a process of its
+own. It is not part of the gateway, and it listens on this machine only:
+
+```bash
+AGENTOS_CONTROL_ACTOR=U0123ABCD uv run python -m agentos.control_api   # 127.0.0.1:8100
+```
+
+The API refuses browser cross-site requests (a foreign `Origin` or
+`Sec-Fetch-Site`), any `Host` header but its own loopback address and port, and
+any write that is not `application/json`.
+
+**Without sign-in configured, never point a tunnel at this port**, and do not add
+it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
+unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
+also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
+as that user, and nothing in a request (header, query or body) can change it. It also
+needs each tenant's Notion key exported (`NOTION_TOKEN`, or the variable the tenant's
+`secrets.notion_token_env` names), because the grant check and publish read Notion
+with it; the process exits naming an unset variable. With
+[sign-in configured](#web-console) the process may bind more widely and every
+request acts as the signed-in user instead. What the user may do comes from their role in the
+tenant named in the path (`/tenants/<tenant id>/...`), decided by
+`ControlPlane`: 403 when the role does not allow it, 404 for an unknown tenant,
+agent, version or member, 409 for a wrong state (publishing a draft or a stale
+version, adding an existing member), 422 for an invalid definition or request.
+
+| Request | Does |
+|---|---|
+| `GET /healthz` | liveness, no identity |
+| `GET /tenants/{t}/me` | your user ID and role |
+| `GET`, `POST /tenants/{t}/agents` | list agents; create one as a draft (`{agent_id, definition}`) |
+| `GET /tenants/{t}/agents/{a}/versions[/{v}]` | versions, newest first; one version |
+| `POST /tenants/{t}/agents/{a}/drafts` | new draft (`{from_version?}`) |
+| `PUT /tenants/{t}/agents/{a}/versions/{v}` | replace a draft (`{definition}`) |
+| `POST .../versions/{v}/submit`, `withdraw`, `reject`, `publish` | lifecycle |
+| `POST .../versions/{v}/check-grants` | check the version's Notion database grants against Notion |
+| `GET`, `POST /tenants/{t}/members`; `PATCH`, `DELETE .../members/{user}` | members |
+| `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
+
+`publish` runs the grant check first (with the tenant's Notion token) and is
+refused with 409 and the problems while any database or page grant has one (a
+page must be readable and not in the trash). If Notion cannot be read right now
+(a network error, a rate limit, a server error) the answer is 502 and nothing is
+published. A new page grant still gets no index schedule until
+the worker restarts. The audit log is paged by `seq`: pass the previous page's
+`next_before` as `before`; `limit` is capped at 200. A write may carry an
+`Idempotency-Key` header: a retry with the same key, path and body records one
+audit event (the change itself is refused the second time, with 409).
+
+## Web console
+
+The same process serves web pages for agents, versions, members and the audit log,
+behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
+JSON API, so a user's role in the tenant decides what they can do in both. The
+console is off unless sign-in is configured.
+
+**In the Slack app** (api.slack.com/apps, the app the gateway uses):
+
+1. OAuth & Permissions → Redirect URLs → add `<AGENTOS_CONSOLE_URL>/auth/slack/callback`
+   and save.
+2. Sign in with Slack uses the OpenID scopes `openid` and `profile`. Add them under
+   OAuth & Permissions → Scopes → **User Token Scopes** (not Bot Token Scopes). The
+   bot scopes are unchanged.
+3. Basic Information → App Credentials: the Client ID and Client Secret.
+
+**In the shell that runs the process** (nothing is stored in a file):
+
+```bash
+export SLACK_CLIENT_ID=...                  # the Slack app's client ID
+export SLACK_CLIENT_SECRET=...              # its client secret
+export AGENTOS_CONSOLE_URL=https://console.example.com   # the public base URL
+export NOTION_TOKEN='<paste here>'          # the tenant's Notion key (its variable, see below)
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
+uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
+```
+
+The grant check ("Check Notion grants", and inside every publish) reads Notion with
+the tenant's own Notion key, so the process needs it too. The variable is the one the
+tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
+`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. The process
+refuses to start, naming the unset variable, when any tenant's is missing.
+
+Sign-in counts as configured only when all three variables are set and the URL is
+`https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or
+`http://localhost:<port>`, where cookies are not `Secure` (a browser would not send
+them over plain http). A partial configuration, or any other URL, stops the process
+at start. A new install gets the `sessions` table from `scripts/init_db.sql`.
+
+To run it locally, set `AGENTOS_CONSOLE_URL=http://127.0.0.1:8100`, add the same
+address plus `/auth/slack/callback` as the Slack app's redirect URL (Slack may insist
+on https there; then use a tunnel), start the process with the default host, and open
+that URL.
+
+A **public URL (a tunnel, a reverse proxy) is allowed only once sign-in is
+configured.** Then the process may listen beyond loopback, the fixed operator
+(`AGENTOS_CONTROL_ACTOR`) is not used and nothing acts without a session, and the
+`Host` allowlist is the host of `AGENTOS_CONSOLE_URL` plus loopback. Point a tunnel
+at this port only in that mode.
+
+How it behaves:
+
+- The Slack user's workspace must be a tenant's `slack_team_id`, and the user must
+  have a role there (an admin in the tenant file, or a `members` row). A user with
+  no role sees a "no access" page and gets no session.
+- A session is a row in Postgres under the tenant's row-level security. The browser
+  holds a random 256-bit ID in an `HttpOnly`, `SameSite=Lax` cookie (`Secure` on
+  https) that expires after 8 hours; only the ID's SHA-256 is stored. **Sign out**
+  deletes the row.
+- Every form carries a per-session CSRF token and must come from the console's own
+  origin. Pages are served with a `Content-Security-Policy` that allows no script and
+  no outside asset.
+- A page never answers 502 or 504, because a proxy such as Cloudflare replaces those
+  with its own error page. When Notion cannot be reached, "Check Notion grants" and a
+  refused publish show the version page with a message and status 503. The JSON API
+  keeps 502.
+- The JSON API accepts the same session cookie. A session is valid only for its own
+  tenant's paths.
+
 ## Restart demo: exactly once, and follow-up that survives a crash
 
 This is the end-to-end proof that the work outlives the process.
@@ -403,7 +707,10 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/activities.py` | All I/O the workflows do |
 | `src/agentos/connectors/` | Connector manifest and the Notion connector, with grant checks |
 | `src/agentos/knowledge/` | Embedder, knowledge store, Notion text extraction and chunking, indexing and search helpers |
+| `src/agentos/control_api.py` | The control-plane API, a local-only process |
+| `src/agentos/grant_checker.py` | Checks a version's Notion database grants |
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
+| `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

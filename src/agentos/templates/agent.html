@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% from "macros.html" import post_button %}
+{% block title %}{{ agent_id }}{% endblock %}
+{% block body %}
+<p><a href="{{ base }}/agents">Agents</a></p>
+<h1>{{ agent_id }}</h1>
+<table>
+  <tr><th>Version</th><th>Status</th><th>Created by</th><th>Submitted by</th><th>Approved by</th><th>Published</th></tr>
+  {% for v in versions %}
+  <tr>
+    <td><a href="{{ base }}/agents/{{ agent_id | urlencode }}/versions/{{ v.version }}">{{ v.version }}</a></td>
+    <td><span class="status">{{ v.status }}</span></td>
+    <td>{{ v.created_by }}</td>
+    <td>{{ v.submitted_by or "" }}</td>
+    <td>{{ v.approved_by or "" }}</td>
+    <td>{{ v.published_at | stamp }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if can_edit %}
+<div class="actions">
+  {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version") }}
+</div>
+{% endif %}
+{% endblock %}

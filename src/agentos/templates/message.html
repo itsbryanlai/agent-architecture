@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block body %}
+<h1>{{ title }}</h1>
+<p class="error">{{ text }}</p>
+{% if back %}<p><a href="{{ back }}">{% if back == "/login" %}Sign in with Slack{% else %}Back{% endif %}</a></p>
+{% elif ctx %}<p><a href="/ui/{{ ctx.tenant_id | urlencode }}/agents">Back to agents</a></p>{% endif %}
+{% endblock %}

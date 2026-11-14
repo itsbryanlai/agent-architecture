@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from temporalio import activity
 
 from agentos.activities import _is_client_error, _non_retryable
+from agentos.agent_store import AgentStore, with_published_agents
 from agentos.config import EMBED_DIMENSIONS
 from agentos.connectors.notion import is_unreachable, normalize_id
 from agentos.knowledge.embedder import Embedder
@@ -34,7 +35,7 @@ log = logging.getLogger("agentos.indexing")
 
 
 class ScopeNotGranted(Exception):
-    """The scope's grant was removed from the tenant's config."""
+    """No published agent of the tenant has the scope granted any more."""
 
 
 @dataclass
@@ -72,8 +73,10 @@ class IndexActivities:
         registry: TenantRegistry,
         store: KnowledgeStore,
         embedder: Embedder,
+        agents: AgentStore,
     ):
         self.registry = registry
+        self.agents = agents
         self.store = store
         self.embedder = embedder
 
@@ -84,15 +87,19 @@ class IndexActivities:
         except UnknownTenant as err:
             raise _non_retryable(err) from err
 
-    def _require_granted(self, tenant_id: str, scope: str) -> TenantRuntime:
-        """The tenant's runtime, only while some agent of it still has the scope granted.
+    async def _granted(self, runtime: TenantRuntime) -> dict[str, str]:
+        """Scope to root page for the pages granted by the tenant's published agents."""
+        return granted_roots(await with_published_agents(self.agents, runtime.config))
+
+    async def _require_granted(self, tenant_id: str, scope: str) -> TenantRuntime:
+        """The tenant's runtime, only while some published agent of it has the scope granted.
 
         A scope is derived from its root page ID, so a scope still granted
         always has the root it was started with. A schedule left over from a
         removed grant fails here, before any Notion or embedding call.
         """
         runtime = self._runtime(tenant_id)
-        if scope not in granted_roots(runtime.config):
+        if scope not in await self._granted(runtime):
             log.warning("scope not granted tenant_id=%s scope=%s", tenant_id, scope)
             raise _non_retryable(ScopeNotGranted(f"scope {scope} is no longer granted"))
         return runtime
@@ -110,7 +117,7 @@ class IndexActivities:
         hash differs from the stored one.
         """
         page_id = normalize_id(page_id)
-        runtime = self._require_granted(tenant_id, scope)
+        runtime = await self._require_granted(tenant_id, scope)
         try:
             content = await page_text(runtime.notion_api, page_id)
         except PageUnavailable:
@@ -164,7 +171,7 @@ class IndexActivities:
         runtime = self._runtime(tenant_id)
         checker = PageChecker(runtime.notion_api)
         result = RefreshResult()
-        for scope, root in granted_roots(runtime.config).items():
+        for scope, root in (await self._granted(runtime)).items():
             if await checker.under_root(page_id, root):
                 synced = await self.sync_page(tenant_id, scope, page_id)
                 if not synced.skipped:
@@ -203,7 +210,7 @@ class IndexActivities:
     @activity.defn(name="prune_scope")
     async def prune_scope(self, tenant_id: str, scope: str, seen_page_ids: list[str]) -> int:
         """Delete stored pages of the scope that are not in ``seen_page_ids``."""
-        self._require_granted(tenant_id, scope)
+        await self._require_granted(tenant_id, scope)
         seen = set(seen_page_ids)
         stored = await self.store.page_hashes(tenant_id, scope)
         gone = [page_id for page_id in stored if page_id not in seen]

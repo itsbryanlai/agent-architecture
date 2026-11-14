@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
+from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     TASK_QUEUE,
     AgentsConfig,
@@ -147,6 +149,8 @@ class Harness:
     idem: InMemoryIdempotencyStore
     links: InMemoryTaskLinkStore
     tool_outputs: InMemoryToolOutputStore
+    audit: InMemoryAuditStore = field(default_factory=InMemoryAuditStore)
+    agent_store: InMemoryAgentStore = field(default_factory=InMemoryAgentStore)
 
     @property
     def client(self):
@@ -166,6 +170,7 @@ async def harness(agents):
         idem=InMemoryIdempotencyStore(),
         links=InMemoryTaskLinkStore(),
         tool_outputs=InMemoryToolOutputStore(),
+        agent_store=seeded_agent_store(agents),
     )
     acts = AgentActivities(
         settings=Settings(),
@@ -175,6 +180,8 @@ async def harness(agents):
         links=h.links,
         llm=h.llm,
         tool_outputs=h.tool_outputs,
+        audit=h.audit,
+        agents=h.agent_store,
     )
     worker = Worker(
         wf_env.client,
@@ -290,6 +297,7 @@ async def kharness():
         tool_outputs=InMemoryToolOutputStore(),
         knowledge=InMemoryKnowledgeStore(),
         embedder=FakeEmbedder(),
+        agent_store=seeded_agent_store(cfg),
     )
     registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, notion)})
     h.acts = AgentActivities(
@@ -300,10 +308,12 @@ async def kharness():
         links=h.links,
         llm=h.llm,
         tool_outputs=h.tool_outputs,
+        audit=h.audit,
+        agents=h.agent_store,
         knowledge=h.knowledge,
         embedder=h.embedder,
     )
-    index_acts = IndexActivities(registry, h.knowledge, h.embedder)
+    index_acts = IndexActivities(registry, h.knowledge, h.embedder, h.agent_store)
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,
@@ -386,6 +396,8 @@ async def two_tenants():
         links=InMemoryTaskLinkStore(),
         llm=h.llm,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(*tenants.tenants.values()),
     )
     worker = Worker(
         wf_env.client,

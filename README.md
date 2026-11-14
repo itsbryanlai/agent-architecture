@@ -544,6 +544,51 @@ Print a tenant's events, newest first, as JSON lines:
 uv run python -m agentos.audit --tenant acme --limit 50
 ```
 
+## Control-plane API
+
+A JSON API for agents, versions, members and the audit log, in a process of its
+own. It is not part of the gateway, and it listens on this machine only:
+
+```bash
+AGENTOS_CONTROL_ACTOR=U0123ABCD uv run python -m agentos.control_api   # 127.0.0.1:8100
+```
+
+The API refuses browser cross-site requests (a foreign `Origin` or
+`Sec-Fetch-Site`), any `Host` header but its own loopback address and port, and
+any write that is not `application/json`.
+
+**Never point a tunnel at this port**, and do not add it to
+`docker-compose.yml` (a container binds `0.0.0.0`). The process exits unless the
+host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It also exits
+without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts as that
+user, and nothing in a request (header, query or body) can change it. Sign-in
+with Slack will replace this. What the user may do comes from their role in the
+tenant named in the path (`/tenants/<tenant id>/...`), decided by
+`ControlPlane`: 403 when the role does not allow it, 404 for an unknown tenant,
+agent, version or member, 409 for a wrong state (publishing a draft or a stale
+version, adding an existing member), 422 for an invalid definition or request.
+
+| Request | Does |
+|---|---|
+| `GET /healthz` | liveness, no identity |
+| `GET /tenants/{t}/me` | your user ID and role |
+| `GET`, `POST /tenants/{t}/agents` | list agents; create one as a draft (`{agent_id, definition}`) |
+| `GET /tenants/{t}/agents/{a}/versions[/{v}]` | versions, newest first; one version |
+| `POST /tenants/{t}/agents/{a}/drafts` | new draft (`{from_version?}`) |
+| `PUT /tenants/{t}/agents/{a}/versions/{v}` | replace a draft (`{definition}`) |
+| `POST .../versions/{v}/submit`, `withdraw`, `reject`, `publish` | lifecycle |
+| `POST .../versions/{v}/check-grants` | check the version's Notion database grants against Notion |
+| `GET`, `POST /tenants/{t}/members`; `PATCH`, `DELETE .../members/{user}` | members |
+| `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
+
+`publish` runs the grant check first (with the tenant's Notion token) and is
+refused with 409 and the problems while any database grant has one. Page grants
+are not part of this check. A new page grant still gets no index schedule until
+the worker restarts. The audit log is paged by `seq`: pass the previous page's
+`next_before` as `before`; `limit` is capped at 200. A write may carry an
+`Idempotency-Key` header: a retry with the same key, path and body records one
+audit event (the change itself is refused the second time, with 409).
+
 ## Restart demo: exactly once, and follow-up that survives a crash
 
 This is the end-to-end proof that the work outlives the process.
@@ -572,6 +617,8 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/activities.py` | All I/O the workflows do |
 | `src/agentos/connectors/` | Connector manifest and the Notion connector, with grant checks |
 | `src/agentos/knowledge/` | Embedder, knowledge store, Notion text extraction and chunking, indexing and search helpers |
+| `src/agentos/control_api.py` | The control-plane API, a local-only process |
+| `src/agentos/grant_checker.py` | Checks a version's Notion database grants |
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |

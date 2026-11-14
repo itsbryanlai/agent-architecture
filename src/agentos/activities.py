@@ -43,6 +43,7 @@ from temporalio.exceptions import ApplicationError
 from agentos import ids
 from agentos.agent_store import AgentStore
 from agentos.audience import UNAVAILABLE, AudienceChecker, AudienceDecision
+from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
@@ -154,11 +155,13 @@ class AgentActivities:
         embedder: Embedder | None = None,
         audience: AudienceChecker | None = None,
         usage: UsageRecorder | None = None,
+        pauses: PauseStore | None = None,
     ):
         self.settings = settings
         self.usage = usage
         self.registry = registry
-        self.audience = audience or AudienceChecker(registry, agents)
+        self.pauses = pauses or InMemoryPauseStore()
+        self.audience = audience or AudienceChecker(registry, agents, pauses=self.pauses)
         self.knowledge = knowledge
         self.embedder = embedder
         self.knowledge_tool = load_manifest(MANIFEST_DIR / "knowledge.yaml").tools[
@@ -798,7 +801,8 @@ class AgentActivities:
         Asker, place and agent come from ``ctx``, which the runtime built from the Slack
         event. A transient Slack failure is retried; any failure that survives the
         retries reaches the workflow as an error, which refuses the turn. On a refusal the
-        decision carries the agent's creator, for the reply to name.
+        decision carries the agent's creator, for the reply to name. A channel where the
+        agent is paused refuses with reason ``paused``, before any Slack lookup.
         """
         self._log("check_audience", ctx.tenant_id, ctx.agent_id)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)

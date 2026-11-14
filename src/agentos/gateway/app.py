@@ -5,6 +5,10 @@ It acknowledges every request quickly and hands the work to Temporal:
 * ``POST /slack/events``: a DM or an @mention signal-with-starts the thread's
   ConversationWorkflow. Slack retries are harmless, because the workflow drops
   duplicate event IDs.
+  A person joining a channel, a channel shared with another organisation and a private
+  channel made public start an ``AudienceWatchWorkflow`` (one per Slack event ID, never
+  reused), which pauses the agents that answer in that channel when they put a guest or
+  an outside person among its readers.
 * ``POST /slack/interactivity``: Submit / Cancel clicks become a ``decision``
   signal to the task named on the card. The gateway passes on who clicked; the
   task workflow decides whether that person may approve. An Edit click opens a
@@ -37,6 +41,8 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request, Response
+from temporalio.common import WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
@@ -46,7 +52,11 @@ from agentos.connectors.notion import normalize_id
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
+    JOINED,
+    PUBLIC,
+    SHARED,
     ApprovalDecision,
+    AudienceEvent,
     ConversationRef,
     DraftView,
     EditRequest,
@@ -146,6 +156,10 @@ def create_app(
             return Response(status_code=200)
 
         event = payload.get("event") or {}
+        watched = _audience_event(tenant, payload, event)
+        if watched is not None:
+            await _start_audience_watch(d, watched)
+            return Response(status_code=200)
         if event.get("bot_id") or event.get("subtype"):
             return Response(status_code=200)
         if event.get("type") == "app_mention":
@@ -242,6 +256,56 @@ def create_app(
         return await _notion_webhook(d, tenant_id, request)
 
     return app
+
+
+def _audience_event(tenant: str, payload: dict, event: dict) -> AudienceEvent | None:
+    """The audience event a Slack event is, or None.
+
+    Three things can change who reads an agent's answers in a channel: a person joining
+    (``member_joined_channel``), the channel being shared with another organisation
+    (``channel_shared``) and a private channel being made public, which Slack reports as
+    a ``message`` event with the subtype ``channel_convert_to_public``.
+    """
+    channel = event.get("channel")
+    if not isinstance(channel, str) or not channel:
+        return None
+    kind, user = None, None
+    if event.get("type") == "member_joined_channel" and event.get("user"):
+        kind, user = JOINED, event["user"]
+    elif event.get("type") == "channel_shared":
+        kind = SHARED
+    elif event.get("type") == "message" and event.get("subtype") == "channel_convert_to_public":
+        kind = PUBLIC
+    if kind is None:
+        return None
+    event_id = payload.get("event_id") or f"{kind}:{channel}:{user or ''}:{event.get('event_ts')}"
+    return AudienceEvent(tenant, event_id, kind, channel, user)
+
+
+async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
+    """Start the workflow for one audience event; a repeat of the event starts nothing."""
+    workflow_id = ids.audience_event_workflow_id(event.tenant_id, event.event_id)
+    try:
+        await d.temporal_client.start_workflow(
+            "AudienceWatchWorkflow",
+            event,
+            id=workflow_id,
+            task_queue=TASK_QUEUE,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        )
+    except WorkflowAlreadyStartedError:
+        log.info(
+            "tenant_id=%s workflow_id=%s audience event already handled",
+            event.tenant_id,
+            workflow_id,
+        )
+        return
+    log.info(
+        "tenant_id=%s workflow_id=%s started audience watch kind=%s",
+        event.tenant_id,
+        workflow_id,
+        event.kind,
+    )
 
 
 async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Response:

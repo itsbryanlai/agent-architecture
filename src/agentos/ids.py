@@ -101,3 +101,24 @@ def usage_embedding_key(
 ) -> str:
     """The embedding of one page by one attempt. One activity can sync several pages and scopes."""
     return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{attempt}:{scope}:{page_id}"
+
+
+# Audience watch. One workflow per Slack event, and keys that make each effect of a pause
+# happen once: the audit event, and the notice to each person.
+
+
+def audience_event_workflow_id(tenant: str, event_id: str) -> str:
+    """The workflow that handles one Slack audience event: a repeat of the event is rejected."""
+    return f"{tenant}:audience-event:{event_id}"
+
+
+def audit_audience_pause_key(tenant: str, agent_id: str, channel: str, paused_at: str) -> str:
+    """The audit event of one pause, named by when it began."""
+    return f"{tenant}:audit:audience-pause:{agent_id}:{channel}:{paused_at}"
+
+
+def audience_pause_notice_key(
+    tenant: str, agent_id: str, channel: str, paused_at: str, recipient: str
+) -> str:
+    """The idempotency key of the direct message that tells one person about one pause."""
+    return f"{tenant}:audience-pause-notice:{agent_id}:{channel}:{paused_at}:{recipient}"

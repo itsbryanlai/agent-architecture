@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from agentos.agent_store import AgentStore
+from agentos.audience_pauses import PauseStore
 from agentos.config import AgentsConfig, AgentVersion
 from agentos.slack_client import SlackLookupError, SlackPoster, SlackUser
 from agentos.slack_format import escape_slack
@@ -52,6 +53,7 @@ GUEST = "guest"
 EXTERNAL = "external"
 DEACTIVATED = "deactivated"
 UNAVAILABLE = "unavailable"  # the lookups failed, so the asker was refused
+PAUSED = "paused"  # the agent is paused in this channel until its owner confirms the audience
 
 
 @dataclass
@@ -181,9 +183,11 @@ class AudienceChecker:
         agents: AgentStore,
         ttl: float = CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        pauses: PauseStore | None = None,
     ):
         self._registry = registry
         self._agents = agents
+        self._pauses = pauses
         self._ttl = ttl
         self._clock = clock
         self._directories: dict[str, SlackDirectory] = {}
@@ -211,6 +215,9 @@ class AudienceChecker:
         in_channel = channel_kind != "im"
         if in_channel and not audience.includes_channel(channel):
             return AudienceDecision(False, CHANNEL)
+        paused = in_channel and self._pauses is not None
+        if paused and await self._pauses.get_active(tenant_id, agent.agent_id, channel):
+            return AudienceDecision(False, PAUSED)
         if not in_channel and not (audience.dm_everyone or audience.dm_user_groups):
             return AudienceDecision(False, DM)
         directory = self.directory(tenant_id)
@@ -278,6 +285,23 @@ def unavailable_text(agent_name: str) -> str:
         f"I couldn't check whether {escape_slack(agent_name)} is available to you just now. "
         "Try again in a few minutes."
     )
+
+
+def paused_text(agent_name: str) -> str:
+    """The one fixed reply in a channel where the agent is paused. The name is escaped."""
+    return (
+        f"{escape_slack(agent_name)} is paused in this channel until its owner reviews "
+        "who can see it."
+    )
+
+
+def decision_text(agent_name: str, decision: AudienceDecision) -> str:
+    """The fixed reply that tells the asker why the turn did not run."""
+    if decision.reason == UNAVAILABLE:
+        return unavailable_text(agent_name)
+    if decision.reason == PAUSED:
+        return paused_text(agent_name)
+    return refusal_text(agent_name, decision.owner)
 
 
 # --- refusals of the control plane -----------------------------------------------------

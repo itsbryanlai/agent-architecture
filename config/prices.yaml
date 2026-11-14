@@ -25,7 +25,7 @@ prices:
   # also shown, not used here). cache_read is the implicit-cache input price, the
   # cache that applies automatically; cache_write is explicit cache creation.
   - model: qwen3.7-plus
-    effective_from: 2026-11-15
+    effective_from: 2026-11-01
     input: 0.40
     output: 1.60
     cache_read: 0.08

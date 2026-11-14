@@ -24,10 +24,12 @@ refuse a publish of a version lower than the one already published, so no
 caller can roll an agent back by publishing an old version. A rollback is a new
 draft copied from the old version, then submitted and published.
 
-Tenant settings (``default_agent``, ``channels``, workspace, secrets) stay in
-the YAML file. The YAML ``agents`` section is only the source of a one-time
-import::
+Tenant settings (``default_agent``, ``channels``, workspace, the names of the
+secret variables) live in the ``tenants`` table (``agentos.tenant_store``). The
+YAML file is only the source of two one-time imports, its tenant section and its
+``agents`` section::
 
+    uv run python -m agentos.tenant_store import
     uv run python -m agentos.agent_store import
 """
 
@@ -810,7 +812,7 @@ def seeded_agent_store(*configs: AgentsConfig) -> InMemoryAgentStore:
 async def with_published_agents(store: AgentStore, config: AgentsConfig) -> AgentsConfig:
     """The tenant's config with ``agents`` replaced by its published set.
 
-    The tenant's settings stay as the YAML file has them. Code that walks a
+    The tenant's settings stay as the tenants table has them. Code that walks a
     tenant's agents (grant checks, index schedules, the embedder check) reads
     this view, so none of it reads the YAML ``agents`` section.
     """
@@ -825,9 +827,9 @@ async def published_tenants(store: AgentStore, tenants: TenantsConfig) -> Tenant
 
 
 async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> str | None:
-    """A message when the tenant file routes to an agent that cannot answer there.
+    """A message when a tenant's routing names an agent that cannot answer there.
 
-    ``default_agent`` and ``channels`` stay in the YAML file and name agents,
+    ``default_agent`` and ``channels`` live in the tenants table and name agents,
     so a process that would route a message to an unpublished agent must not
     start. Neither may it start when a channel is mapped to an agent whose published
     audience leaves that channel out, because every mention there would be refused.

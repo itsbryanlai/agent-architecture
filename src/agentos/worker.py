@@ -20,6 +20,7 @@ from agentos.agent_store import (
     PostgresAgentStore,
     published_tenants,
     startup_agent_failure,
+    with_published_agents,
 )
 from agentos.audience_pauses import PostgresPauseStore
 from agentos.audience_watch import AudienceWatchActivities
@@ -33,10 +34,9 @@ from agentos.config import (
     Settings,
     TenantsConfig,
     load_settings,
-    load_tenants_config,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
-from agentos.crypto_keys import LocalKeyStore, startup_key_failure
+from agentos.crypto_keys import LocalKeyStore, check_keys, startup_key_failure
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -50,7 +50,8 @@ from agentos.stores import (
     PostgresToolOutputStore,
 )
 from agentos.temporal_client import build_temporal_client
-from agentos.tenants import build_registry
+from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
+from agentos.tenants import RegistrySync, build_registry, require_tenant_secret
 from agentos.usage import PostgresUsageStore, UsageRecorder, load_prices
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
@@ -167,19 +168,54 @@ async def check_grants_at_startup(
     return summary
 
 
+# How often the worker re-reads the tenants table. Short, because an activity for a
+# tenant the worker does not know yet fails for good.
+TENANT_SYNC_SECONDS = 5.0
+
+
+async def admit_new_tenant(
+    config: AgentsConfig,
+    keys: LocalKeyStore,
+    agent_store: PostgresAgentStore,
+    log: logging.Logger,
+) -> str | None:
+    """The start-up work for a tenant that appears while the worker runs.
+
+    Its encryption key must be usable, or it is not served until it is. Its published
+    agents' Notion grants are checked once and any problem is logged; a tenant that
+    has just been added normally has none yet, and every publish checks its grants.
+    """
+    problems = check_keys(keys, [config.tenant_id])
+    if problems:
+        return "; ".join(problems)
+    published = await with_published_agents(agent_store, config)
+    if any(
+        agent.grants.notion_databases or agent.grants.notion_pages
+        for agent in published.agents.values()
+    ):
+        api = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
+        log.info("tenant_id=%s checking grants", config.tenant_id)
+        failure = await check_grants_at_startup(api, published, log)
+        if failure:
+            log.error("tenant_id=%s %s", config.tenant_id, failure)
+    return None
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("agentos.worker")
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
-    key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
-    if key_failure:
-        raise SystemExit(key_failure)
     llm = build_llm(settings)
     prices = load_prices(settings.prices_path)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     try:
+        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenants = await startup_tenants(directory)
+        keys = LocalKeyStore(settings.key_dir)
+        key_failure = startup_key_failure(keys, tenants.tenants)
+        if key_failure:
+            raise SystemExit(key_failure)
         agent_store = PostgresAgentStore(pool)
         agent_failure = await startup_agent_failure(agent_store, tenants)
         if agent_failure:
@@ -247,6 +283,13 @@ async def main() -> None:
                 registry, knowledge, embedder, agent_store, usage
             ).all()
         client = await build_temporal_client(settings)
+        tenant_sync = RegistrySync(
+            directory,
+            registry,
+            RealSlackPoster,
+            RealNotionAPI,
+            admit=lambda config: admit_new_tenant(config, keys, agent_store, log),
+        )
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
@@ -254,7 +297,14 @@ async def main() -> None:
             activities=all_activities,
         )
         log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
-        await worker.run()
+        # A tenant added to, changed in or disabled in the database is picked up here,
+        # without a restart. Its own start-up work (key check, grant check) runs when
+        # it first appears; see ``admit_new_tenant``.
+        refresher = asyncio.create_task(tenant_sync.run(TENANT_SYNC_SECONDS))
+        try:
+            await worker.run()
+        finally:
+            refresher.cancel()
     finally:
         await pool.close()
 

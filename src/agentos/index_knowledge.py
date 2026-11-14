@@ -48,10 +48,10 @@ from agentos.config import (
     AgentsConfig,
     Settings,
     load_settings,
-    load_tenants_config,
 )
 from agentos.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from agentos.temporal_client import build_temporal_client
+from agentos.tenant_store import load_stored_tenants
 from agentos.tenants import granted_roots
 from agentos.workflows.indexing import IndexingWorkflow
 
@@ -171,7 +171,7 @@ async def open_agent_store(settings: Settings) -> AsyncIterator[AgentStore]:
 
 async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
+    tenants = await load_stored_tenants(settings.database_url)
     if tenant is not None and tenant not in tenants.tenants:
         raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
     selected = [tenants.tenants[tenant]] if tenant else list(tenants.tenants.values())

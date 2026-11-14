@@ -196,6 +196,18 @@ def create_app(
         referer = urlsplit(headers.get("referer", ""))
         return f"{referer.scheme}://{referer.netloc}" in allowed_origins
 
+    def is_console_page_navigation(request: Request) -> bool:
+        """A top-level browser navigation (not a frame, fetch or embed) to a console page."""
+        headers = request.headers
+        path = request.url.path
+        return (
+            console is not None
+            and request.method in ("GET", "HEAD")
+            and headers.get("sec-fetch-mode") == "navigate"
+            and headers.get("sec-fetch-dest") == "document"
+            and (path in ("/", "/login") or path.startswith("/ui/"))
+        )
+
     @app.middleware("http")
     async def local_browser_guard(request: Request, call_next):
         """Keep a web page in the operator's browser from driving this API.
@@ -207,6 +219,14 @@ def create_app(
         which fails because no CORS is offered). Refusals say nothing about the request.
         A console form post is the one other write: it must come from our own origin
         (the route then checks its CSRF token against the session).
+
+        A cross-site request is one exception besides the Slack callback: a top-level
+        page navigation to a console page (the redirect after Slack sign-in, a link from
+        Slack or an email). The browser labels a redirect chain that passed through
+        another site as cross-site, so refusing it makes the console unreachable. It is
+        safe because every console GET only reads, the page cannot be framed or read by
+        the other site, and the Lax session cookie is already sent on such navigations.
+        Writes, the JSON API and every cross-site request without a console stay refused.
         """
         if request.url.path == "/healthz":
             return await call_next(request)
@@ -219,7 +239,11 @@ def create_app(
         # Slack sends the browser back to the callback from another site; the callback
         # is protected by its state cookie instead.
         arrives_from_slack = console is not None and request.url.path == CALLBACK_PATH
-        if headers.get("sec-fetch-site") in ("cross-site", "same-site") and not arrives_from_slack:
+        if (
+            headers.get("sec-fetch-site") in ("cross-site", "same-site")
+            and not arrives_from_slack
+            and not is_console_page_navigation(request)
+        ):
             return _error(403, "cross-site requests are not allowed")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             media_type = headers.get("content-type", "").split(";")[0].strip().lower()

@@ -115,8 +115,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
   kind               text        NOT NULL
     CHECK (kind IN (
       'answer', 'tool_call', 'hand_off', 'approval', 'write',
-      'agent_create', 'agent_draft', 'agent_submit', 'agent_withdraw', 'agent_reject',
-      'agent_publish', 'member_add', 'member_remove', 'member_role')),
+      'agent_create', 'agent_draft', 'agent_edit', 'agent_import', 'agent_submit',
+      'agent_withdraw', 'agent_reject', 'agent_publish',
+      'member_add', 'member_remove', 'member_role')),
   agent_id           text,                   -- null only for a membership event
   agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked

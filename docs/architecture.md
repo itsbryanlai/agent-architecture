@@ -69,7 +69,9 @@ Rules that apply to every turn:
 - Messages arrive through a signal handler into an inbox, with duplicates dropped by Slack event ID.
 - Agent config is loaded at the start of each turn and pinned to an agent *version*. Edits apply from the next turn onward, and the audit log records which version answered.
 - Chat history lives in Postgres. The workflow only carries a reference to it and a turn counter, which keeps Temporal history small and keeps document content out of it. Tool output text is written to Postgres by the activity that ran the tool; the workflow passes only a reference, and an activity puts the text into history. Each history append carries a key built from the Slack event ID and the turn step, so a retried append never stores a message twice.
-- Each turn has a maximum number of steps and a token budget.
+- Each turn has a maximum number of steps and a token budget. On the last step the model's tool calls are not run: each gets an error result, and the reply says the step limit was reached, so nothing is started that the reply then calls unfinished.
+- History is repaired and windowed every time it is loaded for the LLM. A tool call left without a result gets an error result, so one broken turn can't make every later call fail. Past a size budget the oldest turns are dropped, cutting only at a user message that carries no tool results.
+- When a turn fails, only the tool calls that did not complete are marked as not completed; a call that already produced a result, such as a write task whose approval card went out, keeps it. A turn that fails before its placeholder is posted still tells the user it failed.
 - Multiple tool calls from one LLM response run in parallel and are matched back to the model by their tool-call IDs.
 - Every activity has explicit timeouts and a retry policy. Errors like 4xx, auth failures, and policy denials are non-retryable.
 
@@ -161,6 +163,8 @@ Creators can make a policy stricter but never looser than the admin's ceiling.
 **Exactly-once execution.**
 - Each write carries an idempotency key, `{task_id}:{step}`. Connectors pass it on where the target system supports one. Where it doesn't, the connector looks for a marker (a label or custom field holding the key) before creating anything.
 - An activity retry after a timeout therefore can't create a second item.
+- Editable fields are capped below the target system's limits (Notion takes 2,000 characters per text item; details and comments are capped at 1,900 so the signature fits), so an approved payload can't be rejected for its size.
+- If a step fails after the user was told the task is in hand, the task posts a line in the thread saying so instead of failing silently. While watching, a transient failure is retried on the next poll; a permanent one (the item is gone or no longer granted) ends the watch with a message.
 
 **Watching and follow-up.**
 - Prefer webhooks from the target system. The ingress gateway maps the event to the task and signals it.
@@ -208,7 +212,8 @@ Agents answer from documents their creator granted, and every answer cites its s
 1. One `IndexingWorkflow` per (tenant, scope) walks the tree from the root with the tenant's connector credential, a couple of pages at a time to stay under the source's rate limits. Workflow history carries only page IDs and counts; each page is fetched, split into chunks, embedded and stored inside one activity.
 2. Each page's content hash includes the embedding model, so unchanged pages are skipped, and changing the model re-embeds everything on the next run.
 3. Pages that left the tree, were trashed or can no longer be read are removed from the index.
-4. A Temporal schedule refreshes every granted scope nightly, and an operator command starts a refresh on demand. Updates driven by source webhooks come later.
+4. Every indexing run checks that its scope is still granted before any connector call. The nightly schedule deletes the stored pages and chunks of scopes no longer granted to any agent.
+5. A Temporal schedule refreshes every granted scope nightly, and an operator command starts a refresh on demand. Updates driven by source webhooks come later.
 
 **Embeddings** sit behind one interface that calls any OpenAI-compatible embeddings endpoint: a hosted provider in production, or a local model for development. The vector size is fixed by the index column (1024), so every model must produce that size.
 
@@ -276,6 +281,8 @@ So adding a new system usually means writing and testing a manifest, not a whole
 - Responsiveness: post a "thinking…" placeholder or assistant-thread status immediately, update it with progress ("Searching Confluence…"), and replace it with the final answer.
 - Slack posts are at least once. The posted message's `ts` is kept under an idempotency key, and a retry that finds it uses the existing message instead of posting again. Slack has no idempotency key of its own, so a crash between Slack accepting a post and the `ts` being recorded can repeat the post; a pending marker written before each post makes such a duplicate visible in the logs. Closing that window would need channel-history read scopes, which the app deliberately doesn't request.
 - The model writes Markdown, which Slack doesn't render. Replies are converted to Slack's mrkdwn when they are posted; code, links and citation numbers pass through unchanged, and stored history keeps the model's Markdown.
+- Text the runtime didn't write itself (the model's, the requester's, a Notion title) has `&`, `<` and `>` escaped before it is posted, in replies, approval cards and thread lines. Slack reads `<...>` as mentions and links, so without this a page the model read could make it ping a channel or show a link whose text hides where it goes.
+- Inbound message text is decoded once, in the gateway: Slack's `&amp;`, `&lt;` and `&gt;` become the characters the user typed, and links become their label, or `label (url)` when the user gave one. Mentions stay as Slack markup. The model and stored history see what the user wrote, not Slack's wire format.
 
 ## 10. Data and storage
 

@@ -1,4 +1,8 @@
-"""Turn the model's Markdown into Slack's mrkdwn before a reply is posted.
+"""Convert text at the Slack boundary, in both directions.
+
+Outbound, the model's Markdown becomes Slack's mrkdwn and is escaped before a
+reply is posted. Inbound, :func:`from_slack_text` decodes Slack's encoding of
+what the user typed.
 
 Slack's message text is not Markdown. Bold is ``*x*`` (Markdown: ``**x**``),
 italic is ``_x_`` (Markdown: ``*x*``), strike is ``~x~``, and headings and

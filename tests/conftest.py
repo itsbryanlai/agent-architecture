@@ -374,7 +374,11 @@ async def two_tenants():
     acme_raw, globex_raw = two_tenant_dicts()
     tenants = TenantsConfig.of(parse_agents_config(acme_raw), parse_agents_config(globex_raw))
     wf_env = await WorkflowEnvironment.start_time_skipping()
-    slacks = {t: FakeSlack(emails={ALICE: "alice@example.com"}) for t in tenants.tenants}
+    # Each tenant's Slack client answers for its own workspace, as the real one does.
+    slacks = {
+        t: FakeSlack(emails={ALICE: "alice@example.com"}, team_id=cfg.slack_team_id)
+        for t, cfg in tenants.tenants.items()
+    }
     notions = {t: make_fake_notion() for t in tenants.tenants}
     registry = TenantRegistry(
         {t: runtime_for(cfg, slacks[t], notions[t]) for t, cfg in tenants.tenants.items()}

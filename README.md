@@ -609,8 +609,9 @@ console is off unless sign-in is configured.
 
 1. OAuth & Permissions → Redirect URLs → add `<AGENTOS_CONSOLE_URL>/auth/slack/callback`
    and save.
-2. Sign in with Slack uses the OpenID scopes `openid` and `profile`. The console
-   asks for them at sign-in; there is nothing to add under bot scopes.
+2. Sign in with Slack uses the OpenID scopes `openid` and `profile`. Add them under
+   OAuth & Permissions → Scopes → **User Token Scopes** (not Bot Token Scopes). The
+   bot scopes are unchanged.
 3. Basic Information → App Credentials: the Client ID and Client Secret.
 
 **In the shell that runs the process** (nothing is stored in a file):

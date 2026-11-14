@@ -228,6 +228,9 @@ def knowledge_agents_dict() -> dict:
     hr["name"] = "HR helper"
     plain = copy.deepcopy(base)
     plain["name"] = "Plain helper"
+    # Not the default agent and not routed to any channel, so without its own audience
+    # the audience check would refuse it in the channel the knowledge tests talk in.
+    plain["audience"] = {"channels": ["C_GENERAL"], "dm": "everyone"}
     base["grants"]["notion"]["pages"] = [{"id": ROOT_A, "name": "IT wiki"}]
     hr["grants"]["notion"]["pages"] = [{"id": ROOT_B, "name": "HR wiki"}]
     raw["agents"]["hr-helper"] = hr

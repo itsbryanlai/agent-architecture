@@ -328,6 +328,15 @@ by default. The table owner and any superuser bypass row-level security, so the
 app must not connect as `agentos`; use `agentos` only to run migrations. If you
 set `AGENTOS_DATABASE_URL` yourself, point it at `agentos_app`.
 
+The audit log needs `005`, applied as the owner role the same way:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/005_audit_log.sql
+```
+
+It adds the append-only `audit_events` table (see "Audit log" below). A fresh
+`docker compose up` gets it from `scripts/init_db.sql`.
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -417,6 +426,28 @@ under the granted page), so a page moved or deleted since the last run is
 left out. Passages reach the model wrapped in `<source>` tags as data, numbered
 like `[1]`. When the answer cites a number, the runtime adds a Sources line
 with the page's title and link; the model never writes a link.
+
+## Audit log
+
+Every tenant has an append-only record of what its agents did: who asked, which
+agent and version, whose access was used (`agent:<agent id>`), which tool, what
+was read or changed, and who approved. One row is written for each of: a read
+tool call, a model answer, an approval, a write to Notion (also a failed write),
+and a hand-off to a specialist. A row holds IDs and SHA-256 hashes of the
+canonical JSON of inputs and outputs, never chat text, document text or tool
+input or output. Each row has an event key, so a retried activity records once.
+
+The app role can only INSERT and SELECT on `audit_events`, and a trigger
+rejects UPDATE, DELETE and TRUNCATE for every role. If the database cannot be
+written, the activity fails and is retried, so nothing is done without a
+record. Retention (one year) is not enforced yet: rows are kept until someone
+removes them outside the app.
+
+Print a tenant's events, newest first, as JSON lines:
+
+```bash
+uv run python -m agentos.audit --tenant acme --limit 50
+```
 
 ## Restart demo: exactly once, and follow-up that survives a crash
 

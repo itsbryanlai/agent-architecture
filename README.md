@@ -367,6 +367,13 @@ The web console's sign-in sessions need `008` (see [Web console](#web-console)):
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
 ```
 
+Two more audit event kinds, `agent_edit` and `agent_import`, need `009` (run it before
+the control plane saves an edit or the import runs, or the audit insert is refused):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/009_audit_kinds.sql
+```
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -522,9 +529,11 @@ admin works; the audit event records both IDs. The last admin cannot remove or
 demote themself.
 
 `agentos.control.ControlPlane` checks the role for every change and writes one
-audit event for it (`agent_create`, `agent_draft`, `agent_submit`,
-`agent_withdraw`, `agent_reject`, `agent_publish`, `member_add`, `member_remove`,
-`member_role`). Events hold IDs and a hash of the definition, never the
+audit event for it (`agent_create`, `agent_draft` for a new draft, `agent_edit` for
+replacing a draft's definition, `agent_submit`, `agent_withdraw`, `agent_reject`,
+`agent_publish`, `member_add`, `member_remove`, `member_role`). The one-time YAML
+import writes an `agent_import` event for each agent it inserts, in the same
+transaction (a rerun that skips an agent writes none). Events hold IDs and a hash of the definition, never the
 definition. A refused action is not audited yet. Apply
 `scripts/migrations/007_members.sql` to an existing database.
 
@@ -567,7 +576,10 @@ any write that is not `application/json`.
 it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
 unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
 also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
-as that user, and nothing in a request (header, query or body) can change it. With
+as that user, and nothing in a request (header, query or body) can change it. It also
+needs each tenant's Notion key exported (`NOTION_TOKEN`, or the variable the tenant's
+`secrets.notion_token_env` names), because the grant check and publish read Notion
+with it; the process exits naming an unset variable. With
 [sign-in configured](#web-console) the process may bind more widely and every
 request acts as the signed-in user instead. What the user may do comes from their role in the
 tenant named in the path (`/tenants/<tenant id>/...`), decided by
@@ -620,9 +632,16 @@ console is off unless sign-in is configured.
 export SLACK_CLIENT_ID=...                  # the Slack app's client ID
 export SLACK_CLIENT_SECRET=...              # its client secret
 export AGENTOS_CONSOLE_URL=https://console.example.com   # the public base URL
+export NOTION_TOKEN='<paste here>'          # the tenant's Notion key (its variable, see below)
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
 uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
 ```
+
+The grant check ("Check Notion grants", and inside every publish) reads Notion with
+the tenant's own Notion key, so the process needs it too. The variable is the one the
+tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
+`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. The process
+refuses to start, naming the unset variable, when any tenant's is missing.
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or
@@ -653,6 +672,10 @@ How it behaves:
 - Every form carries a per-session CSRF token and must come from the console's own
   origin. Pages are served with a `Content-Security-Policy` that allows no script and
   no outside asset.
+- A page never answers 502 or 504, because a proxy such as Cloudflare replaces those
+  with its own error page. When Notion cannot be reached, "Check Notion grants" and a
+  refused publish show the version page with a message and status 503. The JSON API
+  keeps 502.
 - The JSON API accepts the same session cookie. A session is valid only for its own
   tenant's paths.
 

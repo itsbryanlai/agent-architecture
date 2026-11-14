@@ -378,10 +378,11 @@ def _targets(args: argparse.Namespace) -> list[tuple[str, str | None]]:
 async def run(args: argparse.Namespace) -> int:
     from agentos.agent_store import PostgresAgentStore
     from agentos.audit import PostgresAuditStore
-    from agentos.config import load_settings, load_tenants_config
+    from agentos.config import load_settings
+    from agentos.tenant_store import load_stored_tenants
 
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
+    tenants = await load_stored_tenants(settings.database_url)
     if args.tenant not in tenants.tenants:
         print(f"unknown tenant '{args.tenant}'; configured: {', '.join(tenants.tenants)}")
         return 2

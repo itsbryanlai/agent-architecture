@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos.agent_store import PENDING, AgentNotFound
+from agentos.audience import AudienceError
 from agentos.config import ConfigError
 from agentos.control import ControlPlane
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -497,11 +498,19 @@ class WebUI:
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         editor = self.can_edit(ctx, await self.owner_of(ctx, agent_id))
+        audience = await ctx.plane.audience_view(
+            ctx.tenant_id,
+            ctx.user_id,
+            agent_id,
+            version,
+            count=(editor or ctx.is_admin) and record.status in ("draft", PENDING),
+        )
         return _page(
             "version.html",
             status,
             ctx=ctx,
             record=record,
+            audience=audience,
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
             is_draft=record.status == "draft",
@@ -558,8 +567,14 @@ class WebUI:
         if action not in moves:
             return _message("Not found", "There is no such action.", 404, ctx)
         call, done = moves[action]
+        extra = {}
+        if action == "publish":
+            extra["confirm_audience"] = _audience_confirmation(ctx)
         try:
-            await call(ctx.tenant_id, ctx.user_id, agent_id, version)
+            await call(ctx.tenant_id, ctx.user_id, agent_id, version, **extra)
+        except AudienceError as err:
+            status = page_status(status_of(err) or 409)
+            return await self.version_page(request, ctx, agent_id, version, status, str(err))
         except GrantProblems as err:
             return await self.version_page(
                 request, ctx, agent_id, version, 409, str(err), reports=err.reports
@@ -612,6 +627,19 @@ _TITLES = {
     422: "Invalid",
     503: "Notion could not be reached",
 }
+
+
+def _audience_confirmation(ctx: Ctx) -> dict[str, int] | None:
+    """The counts the approver ticked the box for, or None when the box is not ticked.
+
+    A count that is not a plain number is treated as no confirmation.
+    """
+    if ctx.get("confirm") != "yes":
+        return None
+    counts = {name: ctx.get(name).strip() for name in ("total", "guests", "external")}
+    if not all(value.isdigit() and len(value) < 9 for value in counts.values()):
+        return None
+    return {name: int(value) for name, value in counts.items()}
 
 
 def _same(a: str, b: str) -> bool:

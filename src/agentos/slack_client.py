@@ -7,7 +7,41 @@ calls for tests.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
+
+# Slack API errors that pass by themselves: a rate limit, or a Slack-side failure.
+TRANSIENT_SLACK_ERRORS = frozenset(
+    {"ratelimited", "rate_limited", "internal_error", "fatal_error", "service_unavailable"}
+)
+PAGE_SIZE = 200
+# A workspace or channel has at most this many entries read; more is a bug or an abuse.
+MAX_PAGES = 500
+
+
+class SlackLookupError(Exception):
+    """A read of Slack's directory failed. ``transient`` says whether a retry may help."""
+
+    def __init__(self, code: str, transient: bool = False):
+        super().__init__(f"Slack lookup failed: {code}")
+        self.code = code
+        self.transient = transient
+
+
+@dataclass(frozen=True)
+class SlackUser:
+    """What the audience rules need to know about one Slack user, from ``users.info``."""
+
+    id: str
+    team_id: str
+    is_restricted: bool = False  # a multi-channel guest
+    is_ultra_restricted: bool = False  # a single-channel guest
+    deleted: bool = False
+    is_bot: bool = False
+
+    @property
+    def is_guest(self) -> bool:
+        return self.is_restricted or self.is_ultra_restricted
 
 
 class SlackPoster(Protocol):
@@ -35,6 +69,22 @@ class SlackPoster(Protocol):
 
     async def open_view(self, trigger_id: str, view: dict) -> None:
         """Open a modal. The trigger ID from a click is valid for 3 seconds."""
+        ...
+
+    async def user_info(self, user_id: str) -> SlackUser:
+        """The user's team and guest flags (needs ``users:read``)."""
+        ...
+
+    async def usergroup_members(self, group_id: str) -> list[str]:
+        """User IDs in a user group (needs ``usergroups:read``)."""
+        ...
+
+    async def channel_members(self, channel_id: str) -> list[str]:
+        """Every member of a channel, all pages (needs ``channels:read`` / ``groups:read``)."""
+        ...
+
+    async def list_users(self) -> list[SlackUser]:
+        """Every user of the workspace, all pages (needs ``users:read``)."""
         ...
 
 
@@ -70,15 +120,112 @@ class RealSlackPoster:
     async def open_view(self, trigger_id: str, view: dict) -> None:
         await self._client.views_open(trigger_id=trigger_id, view=view)
 
+    async def user_info(self, user_id: str) -> SlackUser:
+        try:
+            resp = await self._client.users_info(user=user_id)
+        except Exception as err:
+            raise _lookup_error(err) from err
+        return _user_from(resp.get("user") or {})
+
+    async def usergroup_members(self, group_id: str) -> list[str]:
+        try:
+            resp = await self._client.usergroups_users_list(usergroup=group_id)
+        except Exception as err:
+            raise _lookup_error(err) from err
+        return list(resp.get("users") or [])
+
+    async def channel_members(self, channel_id: str) -> list[str]:
+        members: list[str] = []
+        cursor = None
+        try:
+            for _ in range(MAX_PAGES):
+                resp = await self._client.conversations_members(
+                    channel=channel_id, limit=PAGE_SIZE, cursor=cursor
+                )
+                members.extend(resp.get("members") or [])
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+                if not cursor:
+                    return members
+        except Exception as err:
+            raise _lookup_error(err) from err
+        raise SlackLookupError("too_many_pages")
+
+    async def list_users(self) -> list[SlackUser]:
+        users: list[SlackUser] = []
+        cursor = None
+        try:
+            for _ in range(MAX_PAGES):
+                resp = await self._client.users_list(limit=PAGE_SIZE, cursor=cursor)
+                users.extend(_user_from(raw) for raw in resp.get("members") or [])
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+                if not cursor:
+                    return users
+        except Exception as err:
+            raise _lookup_error(err) from err
+        raise SlackLookupError("too_many_pages")
+
+
+def _user_from(raw: dict) -> SlackUser:
+    return SlackUser(
+        id=raw.get("id", ""),
+        team_id=raw.get("team_id") or "",
+        is_restricted=bool(raw.get("is_restricted")),
+        is_ultra_restricted=bool(raw.get("is_ultra_restricted")),
+        deleted=bool(raw.get("deleted")),
+        is_bot=bool(raw.get("is_bot")),
+    )
+
+
+def _lookup_error(err: Exception) -> SlackLookupError:
+    """A Slack SDK failure as a ``SlackLookupError``; the error code only, never a token."""
+    response = getattr(err, "response", None)
+    code = ""
+    status = None
+    if response is not None:
+        try:
+            code = str(response.get("error") or "")
+        except Exception:  # noqa: BLE001 - an odd response still becomes a lookup error
+            code = ""
+        status = getattr(response, "status_code", None)
+    if not code:
+        code = type(err).__name__
+    transient = (
+        code in TRANSIENT_SLACK_ERRORS
+        or (isinstance(status, int) and (status == 429 or status >= 500))
+        or not hasattr(err, "response")
+    )
+    return SlackLookupError(code, transient=transient)
+
 
 class FakeSlack:
-    """Test fake. Every call is appended to ``calls`` as (method, kwargs)."""
+    """Test fake. Every call is appended to ``calls`` as (method, kwargs).
 
-    def __init__(self, emails: dict[str, str] | None = None):
+    A user not listed in ``users`` is a full member of workspace ``team_id``.
+    """
+
+    def __init__(
+        self,
+        emails: dict[str, str] | None = None,
+        users: dict[str, SlackUser] | None = None,
+        groups: dict[str, list[str]] | None = None,
+        channel_members: dict[str, list[str]] | None = None,
+        team_id: str = "T0TEST",
+    ):
         self.calls: list[tuple[str, dict]] = []
         self.emails = dict(emails or {})
+        self.users = dict(users or {})
+        self.groups = {g: list(m) for g, m in (groups or {}).items()}
+        self.members_of = {c: list(m) for c, m in (channel_members or {}).items()}
+        self.team_id = team_id
+        self._lookup_error: Exception | None = None
+        self._lookup_failures_left: int | None = None
         self._ts = 0
         self._fail_next_update: Exception | None = None
+
+    def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
+        """Make directory lookups raise ``error``: ``times`` of them, or all until set to None."""
+        self._lookup_error = error
+        self._lookup_failures_left = times
 
     def fail_next_update(self, error: Exception) -> None:
         """Make the next update_message raise ``error`` once."""
@@ -122,6 +269,45 @@ class FakeSlack:
 
     async def open_view(self, trigger_id: str, view: dict) -> None:
         self.calls.append(("open_view", {"trigger_id": trigger_id, "view": view}))
+
+    def _check_lookup(self) -> None:
+        if self._lookup_error is None:
+            return
+        if self._lookup_failures_left is not None:
+            self._lookup_failures_left -= 1
+            if self._lookup_failures_left <= 0:
+                error, self._lookup_error = self._lookup_error, None
+                raise error
+        raise self._lookup_error
+
+    async def user_info(self, user_id: str) -> SlackUser:
+        self.calls.append(("user_info", {"user_id": user_id}))
+        self._check_lookup()
+        return self.users.get(user_id) or SlackUser(user_id, self.team_id)
+
+    async def usergroup_members(self, group_id: str) -> list[str]:
+        self.calls.append(("usergroup_members", {"group_id": group_id}))
+        self._check_lookup()
+        return list(self.groups.get(group_id, []))
+
+    async def channel_members(self, channel_id: str) -> list[str]:
+        self.calls.append(("channel_members", {"channel_id": channel_id}))
+        self._check_lookup()
+        return list(self.members_of.get(channel_id, []))
+
+    async def list_users(self) -> list[SlackUser]:
+        self.calls.append(("list_users", {}))
+        self._check_lookup()
+        listed = {u.id: u for u in self.users.values()}
+        for ids in [*self.members_of.values(), *self.groups.values()]:
+            for user_id in ids:
+                listed.setdefault(user_id, SlackUser(user_id, self.team_id))
+        return list(listed.values())
+
+    def lookups(self) -> list[tuple[str, dict]]:
+        """The directory reads made so far."""
+        names = {"user_info", "usergroup_members", "channel_members", "list_users"}
+        return [(name, kw) for name, kw in self.calls if name in names]
 
     def views(self) -> list[dict]:
         return [kw for name, kw in self.calls if name == "open_view"]

@@ -142,6 +142,21 @@ class Definition(_Body):
     definition: dict[str, Any]
 
 
+class AudienceCounts(_Body):
+    total: int
+    guests: int
+    external: int
+
+
+class Publish(BaseModel):
+    """The publish body. Fields it does not know are ignored, as publish always did: a
+    publish carried no body, and who acts never comes from one. A misspelt
+    ``confirm_audience`` is therefore not a confirmation, and the publish is refused."""
+
+    model_config = ConfigDict(extra="ignore")
+    confirm_audience: AudienceCounts | None = None
+
+
 class NewMember(_Body):
     user_id: str
     role: str
@@ -403,9 +418,24 @@ def create_app(
 
     @app.post("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/publish")
     async def publish(
-        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str, version: int
+        tenant_id: Tenant,
+        actor: Actor,
+        rid: RequestId,
+        agent_id: str,
+        version: int,
+        body: Publish | None = None,
     ) -> JSONResponse:
-        return out(await deps.plane.publish_version(tenant_id, actor, agent_id, version, rid))
+        confirm = None if body is None or body.confirm_audience is None else body.confirm_audience
+        return out(
+            await deps.plane.publish_version(
+                tenant_id,
+                actor,
+                agent_id,
+                version,
+                rid,
+                None if confirm is None else confirm.model_dump(),
+            )
+        )
 
     @app.post("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/check-grants")
     async def check_grants(
@@ -471,11 +501,13 @@ async def _real_lifespan(app: FastAPI):
     from psycopg_pool import AsyncConnectionPool
 
     from agentos.agent_store import PostgresAgentStore
+    from agentos.audience import SlackAudienceInspector
     from agentos.audit import PostgresAuditStore
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
     from agentos.members import PostgresMemberStore
     from agentos.sessions import PostgresSessionStore
+    from agentos.slack_client import RealSlackPoster
     from agentos.tenants import require_tenant_secret
 
     logging.basicConfig(level=logging.INFO)
@@ -492,6 +524,21 @@ async def _real_lifespan(app: FastAPI):
                 apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
             return apis[tenant_id]
 
+        slack_clients: dict[str, RealSlackPoster] = {}
+
+        def slack_for(tenant_id: str) -> RealSlackPoster:
+            # Built on first use, so a tenant whose Slack variable is unset fails its
+            # own publish with a message naming the variable, not the whole console.
+            if tenant_id not in slack_clients:
+                config = tenants.get(tenant_id)
+                slack_clients[tenant_id] = RealSlackPoster(
+                    require_tenant_secret(config, "slack_bot_token_env")
+                )
+            return slack_clients[tenant_id]
+
+        def team_for(tenant_id: str) -> str:
+            return tenants.get(tenant_id).slack_team_id
+
         app.state.deps.sessions = PostgresSessionStore(pool)
         app.state.deps.plane = ControlPlane(
             PostgresAgentStore(pool),
@@ -499,6 +546,7 @@ async def _real_lifespan(app: FastAPI):
             PostgresAuditStore(pool),
             tenants,
             NotionGrantChecker(notion_for),
+            SlackAudienceInspector(slack_for, team_for),
         )
         app.state.deps.tenants = tenants
         yield

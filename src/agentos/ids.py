@@ -66,3 +66,13 @@ def audit_control_key(tenant: str, kind: str, nonce: str) -> str:
 def audit_import_key(tenant: str, agent_id: str) -> str:
     """The audit event for an agent the one-time YAML import inserted: one per agent."""
     return f"{tenant}:audit:import:{agent_id}"
+
+
+def audit_audience_refused_key(tenant: str, event_id: str, agent_id: str, target: str = "") -> str:
+    """A turn refused by an agent's audience, or a hand-off to ``target`` refused: once each."""
+    return f"{tenant}:audit:audience-refused:{event_id}:{agent_id}:{target}"
+
+
+def audience_refusal_key(event_id: str, agent_id: str) -> str:
+    """The idempotency key of the reply that tells the asker an agent is not open to them."""
+    return f"{event_id}:audience:{agent_id}"

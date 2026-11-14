@@ -206,10 +206,12 @@ AGENT_AUDIT_KINDS = (
     "agent_publish",
 )
 MEMBER_AUDIT_KINDS = ("member_add", "member_remove", "member_role")
+AUDIENCE_AUDIT_KINDS = ("audience_refused", "audience_confirm")
 AUDIT_KINDS = (
     ("answer", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
     + MEMBER_AUDIT_KINDS
+    + AUDIENCE_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")

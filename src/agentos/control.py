@@ -31,6 +31,13 @@ A caller may pass a ``request_id`` to a write. It is used in place of a random
 value to build the audit event key, so a retry with the same ``request_id``
 records one event. The store's own state check refuses the retried change.
 
+A publish also checks the version's audience. A channel the tenant file routes to the
+agent must be in the audience, or the publish is refused. When the plane has a Slack
+people counter, the publish needs the approver's confirmation of the people who can
+reach the agent: ``confirm_audience`` must equal a fresh count (total, guests,
+external), and an ``audience_confirm`` event records it with the publish. A plane
+built without a counter does not ask: only tests do that.
+
 A refused action is not audited yet.
 
 The audit event is recorded after the change, in its own transaction. If the
@@ -39,7 +46,9 @@ audit store fails, the change is kept and the error is raised.
 
 from __future__ import annotations
 
+import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -51,8 +60,17 @@ from agentos.agent_store import (
     AgentStore,
     AgentVersionRecord,
 )
+from agentos.audience import (
+    AudienceCheckUnavailable,
+    AudienceInspector,
+    AudienceNotConfirmed,
+    AudienceSummary,
+    ChannelOutsideAudience,
+    EffectiveAudience,
+    effective_audience,
+)
 from agentos.audit import AuditStore, canonical_sha256
-from agentos.config import TenantsConfig
+from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
 from agentos.grant_checker import GrantChecker, GrantProblems, GrantReport
 from agentos.members import (
     ADMIN,
@@ -65,10 +83,41 @@ from agentos.members import (
     MemberStore,
 )
 from agentos.models import AuditEvent
+from agentos.slack_client import SlackLookupError
 
 
 class Forbidden(Exception):
     """The actor's role does not allow the action."""
+
+
+@dataclass
+class AudienceView:
+    """What the console shows of a version's audience: the rules in force and who they reach.
+
+    ``summary`` is None when the plane counts no people or Slack could not be read;
+    ``problem`` then says why.
+    """
+
+    effective: EffectiveAudience
+    summary: AudienceSummary | None = None
+    problem: str | None = None
+
+
+def _slack_problem(err: Exception) -> str:
+    """A reason fit to show: the Slack error code or the configuration message, no secrets."""
+    if isinstance(err, SlackLookupError):
+        return f"Slack said '{err.code}'"
+    return str(err)
+
+
+def _no_config(agent: AgentVersion) -> EffectiveAudience:
+    """A tenant with no file section has no routing, so only an explicit audience is known."""
+    a = agent.audience
+    if a is None:
+        return EffectiveAudience(False, (), True, (), False)
+    return EffectiveAudience(
+        True, tuple(a.channels), a.dm_everyone, tuple(a.dm_user_groups), a.guests
+    )
 
 
 class ControlPlane:
@@ -79,7 +128,9 @@ class ControlPlane:
         audit: AuditStore,
         tenants: TenantsConfig,
         grant_checker: GrantChecker,
+        audience: AudienceInspector | None = None,
     ):
+        self._audience = audience
         self._agents = agents
         self._members = members
         self._audit = audit
@@ -194,6 +245,76 @@ class ControlPlane:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         return await self._grant_checker.check(tenant_id, record.agent())
 
+    async def audience_view(
+        self, tenant_id: str, actor: str, agent_id: str, version: int, count: bool = True
+    ) -> AudienceView:
+        """The audience in force for a version and, when ``count``, the people it reaches.
+
+        Any role that reads versions. Slack is read live; a failure is reported in ``problem`` and
+        does not fail the page.
+        """
+        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        effective = await self._effective(tenant_id, record.agent())
+        if not count or self._audience is None:
+            return AudienceView(effective)
+        try:
+            return AudienceView(
+                effective, await self._audience.summary(tenant_id, effective, False)
+            )
+        except (SlackLookupError, ConfigError) as err:
+            return AudienceView(effective, problem=_slack_problem(err))
+
+    async def _effective(self, tenant_id: str, agent: AgentVersion) -> EffectiveAudience:
+        config = self._tenants.get(tenant_id)
+        if config is None or agent.audience is not None:
+            published: dict[str, AgentVersion] = {}
+        else:
+            published = await self._agents.published_all(tenant_id)
+        return effective_audience(agent, config, published) if config else _no_config(agent)
+
+    def _check_mapped_channels(self, tenant_id: str, agent: AgentVersion) -> None:
+        config = self._tenants.get(tenant_id)
+        if config is None:
+            return
+        if problems := channel_audience_problems(config.channels, {agent.agent_id: agent}):
+            raise ChannelOutsideAudience(
+                f"cannot publish agent '{agent.agent_id}': {problems[0]}. Add the channel to "
+                "the audience, or take it out of the tenant file's channels."
+            )
+
+    async def _confirmed_audience(
+        self, tenant_id: str, agent: AgentVersion, confirm: dict[str, int] | None
+    ) -> AudienceSummary:
+        """The fresh count, once the approver's confirmation matches it."""
+        assert self._audience is not None
+        effective = await self._effective(tenant_id, agent)
+        try:
+            summary = await self._audience.summary(tenant_id, effective, True)
+        except (SlackLookupError, ConfigError) as err:
+            raise AudienceCheckUnavailable(
+                f"could not count the people who can reach this agent: {_slack_problem(err)}. "
+                "Nothing was published; try again."
+            ) from err
+        now = summary.confirmation()
+        said = (
+            f"{now['total']} people can reach this agent ({now['guests']} guests, "
+            f"{now['external']} from other workspaces)"
+        )
+        if confirm is None:
+            raise AudienceNotConfirmed(
+                f"{said}. Confirm that they may see what this agent can access: send "
+                f"confirm_audience {json.dumps(now)}."
+            )
+        if confirm != now:
+            raise AudienceNotConfirmed(
+                f"The people who can reach this agent changed since they were counted: {said}. "
+                "Review them and confirm again."
+            )
+        return summary
+
     # --- agents --------------------------------------------------------------
 
     async def add_agent(
@@ -287,15 +408,22 @@ class ControlPlane:
         agent_id: str,
         version: int,
         request_id: str | None = None,
+        confirm_audience: dict[str, int] | None = None,
     ) -> AgentVersionRecord:
         """Publish a pending version. Only an admin, who may be its submitter."""
         await self._require_role(tenant_id, actor, ADMIN)
         pending = await self._agents.get_version(tenant_id, agent_id, version)
+        confirmed: AudienceSummary | None = None
         if pending is not None and pending.status == PENDING:
             # Any other status is refused by the store below, with its own reason.
+            self._check_mapped_channels(tenant_id, pending.agent())
             reports = await self._grant_checker.check(tenant_id, pending.agent())
             if any(report.problems for report in reports):
                 raise GrantProblems(reports)
+            if self._audience is not None:
+                confirmed = await self._confirmed_audience(
+                    tenant_id, pending.agent(), confirm_audience
+                )
         record = await self._agents.publish(tenant_id, agent_id, version, actor)
         await self._record(
             "agent_publish",
@@ -306,6 +434,19 @@ class ControlPlane:
             approver=actor,
             request_id=request_id,
         )
+        if confirmed is not None:
+            counts = confirmed.confirmation()
+            await self._record(
+                "audience_confirm",
+                tenant_id,
+                actor,
+                version=record,
+                requester=record.submitted_by,
+                approver=actor,
+                target=f"total={counts['total']} guests={counts['guests']} "
+                f"external={counts['external']}",
+                request_id=request_id,
+            )
         return record
 
     # --- members -------------------------------------------------------------

@@ -61,3 +61,8 @@ def audit_write_key(idem_key: str, outcome: str) -> str:
 def audit_control_key(tenant: str, kind: str, nonce: str) -> str:
     """One agent-lifecycle or membership change made through the control plane."""
     return f"{tenant}:audit:control:{kind}:{nonce}"
+
+
+def audit_import_key(tenant: str, agent_id: str) -> str:
+    """The audit event for an agent the one-time YAML import inserted: one per agent."""
+    return f"{tenant}:audit:import:{agent_id}"

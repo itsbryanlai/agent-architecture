@@ -44,6 +44,8 @@ from typing import Any, Protocol
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from agentos import ids
+from agentos.audit import AuditStore, canonical_sha256, insert_event
 from agentos.config import (
     AgentsConfig,
     AgentVersion,
@@ -53,6 +55,7 @@ from agentos.config import (
     check_front_doors,
     parse_agent,
 )
+from agentos.models import AuditEvent
 from agentos.stores import tenant_transaction
 
 IMPORT_USER = "import:yaml"
@@ -191,6 +194,27 @@ class AgentStore(Protocol):
         import is checked like a publish.
         """
         ...
+
+
+def import_event(
+    tenant_id: str, agent_id: str, definition: dict[str, Any], imported_by: str
+) -> AuditEvent:
+    """The audit event for one agent the import inserted as version 1.
+
+    The import is its own requester and approver, as the version row records. The
+    definition is hashed, never stored.
+    """
+    return AuditEvent(
+        tenant_id=tenant_id,
+        event_key=ids.audit_import_key(tenant_id, agent_id),
+        kind="agent_import",
+        agent_id=agent_id,
+        agent_version=1,
+        requester_user_id=imported_by,
+        identity=f"user:{imported_by}",
+        input_sha256=canonical_sha256(definition),
+        approver_user_id=imported_by,
+    )
 
 
 def check_publish(published: dict[str, AgentVersion], new: AgentVersion) -> None:
@@ -496,20 +520,17 @@ class PostgresAgentStore:
                     "INSERT INTO agents (tenant_id, agent_id, created_by) VALUES (%s, %s, %s)",
                     (tenant_id, agent_id, imported_by),
                 )
+                definition = agent_definition(agent)
                 await conn.execute(
                     """
                     INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition,
                                                 created_by, approved_by, published_at)
                     VALUES (%s, %s, 1, 'published', %s, %s, %s, now())
                     """,
-                    (
-                        tenant_id,
-                        agent_id,
-                        Jsonb(agent_definition(agent)),
-                        imported_by,
-                        imported_by,
-                    ),
+                    (tenant_id, agent_id, Jsonb(definition), imported_by, imported_by),
                 )
+                # In the same transaction: an agent is never imported without its record.
+                await insert_event(conn, import_event(tenant_id, agent_id, definition, imported_by))
                 result.imported.append(agent_id)
         return result
 
@@ -543,8 +564,10 @@ class PostgresAgentStore:
 class InMemoryAgentStore:
     """The same lifecycle in memory, for tests. It mirrors the database trigger."""
 
-    def __init__(self) -> None:
+    def __init__(self, audit: AuditStore | None = None) -> None:
         self._agents: dict[tuple[str, str], list[AgentVersionRecord]] = {}
+        # The Postgres store writes audit rows in its own transaction; this stands in.
+        self._audit = audit
 
     @classmethod
     def seeded(cls, *configs: AgentsConfig, by: str = IMPORT_USER) -> InMemoryAgentStore:
@@ -755,19 +778,22 @@ class InMemoryAgentStore:
         check_front_doors({**await self.published_all(tenant_id), **new})
         now = datetime.now(UTC)
         for agent_id, agent in new.items():
+            definition = agent_definition(agent)
             self._agents[(tenant_id, agent_id)] = [
                 AgentVersionRecord(
                     tenant_id,
                     agent_id,
                     1,
                     PUBLISHED,
-                    agent_definition(agent),
+                    definition,
                     imported_by,
                     now,
                     approved_by=imported_by,
                     published_at=now,
                 )
             ]
+            if self._audit is not None:
+                await self._audit.record(import_event(tenant_id, agent_id, definition, imported_by))
             result.imported.append(agent_id)
         return result
 

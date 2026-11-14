@@ -82,40 +82,49 @@ def _check_limit(limit: int) -> int:
     return limit
 
 
+async def insert_event(conn, event: AuditEvent) -> None:
+    """Append ``event`` on a connection already inside the event's tenant transaction.
+
+    A repeat of the same (tenant_id, event_key) stores nothing. Another store that
+    changes something and must record it in the same transaction calls this.
+    """
+    await conn.execute(
+        """
+        INSERT INTO audit_events (
+          tenant_id, event_key, kind, agent_id, agent_version, requester_user_id,
+          identity, conversation_id, task_id, tool, target, input_sha256,
+          output_sha256, approver_user_id, outcome
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (tenant_id, event_key) DO NOTHING
+        """,
+        (
+            event.tenant_id,
+            event.event_key,
+            event.kind,
+            event.agent_id,
+            event.agent_version,
+            event.requester_user_id,
+            event.identity,
+            event.conversation_id,
+            event.task_id,
+            event.tool,
+            event.target,
+            event.input_sha256,
+            event.output_sha256,
+            event.approver_user_id,
+            event.outcome,
+        ),
+    )
+
+
 class PostgresAuditStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
 
     async def record(self, event: AuditEvent) -> None:
         async with tenant_transaction(self._pool, event.tenant_id) as conn:
-            await conn.execute(
-                """
-                INSERT INTO audit_events (
-                  tenant_id, event_key, kind, agent_id, agent_version, requester_user_id,
-                  identity, conversation_id, task_id, tool, target, input_sha256,
-                  output_sha256, approver_user_id, outcome
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (tenant_id, event_key) DO NOTHING
-                """,
-                (
-                    event.tenant_id,
-                    event.event_key,
-                    event.kind,
-                    event.agent_id,
-                    event.agent_version,
-                    event.requester_user_id,
-                    event.identity,
-                    event.conversation_id,
-                    event.task_id,
-                    event.tool,
-                    event.target,
-                    event.input_sha256,
-                    event.output_sha256,
-                    event.approver_user_id,
-                    event.outcome,
-                ),
-            )
+            await insert_event(conn, event)
 
     async def list(
         self,

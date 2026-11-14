@@ -198,6 +198,8 @@ class DraftView:
 AGENT_AUDIT_KINDS = (
     "agent_create",
     "agent_draft",
+    "agent_edit",
+    "agent_import",
     "agent_submit",
     "agent_withdraw",
     "agent_reject",

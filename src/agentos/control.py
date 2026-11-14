@@ -235,7 +235,7 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.replace_draft(tenant_id, agent_id, version, definition)
-        await self._record("agent_draft", tenant_id, actor, version=record, request_id=request_id)
+        await self._record("agent_edit", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def submit_version(

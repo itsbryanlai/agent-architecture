@@ -14,6 +14,11 @@ Rules kept here:
   is read from Notion: a page event is dropped (the nightly run catches up), and a page
   or prune step of a full run fails for good, so the run ends without pruning anything.
   The switch is read afresh at every step.
+* While the tenant's monthly spend is at or over its tenant-wide budget (see
+  ``agentos.budgets``) no embedding call is made. The page is neither stored nor skipped: its
+  sub-page IDs still go back so the run keeps every page it saw, and nothing is pruned
+  because of the stop. Indexing resumes by itself when the budget is raised or removed or
+  the UTC month turns. Agent budgets never stop indexing.
 * Log lines carry the tenant, scope and page ID only.
 """
 
@@ -28,6 +33,7 @@ from temporalio import activity
 from agentos import ids
 from agentos.activities import _activity_ref, _is_client_error, _non_retryable
 from agentos.agent_store import AgentStore, with_published_agents
+from agentos.budgets import TENANT, BudgetGuard
 from agentos.config import EMBED_DIMENSIONS
 from agentos.connectors.notion import is_unreachable, normalize_id
 from agentos.knowledge.embedder import Embedder
@@ -58,6 +64,7 @@ class SyncResult:
     changed: bool = False
     chunks: int = 0
     skipped: bool = False
+    budget_stopped: bool = False  # changed, but not embedded: the tenant budget is reached
 
 
 @dataclass
@@ -90,7 +97,9 @@ class IndexActivities:
         agents: AgentStore,
         usage: UsageRecorder | None = None,
         switches: SwitchStore | None = None,
+        budgets: BudgetGuard | None = None,
     ):
+        self.budgets = budgets
         self.switches = switches or InMemorySwitchStore()
         self.usage = usage
         self.registry = registry
@@ -205,7 +214,7 @@ class IndexActivities:
         for scope, root in (await self._granted(runtime)).items():
             if await checker.under_root(page_id, root):
                 synced = await self.sync_page(tenant_id, scope, page_id)
-                if not synced.skipped:
+                if not synced.skipped and not synced.budget_stopped:
                     result.indexed.append(scope)
             elif page_id in await self.store.page_hashes(tenant_id, scope):
                 await self.store.delete_pages(tenant_id, scope, [page_id])
@@ -219,6 +228,9 @@ class IndexActivities:
         stored = await self.store.page_hashes(tenant_id, scope)
         if stored.get(page_id) == digest:
             return SyncResult(content.child_page_ids, changed=False, chunks=len(chunks))
+        if chunks and self.budgets is not None and await self.budgets.tenant_stopped(tenant_id):
+            log.info("indexing stopped tenant_id=%s scope=%s budget=%s", tenant_id, scope, TENANT)
+            return SyncResult(content.child_page_ids, budget_stopped=True, chunks=len(chunks))
         vectors = await self.embedder.embed(chunks) if chunks else []
         if chunks and self.usage is not None:
             await self.usage.embedding(

@@ -90,6 +90,7 @@ from agentos.audience import (
 from agentos.audience_pauses import InMemoryPauseStore, NotPaused, PauseRecord, PauseStore
 from agentos.audit import AuditStore, canonical_sha256
 from agentos.budgets import (
+    AGENT_KINDS,
     Budget,
     BudgetLine,
     BudgetStore,
@@ -347,7 +348,7 @@ class ControlPlane:
         if role != ADMIN:
             agents = [a for a in agents if a.created_by == actor]
         lines = [
-            BudgetLine.of(a.agent_id, rows.get(a.agent_id), spend.of(a.agent_id))
+            BudgetLine.of(a.agent_id, rows.get(a.agent_id), spend.of(a.agent_id), AGENT_KINDS)
             for a in sorted(agents, key=lambda a: a.agent_id)
         ]
         tenant = BudgetLine.of(None, rows.get(None), spend.tenant) if role == ADMIN else None

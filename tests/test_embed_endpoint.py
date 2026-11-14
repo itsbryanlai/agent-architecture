@@ -5,6 +5,7 @@ from temporalio.exceptions import ApplicationError
 
 from agentos.config import AgentsConfig, Settings, TenantsConfig, load_settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
+from agentos.ids import knowledge_scope
 from agentos.knowledge.embedder import FakeEmbedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -63,21 +64,22 @@ class FailingEmbedder(FakeEmbedder):
 def activities_for(embedder) -> IndexActivities:
     api = FakeNotionAPI()
     api.add_page_tree(ROOT, {"title": "Guide", "blocks": [text_block("paragraph", "Some text.")]})
-    raw = agents_dict()
-    raw["tenant_id"] = "t1"
-    config = parse_agents_config(raw)
-    registry = TenantRegistry({"t1": runtime_for(config, FakeSlack(), api)})
+    config = with_pages()
+    registry = TenantRegistry({config.tenant_id: runtime_for(config, FakeSlack(), api)})
     return IndexActivities(registry, InMemoryKnowledgeStore(), embedder)
 
 
 async def test_sync_page_client_error_is_non_retryable():
     acts = activities_for(FailingEmbedder(404))
     with pytest.raises(ApplicationError) as caught:
-        await acts.sync_page("t1", "notion:page:x", ROOT)
+        await acts.sync_page(with_pages().tenant_id, knowledge_scope(ROOT), ROOT)
     assert caught.value.non_retryable is True
+    # It came from the embedder, not from a revoked-grant check.
+    assert caught.value.type == "RuntimeError"
+    assert "embedder said no" in str(caught.value)
 
 
 async def test_sync_page_server_error_is_retried():
     acts = activities_for(FailingEmbedder(500))
     with pytest.raises(RuntimeError, match="embedder said no"):
-        await acts.sync_page("t1", "notion:page:x", ROOT)
+        await acts.sync_page(with_pages().tenant_id, knowledge_scope(ROOT), ROOT)

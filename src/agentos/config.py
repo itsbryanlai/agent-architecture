@@ -34,6 +34,8 @@ DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 # password is a local development value, like the Compose one.
 DEFAULT_DATABASE_URL = "postgresql://agentos_app:agentos_app@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
+# Model prices in US dollars per million tokens, used to cost each model call.
+DEFAULT_PRICES_PATH = "config/prices.yaml"
 # The directory where the gateway writes each tenant's Notion verification token.
 DEFAULT_NOTION_TOKEN_DIR = "~/.agentos"
 # The directory of per-tenant payload encryption key files, <tenant_id>.key.
@@ -102,6 +104,7 @@ class Settings:
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
+    prices_path: str = DEFAULT_PRICES_PATH
     # Sign in with Slack for the web console: the Slack app's client ID and secret,
     # and the public base URL the browser reaches the console at. The console is
     # configured only when all three are set (see ``slack_signin``).
@@ -155,6 +158,7 @@ def load_settings() -> Settings:
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
+        prices_path=env.get("AGENTOS_PRICES") or DEFAULT_PRICES_PATH,
         slack_client_id=env.get("SLACK_CLIENT_ID") or None,
         slack_client_secret=env.get("SLACK_CLIENT_SECRET") or None,
         console_url=env.get("AGENTOS_CONSOLE_URL") or None,
@@ -258,6 +262,8 @@ class AgentVersion:
     # Agents this one may hand a thread to. An agent with specialists is a
     # front door.
     specialists: list[str] = field(default_factory=list)
+    # An optional label the usage page groups cost by. Empty means no team.
+    team: str = ""
 
 
 @dataclass
@@ -397,6 +403,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
         description=str(raw.get("description") or "").strip(),
         specialists=_parse_specialists(where, raw.get("specialists")),
+        team=_parse_team(where, raw.get("team")),
     )
 
 
@@ -427,6 +434,7 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         if property_ids:
             entry["property_ids"] = property_ids
         databases.append(entry)
+    optional: dict[str, Any] = {"team": agent.team} if agent.team else {}
     return {
         "name": agent.name,
         "description": agent.description,
@@ -441,7 +449,27 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         "follow_up": dataclasses.asdict(agent.follow_up),
         "approval": dataclasses.asdict(agent.approval),
         "specialists": list(agent.specialists),
+        **optional,
     }
+
+
+MAX_TEAM_LENGTH = 64
+
+
+def _parse_team(where: str, raw: Any) -> str:
+    """The ``team`` label: a short single-line string, or absent."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ConfigError(f"{where}: 'team' must be a text label such as IT")
+    team = raw.strip()
+    if not team:
+        raise ConfigError(f"{where}: 'team' must not be empty; leave it out for no team")
+    if len(team) > MAX_TEAM_LENGTH:
+        raise ConfigError(f"{where}: 'team' must be at most {MAX_TEAM_LENGTH} characters")
+    if not team.isprintable():
+        raise ConfigError(f"{where}: 'team' must be one line of printable characters")
+    return team
 
 
 def _parse_specialists(where: str, raw: Any) -> list[str]:

@@ -21,7 +21,8 @@ from dataclasses import dataclass, field
 
 from temporalio import activity
 
-from agentos.activities import _is_client_error, _non_retryable
+from agentos import ids
+from agentos.activities import _activity_ref, _is_client_error, _non_retryable
 from agentos.agent_store import AgentStore, with_published_agents
 from agentos.config import EMBED_DIMENSIONS
 from agentos.connectors.notion import is_unreachable, normalize_id
@@ -30,6 +31,7 @@ from agentos.knowledge.notion_text import PageUnavailable, chunk, page_text
 from agentos.knowledge.search import PageChecker
 from agentos.knowledge.store import KnowledgeStore
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant, granted_roots
+from agentos.usage import UsageRecorder
 
 log = logging.getLogger("agentos.indexing")
 
@@ -74,7 +76,9 @@ class IndexActivities:
         store: KnowledgeStore,
         embedder: Embedder,
         agents: AgentStore,
+        usage: UsageRecorder | None = None,
     ):
+        self.usage = usage
         self.registry = registry
         self.agents = agents
         self.store = store
@@ -189,6 +193,15 @@ class IndexActivities:
         if stored.get(page_id) == digest:
             return SyncResult(content.child_page_ids, changed=False, chunks=len(chunks))
         vectors = await self.embedder.embed(chunks) if chunks else []
+        if chunks and self.usage is not None:
+            await self.usage.embedding(
+                tenant_id=tenant_id,
+                key=ids.usage_embedding_key(
+                    tenant_id, *_activity_ref(f"{tenant_id}:index"), scope, page_id
+                ),
+                model=self.embedder.model,
+                billed=getattr(vectors, "billed", None),
+            )
         await self.store.replace_page(
             tenant_id,
             scope,

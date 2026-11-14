@@ -103,6 +103,22 @@ class ToolResult:
 
 
 @dataclass
+class Usage:
+    """What one model call used, as the provider reported it.
+
+    ``input_tokens`` excludes the tokens served from or written to the prompt
+    cache, which are counted separately because they are priced differently.
+    ``model`` is the name the provider reported; None when it reported none.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    model: str | None = None
+
+
+@dataclass
 class LLMResponse:
     text: str | None
     tool_calls: list[ToolCall]
@@ -112,6 +128,7 @@ class LLMResponse:
     # unchanged. Empty when the client has no raw blocks (the scripted fake);
     # history is then rebuilt from ``text`` and ``tool_calls``.
     content: list[dict] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
 
 
 @dataclass

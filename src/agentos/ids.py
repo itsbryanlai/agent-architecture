@@ -66,3 +66,19 @@ def audit_control_key(tenant: str, kind: str, nonce: str) -> str:
 def audit_import_key(tenant: str, agent_id: str) -> str:
     """The audit event for an agent the one-time YAML import inserted: one per agent."""
     return f"{tenant}:audit:import:{agent_id}"
+
+
+# Usage row keys. Each names one activity, so an activity that retries records
+# its usage once. Every key starts with the tenant ID.
+
+
+def usage_call_key(tenant: str, workflow_id: str, run_id: str, activity_id: str) -> str:
+    """The model call made by one activity of one workflow run."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}"
+
+
+def usage_embedding_key(
+    tenant: str, workflow_id: str, run_id: str, activity_id: str, scope: str, page_id: str
+) -> str:
+    """The embedding of one page. One activity can sync several pages and scopes."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{scope}:{page_id}"

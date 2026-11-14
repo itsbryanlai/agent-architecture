@@ -47,6 +47,7 @@ from agentos.stores import (
 )
 from agentos.temporal_client import build_temporal_client
 from agentos.tenants import build_registry
+from agentos.usage import PostgresUsageStore, UsageRecorder, load_prices
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
@@ -170,6 +171,7 @@ async def main() -> None:
     if key_failure:
         raise SystemExit(key_failure)
     llm = build_llm(settings)
+    prices = load_prices(settings.prices_path)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     try:
@@ -202,6 +204,8 @@ async def main() -> None:
                 urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
             )
         knowledge = PostgresKnowledgeStore(pool)
+        usage = UsageRecorder(PostgresUsageStore(pool), prices)
+        log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         activities = AgentActivities(
             settings=settings,
             registry=registry,
@@ -214,13 +218,16 @@ async def main() -> None:
             agents=agent_store,
             knowledge=knowledge,
             embedder=embedder,
+            usage=usage,
         )
         workflows: list = [ConversationWorkflow, TaskWorkflow]
         all_activities = activities.all()
         if embedder is not None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
-            all_activities += IndexActivities(registry, knowledge, embedder, agent_store).all()
+            all_activities += IndexActivities(
+                registry, knowledge, embedder, agent_store, usage
+            ).all()
         client = await build_temporal_client(settings)
         worker = Worker(
             client,

@@ -18,6 +18,16 @@ from typing import Protocol
 BATCH_SIZE = 10
 
 
+class Embeddings(list):
+    """The vectors of one ``embed`` call, plus the billed input count the endpoint reported.
+
+    ``billed`` is None when the endpoint does not report usage. It is a list in
+    every other way, so callers that only want the vectors need not know.
+    """
+
+    billed: int | None = None
+
+
 class Embedder(Protocol):
     model: str
     dimensions: int
@@ -44,7 +54,8 @@ class OpenAICompatibleEmbedder:
         self.dimensions = dimensions
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
+        vectors = Embeddings()
+        billed: int | None = 0
         for start in range(0, len(texts), BATCH_SIZE):
             batch = texts[start : start + BATCH_SIZE]
             resp = await self._client.embeddings.create(
@@ -53,6 +64,11 @@ class OpenAICompatibleEmbedder:
                 dimensions=self.dimensions,
                 encoding_format="float",
             )
+            reported = getattr(getattr(resp, "usage", None), "prompt_tokens", None)
+            if isinstance(reported, int) and not isinstance(reported, bool) and billed is not None:
+                billed += reported
+            else:
+                billed = None
             data = sorted(resp.data, key=lambda d: d.index)
             if len(data) != len(batch):
                 raise ValueError(f"expected {len(batch)} embeddings, got {len(data)}")
@@ -61,6 +77,7 @@ class OpenAICompatibleEmbedder:
                 if len(vector) != self.dimensions:
                     raise ValueError(f"expected {self.dimensions} dimensions, got {len(vector)}")
                 vectors.append(vector)
+        vectors.billed = billed
         return vectors
 
 
@@ -69,16 +86,21 @@ class FakeEmbedder:
 
     Texts that share words end up close together. ``texts_embedded`` counts how many
     texts were embedded, so tests can see whether anything was re-embedded.
+    ``usage_per_text`` is the billed count it reports per text; None reports no usage.
     """
 
     def __init__(self, dimensions: int = 1024, model: str = "fake-embed"):
         self.model = model
         self.dimensions = dimensions
         self.texts_embedded = 0
+        self.usage_per_text: int | None = 1
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         self.texts_embedded += len(texts)
-        return [self._one(t) for t in texts]
+        vectors = Embeddings(self._one(t) for t in texts)
+        if self.usage_per_text is not None:
+            vectors.billed = self.usage_per_text * len(texts)
+        return vectors
 
     def _one(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions

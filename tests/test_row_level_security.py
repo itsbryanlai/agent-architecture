@@ -3,18 +3,19 @@
 The policies themselves are checked against a real Postgres outside this suite.
 """
 
+import hashlib
 import inspect
 import re
 import types
 import typing
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
 
-from agentos import agent_store, audit, members, stores
+from agentos import agent_store, audit, members, sessions, stores
 from agentos.agent_store import PostgresAgentStore
 from agentos.audit import PostgresAuditStore
 from agentos.config import (
@@ -27,6 +28,7 @@ from agentos.knowledge import store as knowledge_store
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
+from agentos.sessions import PostgresSessionStore
 from agentos.stores import (
     PostgresHistoryStore,
     PostgresIdempotencyStore,
@@ -42,6 +44,7 @@ MIGRATION = (ROOT / "scripts" / "migrations" / "004_row_level_security.sql").rea
 AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
 AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
 MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
+SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -52,6 +55,7 @@ POSTGRES_STORES = [
     PostgresAuditStore,
     PostgresAgentStore,
     PostgresMemberStore,
+    PostgresSessionStore,
 ]
 
 
@@ -110,6 +114,8 @@ def sample_value(hint):
         return {"k": "v"}
     if hint is datetime:
         return datetime(2026, 1, 1)
+    if hint is timedelta:
+        return timedelta(hours=8)
     if typing.get_origin(hint) is types.UnionType:
         return sample_value(next(a for a in typing.get_args(hint) if a is not type(None)))
     if hint is AuditEvent:
@@ -147,12 +153,15 @@ AGENT_ROW = (
 
 AGENT_RECORD_ROW = ("acme", "it-helper", "U1", None)
 MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
+SESSION_ROW = ("acme", "U1", "csrf-secret", datetime(2026, 1, 1), datetime(2026, 1, 2))
 
 
 def row_for(cls, method_name):
     """The row a store's reads need, since the fake returns it for every query."""
     if cls is PostgresMemberStore:
         return MEMBER_ROW
+    if cls is PostgresSessionStore:
+        return SESSION_ROW
     if cls is PostgresAgentStore:
         return AGENT_RECORD_ROW if method_name in ("get_agent", "list_agents") else AGENT_ROW
     return None
@@ -169,7 +178,7 @@ def public_methods(cls):
 def test_store_classes_are_all_covered():
     # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store, audit, agent_store, members):
+    for module in (stores, knowledge_store, audit, agent_store, members, sessions):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -251,6 +260,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(AUDIT_MIGRATION)
         | rls_tables_forced(AGENTS_MIGRATION)
         | rls_tables_forced(MEMBERS_MIGRATION)
+        | rls_tables_forced(SESSIONS_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
@@ -297,3 +307,41 @@ def test_init_db_matches_the_members_migration_and_widens_the_audit_log():
     assert "ALTER COLUMN agent_id DROP NOT NULL" in MEMBERS_MIGRATION
     assert "ALTER COLUMN agent_version DROP NOT NULL" in MEMBERS_MIGRATION
     assert "audit_events_agent_required" in INIT_DB
+
+
+@pytest.mark.parametrize("sql", [SESSIONS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+def test_sessions_sql_is_tenant_scoped_and_never_updated_by_the_app_role(sql):
+    assert "PRIMARY KEY (tenant_id, session_hash)" in sql
+    assert "ALTER TABLE sessions ENABLE ROW LEVEL SECURITY" in sql
+    assert "ALTER TABLE sessions FORCE ROW LEVEL SECURITY" in sql
+    assert "CREATE POLICY tenant_isolation ON sessions" in sql
+    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "REVOKE ALL ON sessions FROM agentos_app" in sql
+    assert "GRANT SELECT, INSERT, DELETE ON sessions TO agentos_app" in sql
+    assert "UPDATE ON sessions" not in sql
+    # The session ID itself has no column: only its hash is stored.
+    assert "session_hash" in sql and "session_id" not in sql
+
+
+def test_init_db_matches_the_sessions_migration():
+    block = SESSIONS_MIGRATION[SESSIONS_MIGRATION.index("CREATE TABLE IF NOT EXISTS sessions") :]
+    assert block.rstrip() in INIT_DB
+
+
+async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash():
+    pool = FakePool(SESSION_ROW)
+    store = PostgresSessionStore(pool)
+    now = datetime(2026, 1, 1)
+    issued = await store.create("acme", "U1", now)
+    await store.get("acme", issued.token, now)
+    await store.delete("acme", issued.token)
+    sql = [e for e in pool.events if e[0] == "execute" and "set_config" not in e[1]]
+    assert all("tenant_id = %s" in e[1] or "INSERT" in e[1] for e in sql)
+    for event in sql:
+        params = event[2]
+        assert issued.token not in params
+    inserted = next(e for e in sql if "INSERT" in e[1])
+    assert hashlib.sha256(issued.token.encode()).hexdigest() in inserted[2]
+    selected = next(e for e in sql if e[1].startswith("SELECT"))
+    assert "expires_at > %s" in selected[1]

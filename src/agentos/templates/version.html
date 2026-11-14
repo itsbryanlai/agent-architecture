@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros.html" import post_button %}
+{% from "macros.html" import post_button, paused_channels %}
 {% block title %}{{ record.agent_id }} v{{ record.version }}{% endblock %}
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a> / <a href="{{ agent_url }}">{{ record.agent_id }}</a></p>
@@ -81,6 +81,8 @@
 {% elif audience.problem %}
 <p class="error">Could not count the people who can reach this agent: {{ audience.problem }}.</p>
 {% endif %}
+
+{{ paused_channels(paused, agent_url ~ "/channels", ctx.csrf) }}
 
 <h2>Definition</h2>
 {% if editor and is_draft %}

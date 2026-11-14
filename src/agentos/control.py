@@ -40,6 +40,12 @@ reach the agent: ``confirm_audience`` must equal a fresh count (total, guests,
 external), and an ``audience_confirm`` event records it with the publish. A plane
 built without a counter does not ask: only tests do that.
 
+Audience changes are watched (see ``audience_watch.py``): an agent paused in a channel
+stays paused until ``resume_channel``, which the agent's creator or an admin calls with
+the fresh count of the people in that channel, like a publish. Reading the paused
+channels (``paused_channels``) is for admins and the agent's editors. Resuming is audited
+as ``audience_resume``.
+
 A refused action is not audited yet.
 
 The audit event is recorded after the change, in its own transaction. If the
@@ -72,6 +78,7 @@ from agentos.audience import (
     EffectiveAudience,
     effective_audience,
 )
+from agentos.audience_pauses import InMemoryPauseStore, NotPaused, PauseRecord, PauseStore
 from agentos.audit import AuditStore, canonical_sha256
 from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
 from agentos.grant_checker import GrantChecker, GrantProblems, GrantReport
@@ -114,6 +121,19 @@ class AudienceView:
     problem: str | None = None
 
 
+@dataclass
+class PausedChannel:
+    """A paused channel as the console shows it, with the people in the channel just now.
+
+    ``summary`` is None when the plane counts no people or Slack could not be read;
+    ``problem`` then says why.
+    """
+
+    pause: PauseRecord
+    summary: AudienceSummary | None = None
+    problem: str | None = None
+
+
 def _slack_problem(err: Exception) -> str:
     """A reason fit to show: the Slack error code or the configuration message, no secrets."""
     if isinstance(err, SlackLookupError):
@@ -131,6 +151,11 @@ def _no_config(agent: AgentVersion) -> EffectiveAudience:
     )
 
 
+def _channel_only(pause: PauseRecord) -> EffectiveAudience:
+    """An audience of one channel and no direct messages, to count the people in it."""
+    return EffectiveAudience(True, (pause.channel,), False, (), True)
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -142,7 +167,9 @@ class ControlPlane:
         audience: AudienceInspector | None = None,
         usage: UsageStore | None = None,
         clock: Callable[[], datetime] = utcnow,
+        pauses: PauseStore | None = None,
     ):
+        self._pauses = InMemoryPauseStore() if pauses is None else pauses
         self._audience = audience
         self._usage = InMemoryUsageStore() if usage is None else usage
         self._clock = clock
@@ -306,6 +333,117 @@ class ControlPlane:
             )
         except (SlackLookupError, ConfigError) as err:
             return AudienceView(effective, problem=_slack_problem(err))
+
+    async def paused_channels(
+        self, tenant_id: str, actor: str, agent_id: str | None = None, count: bool = True
+    ) -> list[PausedChannel]:
+        """The channels where agents are paused, each with the people in it just now.
+
+        An admin reads every agent's; a creator reads the agents they created. With
+        ``agent_id`` the actor must be an admin or that agent's creator. Slack is read
+        live (the workspace list may be a few minutes old); a failure is reported in
+        ``problem`` and does not fail the read.
+        """
+        if agent_id is not None:
+            await self._require_editor(tenant_id, actor, agent_id)
+            pauses = await self._pauses.list_active(tenant_id, agent_id)
+        else:
+            role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+            pauses = await self._pauses.list_active(tenant_id)
+            if role != ADMIN:
+                mine = {
+                    a.agent_id
+                    for a in await self._agents.list_agents(tenant_id)
+                    if a.created_by == actor
+                }
+                pauses = [p for p in pauses if p.agent_id in mine]
+        views = []
+        for pause in pauses:
+            if not count or self._audience is None:
+                views.append(PausedChannel(pause))
+                continue
+            try:
+                summary = await self._audience.summary(tenant_id, _channel_only(pause), False)
+            except (SlackLookupError, ConfigError) as err:
+                views.append(PausedChannel(pause, problem=_slack_problem(err)))
+            else:
+                views.append(PausedChannel(pause, summary))
+        return views
+
+    async def resume_channel(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        channel: str,
+        confirm_audience: dict[str, int] | None = None,
+        request_id: str | None = None,
+    ) -> PauseRecord:
+        """End a pause. The agent's creator or an admin, who confirms who is in the channel.
+
+        ``confirm_audience`` must equal a fresh count of the channel's people (total,
+        guests, external), as a publish asks. A plane built without a counter does not
+        ask: only tests do that.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        pause = await self._pauses.get_active(tenant_id, agent_id, channel)
+        if pause is None:
+            raise NotPaused(f"agent '{agent_id}' is not paused in channel '{channel}'")
+        counts = ""
+        if self._audience is not None:
+            summary = await self._confirmed_channel(tenant_id, pause, confirm_audience)
+            c = summary.confirmation()
+            counts = f" total={c['total']} guests={c['guests']} external={c['external']}"
+        closed = await self._pauses.close_pause(tenant_id, agent_id, channel, actor, self._clock())
+        if closed is None:
+            raise NotPaused(f"agent '{agent_id}' is not paused in channel '{channel}'")
+        published = await self._agents.published(tenant_id, agent_id)
+        version = (
+            None
+            if published is None
+            else await self._agents.get_version(tenant_id, agent_id, published.version)
+        )
+        if version is not None:
+            await self._record(
+                "audience_resume",
+                tenant_id,
+                actor,
+                version=version,
+                approver=actor,
+                target=f"{channel}{counts}",
+                tool=pause.reason,
+                request_id=request_id,
+            )
+        return closed
+
+    async def _confirmed_channel(
+        self, tenant_id: str, pause: PauseRecord, confirm: dict[str, int] | None
+    ) -> AudienceSummary:
+        """The fresh count of the paused channel, once the confirmation matches it."""
+        assert self._audience is not None
+        try:
+            summary = await self._audience.summary(tenant_id, _channel_only(pause), True)
+        except (SlackLookupError, ConfigError) as err:
+            raise AudienceCheckUnavailable(
+                f"could not count the people in this channel: {_slack_problem(err)}. "
+                "Nothing was resumed; try again."
+            ) from err
+        now = summary.confirmation()
+        said = (
+            f"{now['total']} people are in this channel ({now['guests']} guests, "
+            f"{now['external']} from other workspaces)"
+        )
+        if confirm is None:
+            raise AudienceNotConfirmed(
+                f"{said}. Confirm that they may see what this agent says here: send "
+                f"confirm_audience {json.dumps(now)}."
+            )
+        if confirm != now:
+            raise AudienceNotConfirmed(
+                f"The people in this channel changed since they were counted: {said}. "
+                "Review them and confirm again."
+            )
+        return summary
 
     async def _effective(self, tenant_id: str, agent: AgentVersion) -> EffectiveAudience:
         config = self._tenants.get(tenant_id)

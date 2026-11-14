@@ -511,6 +511,7 @@ async def _real_lifespan(app: FastAPI):
 
     from agentos.agent_store import PostgresAgentStore
     from agentos.audience import SlackAudienceInspector
+    from agentos.audience_pauses import PostgresPauseStore
     from agentos.audit import PostgresAuditStore
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
@@ -558,6 +559,7 @@ async def _real_lifespan(app: FastAPI):
             NotionGrantChecker(notion_for),
             SlackAudienceInspector(slack_for, team_for),
             usage=PostgresUsageStore(pool),
+            pauses=PostgresPauseStore(pool),
         )
         app.state.deps.tenants = tenants
         yield

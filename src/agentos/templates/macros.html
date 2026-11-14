@@ -5,3 +5,37 @@
   <button type="submit">{{ label }}</button>
 </form>
 {%- endmacro %}
+
+{% macro paused_channels(paused, resume_base, csrf) -%}
+{% if paused %}
+<h2>Paused channels</h2>
+<p class="muted">This agent does not answer in these channels until its owner or an admin confirms who can see them. Direct messages and other channels are not affected.</p>
+<table>
+  <tr><th>Channel</th><th>Why</th><th>Since</th><th>People in it now</th><th></th></tr>
+  {% for v in paused %}
+  <tr>
+    <td><code>{{ v.pause.channel }}</code></td>
+    <td>{{ pause_reason(v.pause.reason) }}</td>
+    <td>{{ v.pause.paused_at | stamp }}</td>
+    <td>
+      {% if v.summary %}<strong>{{ v.summary.total }} people</strong>: {{ v.summary.guests }} guest{{ "" if v.summary.guests == 1 else "s" }}, {{ v.summary.external }} from another workspace
+      {% elif v.problem %}<span class="error">Could not count: {{ v.problem }}</span>
+      {% else %}not counted{% endif %}
+    </td>
+    <td>
+      <form method="post" action="{{ resume_base }}/{{ v.pause.channel | urlencode }}/resume">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        {% if v.summary %}
+        <input type="hidden" name="total" value="{{ v.summary.total }}">
+        <input type="hidden" name="guests" value="{{ v.summary.guests }}">
+        <input type="hidden" name="external" value="{{ v.summary.external }}">
+        <label><input type="checkbox" name="confirm" value="yes"> I confirm these people may see what this agent says here</label>
+        {% endif %}
+        <button type="submit">Resume</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{%- endmacro %}

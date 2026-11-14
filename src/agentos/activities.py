@@ -44,6 +44,7 @@ from agentos import ids
 from agentos.agent_store import AgentStore
 from agentos.audience import UNAVAILABLE, AudienceChecker, AudienceDecision
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
+from agentos.budgets import BudgetGuard
 from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
@@ -154,9 +155,11 @@ class AgentActivities:
         embedder: Embedder | None = None,
         audience: AudienceChecker | None = None,
         usage: UsageRecorder | None = None,
+        budgets: BudgetGuard | None = None,
     ):
         self.settings = settings
         self.usage = usage
+        self.budgets = budgets
         self.registry = registry
         self.audience = audience or AudienceChecker(registry, agents)
         self.knowledge = knowledge
@@ -439,6 +442,12 @@ class AgentActivities:
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if self.budgets is not None:
+            # Before any model call: a reached budget answers with a fixed text, bills nothing
+            # and records no usage row.
+            stopped = await self.budgets.stop_response(ctx.tenant_id, ctx.agent_id, agent.name)
+            if stopped is not None:
+                return stopped
         messages = prepare_for_model(await self.history.load(ctx.tenant_id, conversation_id))
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
         system = agent.system_prompt

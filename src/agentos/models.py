@@ -224,11 +224,14 @@ AGENT_AUDIT_KINDS = (
 )
 MEMBER_AUDIT_KINDS = ("member_add", "member_remove", "member_role")
 AUDIENCE_AUDIT_KINDS = ("audience_refused", "audience_confirm")
+# A budget belongs to an agent or to the whole tenant, not to a version of an agent.
+BUDGET_AUDIT_KINDS = ("budget_set",)
 AUDIT_KINDS = (
     ("answer", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
     + MEMBER_AUDIT_KINDS
     + AUDIENCE_AUDIT_KINDS
+    + BUDGET_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -246,7 +249,7 @@ class AuditEvent:
     tenant_id: str
     event_key: str  # unique per tenant: a retried activity records once
     kind: str
-    agent_id: str | None  # None only for a membership event
+    agent_id: str | None  # None only for a membership event or a tenant-wide budget
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -268,7 +271,7 @@ class AuditEvent:
             raise ValueError("an audit event needs a tenant_id and an event_key")
         if self.kind not in AUDIT_KINDS:
             raise ValueError(f"invalid audit kind {self.kind!r}")
-        if self.kind not in MEMBER_AUDIT_KINDS and (
+        if self.kind not in MEMBER_AUDIT_KINDS + BUDGET_AUDIT_KINDS and (
             not self.agent_id or self.agent_version is None
         ):
             raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")

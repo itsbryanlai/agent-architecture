@@ -520,7 +520,10 @@ def test_sql_has_row_level_security_grants_trigger_and_one_published_index(sql):
     assert "REVOKE ALL ON agents, agent_versions FROM agentos_app" in sql
     assert "GRANT SELECT, INSERT ON agents TO agentos_app" in sql
     assert "GRANT SELECT, INSERT, UPDATE ON agent_versions TO agentos_app" in sql
-    assert "DELETE ON" not in sql.split("REVOKE ALL ON agents")[1]
+    agents_part = sql.split("REVOKE ALL ON agents")[1].split("CREATE TABLE IF NOT EXISTS members")[
+        0
+    ]
+    assert "DELETE ON" not in agents_part
 
     assert "PRIMARY KEY (tenant_id, agent_id)" in sql
     assert "PRIMARY KEY (tenant_id, agent_id, version)" in sql

@@ -428,3 +428,13 @@ async def test_postgres_store_sets_the_tenant_before_each_call():
     insert = pool.events[2][1]
     assert "ON CONFLICT (tenant_id, event_key) DO NOTHING" in insert
     assert "UPDATE" not in insert and "DELETE" not in insert
+
+
+def test_only_a_membership_event_may_name_no_agent():
+    event = AuditEvent(TENANT, "k", "member_add", None, None, ALICE, f"user:{ALICE}", target="U2")
+    assert (event.agent_id, event.agent_version) == (None, None)
+    for kind in ("answer", "agent_publish"):
+        with pytest.raises(ValueError):
+            AuditEvent(TENANT, "k", kind, None, None, ALICE, f"user:{ALICE}")
+        with pytest.raises(ValueError):
+            AuditEvent(TENANT, "k", kind, "a", None, ALICE, f"user:{ALICE}")

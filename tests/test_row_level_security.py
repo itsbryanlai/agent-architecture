@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from agentos import agent_store, audit, stores
+from agentos import agent_store, audit, members, stores
 from agentos.agent_store import PostgresAgentStore
 from agentos.audit import PostgresAuditStore
 from agentos.config import (
@@ -25,6 +25,7 @@ from agentos.config import (
 )
 from agentos.knowledge import store as knowledge_store
 from agentos.knowledge.store import PostgresKnowledgeStore
+from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.stores import (
     PostgresHistoryStore,
@@ -40,6 +41,7 @@ INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
 MIGRATION = (ROOT / "scripts" / "migrations" / "004_row_level_security.sql").read_text()
 AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
 AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
+MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -49,6 +51,7 @@ POSTGRES_STORES = [
     PostgresKnowledgeStore,
     PostgresAuditStore,
     PostgresAgentStore,
+    PostgresMemberStore,
 ]
 
 
@@ -142,6 +145,19 @@ AGENT_ROW = (
 )
 
 
+AGENT_RECORD_ROW = ("acme", "it-helper", "U1", None)
+MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
+
+
+def row_for(cls, method_name):
+    """The row a store's reads need, since the fake returns it for every query."""
+    if cls is PostgresMemberStore:
+        return MEMBER_ROW
+    if cls is PostgresAgentStore:
+        return AGENT_RECORD_ROW if method_name in ("get_agent", "list_agents") else AGENT_ROW
+    return None
+
+
 def public_methods(cls):
     return [
         name
@@ -153,7 +169,7 @@ def public_methods(cls):
 def test_store_classes_are_all_covered():
     # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store, audit, agent_store):
+    for module in (stores, knowledge_store, audit, agent_store, members):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -164,7 +180,7 @@ async def test_every_postgres_store_method_sets_tenant_first():
     checked = 0
     for cls in POSTGRES_STORES:
         for name in public_methods(cls):
-            pool = FakePool(AGENT_ROW if cls is PostgresAgentStore else None)
+            pool = FakePool(row_for(cls, name))
             method = getattr(cls(pool), name)
             hints = typing.get_type_hints(getattr(cls, name))
             kwargs = {
@@ -174,6 +190,8 @@ async def test_every_postgres_store_method_sets_tenant_first():
             }
             if "definition" in kwargs:
                 kwargs["definition"] = agent_definition(SAMPLE_AGENT)
+            if "role" in kwargs:
+                kwargs["role"] = "creator"
             if "agents" in kwargs:
                 kwargs["agents"] = {"it-helper": SAMPLE_AGENT}
             if "tenant_id" in inspect.signature(method).parameters:
@@ -192,7 +210,7 @@ async def test_every_postgres_store_method_sets_tenant_first():
             assert events[-1] == ("commit",), label
             assert events.count(("transaction",)) == 1, label
             checked += 1
-    assert checked >= 11
+    assert checked >= 16
 
 
 async def test_tenant_transaction_rejects_empty_tenant():
@@ -232,6 +250,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         rls_tables(MIGRATION)
         | rls_tables_forced(AUDIT_MIGRATION)
         | rls_tables_forced(AGENTS_MIGRATION)
+        | rls_tables_forced(MEMBERS_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
@@ -249,3 +268,32 @@ def test_migration_and_init_db_cover_every_tenant_table():
 
 def test_default_database_url_uses_app_role():
     assert urlparse(DEFAULT_DATABASE_URL).username == "agentos_app"
+
+
+@pytest.mark.parametrize("sql", [MEMBERS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+def test_members_sql_is_tenant_scoped_and_lets_the_app_role_delete(sql):
+    assert "PRIMARY KEY (tenant_id, user_id)" in sql
+    assert "CHECK (role IN ('admin', 'creator'))" in sql
+    assert "ALTER TABLE members ENABLE ROW LEVEL SECURITY" in sql
+    assert "ALTER TABLE members FORCE ROW LEVEL SECURITY" in sql
+    assert "CREATE POLICY tenant_isolation ON members" in sql
+    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "REVOKE ALL ON members FROM agentos_app" in sql
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON members TO agentos_app" in sql
+
+
+def test_init_db_matches_the_members_migration_and_widens_the_audit_log():
+    block = MEMBERS_MIGRATION[MEMBERS_MIGRATION.index("CREATE TABLE IF NOT EXISTS members") :]
+    block = block[: block.index("ALTER TABLE audit_events")].rstrip()
+    assert block in INIT_DB
+    kinds = [
+        *("agent_create", "agent_draft", "agent_submit", "agent_withdraw"),
+        *("agent_reject", "agent_publish", "member_add", "member_remove", "member_role"),
+    ]
+    for kind in kinds:
+        assert f"'{kind}'" in MEMBERS_MIGRATION
+        assert f"'{kind}'" in INIT_DB
+    assert "ALTER COLUMN agent_id DROP NOT NULL" in MEMBERS_MIGRATION
+    assert "ALTER COLUMN agent_version DROP NOT NULL" in MEMBERS_MIGRATION
+    assert "audit_events_agent_required" in INIT_DB

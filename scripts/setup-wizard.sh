@@ -216,6 +216,21 @@ if confirm "Write them now?"; then
 else
   TODO+=("Set slack_team_id and the database id in config/agents.yaml")
 fi
+say ""
+say "Tenant settings live in the database. This imports the tenant section of"
+say "config/agents.yaml into the tenants table (a tenant already there is skipped):"
+step "uv run python -m agentos.tenant_store import"
+note "Needs Postgres from stage 2. No secret is involved."
+if confirm "Import the tenant now?"; then
+  if uv run python -m agentos.tenant_store import; then
+    ok "tenant imported"
+  else
+    warn "the import failed; fix the cause above and run it again"
+    TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+  fi
+else
+  TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+fi
 pause
 
 # ── 7 ─────────────────────────────────────────────────────────────────────
@@ -241,6 +256,10 @@ printf '\n'
 say "Then, with NOTION_TOKEN exported, check the Notion grant and print its"
 say "property IDs; paste the property_ids block it prints into config/agents.yaml:"
 step "uv run python -m agentos.check_grants"
+printf '\n'
+say "Then import the agents into the database, once. An agent already imported is"
+say "skipped, so do this after the property_ids are in the file:"
+step "uv run python -m agentos.agent_store import"
 printf '\n'
 say "Then run, each in its own terminal:"
 step "uv run python -m agentos.worker"

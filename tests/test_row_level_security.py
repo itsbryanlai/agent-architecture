@@ -65,6 +65,7 @@ USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text(
 BUDGETS_MIGRATION = (ROOT / "scripts" / "migrations" / "012_budgets.sql").read_text()
 WATCH_MIGRATION = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
 SWITCHES_MIGRATION = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
+TENANTS_MIGRATION = (ROOT / "scripts" / "migrations" / "015_tenants.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -314,6 +315,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(BUDGETS_MIGRATION)
         | rls_tables_forced(WATCH_MIGRATION)
         | rls_tables_forced(SWITCHES_MIGRATION)
+        | rls_tables_forced(TENANTS_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)

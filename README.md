@@ -28,10 +28,11 @@ saving replaces the draft and asks for a fresh approval (the old buttons stop
 working). A request can be edited up to 5 times.
 
 One deployment can serve several tenants (see [Several tenants](#several-tenants)).
-A single tenant is set in `config/agents.yaml`. Every workflow ID, database
-row and log line carries the tenant ID. Agents live in the database (see
-[Agents in the database](#agents-in-the-database)); the YAML file holds the
-tenant's settings and the agents to import once.
+Tenants and agents live in the database (see
+[Tenants in the database](#tenants-in-the-database) and
+[Agents in the database](#agents-in-the-database)). A tenant starts as a YAML
+file, such as `config/agents.yaml`, that you import once. Every workflow ID,
+database row and log line carries the tenant ID.
 
 ## Prerequisites
 
@@ -51,7 +52,8 @@ scripts/setup-wizard.sh
 The wizard starts Postgres and Temporal, walks you through the tunnel, the
 Slack app (from `slack/app-manifest.yaml`) and the Notion integration and
 database, and writes the non-secret values (Slack team ID, Notion database ID)
-into `config/agents.yaml`.
+into `config/agents.yaml`. It then imports the tenant into the database (see
+below).
 
 It never asks for, stores or prints a secret. At the end it shows the
 `export` lines you fill in and run yourself:
@@ -84,15 +86,18 @@ that block into the grant in `config/agents.yaml`. The worker checks the same
 things at startup and refuses to start if anything is wrong or an ID is
 missing. The command exits 1 on any problem.
 
-Import the agents from the YAML file into the database, once, after the
-database has the `006` migration (a fresh `docker compose up` has it):
+Import the tenant and its agents from the YAML file into the database, once.
+It needs the `006` and `015` migrations (a fresh `docker compose up` has both):
 
 ```bash
+uv run python -m agentos.tenant_store import
 uv run python -m agentos.agent_store import
 ```
 
-The worker and the gateway refuse to start while the tenant's `default_agent`
-or a channel's agent has no published version, so run this before them. See
+The worker, the gateway and the console refuse to start while the `tenants`
+table is empty, or while a tenant's `default_agent` or a channel's agent has no
+published version, so run these before them. See
+[Tenants in the database](#tenants-in-the-database) and
 [Agents in the database](#agents-in-the-database).
 
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
@@ -101,7 +106,7 @@ below),
 (default `postgresql://agentos_app:agentos_app@localhost:55432/agentos`, the
 local development app role, on the host port 55432 that Compose publishes) and `AGENTOS_CONFIG`
 (default `config/agents.yaml`; a file for one tenant, or a directory with one
-`*.yaml` per tenant).
+`*.yaml` per tenant). Only the two import commands and `check_grants` read it.
 
 If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
 export the `AGENTOS_` names instead: the old ones are now ignored.
@@ -198,8 +203,9 @@ agents:
 ## Several tenants
 
 `AGENTOS_CONFIG` may name a **directory**. Every `*.yaml` directly inside it is
-one tenant, in the same format as `config/agents.yaml`. The gateway and the
-worker serve all of them side by side:
+one tenant, in the same format as `config/agents.yaml`. Import them once
+(`uv run python -m agentos.tenant_store import`); the gateway, the worker and
+the console then serve all of them side by side from the database:
 
 ```
 config/tenants/
@@ -241,6 +247,47 @@ export AGENTOS_CONFIG=config/tenants
 - `check_grants` checks every tenant. `index_knowledge` indexes every tenant,
   or one with `--tenant <tenant_id>`; schedules are kept per tenant.
 - A single file keeps working exactly as before.
+
+## Tenants in the database
+
+After the one-time import, the `tenants` table is the source of truth for
+tenant settings: the Slack workspace, whether the tenant is enabled, the
+default agent, the channel routing, the admins, the Notion workspace and the
+**names** of the secret variables. A secret value is never stored; secrets
+still come only from the environment. Agents are in their own table.
+
+```bash
+uv run python -m agentos.tenant_store import
+```
+
+- The import adds each YAML tenant that is not in the table yet and **skips**
+  one that is, so running it again never overwrites a setting changed since.
+  A tenant that would share a Slack workspace, a Notion workspace or a secret
+  variable with a stored one is refused, with both tenants named.
+- Editing the YAML file after the import changes nothing. Change a tenant in
+  the database. There is no console page for it yet, so for now that is SQL
+  run as the owner role, for example `UPDATE tenants SET enabled = false WHERE tenant_id = 'acme'`. A trigger moves
+  `updated_at` on every update, which is how the processes notice the change.
+- Every process starts only if the table has an enabled tenant. An empty table
+  stops it with a message that names the import; there is no silent fallback to
+  the YAML file.
+- **No restart.** The gateway and the console re-read the table every 15
+  seconds, the worker every 5. The gateway serves a new tenant at once, because
+  an event from a Slack workspace it does not know is looked up in the
+  database. The worker builds the new tenant's Slack and Notion clients from its
+  variables (a tenant whose variable is unset or whose key file is unusable is
+  skipped and logged once, and tried again on the next pass). A **disabled**
+  tenant is dropped within that time: the gateway answers nothing for it, the
+  worker no longer runs its activities, and the console refuses its sign-ins
+  and sessions. Re-enabling it brings it back the same way.
+- A tenant's index schedules are still created by `index_knowledge --schedule`,
+  which you run after adding a tenant. The worker decides at start-up whether
+  it runs the indexing workflows (some published agent has a page grant), so
+  restart it once when a deployment's first page grant is published.
+- Row-level security hides every tenant's row from the others. The two reads
+  that cross tenants (a Slack workspace to its tenant, and the list of tenants)
+  go through two `SECURITY DEFINER` functions that return the tenant ID, the
+  enabled flag and a change time only. The app role cannot delete a tenant.
 
 ## Encrypted workflow data
 
@@ -497,6 +544,15 @@ the control plane saves an edit or the import runs, or the audit insert is refus
 
 ```bash
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/009_audit_kinds.sql
+```
+
+Tenants in the database need migration `015` (a new install gets the table and
+its two functions from `scripts/init_db.sql`). Run it as the owner role, then
+import the tenants, **before** the worker, the gateway and the console restart:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/015_tenants.sql
+uv run python -m agentos.tenant_store import
 ```
 
 Agent audiences add two audit event kinds, `audience_refused` and `audience_confirm`, and
@@ -934,6 +990,7 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
+| `src/agentos/tenant_store.py` | Tenants in the database: one-time YAML import, the narrow cross-tenant reads, and the cached live view every process serves from |
 | `src/agentos/usage.py` | Usage rows, model prices, pricing at record time and the usage report |
 | `src/agentos/budgets.py` | Monthly budgets, the stop before a model call, and the warning levels |
 | `src/agentos/switches.py` | Kill switches: the table, the checks, and the operator command |

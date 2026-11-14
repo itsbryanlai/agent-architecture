@@ -282,17 +282,22 @@ class WebUI:
                 "Wrong organisation", "This session belongs to another organisation.", 403
             )
         deps = self.deps
+        config = await deps.tenants.get(tenant_id)
+        if config is None:
+            # Unknown or disabled: a session of a disabled tenant stops working.
+            return _message(
+                "Not available", "This organisation is not available.", 403, back="/login"
+            )
         role = await deps.plane.role_of(tenant_id, session.user_id)
         if role is None:
             return self.no_access()
-        config = deps.tenants.get(tenant_id)
         ctx = Ctx(
             tenant_id=tenant_id,
             user_id=session.user_id,
             role=role,
             csrf=session.csrf_secret,
             plane=deps.plane,
-            config_admins=() if config is None else config.admins,
+            config_admins=config.admins,
             now=deps.console.clock(),
         )
         if post:
@@ -370,8 +375,8 @@ class WebUI:
     async def login(self, request: Request) -> Response:
         sign_in = self.deps.console.sign_in
         tenants = self.deps.tenants
-        only = None if tenants is None else tenants.only_tenant()
-        team = None if only is None else tenants.get(only).slack_team_id
+        only = None if tenants is None else await tenants.only_tenant()
+        team = None if only is None else (await tenants.get(only)).slack_team_id
         state, nonce = new_login_values()
         response = _redirect(authorize_url(sign_in, state, nonce, team))
         response.set_cookie(
@@ -407,7 +412,7 @@ class WebUI:
         except SlackSignInError as err:
             log.warning("sign-in refused: %s", err)
             return refused("Sign-in could not be completed. Start again.", 503)
-        tenant_id = self.deps.tenants.by_slack_team(identity.team_id)
+        tenant_id = await self.deps.tenants.for_slack_team(identity.team_id)
         if tenant_id is None:
             return refused("This console is not set up for your Slack workspace.", 403)
         if await self.deps.plane.role_of(tenant_id, identity.user_id) is None:

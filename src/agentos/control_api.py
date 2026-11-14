@@ -43,7 +43,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from agentos.agent_store import AgentNotFound
-from agentos.config import ConfigError, Settings, TenantsConfig, load_settings, load_tenants_config
+from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
 from agentos.control import ControlPlane
 from agentos.control_errors import STATUS_BY_ERROR
 from agentos.grant_checker import GrantProblems
@@ -55,6 +55,7 @@ from agentos.slack_signin import (
     SlackSession,
     sign_in_from_settings,
 )
+from agentos.tenant_store import TenantSource, as_source
 from agentos.tenants import notion_key_failure
 from agentos.web_ui import CONSOLE_FORM_PREFIXES, install_web_ui
 
@@ -181,14 +182,14 @@ def _error(status: int, message: str, **extra: Any) -> JSONResponse:
 @dataclass
 class ControlDeps:
     plane: ControlPlane | None
-    tenants: TenantsConfig | None
+    tenants: TenantSource | None
     sessions: SessionStore | None = None
     console: Console | None = None
 
 
 def create_app(
     plane: ControlPlane | None,
-    tenants: TenantsConfig | None,
+    tenants: TenantsConfig | TenantSource | None,
     identity: IdentityProvider,
     lifespan: Any = None,
     port: int = DEFAULT_PORT,
@@ -200,7 +201,7 @@ def create_app(
     With a ``console`` the app also serves the web pages, and ``identity`` should be
     ``SlackSession()``. The Host and Origin allowlists then include the console URL.
     """
-    deps = ControlDeps(plane, tenants, sessions, console)
+    deps = ControlDeps(plane, as_source(tenants), sessions, console)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
@@ -313,8 +314,8 @@ def create_app(
         log.error("control API error: %s", type(err).__name__)
         return _error(500, "internal error")
 
-    def known_tenant(tenant_id: str) -> str:
-        if deps.tenants is None or deps.tenants.get(tenant_id) is None:
+    async def known_tenant(tenant_id: str) -> str:
+        if deps.tenants is None or await deps.tenants.get(tenant_id) is None:
             raise HTTPException(404, f"unknown tenant '{tenant_id}'")
         return tenant_id
 
@@ -604,20 +605,23 @@ async def _real_lifespan(app: FastAPI):
     from agentos.sessions import PostgresSessionStore
     from agentos.slack_client import RealSlackPoster
     from agentos.switches import PostgresSwitchStore
+    from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
     from agentos.tenants import require_tenant_secret
     from agentos.usage import PostgresUsageStore
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     try:
+        directory = TenantDirectory(PostgresTenantStore(pool))
+        if failure := notion_key_failure(await startup_tenants(directory)):
+            raise SystemExit(failure)
         apis: dict[str, RealNotionAPI] = {}
 
         def notion_for(tenant_id: str) -> RealNotionAPI:
             if tenant_id not in apis:
-                config = tenants.get(tenant_id)
+                config = directory.latest().get(tenant_id)
                 apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
             return apis[tenant_id]
 
@@ -627,21 +631,21 @@ async def _real_lifespan(app: FastAPI):
             # Built on first use, so a tenant whose Slack variable is unset fails its
             # own publish with a message naming the variable, not the whole console.
             if tenant_id not in slack_clients:
-                config = tenants.get(tenant_id)
+                config = directory.latest().get(tenant_id)
                 slack_clients[tenant_id] = RealSlackPoster(
                     require_tenant_secret(config, "slack_bot_token_env")
                 )
             return slack_clients[tenant_id]
 
         def team_for(tenant_id: str) -> str:
-            return tenants.get(tenant_id).slack_team_id
+            return directory.latest().get(tenant_id).slack_team_id
 
         app.state.deps.sessions = PostgresSessionStore(pool)
         app.state.deps.plane = ControlPlane(
             PostgresAgentStore(pool),
             PostgresMemberStore(pool),
             PostgresAuditStore(pool),
-            tenants,
+            directory,
             NotionGrantChecker(notion_for),
             SlackAudienceInspector(slack_for, team_for),
             usage=PostgresUsageStore(pool),
@@ -649,7 +653,7 @@ async def _real_lifespan(app: FastAPI):
             pauses=PostgresPauseStore(pool),
             switches=PostgresSwitchStore(pool),
         )
-        app.state.deps.tenants = tenants
+        app.state.deps.tenants = directory
         yield
     finally:
         await pool.close()
@@ -696,12 +700,6 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     settings = load_settings()
-    try:
-        failure = notion_key_failure(load_tenants_config(settings.config_path))
-    except ConfigError as err:
-        raise SystemExit(str(err)) from err
-    if failure:
-        raise SystemExit(failure)
     app = build_process_app(args.host, args.port, settings, os.environ)
     uvicorn.run(app, host=args.host, port=args.port)
 

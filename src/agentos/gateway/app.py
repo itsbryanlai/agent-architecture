@@ -62,6 +62,7 @@ from agentos.models import (
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
+from agentos.tenant_store import TenantSource, as_source
 
 log = logging.getLogger("agentos.gateway")
 
@@ -86,7 +87,7 @@ MULTILINE_FIELDS = {"details", "comment"}
 @dataclass
 class GatewayDeps:
     settings: Settings
-    tenants: TenantsConfig
+    tenants: TenantSource
     temporal_client: Any
     links: TaskLinkStore
     verifier: Any  # slack_sdk.signature.SignatureVerifier or compatible
@@ -103,7 +104,7 @@ class GatewayDeps:
 
 def create_app(
     settings: Settings | None,
-    tenants: TenantsConfig | None,
+    tenants: TenantsConfig | TenantSource | None,
     temporal_client: Any,
     links: TaskLinkStore | None,
     verifier: Any,
@@ -116,7 +117,14 @@ def create_app(
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
         app.state.deps = GatewayDeps(
-            settings, tenants, temporal_client, links, verifier, slack_for, agents, switches
+            settings,
+            as_source(tenants),
+            temporal_client,
+            links,
+            verifier,
+            slack_for,
+            agents,
+            switches,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -150,7 +158,7 @@ def create_app(
         if payload.get("type") != "event_callback":
             return Response(status_code=200)
         team_id = payload.get("team_id")
-        tenant = d.tenants.by_slack_team(team_id)
+        tenant = await d.tenants.for_slack_team(team_id)
         if tenant is None:
             log.warning("ignored event from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
@@ -182,7 +190,9 @@ def create_app(
         workflow_id = ids.conversation_id(tenant, channel, thread_ts)
         # A running thread keeps its own agent: the start argument is ignored
         # when the workflow exists, and only the signal lands.
-        config = d.tenants.tenants[tenant]
+        config = await d.tenants.get(tenant)
+        if config is None:
+            return Response(status_code=200)
         agent_id = config.default_agent
         if channel_kind == "channel":
             agent_id = config.channels.get(channel, agent_id)
@@ -211,7 +221,7 @@ def create_app(
         form = parse_qs(body.decode("utf-8"))
         payload = json.loads((form.get("payload") or ["{}"])[0])
         team_id = (payload.get("team") or {}).get("id")
-        tenant = d.tenants.by_slack_team(team_id)
+        tenant = await d.tenants.for_slack_team(team_id)
         if tenant is None:
             log.warning("ignored interaction from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
@@ -255,7 +265,7 @@ def create_app(
         # Kept so a subscription made before there were several tenants keeps
         # working: it is the only tenant's, while exactly one is configured.
         d = deps(request)
-        tenant_id = d.tenants.only_tenant()
+        tenant_id = await d.tenants.only_tenant()
         if tenant_id is None:
             return Response(status_code=404)
         return await _notion_webhook(d, tenant_id, request)
@@ -312,7 +322,7 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
     if not TENANT_ID_PATTERN.fullmatch(tenant):
         # Never look up, or build a file name from, a path that is not a tenant ID.
         return Response(status_code=404)
-    config = d.tenants.get(tenant)
+    config = await d.tenants.get(tenant)
     if config is None:
         log.warning("Notion webhook for an unknown tenant tenant_id=%s", tenant)
         return Response(status_code=404)
@@ -570,37 +580,56 @@ async def _real_lifespan(app: FastAPI):
     from slack_sdk.signature import SignatureVerifier
 
     from agentos.agent_store import PostgresAgentStore
-    from agentos.config import load_settings, load_tenants_config
+    from agentos.config import load_settings
     from agentos.crypto_keys import LocalKeyStore, startup_key_failure
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
-    from agentos.tenants import build_slack_clients
+    from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
+    from agentos.tenants import require_tenant_secret
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
-    key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
-    if key_failure:
-        raise SystemExit(key_failure)
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
     client = await build_temporal_client(settings)
     pool = AsyncConnectionPool(settings.database_url, open=False)
     await pool.open()
     agent_store = PostgresAgentStore(pool)
     try:
+        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenants = await startup_tenants(directory)
+        key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
+        if key_failure:
+            raise SystemExit(key_failure)
         agent_failure = await startup_agent_failure(agent_store, tenants)
         if agent_failure:
             raise SystemExit(agent_failure)
-        slack_clients = build_slack_clients(tenants, RealSlackPoster)
+        slack_clients: dict[str, RealSlackPoster] = {}
+
+        def slack_for(tenant_id: str) -> RealSlackPoster:
+            # Built on first use from the tenant's current settings, so a tenant added
+            # while the gateway runs gets its own client; a tenant whose variable is
+            # unset fails its own form, not the gateway.
+            if tenant_id not in slack_clients:
+                config = directory.latest().get(tenant_id)
+                if config is None:
+                    raise KeyError(tenant_id)
+                slack_clients[tenant_id] = RealSlackPoster(
+                    require_tenant_secret(config, "slack_bot_token_env")
+                )
+            return slack_clients[tenant_id]
+
+        # A tenant whose variable is unset is refused at start-up, as before.
+        for config in tenants.tenants.values():
+            slack_for(config.tenant_id)
         app.state.deps = GatewayDeps(
             settings,
-            tenants,
+            directory,
             client,
             PostgresTaskLinkStore(pool),
             verifier,
-            slack_clients.__getitem__,
+            slack_for,
             agent_store,
             switches=PostgresSwitchStore(pool),
         )

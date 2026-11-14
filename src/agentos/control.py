@@ -21,7 +21,7 @@ Roles. A tenant has admins and creators.
   admin reads all of them; a creator reads the budgets of the agents they created, and
   never sets one. Every change is audited as ``budget_set`` with the new amount in
   ``target`` (``0`` and ``tool=remove`` for a removal).
-- A user listed in the tenant YAML ``admins`` is always an admin. Nobody can
+- A user listed in the tenant's ``admins`` setting is always an admin. Nobody can
   remove or demote that user here, because it is configuration. A user with a
   ``members`` row has that row's role. Anyone else has no role.
 
@@ -119,6 +119,7 @@ from agentos.switches import (
     read_state,
     set_switch,
 )
+from agentos.tenant_store import TenantSource, as_source
 from agentos.usage import (
     InMemoryUsageStore,
     UsageReport,
@@ -187,7 +188,7 @@ class ControlPlane:
         agents: AgentStore,
         members: MemberStore,
         audit: AuditStore,
-        tenants: TenantsConfig,
+        tenants: TenantsConfig | TenantSource,
         grant_checker: GrantChecker,
         audience: AudienceInspector | None = None,
         usage: UsageStore | None = None,
@@ -205,18 +206,18 @@ class ControlPlane:
         self._agents = agents
         self._members = members
         self._audit = audit
-        self._tenants = tenants
+        self._tenants = as_source(tenants)
         self._grant_checker = grant_checker
 
     # --- roles ---------------------------------------------------------------
 
-    def _config_admins(self, tenant_id: str) -> tuple[str, ...]:
-        config = self._tenants.get(tenant_id)
+    async def _config_admins(self, tenant_id: str) -> tuple[str, ...]:
+        config = await self._tenants.get(tenant_id)
         return () if config is None else config.admins
 
     async def role_of(self, tenant_id: str, user_id: str) -> str | None:
-        """The user's role: a YAML admin is an admin, else the members row, else None."""
-        if user_id in self._config_admins(tenant_id):
+        """The user's role: a configured admin is an admin, else the members row, else None."""
+        if user_id in await self._config_admins(tenant_id):
             return ADMIN
         row = await self._members.get_member(tenant_id, user_id)
         return None if row is None else row.role
@@ -238,7 +239,7 @@ class ControlPlane:
 
     async def _admin_count(self, tenant_id: str) -> int:
         rows = await self._members.list_members(tenant_id)
-        admins = set(self._config_admins(tenant_id))
+        admins = set(await self._config_admins(tenant_id))
         admins.update(m.user_id for m in rows if m.role == ADMIN)
         return len(admins)
 
@@ -292,7 +293,7 @@ class ControlPlane:
         return await self._agents.get_version(tenant_id, agent_id, version)
 
     async def list_members(self, tenant_id: str, actor: str) -> list[MemberRecord]:
-        """The member rows. A YAML admin has no row; see ``role_of``."""
+        """The member rows. A configured admin has no row; see ``role_of``."""
         await self._require_role(tenant_id, actor, ADMIN)
         return await self._members.list_members(tenant_id)
 
@@ -505,15 +506,15 @@ class ControlPlane:
         return summary
 
     async def _effective(self, tenant_id: str, agent: AgentVersion) -> EffectiveAudience:
-        config = self._tenants.get(tenant_id)
+        config = await self._tenants.get(tenant_id)
         if config is None or agent.audience is not None:
             published: dict[str, AgentVersion] = {}
         else:
             published = await self._agents.published_all(tenant_id)
         return effective_audience(agent, config, published) if config else _no_config(agent)
 
-    def _check_mapped_channels(self, tenant_id: str, agent: AgentVersion) -> None:
-        config = self._tenants.get(tenant_id)
+    async def _check_mapped_channels(self, tenant_id: str, agent: AgentVersion) -> None:
+        config = await self._tenants.get(tenant_id)
         if config is None:
             return
         if problems := channel_audience_problems(config.channels, {agent.agent_id: agent}):
@@ -653,7 +654,7 @@ class ControlPlane:
         confirmed: AudienceSummary | None = None
         if pending is not None and pending.status == PENDING:
             # Any other status is refused by the store below, with its own reason.
-            self._check_mapped_channels(tenant_id, pending.agent())
+            await self._check_mapped_channels(tenant_id, pending.agent())
             reports = await self._grant_checker.check(tenant_id, pending.agent())
             if any(report.problems for report in reports):
                 raise GrantProblems(reports)
@@ -790,7 +791,7 @@ class ControlPlane:
         self, tenant_id: str, actor: str, user_id: str, role: str, request_id: str | None = None
     ) -> None:
         await self._require_role(tenant_id, actor, ADMIN)
-        if user_id in self._config_admins(tenant_id):
+        if user_id in await self._config_admins(tenant_id):
             raise MemberError(f"'{user_id}' is an admin set in the tenant file")
         await self._members.add_member(tenant_id, user_id, role, actor)
         await self._record(
@@ -834,8 +835,8 @@ class ControlPlane:
         await self._record("member_remove", tenant_id, actor, target=user_id, request_id=request_id)
 
     async def _protected_member(self, tenant_id: str, user_id: str) -> MemberRecord:
-        """The member's row, after refusing a YAML admin, who is configuration."""
-        if user_id in self._config_admins(tenant_id):
+        """The member's row, after refusing a configured admin, who is configuration."""
+        if user_id in await self._config_admins(tenant_id):
             raise Forbidden(f"'{user_id}' is an admin set in the tenant file")
         row = await self._members.get_member(tenant_id, user_id)
         if row is None:

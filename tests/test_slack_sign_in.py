@@ -19,6 +19,7 @@ from agentos.slack_signin import (
     read_session_cookie,
     sign_in_from_settings,
 )
+from agentos.tenant_store import StaticTenants
 from tests.conftest import GLOBEX, GLOBEX_TEAM, TEAM, TENANT
 from tests.console_harness import (
     CLIENT_ID,
@@ -502,7 +503,7 @@ async def test_with_sign_in_the_process_binds_publicly_and_the_fixed_operator_is
     for environ in ({}, {"AGENTOS_CONTROL_ACTOR": ROOT}):
         app = build_process_app("0.0.0.0", 8100, full(), environ)
         assert app.state.deps.console.sign_in.console_url == CONSOLE_URL
-        app.state.deps.tenants = h.tenants  # what the real start-up fills in
+        app.state.deps.tenants = StaticTenants(h.tenants)  # what the real start-up fills in
         app.state.deps.plane = h.plane
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url=CONSOLE_URL) as c:

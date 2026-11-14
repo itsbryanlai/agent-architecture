@@ -24,6 +24,7 @@ from agentos import (
     members,
     sessions,
     stores,
+    switches,
     usage,
 )
 from agentos.agent_store import PostgresAgentStore
@@ -48,6 +49,7 @@ from agentos.stores import (
     PostgresToolOutputStore,
     tenant_transaction,
 )
+from agentos.switches import PostgresSwitchStore
 from agentos.usage import PostgresUsageStore, UsageEvent
 from tests.conftest import agents_dict
 
@@ -62,6 +64,7 @@ AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "010_audience.sql").r
 USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text()
 BUDGETS_MIGRATION = (ROOT / "scripts" / "migrations" / "012_budgets.sql").read_text()
 WATCH_MIGRATION = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
+SWITCHES_MIGRATION = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -76,6 +79,7 @@ POSTGRES_STORES = [
     PostgresUsageStore,
     PostgresBudgetStore,
     PostgresPauseStore,
+    PostgresSwitchStore,
 ]
 
 
@@ -222,6 +226,7 @@ def test_store_classes_are_all_covered():
         usage,
         budgets,
         audience_pauses,
+        switches,
     ):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
@@ -308,6 +313,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(USAGE_MIGRATION)
         | rls_tables_forced(BUDGETS_MIGRATION)
         | rls_tables_forced(WATCH_MIGRATION)
+        | rls_tables_forced(SWITCHES_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
@@ -394,7 +400,7 @@ async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash()
     assert "expires_at > %s" in selected[1]
 
 
-@pytest.mark.parametrize("sql", [WATCH_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+@pytest.mark.parametrize("sql", [SWITCHES_MIGRATION, INIT_DB], ids=["migration", "init_db"])
 def test_every_audit_kind_the_code_can_write_is_allowed_by_the_sql(sql):
     from agentos.models import AUDIT_KINDS
 
@@ -422,7 +428,7 @@ def test_init_db_has_the_same_audit_kinds_as_the_migration():
         block = sql[sql.index(after) :]
         return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
-    assert kinds_in(WATCH_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
+    assert kinds_in(SWITCHES_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
 
 
 async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert():

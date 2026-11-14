@@ -33,6 +33,7 @@ from agentos.stores import (
     InMemoryTaskLinkStore,
     InMemoryToolOutputStore,
 )
+from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
@@ -151,6 +152,7 @@ class Harness:
     tool_outputs: InMemoryToolOutputStore
     audit: InMemoryAuditStore = field(default_factory=InMemoryAuditStore)
     agent_store: InMemoryAgentStore = field(default_factory=InMemoryAgentStore)
+    switches: InMemorySwitchStore = field(default_factory=InMemorySwitchStore)
 
     @property
     def client(self):
@@ -182,6 +184,7 @@ async def harness(agents):
         tool_outputs=h.tool_outputs,
         audit=h.audit,
         agents=h.agent_store,
+        switches=h.switches,
     )
     worker = Worker(
         wf_env.client,
@@ -312,8 +315,11 @@ async def kharness():
         agents=h.agent_store,
         knowledge=h.knowledge,
         embedder=h.embedder,
+        switches=h.switches,
     )
-    index_acts = IndexActivities(registry, h.knowledge, h.embedder, h.agent_store)
+    index_acts = IndexActivities(
+        registry, h.knowledge, h.embedder, h.agent_store, switches=h.switches
+    )
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,

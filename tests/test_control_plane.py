@@ -398,14 +398,18 @@ STORE_WRITES = {
     "remove_member",
     "open_pause",
     "close_pause",
+    "switch_off",
+    "switch_on",
 }
 # audience_watch.py pauses an agent from a Slack event; resuming is the control plane's.
+# switches.py changes a switch for the control plane and for the host operator's command.
 MAY_CALL_WRITES = {
     "control.py",
     "agent_store.py",
     "members.py",
     "audience_pauses.py",
     "audience_watch.py",
+    "switches.py",
 }
 
 
@@ -436,5 +440,7 @@ def test_the_scan_finds_the_calls_it_is_looking_for():
         for node in ast.walk(ast.parse((SRC / "control.py").read_text()))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
-    # The import and opening a pause start outside the control plane (CLI, Slack event).
-    assert STORE_WRITES - {"import_agents", "open_pause"} <= calls
+    # The import and opening a pause start outside the control plane (CLI, Slack event), and
+    # the control plane changes a switch through ``switches.set_switch``, which it shares with
+    # the operator's command.
+    assert STORE_WRITES - {"import_agents", "open_pause", "switch_off", "switch_on"} <= calls

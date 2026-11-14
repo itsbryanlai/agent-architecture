@@ -9,8 +9,9 @@ from agentos.agent_store import AgentStoreError, InMemoryAgentStore, PostgresAge
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane, Forbidden
+from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore, MemberError
-from tests.conftest import TENANT, agents_dict
+from tests.conftest import TENANT, agents_dict, make_fake_notion
 from tests.test_agent_store import helper_block
 from tests.test_row_level_security import AGENT_ROW, FakeConnection, FakePool
 
@@ -36,7 +37,9 @@ async def make_plane(admins: tuple[str, ...] = (ROOT,), seed: bool = True):
         await members.add_member(TENANT, ADMIN2, "admin", ROOT)
         await members.add_member(TENANT, OWNER, "creator", ROOT)
         await members.add_member(TENANT, OTHER, "creator", ROOT)
-    return ControlPlane(agents, members, audit, tenants(*admins)), agents, members, audit
+    checker = NotionGrantChecker(lambda tenant_id: make_fake_notion())
+    plane = ControlPlane(agents, members, audit, tenants(*admins), checker)
+    return plane, agents, members, audit
 
 
 async def refused(coro):
@@ -410,6 +413,12 @@ def test_only_the_control_plane_and_the_stores_call_the_store_writes():
             ):
                 offenders.append(f"{path.relative_to(SRC)}:{node.lineno} {node.func.attr}")
     assert offenders == []
+
+
+def test_the_control_api_is_scanned_and_may_not_call_the_store_writes():
+    assert "control_api.py" not in MAY_CALL_WRITES
+    assert (SRC / "control_api.py").exists()
+    assert (SRC / "control_api.py") in set(SRC.rglob("*.py"))
 
 
 def test_the_scan_finds_the_calls_it_is_looking_for():

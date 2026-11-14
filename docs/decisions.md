@@ -38,7 +38,7 @@ Last reviewed 2026-11-14.
 - **Alternatives considered:** acting on behalf of each user (agents behave differently for each person, and every user must connect every account); "channel-safe" knowledge only (too restrictive for team agents).
 - **Risks and the guardrails that come with this decision:**
   - *A creator over-shares:* grants can't exceed the creator's own access; the admin approves publishing and any wider grants; the creator confirms an explicit audience summary when deploying.
-  - *The audience changes after deploy:* membership changes are watched; a new external guest or Slack Connect share pauses the agent in that channel until the creator confirms again.
+  - *The audience changes after deploy:* a Slack Connect share of the channel is watched and pauses the agent in that channel until the creator confirms again. Who is added to a channel is the admins' responsibility and pauses nothing.
   - *The creator leaves:* grants are re-checked every night against the creator's access and suspended if it no longer holds; the agent's owner and the admin are notified.
   - *Questions about one person's own records:* see D-17.
 

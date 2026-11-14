@@ -252,6 +252,7 @@ async def main() -> None:
         switches = PostgresSwitchStore(pool)
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
+        budget_guard = BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool))
         activities = AgentActivities(
             settings=settings,
             registry=registry,
@@ -265,7 +266,7 @@ async def main() -> None:
             knowledge=knowledge,
             embedder=embedder,
             usage=usage,
-            budgets=BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool)),
+            budgets=budget_guard,
             pauses=pauses,
             switches=switches,
         )
@@ -283,7 +284,7 @@ async def main() -> None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
             all_activities += IndexActivities(
-                registry, knowledge, embedder, agent_store, usage, switches
+                registry, knowledge, embedder, agent_store, usage, switches, budget_guard
             ).all()
         client = await build_temporal_client(settings)
         tenant_sync = RegistrySync(

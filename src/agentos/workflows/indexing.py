@@ -8,6 +8,8 @@ One workflow runs per (tenant, scope). Rules it keeps:
 * Walking the tree is breadth first from the root, at most two pages read at a
   time (Notion rate limits) and at most ``MAX_PAGES_PER_SCOPE`` pages. When the
   cap is hit it stops discovering new pages but still prunes with what it saw.
+* A page the tenant budget stopped from being embedded is counted in ``deferred``. It is kept,
+  not pruned, and a later run indexes it once the budget allows.
 * A page that was skipped (trashed or unreachable) is not kept: it is pruned
   from the store like a page that left the tree.
 * Workflow code is deterministic: no I/O, no clocks, no randomness.
@@ -32,6 +34,7 @@ class IndexSummary:
     changed: int
     skipped: int
     pruned: int
+    deferred: int = 0
 
 
 @workflow.defn(name="IndexingWorkflow")
@@ -46,6 +49,7 @@ class IndexingWorkflow:
         queue: list[str] | None = None,
         skipped: list[str] | None = None,
         changed: int = 0,
+        deferred: int = 0,
     ) -> IndexSummary:
         # A fresh start begins at the root; a continue-as-new carries the walk.
         # ``root_page_id`` is the normalized 32-hex ID.
@@ -74,6 +78,7 @@ class IndexingWorkflow:
                     skipped.append(page_id)
                     continue
                 changed += int(result.changed)
+                deferred += int(result.budget_stopped)
                 for child in result.child_page_ids:
                     if child in seen:
                         continue
@@ -93,7 +98,7 @@ class IndexingWorkflow:
 
             if queue and workflow.info().is_continue_as_new_suggested():
                 workflow.continue_as_new(
-                    args=[tenant_id, scope, root_page_id, seen, queue, skipped, changed]
+                    args=[tenant_id, scope, root_page_id, seen, queue, skipped, changed, deferred]
                 )
 
         kept = [page_id for page_id in seen if page_id not in set(skipped)]
@@ -103,4 +108,10 @@ class IndexingWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
-        return IndexSummary(pages=len(seen), changed=changed, skipped=len(skipped), pruned=pruned)
+        return IndexSummary(
+            pages=len(seen),
+            changed=changed,
+            skipped=len(skipped),
+            pruned=pruned,
+            deferred=deferred,
+        )

@@ -46,7 +46,9 @@ log = logging.getLogger("agentos.usage")
 
 LLM = "llm"
 EMBEDDING = "embedding"
-KINDS = (LLM, EMBEDDING)
+# The cost types, in display order, each with the label people read. A new cost type is one
+# entry here: budgets split spend by this list wherever they show it.
+KIND_LABELS = {LLM: "Model", EMBEDDING: "Embedding"}
 
 PER_MILLION = Decimal(1_000_000)
 COST_PLACES = Decimal("0.00000001")

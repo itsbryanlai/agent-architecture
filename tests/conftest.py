@@ -14,6 +14,7 @@ from temporalio.worker import Worker
 from agentos.activities import AgentActivities
 from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore
+from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import (
     TASK_QUEUE,
     AgentsConfig,
@@ -35,6 +36,7 @@ from agentos.stores import (
 )
 from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
+from agentos.usage import InMemoryUsageStore
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
@@ -282,6 +284,8 @@ class KnowledgeHarness(Harness):
     knowledge: InMemoryKnowledgeStore = None  # type: ignore[assignment]
     embedder: FakeEmbedder = None  # type: ignore[assignment]
     acts: AgentActivities = None  # type: ignore[assignment]
+    budgets: InMemoryBudgetStore = None  # type: ignore[assignment]
+    usage_store: InMemoryUsageStore = None  # type: ignore[assignment]
 
 
 @pytest.fixture
@@ -304,6 +308,8 @@ async def kharness():
         knowledge=InMemoryKnowledgeStore(),
         embedder=FakeEmbedder(),
         agent_store=seeded_agent_store(cfg),
+        budgets=InMemoryBudgetStore(),
+        usage_store=InMemoryUsageStore(),
     )
     registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, notion)})
     h.acts = AgentActivities(
@@ -321,7 +327,12 @@ async def kharness():
         switches=h.switches,
     )
     index_acts = IndexActivities(
-        registry, h.knowledge, h.embedder, h.agent_store, switches=h.switches
+        registry,
+        h.knowledge,
+        h.embedder,
+        h.agent_store,
+        switches=h.switches,
+        budgets=BudgetGuard(h.budgets, h.usage_store, ttl_seconds=0),
     )
     worker = Worker(
         wf_env.client,

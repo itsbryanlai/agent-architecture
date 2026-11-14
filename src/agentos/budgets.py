@@ -15,7 +15,13 @@ flight. A raised budget takes up to one window to lift a stop for the same reaso
 
 A cost that is null (a model with no price) cannot be added to a dollar amount. Those rows
 are counted in ``Spend.unpriced_calls`` so a page can say the budget cannot see them; they
-are never summed as zero silently.
+are never summed as zero silently. Spend and unpriced counts are also kept per cost type
+(``usage.KIND_LABELS``), so a budget line shows model and embedding spend side by side.
+
+Indexing asks ``BudgetGuard.tenant_stopped`` before each embedding call. It is the same
+cached read as the turn check, so a page can be embedded up to one window per worker process
+after the budget was reached, plus the pages already in flight. Embedding costs are small
+next to that overspend.
 
 If the budgets or the spend cannot be read, the check raises. The activity fails and
 Temporal retries it, so a read failure never lets a call through unchecked.
@@ -33,9 +39,10 @@ from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
+from agentos import usage as usage_module
 from agentos.models import LLMResponse
 from agentos.stores import tenant_transaction
-from agentos.usage import EMBEDDING, UsageGroup, UsageStore, month_bounds, utcnow
+from agentos.usage import LLM, UsageGroup, UsageStore, month_bounds, utcnow
 
 log = logging.getLogger("agentos.budgets")
 
@@ -46,6 +53,7 @@ WARN_PERCENT = 80
 CENTS = Decimal("0.01")
 MAX_AMOUNT = Decimal("9999999999.99")
 DEFAULT_TTL_SECONDS = 60
+AGENT_KINDS = (LLM,)  # the cost types an agent budget counts
 
 _AMOUNT = re.compile(r"\d{1,10}(\.\d{1,2})?")
 _BAD_AMOUNT = (
@@ -197,15 +205,58 @@ class PostgresBudgetStore:
 
 
 @dataclass
+class KindSpend:
+    """One cost type's part of a scope's spend."""
+
+    kind: str
+    cost: Decimal = Decimal(0)
+    unpriced_calls: int = 0
+
+    @property
+    def label(self) -> str:
+        return usage_module.KIND_LABELS.get(self.kind, self.kind)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "label": self.label,
+            "spend": format(self.cost.normalize(), "f"),
+            "unpriced_calls": self.unpriced_calls,
+        }
+
+
+@dataclass
 class Spend:
     """What was spent in a scope: the priced rows' dollars, and how many rows had no price."""
 
     cost: Decimal = Decimal(0)
     unpriced_calls: int = 0
+    by_kind: dict[str, KindSpend] = field(default_factory=dict)
 
     def add(self, group: UsageGroup) -> None:
         self.cost += group.cost
         self.unpriced_calls += group.unpriced_calls
+        part = self.by_kind.setdefault(group.kind, KindSpend(group.kind))
+        part.cost += group.cost
+        part.unpriced_calls += group.unpriced_calls
+
+    def kinds(self, only: tuple[str, ...] | None = None) -> list[KindSpend]:
+        """The split by cost type, in the order of ``usage.KIND_LABELS``, then any other kind seen.
+
+        ``only`` limits it to the cost types the scope counts (an agent counts model calls only).
+        """
+        order = list(usage_module.KIND_LABELS) + [
+            k for k in self.by_kind if k not in usage_module.KIND_LABELS
+        ]
+        return [
+            KindSpend(
+                k,
+                self.by_kind[k].cost if k in self.by_kind else Decimal(0),
+                self.by_kind[k].unpriced_calls if k in self.by_kind else 0,
+            )
+            for k in order
+            if only is None or k in only
+        ]
 
 
 @dataclass
@@ -221,7 +272,7 @@ def month_spend(groups: list[UsageGroup]) -> MonthSpend:
     spend = MonthSpend()
     for g in groups:
         spend.tenant.add(g)
-        if g.kind != EMBEDDING and g.agent_id is not None:
+        if g.kind in AGENT_KINDS and g.agent_id is not None:
             spend.agents.setdefault(g.agent_id, Spend()).add(g)
     return spend
 
@@ -253,9 +304,17 @@ class BudgetLine:
     level: str
     updated_by: str | None = None
     updated_at: datetime | None = None
+    kinds: list[KindSpend] = field(default_factory=list)  # spend and unpriced calls by cost type
 
     @classmethod
-    def of(cls, agent_id: str | None, budget: Budget | None, spend: Spend) -> BudgetLine:
+    def of(
+        cls,
+        agent_id: str | None,
+        budget: Budget | None,
+        spend: Spend,
+        kinds: tuple[str, ...] | None = None,
+    ) -> BudgetLine:
+        """``kinds`` limits the split to the cost types the scope counts; None means all."""
         amount = None if budget is None else budget.amount
         percent, level = level_of(spend.cost, amount)
         return cls(
@@ -267,6 +326,7 @@ class BudgetLine:
             level,
             None if budget is None else budget.updated_by,
             None if budget is None else budget.updated_at,
+            spend.kinds(kinds),
         )
 
     @property
@@ -282,6 +342,7 @@ class BudgetLine:
             "percent": self.percent,
             "level": self.level,
             "unpriced_calls": self.unpriced_calls,
+            "kinds": [k.as_dict() for k in self.kinds],
             "updated_by": self.updated_by,
             "updated_at": None if self.updated_at is None else self.updated_at.isoformat(),
         }
@@ -347,6 +408,12 @@ class BudgetGuard:
         if limit is not None and cached.spend.tenant.cost >= limit:
             return TENANT
         return None
+
+    async def tenant_stopped(self, tenant_id: str) -> bool:
+        """True when the tenant-wide budget is reached. Agent budgets never count here."""
+        cached = await self._read(tenant_id)
+        limit = cached.budgets.get(None)
+        return limit is not None and cached.spend.tenant.cost >= limit
 
     async def stop_response(
         self, tenant_id: str, agent_id: str, agent_name: str

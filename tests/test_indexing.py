@@ -1,10 +1,14 @@
 """Indexing: page text, chunks, and the workflow that walks a granted tree."""
 
+from datetime import UTC, datetime
+from decimal import Decimal
+
 from agentos import ids
 from agentos.config import TASK_QUEUE, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.index_knowledge import granted_roots, start_indexing
 from agentos.knowledge.notion_text import CHUNK_CHARS, TextBlock, chunk, page_text
+from agentos.usage import UsageEvent
 from agentos.workflows.indexing import IndexingWorkflow
 from tests.conftest import (
     PAGE_A1,
@@ -201,3 +205,70 @@ async def test_index_command_starts_one_workflow_per_scope(kharness):
     assert [workflow_id for workflow_id, _ in started] == [ids.index_workflow_id(TENANT, SCOPE_A)]
     summary = await started[0][1].result()
     assert summary.pages == 3
+
+
+async def over_the_tenant_budget(h):
+    await h.budgets.set_budget(TENANT, None, Decimal(5), "root")
+    await h.usage_store.record(
+        UsageEvent(
+            tenant_id=TENANT,
+            usage_key="spent",
+            kind="llm",
+            agent_id="it-helper",
+            agent_version=1,
+            model="m",
+            cost=Decimal(5),
+            at=datetime.now(UTC),
+        )
+    )
+
+
+async def test_a_run_over_the_tenant_budget_embeds_nothing_and_prunes_nothing(kharness):
+    h = kharness
+    await run_index(h)
+    stored = dict(h.knowledge.pages)
+    embedded = h.embedder.texts_embedded
+    h.notion.set_blocks(
+        PAGE_A1,
+        [
+            tb("paragraph", "Laptops are now replaced every four years."),
+            {
+                "id": PAGE_A2,
+                "type": "child_page",
+                "has_children": False,
+                "child_page": {"title": "Batteries"},
+            },
+        ],
+    )
+    await over_the_tenant_budget(h)
+
+    summary = await h.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, SCOPE_A, ROOT_A_PLAIN],
+        id=ids.index_workflow_id(TENANT, SCOPE_A) + ":2",
+        task_queue=TASK_QUEUE,
+    )
+
+    assert h.embedder.texts_embedded == embedded
+    assert (summary.pages, summary.changed, summary.skipped, summary.pruned) == (3, 0, 0, 0)
+    assert summary.deferred == 1
+    assert h.knowledge.pages == stored
+
+
+async def test_the_run_picks_up_again_when_the_budget_is_raised(kharness):
+    h = kharness
+    await over_the_tenant_budget(h)
+    first = await run_index(h)
+    assert (first.pages, first.changed, first.deferred, first.pruned) == (3, 0, 3, 0)
+    assert h.knowledge.pages == {}
+
+    await h.budgets.set_budget(TENANT, None, Decimal(500), "root")
+    again = await h.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, SCOPE_A, ROOT_A_PLAIN],
+        id=ids.index_workflow_id(TENANT, SCOPE_A) + ":2",
+        task_queue=TASK_QUEUE,
+    )
+
+    assert (again.changed, again.deferred) == (3, 0)
+    assert len(h.knowledge.pages) == 3

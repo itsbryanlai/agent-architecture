@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from temporalio.testing import ActivityEnvironment
 
+from agentos import usage as usage_module
 from agentos.activities import AgentActivities
 from agentos.agent_store import AgentNotFound, seeded_agent_store
 from agentos.audit import InMemoryAuditStore
@@ -24,9 +25,12 @@ from agentos.budgets import (
     PostgresBudgetStore,
     stop_text,
 )
-from agentos.config import Settings
+from agentos.config import Settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import Forbidden
+from agentos.knowledge.embedder import FakeEmbedder
+from agentos.knowledge.indexing import IndexActivities
+from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
 from agentos.models import AUDIT_KINDS, AuditEvent, LLMResponse, TurnContext, Usage
 from agentos.slack_client import FakeSlack
@@ -38,10 +42,10 @@ from agentos.stores import (
 )
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, Prices, UsageEvent, UsageRecorder
-from tests.conftest import ALICE, TENANT
+from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
 from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
 from tests.test_row_level_security import FakePool
-from tests.test_usage import block, price
+from tests.test_usage import SCOPE, _page_agents, block, price
 
 REPO = Path(__file__).resolve().parent.parent
 D = Decimal
@@ -616,7 +620,7 @@ async def test_the_usage_page_says_the_budget_cannot_see_unpriced_calls(h):
 
     text = text_of(await page(h, ROOT))
 
-    assert "1 call has no price" in text and "cannot count" in text
+    assert "1 model call has no price" in text and "cannot count" in text
 
 
 async def test_no_unpriced_warning_when_no_budget_is_set_or_every_call_is_priced(h):
@@ -811,3 +815,241 @@ async def test_the_postgres_store_upserts_by_scope_and_names_the_tenant_in_every
     assert upsert[2][0] == TENANT and upsert[2][1] is None and upsert_agent[2][1] == "mine"
     assert "tenant_id = %s" in listing[1] and listing[2] == (TENANT,)
     assert "DELETE FROM budgets" in delete[1] and delete[2][0] == TENANT
+
+
+# --- indexing stops at the tenant budget ---------------------------------------------------------
+
+
+def index_world(clock=None, ttl=60):
+    cfg = parse_agents_config(_page_agents())
+    notion = make_fake_notion()
+    notion.add_page_tree(ROOT_A, a_tree())
+    registry = TenantRegistry({TENANT: runtime_for(cfg, FakeSlack(), notion)})
+    guard, budgets, usage = make_guard(ttl=ttl, clock=clock)
+    embedder = FakeEmbedder()
+    store = InMemoryKnowledgeStore()
+    acts = IndexActivities(
+        registry,
+        store,
+        embedder,
+        seeded_agent_store(cfg),
+        usage=UsageRecorder(usage, Prices([])),
+        budgets=guard,
+    )
+    return acts, embedder, store, budgets, usage
+
+
+async def sync_root(acts):
+    return await ActivityEnvironment().run(acts.sync_page, TENANT, SCOPE, ROOT_A)
+
+
+async def test_a_tenant_at_its_budget_makes_no_embedding_call_and_says_so_once(caplog):
+    acts, embedder, store, budgets, usage = index_world()
+    await budgets.set_budget(TENANT, None, D("10"), ROOT)
+    await usage.record(usage_row("1", cost="10"))
+
+    with caplog.at_level(logging.INFO, logger="agentos.indexing"):
+        result = await sync_root(acts)
+
+    assert embedder.texts_embedded == 0 and store.pages == {}
+    assert result.budget_stopped and not result.skipped and not result.changed
+    assert result.child_page_ids
+    [line] = [r.getMessage() for r in caplog.records if "budget" in r.getMessage()]
+    assert line == f"indexing stopped tenant_id={TENANT} scope={SCOPE} budget=tenant"
+
+
+async def test_a_tenant_over_its_budget_makes_no_embedding_call():
+    acts, embedder, _, budgets, usage = index_world()
+    await budgets.set_budget(TENANT, None, D("10"), ROOT)
+    await usage.record(usage_row("1", cost="10.01"))
+
+    await sync_root(acts)
+
+    assert embedder.texts_embedded == 0
+
+
+async def test_a_tenant_under_its_budget_is_indexed():
+    acts, embedder, store, budgets, usage = index_world()
+    await budgets.set_budget(TENANT, None, D("10"), ROOT)
+    await usage.record(usage_row("1", cost="9.99"))
+
+    result = await sync_root(acts)
+
+    assert result.changed and not result.budget_stopped
+    assert embedder.texts_embedded > 0 and len(store.pages) == 1
+
+
+async def test_indexing_resumes_when_the_budget_is_raised_or_removed_or_the_month_turns():
+    clock = Clock()
+    acts, embedder, store, budgets, usage = index_world(clock=clock)
+    await budgets.set_budget(TENANT, None, D("10"), ROOT)
+    await usage.record(usage_row("1", cost="10"))
+    assert (await sync_root(acts)).budget_stopped
+
+    await budgets.set_budget(TENANT, None, D("20"), ROOT)
+    clock.now += timedelta(seconds=60)
+    assert not (await sync_root(acts)).budget_stopped
+    assert embedder.texts_embedded > 0
+
+    store.pages.clear()
+    await budgets.set_budget(TENANT, None, D("1"), ROOT)
+    clock.now += timedelta(seconds=60)
+    assert (await sync_root(acts)).budget_stopped
+
+    await budgets.remove_budget(TENANT, None)
+    clock.now += timedelta(seconds=60)
+    assert (await sync_root(acts)).changed
+
+    store.pages.clear()
+    await budgets.set_budget(TENANT, None, D("1"), ROOT)
+    clock.now += timedelta(seconds=60)
+    assert (await sync_root(acts)).budget_stopped
+    clock.now = datetime(2026, 12, 1, 0, 0, tzinfo=UTC)
+    assert (await sync_root(acts)).changed
+
+
+async def test_an_agent_budget_at_its_limit_never_stops_indexing():
+    acts, embedder, _, budgets, usage = index_world()
+    await budgets.set_budget(TENANT, "it-helper", D("1"), ROOT)
+    await usage.record(usage_row("1", cost="50"))
+
+    result = await sync_root(acts)
+
+    assert result.changed and not result.budget_stopped and embedder.texts_embedded > 0
+
+
+async def test_an_unchanged_page_is_not_a_budget_stop():
+    acts, _, _, budgets, usage = index_world()
+    await sync_root(acts)
+    await budgets.set_budget(TENANT, None, D("1"), ROOT)
+    await usage.record(usage_row("1", cost="5"))
+
+    result = await sync_root(acts)
+
+    assert not result.changed and not result.budget_stopped
+
+
+async def test_a_page_event_over_budget_is_not_reported_as_indexed_or_removed():
+    acts, embedder, _, budgets, usage = index_world()
+    await budgets.set_budget(TENANT, None, D("1"), ROOT)
+    await usage.record(usage_row("1", cost="5"))
+
+    result = await ActivityEnvironment().run(acts.refresh_page, TENANT, ROOT_A)
+
+    assert (result.indexed, result.removed) == ([], [])
+    assert embedder.texts_embedded == 0
+
+
+async def test_an_unreadable_budget_fails_the_indexing_step_instead_of_embedding():
+    class Broken(InMemoryBudgetStore):
+        async def list(self, tenant_id):
+            raise RuntimeError("database down")
+
+    acts, embedder, *_ = index_world()
+    acts.budgets = BudgetGuard(Broken(), InMemoryUsageStore(), Clock())
+
+    with pytest.raises(RuntimeError):
+        await sync_root(acts)
+
+    assert embedder.texts_embedded == 0
+
+
+# --- spend per cost type -------------------------------------------------------------------------
+
+
+async def test_the_tenant_line_splits_its_spend_by_cost_type_and_the_agent_line_is_model_only(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("100"))
+    await seed_spend(h, "mine", "5")
+    await seed_spend(h, None, "2.5", key="emb", kind="embedding")
+
+    view = await h.plane.budgets(TENANT, ROOT)
+
+    assert [(k.kind, k.label, k.cost) for k in view.tenant.kinds] == [
+        ("llm", "Model", D("5")),
+        ("embedding", "Embedding", D("2.5")),
+    ]
+    mine = next(x for x in view.agents if x.agent_id == "mine")
+    assert [(k.kind, k.cost) for k in mine.kinds] == [("llm", D("5"))]
+
+
+async def test_the_api_reads_spend_per_cost_type(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("100"))
+    await seed_spend(h, "mine", "5")
+    await seed_spend(h, None, "2.5", key="emb", kind="embedding")
+
+    body = (await api(h, ROOT, "GET", f"/tenants/{TENANT}/budgets")).json()
+
+    assert body["tenant"]["spend"] == "7.5"
+    assert body["tenant"]["kinds"] == [
+        {"kind": "llm", "label": "Model", "spend": "5", "unpriced_calls": 0},
+        {"kind": "embedding", "label": "Embedding", "spend": "2.5", "unpriced_calls": 0},
+    ]
+    mine = next(x for x in body["agents"] if x["agent_id"] == "mine")
+    assert [k["kind"] for k in mine["kinds"]] == ["llm"]
+
+
+async def test_the_usage_page_shows_model_and_embedding_spend_side_by_side(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("100"))
+    await seed_spend(h, "mine", "5")
+    await seed_spend(h, None, "2.5", key="emb", kind="embedding")
+
+    text = text_of(await page(h, ROOT))
+
+    assert "Model $5.0000" in text and "Embedding $2.5000" in text
+
+
+async def test_the_eighty_percent_warning_names_each_cost_type(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("10"))
+    await seed_spend(h, "mine", "6")
+    await seed_spend(h, None, "2.5", key="emb", kind="embedding")
+
+    text = text_of(await page(h, ROOT))
+
+    assert "The organisation has used 85% of its monthly budget" in text
+    assert "Model $6.0000" in text and "Embedding $2.5000" in text
+
+
+async def test_the_stopped_notice_for_the_tenant_says_indexing_is_paused_too(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("10"))
+    await seed_spend(h, None, "10", key="emb", kind="embedding")
+
+    text = text_of(await page(h, ROOT))
+
+    assert "The organisation has reached its monthly budget" in text
+    assert "indexing is paused" in text
+
+
+async def test_the_agent_page_shows_its_spend_by_cost_type(h):
+    await h.plane.set_budget(TENANT, ROOT, "mine", D("10"))
+    await seed_spend(h, "mine", "8")
+
+    text = text_of(await page(h, OWNER, f"{UI}/agents/mine"))
+
+    assert "$8.0000 of $10.00" in text and "Model $8.0000" in text
+
+
+async def test_a_new_cost_type_in_the_kinds_list_shows_on_the_page_and_in_the_api(h, monkeypatch):
+    monkeypatch.setitem(usage_module.KIND_LABELS, "storage", "Storage")
+    await h.plane.set_budget(TENANT, ROOT, None, D("100"))
+    await seed_spend(h, None, "3", key="s", kind="storage")
+
+    text = text_of(await page(h, ROOT))
+    body = (await api(h, ROOT, "GET", f"/tenants/{TENANT}/budgets")).json()
+
+    assert "Storage $3.0000" in text
+    assert [k["kind"] for k in body["tenant"]["kinds"]] == ["llm", "embedding", "storage"]
+    assert body["tenant"]["spend"] == "3"
+
+
+async def test_unpriced_calls_are_warned_per_cost_type(h):
+    await h.plane.set_budget(TENANT, ROOT, None, D("100"))
+    await seed_spend(h, "mine", None, key="np1")
+    await seed_spend(h, "mine", None, key="np2")
+    await seed_spend(h, None, None, key="np3", kind="embedding")
+
+    view = await h.plane.budgets(TENANT, ROOT)
+    text = text_of(await page(h, ROOT))
+
+    assert [(k.kind, k.unpriced_calls) for k in view.tenant.kinds] == [("llm", 2), ("embedding", 1)]
+    assert "2 model calls have no price" in text
+    assert "1 embedding call has no price" in text

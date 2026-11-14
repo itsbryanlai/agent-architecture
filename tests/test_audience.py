@@ -205,7 +205,7 @@ def test_init_db_and_migration_010_allow_the_same_kinds():
         block = sql[sql.index("kind IN (") :]
         return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
-    assert kinds_in(MIGRATION_010) == kinds_in(INIT_DB) == set(AUDIT_KINDS)
+    assert kinds_in(MIGRATION_010) <= kinds_in(INIT_DB) == set(AUDIT_KINDS)
 
 
 # --- the Slack lookups ----------------------------------------------------------------

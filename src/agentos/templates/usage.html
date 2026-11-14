@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros.html" import post_button, budget_alerts %}
 {% block title %}Usage{% endblock %}
 {% macro cost(t) -%}
   {%- if t.unpriced_calls and not t.cost %}no price
@@ -12,6 +13,8 @@
 {%- endmacro %}
 {% block body %}
 <h1>Usage</h1>
+{{ budget_alerts(budgets.tenant, "The organisation") }}
+{% for line in budgets.agents %}{{ budget_alerts(line, line.agent_id) }}{% endfor %}
 <form method="get" action="{{ base }}/usage" class="actions">
   <label for="month">Month (UTC)</label>
   <select id="month" name="month">
@@ -27,6 +30,35 @@
 <table>
   {{ head("All") }}
   <tr><td>{{ report.month }}</td>{{ numbers(report.total) }}</tr>
+</table>
+
+<h2>Budgets</h2>
+<p class="muted">Monthly limits in US dollars for {{ budgets.month }} (UTC), set by an admin. A warning shows from 80% and an agent stops answering at 100%. A cost with no price cannot be counted against a budget.</p>
+{% macro budget_row(line, label, agent_id) %}
+  <tr>
+    <td>{{ label }}</td>
+    <td>{{ line.spend | usd }}</td>
+    <td>{% if line.amount is none %}<span class="muted">no limit</span>{% else %}{{ line.amount | usd2 }}{% endif %}</td>
+    <td>{% if line.percent is none %}{% else %}{{ line.percent }}%{% endif %}</td>
+    {% if ctx.is_admin %}
+    <td>
+      <form class="inline" method="post" action="{{ base }}/budgets">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="agent_id" value="{{ agent_id }}">
+        <input type="text" name="amount" size="10" inputmode="decimal" aria-label="Monthly budget in US dollars for {{ label }}" placeholder="dollars" value="{% if line.amount is not none %}{{ line.amount }}{% endif %}">
+        <button type="submit">{{ "Change" if line.amount is not none else "Set" }}</button>
+      </form>
+      {% if line.amount is not none %}{{ post_button(base ~ "/budgets/remove", ctx.csrf, "Remove", {"agent_id": agent_id}) }}{% endif %}
+    </td>
+    {% endif %}
+  </tr>
+{% endmacro %}
+<table>
+  <tr><th>Scope</th><th>Spent</th><th>Budget</th><th>Used</th>{% if ctx.is_admin %}<th></th>{% endif %}</tr>
+  {% if budgets.tenant %}{{ budget_row(budgets.tenant, "Whole organisation", "") }}{% endif %}
+  {% for line in budgets.agents %}{{ budget_row(line, line.agent_id, line.agent_id) }}{% else %}
+  <tr><td colspan="5" class="muted">No agents.</td></tr>
+  {% endfor %}
 </table>
 
 <h2>By agent</h2>

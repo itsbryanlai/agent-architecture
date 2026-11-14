@@ -22,6 +22,7 @@ from agentos.agent_store import (
     startup_agent_failure,
 )
 from agentos.audit import PostgresAuditStore
+from agentos.budgets import BudgetGuard, PostgresBudgetStore
 from agentos.config import (
     EMBED_DIMENSIONS,
     PROVIDER_QWEN,
@@ -219,6 +220,7 @@ async def main() -> None:
             knowledge=knowledge,
             embedder=embedder,
             usage=usage,
+            budgets=BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool)),
         )
         workflows: list = [ConversationWorkflow, TaskWorkflow]
         all_activities = activities.all()

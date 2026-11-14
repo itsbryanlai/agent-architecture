@@ -17,6 +17,10 @@ Roles. A tenant has admins and creators.
   any agent.
 - An admin reads usage and cost for every agent; a creator reads it for the agents
   they created. Usage is never broken down by requester.
+- An admin sets, raises and removes monthly budgets (one for the tenant, one per agent). An
+  admin reads all of them; a creator reads the budgets of the agents they created, and
+  never sets one. Every change is audited as ``budget_set`` with the new amount in
+  ``target`` (``0`` and ``tool=remove`` for a removal).
 - A user listed in the tenant YAML ``admins`` is always an admin. Nobody can
   remove or demote that user here, because it is configuration. A user with a
   ``members`` row has that row's role. Anyone else has no role.
@@ -73,6 +77,15 @@ from agentos.audience import (
     effective_audience,
 )
 from agentos.audit import AuditStore, canonical_sha256
+from agentos.budgets import (
+    Budget,
+    BudgetLine,
+    BudgetStore,
+    BudgetsView,
+    InMemoryBudgetStore,
+    month_spend,
+    parse_amount,
+)
 from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
 from agentos.grant_checker import GrantChecker, GrantProblems, GrantReport
 from agentos.members import (
@@ -141,10 +154,12 @@ class ControlPlane:
         grant_checker: GrantChecker,
         audience: AudienceInspector | None = None,
         usage: UsageStore | None = None,
+        budgets: BudgetStore | None = None,
         clock: Callable[[], datetime] = utcnow,
     ):
         self._audience = audience
         self._usage = InMemoryUsageStore() if usage is None else usage
+        self._budgets = InMemoryBudgetStore() if budgets is None else budgets
         self._clock = clock
         self._agents = agents
         self._members = members
@@ -195,6 +210,7 @@ class ControlPlane:
         actor: str,
         *,
         version: AgentVersionRecord | None = None,
+        agent_id: str | None = None,
         requester: str | None = None,
         approver: str | None = None,
         target: str | None = None,
@@ -207,7 +223,7 @@ class ControlPlane:
                 tenant_id=tenant_id,
                 event_key=ids.audit_control_key(tenant_id, kind, request_id or uuid.uuid4().hex),
                 kind=kind,
-                agent_id=None if version is None else version.agent_id,
+                agent_id=agent_id if version is None else version.agent_id,
                 agent_version=None if version is None else version.version,
                 requester_user_id=requester or actor,
                 identity=f"user:{actor}",
@@ -274,6 +290,26 @@ class ControlPlane:
             record = await self._agents.get_version(tenant_id, agent_id, version)
             teams[(agent_id, version)] = None if record is None else (record.agent().team or None)
         return build_report(label, groups, teams)
+
+    async def budgets(self, tenant_id: str, actor: str) -> BudgetsView:
+        """Each agent's budget against the spend of the current UTC month.
+
+        An admin gets the tenant-wide line and every agent; a creator the agents they
+        created and no tenant line. An agent with no budget is listed with no limit.
+        """
+        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        start, end, label = month_bounds(None, self._clock())
+        spend = month_spend(await self._usage.totals(tenant_id, start, end))
+        rows = {b.agent_id: b for b in await self._budgets.list(tenant_id)}
+        agents = await self._agents.list_agents(tenant_id)
+        if role != ADMIN:
+            agents = [a for a in agents if a.created_by == actor]
+        lines = [
+            BudgetLine.of(a.agent_id, rows.get(a.agent_id), spend.of(a.agent_id))
+            for a in sorted(agents, key=lambda a: a.agent_id)
+        ]
+        tenant = BudgetLine.of(None, rows.get(None), spend.tenant) if role == ADMIN else None
+        return BudgetsView(label, tenant, lines)
 
     async def check_version_grants(
         self, tenant_id: str, actor: str, agent_id: str, version: int
@@ -488,6 +524,52 @@ class ControlPlane:
                 request_id=request_id,
             )
         return record
+
+    # --- budgets -------------------------------------------------------------
+
+    async def set_budget(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str | None,
+        amount: Any,
+        request_id: str | None = None,
+    ) -> Budget:
+        """Set or raise the monthly budget of an agent, or of the tenant when ``agent_id`` is None.
+
+        Only an admin. The amount is dollars and cents, refused rather than rounded.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        amount = parse_amount(amount)
+        if agent_id is not None and await self._agents.get_agent(tenant_id, agent_id) is None:
+            raise AgentNotFound(f"agent '{agent_id}' does not exist")
+        budget = await self._budgets.set_budget(tenant_id, agent_id, amount, actor)
+        await self._record(
+            "budget_set",
+            tenant_id,
+            actor,
+            agent_id=agent_id,
+            target=format(budget.amount, "f"),
+            tool="set",
+            request_id=request_id,
+        )
+        return budget
+
+    async def remove_budget(
+        self, tenant_id: str, actor: str, agent_id: str | None, request_id: str | None = None
+    ) -> None:
+        """Lift a budget, so the scope has no limit. Only an admin."""
+        await self._require_role(tenant_id, actor, ADMIN)
+        await self._budgets.remove_budget(tenant_id, agent_id)
+        await self._record(
+            "budget_set",
+            tenant_id,
+            actor,
+            agent_id=agent_id,
+            target="0",
+            tool="remove",
+            request_id=request_id,
+        )
 
     # --- members -------------------------------------------------------------
 

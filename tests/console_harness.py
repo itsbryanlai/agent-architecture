@@ -11,6 +11,7 @@ import httpx
 
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
+from agentos.budgets import InMemoryBudgetStore
 from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane
 from agentos.control_api import create_app
@@ -95,6 +96,7 @@ class ConsoleHarness:
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
         self.usage = InMemoryUsageStore()
+        self.budgets = InMemoryBudgetStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -113,6 +115,7 @@ class ConsoleHarness:
             NotionGrantChecker(lambda tenant_id: self.notion),
             audience,
             usage=self.usage,
+            budgets=self.budgets,
             clock=self.clock,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)

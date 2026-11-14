@@ -5,3 +5,8 @@
   <button type="submit">{{ label }}</button>
 </form>
 {%- endmacro %}
+{% macro budget_alerts(line, name) -%}
+{% if line and line.level == "warning" %}<p class="warn">{{ name }} has used {{ line.percent }}% of its monthly budget ({{ line.spend | usd }} of {{ line.amount | usd2 }}).</p>{% endif %}
+{% if line and line.level == "stopped" %}<p class="error">{{ name }} has reached its monthly budget and is not answering. An admin can raise it.</p>{% endif %}
+{% if line and line.cannot_see_unpriced %}<p class="warn">{{ line.unpriced_calls }} call{{ "" if line.unpriced_calls == 1 else "s" }} {{ "has" if line.unpriced_calls == 1 else "have" }} no price this month, so the budget for {{ name }} cannot count {{ "it" if line.unpriced_calls == 1 else "them" }}.</p>{% endif %}
+{%- endmacro %}

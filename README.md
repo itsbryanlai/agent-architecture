@@ -346,6 +346,40 @@ created. **Download CSV** exports the same aggregates. The JSON API serves them 
 `GET /tenants/<t>/usage?month=YYYY-MM`. There is no per-person view: nothing is
 grouped, filtered or exported by who asked.
 
+### Monthly budgets
+
+An admin can set a monthly budget in US dollars for the whole organisation and for each
+agent, for the UTC calendar month. No budget means no limit. The organisation budget counts
+every model call and every embedding; an agent's budget counts that agent's model calls
+across all its versions.
+
+- From **80%** the Usage page, and the agent's page, show a warning with the spend, the
+  budget and the percent.
+- At **100%** the agent answers every message with "<agent name> has reached its monthly
+  budget. An admin can raise it in the console." and does not call the model, so nothing
+  more is billed and no usage row is written. This applies when either the agent's or the
+  organisation's budget is reached. Each stopped turn logs one line with the tenant, the
+  agent and which budget, and nothing else.
+- Admins set, raise and remove budgets on the **Usage** page and through the API; each
+  change is an audit event (`budget_set`, with the new amount, or `0` for a removal).
+  Creators see the budgets of the agents they created, read-only.
+- The worker reads the month's spend at most once a minute per organisation. The most a
+  budget can be overspent is what the organisation spends in one such minute on each worker
+  process, plus the calls already running; a raised budget lifts a stop within a minute.
+- A call to a model with no price has no dollar cost, so a budget cannot count it. The
+  pages say so, with the number of such calls, whenever a budget is set and the month has
+  any. Add the model to `config/prices.yaml` to bring its calls under the budget.
+- If the worker cannot read the budgets or the spend, the model call fails and Temporal
+  retries it; a call is never let through unchecked.
+
+Budgets need migration `012` (a new install gets the table from `scripts/init_db.sql`).
+Run it before the worker or the console runs the new code, or the budget reads fail and the
+audit insert for `budget_set` is refused:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/012_budgets.sql
+```
+
 ## Upgrading an existing local database
 
 Chat history appends are now idempotent by a per-step key. A database created
@@ -645,6 +679,8 @@ version, adding an existing member), 422 for an invalid definition or request.
 | `POST .../versions/{v}/submit`, `withdraw`, `reject`, `publish` | lifecycle |
 | `POST .../versions/{v}/check-grants` | check the version's Notion database grants against Notion |
 | `GET`, `POST /tenants/{t}/members`; `PATCH`, `DELETE .../members/{user}` | members |
+| `GET /tenants/{t}/budgets` | budgets against this month's spend: the organisation line (admins) and the agents (a creator sees their own) |
+| `PUT`, `DELETE /tenants/{t}/budget`; `PUT`, `DELETE /tenants/{t}/agents/{a}/budget` | set or raise (`{amount}` in dollars, at most two decimals) or remove the organisation or an agent budget; admins only |
 | `GET /tenants/{t}/usage?month=YYYY-MM` | usage and cost by agent, team and model for a UTC month (default the current one); a creator sees only their agents |
 | `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
 
@@ -803,5 +839,6 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
 | `src/agentos/usage.py` | Usage rows, model prices, pricing at record time and the usage report |
+| `src/agentos/budgets.py` | Monthly budgets, the stop before a model call, and the warning levels |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

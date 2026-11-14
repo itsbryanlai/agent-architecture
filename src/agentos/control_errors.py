@@ -6,6 +6,7 @@ status and show its message, so the mapping lives here once.
 
 from agentos.agent_store import AgentNotFound, AgentStoreError
 from agentos.audience import AudienceCheckUnavailable, AudienceError
+from agentos.budgets import BudgetError, BudgetNotFound, InvalidBudget
 from agentos.config import ConfigError
 from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
@@ -16,6 +17,9 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     AgentNotFound: 404,
     MemberNotFound: 404,
     InvalidMember: 422,
+    InvalidBudget: 422,
+    BudgetNotFound: 404,
+    BudgetError: 409,
     AgentStoreError: 409,
     MemberError: 409,
     ConfigError: 422,

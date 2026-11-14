@@ -118,8 +118,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
       'agent_create', 'agent_draft', 'agent_edit', 'agent_import', 'agent_submit',
       'agent_withdraw', 'agent_reject', 'agent_publish',
       'member_add', 'member_remove', 'member_role',
-      'audience_refused', 'audience_confirm')),
-  agent_id           text,                   -- null only for a membership event
+      'audience_refused', 'audience_confirm',
+      'budget_set')),
+  agent_id           text,                   -- null only for a membership event or a tenant-wide budget
   agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked
   identity           text        NOT NULL,   -- whose access was used, e.g. agent:it-helper
@@ -134,7 +135,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   PRIMARY KEY (tenant_id, event_key),
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
-    kind IN ('member_add', 'member_remove', 'member_role')
+    kind IN ('member_add', 'member_remove', 'member_role', 'budget_set')
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
@@ -383,5 +384,36 @@ ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON usage_events;
 CREATE POLICY tenant_isolation ON usage_events
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Monthly budgets, per tenant and per agent. Same as migration 012.
+CREATE TABLE IF NOT EXISTS budgets (
+  tenant_id   text          NOT NULL,
+  agent_id    text,                          -- null is the tenant-wide budget
+  amount_usd  numeric(12, 2) NOT NULL CHECK (amount_usd > 0),
+  updated_by  text          NOT NULL,
+  updated_at  timestamptz   NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS budgets_one_per_scope
+  ON budgets (tenant_id, (COALESCE(agent_id, '')));
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON budgets FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON budgets TO agentos_app;
+
+ALTER TABLE budgets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE budgets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON budgets;
+CREATE POLICY tenant_isolation ON budgets
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from agentos import agent_store, audit, members, sessions, stores
+from agentos import agent_store, audit, members, sessions, stores, usage
 from agentos.agent_store import PostgresAgentStore
 from agentos.audit import PostgresAuditStore
 from agentos.config import (
@@ -36,6 +36,7 @@ from agentos.stores import (
     PostgresToolOutputStore,
     tenant_transaction,
 )
+from agentos.usage import PostgresUsageStore, UsageEvent
 from tests.conftest import agents_dict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +47,7 @@ AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_tex
 MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
 SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read_text()
 AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "009_audit_kinds.sql").read_text()
+USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -57,6 +59,7 @@ POSTGRES_STORES = [
     PostgresAgentStore,
     PostgresMemberStore,
     PostgresSessionStore,
+    PostgresUsageStore,
 ]
 
 
@@ -123,6 +126,10 @@ def sample_value(hint):
         return AuditEvent("acme", "k1", "answer", "a", 1, "U1", "agent:a")
     if hint is AgentVersion:
         return SAMPLE_AGENT
+    if hint is UsageEvent:
+        return UsageEvent(
+            tenant_id="acme", usage_key="k", kind="llm", agent_id="a", agent_version=1, model="m"
+        )
     origin = typing.get_origin(hint)
     args = typing.get_args(hint)
     if origin is dict:
@@ -163,6 +170,8 @@ def row_for(cls, method_name):
         return MEMBER_ROW
     if cls is PostgresSessionStore:
         return SESSION_ROW
+    if cls is PostgresUsageStore:
+        return None
     if cls is PostgresAgentStore:
         return AGENT_RECORD_ROW if method_name in ("get_agent", "list_agents") else AGENT_ROW
     return None
@@ -179,7 +188,7 @@ def public_methods(cls):
 def test_store_classes_are_all_covered():
     # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store, audit, agent_store, members, sessions):
+    for module in (stores, knowledge_store, audit, agent_store, members, sessions, usage):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -262,6 +271,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(AGENTS_MIGRATION)
         | rls_tables_forced(MEMBERS_MIGRATION)
         | rls_tables_forced(SESSIONS_MIGRATION)
+        | rls_tables_forced(USAGE_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
@@ -393,3 +403,42 @@ async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert(
     assert "ON CONFLICT (tenant_id, event_key) DO NOTHING" in audit[1]
     assert audit[2][:5] == ("acme", "acme:audit:import:it-helper", "agent_import", "it-helper", 1)
     assert pool.events[-1] == ("commit",)
+
+
+@pytest.mark.parametrize("sql", [USAGE_MIGRATION, INIT_DB], ids=["migration", "init_db"])
+def test_usage_sql_is_tenant_scoped_append_only_for_the_app_role_and_indexed_by_month(sql):
+    assert "PRIMARY KEY (tenant_id, usage_key)" in sql
+    assert "ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY" in sql
+    assert "ALTER TABLE usage_events FORCE ROW LEVEL SECURITY" in sql
+    assert "CREATE POLICY tenant_isolation ON usage_events" in sql
+    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
+    assert "REVOKE ALL ON usage_events FROM agentos_app" in sql
+    assert "GRANT SELECT, INSERT ON usage_events TO agentos_app" in sql
+    assert "UPDATE ON usage_events" not in sql and "DELETE ON usage_events" not in sql
+    assert "ON usage_events (tenant_id, at)" in sql
+    assert "CHECK (kind IN ('llm', 'embedding'))" in sql
+    assert "cost_usd" in sql and "numeric" in sql
+
+
+def test_a_usage_row_has_no_requester_column_and_no_content_column():
+    columns = USAGE_MIGRATION[USAGE_MIGRATION.index("CREATE TABLE") :]
+    columns = columns[: columns.index("\n);")]
+    for word in ("user", "requester", "text_body", "content", "prompt"):
+        assert word not in columns
+
+
+def test_init_db_matches_the_usage_migration():
+    block = USAGE_MIGRATION[USAGE_MIGRATION.index("CREATE TABLE IF NOT EXISTS usage_events") :]
+    assert block.rstrip() in INIT_DB
+
+
+async def test_the_usage_insert_ignores_a_repeat_and_names_the_tenant():
+    pool = FakePool()
+    store = PostgresUsageStore(pool)
+
+    await store.record(sample_value(UsageEvent))
+
+    insert = next(e for e in pool.events if e[0] == "execute" and "INSERT" in e[1])
+    assert "ON CONFLICT (tenant_id, usage_key) DO NOTHING" in insert[1]
+    assert insert[2][0] == "acme"

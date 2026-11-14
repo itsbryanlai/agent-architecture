@@ -26,6 +26,7 @@ from agentos.slack_signin import (
     SlackSession,
     SlackSignInError,
 )
+from agentos.usage import InMemoryUsageStore
 from tests.conftest import (
     TEAM,
     TENANT,
@@ -93,6 +94,7 @@ class ConsoleHarness:
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
+        self.usage = InMemoryUsageStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -109,6 +111,8 @@ class ConsoleHarness:
             self.audit,
             self.tenants,
             NotionGrantChecker(lambda tenant_id: self.notion),
+            usage=self.usage,
+            clock=self.clock,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

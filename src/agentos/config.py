@@ -392,6 +392,8 @@ def _check_front_doors(agents: dict[str, AgentVersion]) -> None:
     for agent_id, agent in agents.items():
         for specialist_id in agent.specialists:
             where = f"agent '{agent_id}' specialist '{specialist_id}'"
+            if agent.specialists.count(specialist_id) > 1:
+                raise ConfigError(f"{where}: listed more than once")
             specialist = agents.get(specialist_id)
             if specialist is None:
                 raise ConfigError(f"{where}: is not a defined agent")

@@ -35,8 +35,8 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from agentos.agent_store import PENDING, AgentNotFound
 from agentos.config import ConfigError
 from agentos.control import ControlPlane
-from agentos.control_errors import REFUSALS, status_of
-from agentos.grant_checker import GrantProblems
+from agentos.control_errors import REFUSALS, page_status, status_of
+from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.members import ADMIN, CREATOR, ROLES
 from agentos.sessions import SESSION_LIFETIME
 from agentos.slack_signin import (
@@ -308,6 +308,7 @@ class WebUI:
     ) -> Response:
         """A refusal as a page: the control plane's message with the status the API maps."""
         status = status_of(err)
+        status = None if status is None else page_status(status)
         if status is None:
             log.error("console error: %s", type(err).__name__)
             return _message("Something went wrong", "Internal error.", 500, ctx, back)
@@ -368,7 +369,7 @@ class WebUI:
             identity = identity_from_token_response(tokens, sign_in, login[1], console.clock())
         except SlackSignInError as err:
             log.warning("sign-in refused: %s", err)
-            return refused("Sign-in could not be completed. Start again.", 502)
+            return refused("Sign-in could not be completed. Start again.", 503)
         tenant_id = self.deps.tenants.by_slack_team(identity.team_id)
         if tenant_id is None:
             return refused("This console is not set up for your Slack workspace.", 403)
@@ -529,10 +530,21 @@ class WebUI:
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.version_url(ctx, agent_id, version, "saved"))
 
-    async def check_grants(self, request: Request, ctx: Ctx, agent_id: str, version: int):
-        reports = await ctx.plane.check_version_grants(
-            ctx.tenant_id, ctx.user_id, agent_id, version
+    async def notion_down(
+        self, request: Request, ctx: Ctx, agent_id: str, version: int
+    ) -> Response:
+        """The version page with a fixed message; 503 because a proxy hides a 502."""
+        return await self.version_page(
+            request, ctx, agent_id, version, page_status(502), NOTION_DOWN
         )
+
+    async def check_grants(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            reports = await ctx.plane.check_version_grants(
+                ctx.tenant_id, ctx.user_id, agent_id, version
+            )
+        except GrantCheckUnavailable:
+            return await self.notion_down(request, ctx, agent_id, version)
         return await self.version_page(request, ctx, agent_id, version, reports=reports)
 
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
@@ -552,6 +564,8 @@ class WebUI:
             return await self.version_page(
                 request, ctx, agent_id, version, 409, str(err), reports=err.reports
             )
+        except GrantCheckUnavailable:
+            return await self.notion_down(request, ctx, agent_id, version)
         return _redirect(self.version_url(ctx, agent_id, version, done))
 
     async def members(self, request: Request, ctx: Ctx) -> Response:
@@ -589,12 +603,14 @@ class WebUI:
         return _page("audit.html", ctx=ctx, events=events, older=older, base=self.base(ctx))
 
 
+NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
+
 _TITLES = {
     403: "Not allowed",
     404: "Not found",
     409: "Not possible now",
     422: "Invalid",
-    502: "Notion could not be reached",
+    503: "Notion could not be reached",
 }
 
 

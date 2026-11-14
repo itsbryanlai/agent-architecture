@@ -35,3 +35,13 @@ def status_of(err: Exception) -> int | None:
         if cls in STATUS_BY_ERROR:
             return STATUS_BY_ERROR[cls]
     return None
+
+
+# Behind a CDN or proxy (Cloudflare) an origin's 502 and 504 are replaced by the
+# proxy's own error page, so the message is lost. An HTML page says 503 instead.
+_PAGE_STATUS = {502: 503, 504: 503}
+
+
+def page_status(status: int) -> int:
+    """The status for a refusal shown as a web page: never 502 or 504."""
+    return _PAGE_STATUS.get(status, status)

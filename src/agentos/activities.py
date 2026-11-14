@@ -21,6 +21,9 @@ Rules kept here:
   and the system prompt tells the model never to follow instructions in it.
   Knowledge comes only from the agent's own granted pages, and each page is
   re-checked with Notion before the model sees it.
+* Every action is audited by the activity that does it (see ``agentos.audit``):
+  an audit write that fails fails the activity, so Temporal retries it and
+  nothing is done without a record. Events hold IDs and hashes, never text.
 * Log lines carry tenant, agent and workflow IDs only, never message text,
   document content or secrets.
 """
@@ -34,6 +37,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from agentos import ids
+from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.config import AgentVersion, Settings
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
@@ -55,6 +59,10 @@ from agentos.knowledge.search import (
 from agentos.knowledge.store import KnowledgeStore
 from agentos.llm import LLMClient
 from agentos.models import (
+    HAND_OFF_ANNOUNCEMENT,
+    OUT_OF_STEPS,
+    TURN_FAILED,
+    AuditEvent,
     Citation,
     LLMResponse,
     NotionItem,
@@ -119,6 +127,7 @@ class AgentActivities:
         links: TaskLinkStore,
         llm: LLMClient,
         tool_outputs: ToolOutputStore,
+        audit: AuditStore,
         knowledge: KnowledgeStore | None = None,
         embedder: Embedder | None = None,
     ):
@@ -131,6 +140,7 @@ class AgentActivities:
         ]
         self.history = history
         self.tool_outputs = tool_outputs
+        self.audit = audit
         self.idem = idem
         self.links = links
         self.llm = llm
@@ -152,6 +162,7 @@ class AgentActivities:
             self.create_notion_item,
             self.get_notion_item,
             self.post_in_thread,
+            self.record_hand_off,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -193,6 +204,83 @@ class AgentActivities:
     def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
         self._agent(tenant_id, agent_id)
         return self._runtime(tenant_id).connectors[agent_id]
+
+    async def _record(
+        self,
+        ctx: TurnContext,
+        kind: str,
+        event_key: str,
+        *,
+        outcome: str = "ok",
+        conversation_id: str | None = None,
+        task_id: str | None = None,
+        tool: str | None = None,
+        target: str | None = None,
+        input_sha256: str | None = None,
+        output_sha256: str | None = None,
+        approver_user_id: str | None = None,
+    ) -> None:
+        """Append one audit event for the agent and requester in ``ctx``."""
+        await self.audit.record(
+            AuditEvent(
+                tenant_id=ctx.tenant_id,
+                event_key=event_key,
+                kind=kind,
+                agent_id=ctx.agent_id,
+                agent_version=ctx.agent_version,
+                requester_user_id=ctx.requester_user_id,
+                identity=agent_identity(ctx.agent_id),
+                outcome=outcome,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                tool=tool,
+                target=target,
+                input_sha256=input_sha256,
+                output_sha256=output_sha256,
+                approver_user_id=approver_user_id,
+            )
+        )
+
+    async def _record_approval(self, spec: TaskSpec, task_id: str, target: str) -> None:
+        """Record that the requester approved exactly this payload, before it runs.
+
+        The task workflow accepts a decision only from the requester, so the
+        approver is the requester. Nothing reaches this activity until then.
+        """
+        ctx = spec.ctx
+        await self._record(
+            ctx,
+            "approval",
+            ids.audit_approval_key(task_id, spec.approval_nonce),
+            task_id=task_id,
+            tool=spec.tool_name,
+            target=target,
+            input_sha256=canonical_sha256(spec.payload),
+            approver_user_id=ctx.requester_user_id,
+        )
+
+    async def _record_write(
+        self,
+        spec: TaskSpec,
+        task_id: str,
+        idem_key: str,
+        target: str,
+        outcome: str,
+        output: object = None,
+    ) -> None:
+        ctx = spec.ctx
+        await self._record(
+            ctx,
+            "write",
+            ids.audit_write_key(idem_key, outcome),
+            outcome=outcome,
+            task_id=task_id,
+            tool=spec.tool_name,
+            target=target,
+            input_sha256=canonical_sha256(spec.payload),
+            output_sha256=None if output is None else canonical_sha256(output),
+            approver_user_id=ctx.requester_user_id,
+        )
 
     async def _post_once(
         self,
@@ -374,6 +462,26 @@ class AgentActivities:
         footer = await self._sources_footer(ctx, text, citations or [])
         slack = self._runtime(ctx.tenant_id).slack
         await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
+        if self._is_model_answer(ctx.tenant_id, text):
+            conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+            await self._record(
+                ctx,
+                "answer",
+                ids.audit_answer_key(conversation_id, placeholder_ts),
+                conversation_id=conversation_id,
+                output_sha256=canonical_sha256(text),
+            )
+
+    def _is_model_answer(self, tenant_id: str, text: str) -> bool:
+        """False for the notices the runtime posts itself through the reply path.
+
+        The workflow sends the same arguments for an answer, a failure notice
+        and a hand-off announcement, so they are told apart by their text.
+        """
+        if text in (TURN_FAILED, OUT_OF_STEPS):
+            return False
+        names = (a.name for a in self._runtime(tenant_id).config.agents.values())
+        return text not in {HAND_OFF_ANNOUNCEMENT.format(agent=n) for n in names}
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:
@@ -405,6 +513,16 @@ class AgentActivities:
         else:
             text, is_error = await self._read_tool_output(ctx, call)
         await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
+        await self._record(
+            ctx,
+            "tool_call",
+            ids.audit_tool_call_key(conversation_id, call.id),
+            outcome="error" if is_error else "ok",
+            conversation_id=conversation_id,
+            tool=call.name,
+            input_sha256=canonical_sha256(call.input),
+            output_sha256=canonical_sha256(text),
+        )
         return ToolResult(call.id, stored=True, is_error=is_error, citations=citations)
 
     async def _search_knowledge(
@@ -549,41 +667,47 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
         agent = self._agent(ctx.tenant_id, ctx.agent_id)
+        page_id = spec.payload["page_id"]
+        idem_key = f"{task_id}:comment"
+        await self._record_approval(spec, task_id, page_id)
         try:
-            return await self._connector(ctx.tenant_id, ctx.agent_id).add_comment(
-                spec.payload["page_id"],
-                spec.payload["comment"],
-                f"{task_id}:comment",
-                agent.name,
+            comment_id = await self._connector(ctx.tenant_id, ctx.agent_id).add_comment(
+                page_id, spec.payload["comment"], idem_key, agent.name
             )
-        except ConnectorError as err:
-            raise _non_retryable(err) from err
         except Exception as err:
-            if _is_client_error(err):
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, task_id, idem_key, page_id, "error")
                 raise _non_retryable(err) from err
             raise
+        await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
+        return comment_id
 
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         ctx = spec.ctx
         self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
         connector = self._connector(ctx.tenant_id, ctx.agent_id)
+        database_id = spec.payload["database_id"]
+        idem_key = f"{task_id}:create"
+        await self._record_approval(spec, task_id, database_id)
         email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
         try:
             item = await connector.create_item(
-                database_id=spec.payload["database_id"],
+                database_id=database_id,
                 title=spec.payload["title"],
                 details=spec.payload["details"],
                 requester_email=email,
-                idem_key=f"{task_id}:create",
+                idem_key=idem_key,
             )
-        except ConnectorError as err:
-            raise _non_retryable(err) from err
         except Exception as err:
-            if _is_client_error(err):
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, task_id, idem_key, database_id, "error")
                 raise _non_retryable(err) from err
             raise
         await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
+        await self._record_write(
+            spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
+        )
         return item
 
     @activity.defn(name="get_notion_item")
@@ -603,6 +727,22 @@ class AgentActivities:
     async def post_in_thread(self, ctx: TurnContext, text: str, idem_key: str) -> str:
         self._log("post_in_thread", ctx.tenant_id, ctx.agent_id)
         return await self._post_once(ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts)
+
+    @activity.defn(name="record_hand_off")
+    async def record_hand_off(self, ctx: TurnContext, target_agent: str, event_id: str) -> None:
+        """Audit a front door handing the thread to one of its specialists.
+
+        ``ctx`` is the front door's; ``target_agent`` is the specialist.
+        """
+        self._log("record_hand_off", ctx.tenant_id, ctx.agent_id, target=target_agent)
+        self._agent(ctx.tenant_id, target_agent)
+        await self._record(
+            ctx,
+            "hand_off",
+            ids.audit_hand_off_key(ctx.tenant_id, event_id),
+            conversation_id=ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts),
+            target=target_agent,
+        )
 
 
 def _format_items(items: list[NotionItem]) -> str:

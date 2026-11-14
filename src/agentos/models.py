@@ -8,9 +8,17 @@ objects.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from agentos.slack_format import escape_slack
+
+# Texts the runtime itself posts through the reply path. A model answer is
+# every other text, so the audit log tells them apart by these.
+OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
+TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
+HAND_OFF_ANNOUNCEMENT = "{agent} here, picking this up."
 
 
 @dataclass
@@ -185,3 +193,46 @@ class DraftView:
     nonce: str
     requester_user_id: str
     editable: bool  # True only while awaiting approval and under the edit limit
+
+
+AUDIT_KINDS = ("answer", "tool_call", "hand_off", "approval", "write")
+AUDIT_OUTCOMES = ("ok", "error")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """One thing an agent did, as references and hashes only.
+
+    Nothing here holds chat text, document text or a tool's input or output:
+    those are kept as SHA-256 hashes of their canonical JSON, and everything
+    else is an ID. ``at`` is set by the store when the event is recorded.
+    """
+
+    tenant_id: str
+    event_key: str  # unique per tenant: a retried activity records once
+    kind: str
+    agent_id: str
+    agent_version: int
+    requester_user_id: str
+    identity: str  # whose access was used, e.g. "agent:it-helper"
+    outcome: str = "ok"
+    conversation_id: str | None = None
+    task_id: str | None = None
+    tool: str | None = None
+    target: str | None = None  # a Notion page or database ID, or a specialist ID
+    input_sha256: str | None = None
+    output_sha256: str | None = None
+    approver_user_id: str | None = None
+    at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.tenant_id or not self.event_key:
+            raise ValueError("an audit event needs a tenant_id and an event_key")
+        if self.kind not in AUDIT_KINDS:
+            raise ValueError(f"invalid audit kind {self.kind!r}")
+        if self.outcome not in AUDIT_OUTCOMES:
+            raise ValueError(f"invalid audit outcome {self.outcome!r}")
+        for digest in (self.input_sha256, self.output_sha256):
+            if digest is not None and not _SHA256_HEX.fullmatch(digest):
+                raise ValueError("audit hashes must be 64 lowercase hex characters")

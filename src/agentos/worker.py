@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.audit import PostgresAuditStore
 from agentos.config import (
     EMBED_DIMENSIONS,
     PROVIDER_QWEN,
@@ -194,6 +195,7 @@ async def main() -> None:
             links=PostgresTaskLinkStore(pool),
             llm=llm,
             tool_outputs=PostgresToolOutputStore(pool),
+            audit=PostgresAuditStore(pool),
             knowledge=knowledge,
             embedder=embedder,
         )

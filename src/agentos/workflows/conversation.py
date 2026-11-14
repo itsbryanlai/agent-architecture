@@ -47,6 +47,9 @@ with workflow.unsafe.imports_passed_through():
     from agentos.config import AgentVersion
     from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
+        HAND_OFF_ANNOUNCEMENT,
+        OUT_OF_STEPS,
+        TURN_FAILED,
         Citation,
         ConversationRef,
         InboundMessage,
@@ -63,9 +66,7 @@ with workflow.unsafe.imports_passed_through():
 IDLE_TIMEOUT = timedelta(days=7)
 SEEN_LIMIT = 500
 MAX_CITATIONS = 200
-OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
-TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
 TOOL_NOT_COMPLETED = "The tool call did not complete."
 STEP_LIMIT_REACHED = "step limit reached"
 HAND_OFF_ACCEPTED = "Handed to {agent}. They will answer now."
@@ -484,9 +485,22 @@ class ConversationWorkflow:
         specialist = await self._load_agent(ref.tenant_id, target)
         new_ref = ConversationRef(ref.tenant_id, target, ref.channel, ref.thread_ts)
         ctx = self._turn_context(new_ref, specialist, m)
+        # Audited before anything is shown, so a failure to record leaves the
+        # thread with the front door and nothing announced.
+        await workflow.execute_activity_method(
+            AgentActivities.record_hand_off,
+            args=[state.ctx, target, m.event_id],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
         await workflow.execute_activity_method(
             AgentActivities.finalize_reply,
-            args=[state.ctx, state.placeholder_ts, f"{specialist.name} here, picking this up.", []],
+            args=[
+                state.ctx,
+                state.placeholder_ts,
+                HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name),
+                [],
+            ],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

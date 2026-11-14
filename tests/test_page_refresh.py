@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos import ids
+from agentos.agent_store import seeded_agent_store
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
 from agentos.knowledge.embedder import FakeEmbedder
@@ -73,6 +74,7 @@ def gateway(raw_agents: dict, temporal: FakeTemporalClient, links=None) -> TestC
         temporal,
         links or InMemoryTaskLinkStore(),
         SignatureVerifier("x"),
+        agents=seeded_agent_store(parse_agents_config(raw_agents)),
     )
     return TestClient(app)
 

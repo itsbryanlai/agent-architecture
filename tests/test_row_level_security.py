@@ -14,9 +14,15 @@ from urllib.parse import urlparse
 
 import pytest
 
-from agentos import audit, stores
+from agentos import agent_store, audit, stores
+from agentos.agent_store import PostgresAgentStore
 from agentos.audit import PostgresAuditStore
-from agentos.config import DEFAULT_DATABASE_URL
+from agentos.config import (
+    DEFAULT_DATABASE_URL,
+    AgentVersion,
+    agent_definition,
+    parse_agents_config,
+)
 from agentos.knowledge import store as knowledge_store
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.models import AuditEvent
@@ -27,11 +33,13 @@ from agentos.stores import (
     PostgresToolOutputStore,
     tenant_transaction,
 )
+from tests.conftest import agents_dict
 
 ROOT = Path(__file__).resolve().parent.parent
 INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
 MIGRATION = (ROOT / "scripts" / "migrations" / "004_row_level_security.sql").read_text()
 AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
+AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -40,26 +48,31 @@ POSTGRES_STORES = [
     PostgresTaskLinkStore,
     PostgresKnowledgeStore,
     PostgresAuditStore,
+    PostgresAgentStore,
 ]
 
 
 class FakeCursor:
     rowcount = 0
 
+    def __init__(self, row=None):
+        self.row = row
+
     async def fetchone(self):
-        return (1,)
+        return (1,) if self.row is None else self.row
 
     async def fetchall(self):
-        return []
+        return [] if self.row is None else [self.row]
 
 
 class FakeConnection:
-    def __init__(self, events: list):
+    def __init__(self, events: list, row=None):
         self.events = events
+        self.row = row
 
     async def execute(self, sql, params=None):
         self.events.append(("execute", " ".join(sql.split()), params))
-        return FakeCursor()
+        return FakeCursor(self.row)
 
     @asynccontextmanager
     async def transaction(self):
@@ -69,14 +82,16 @@ class FakeConnection:
 
 
 class FakePool:
-    def __init__(self):
+    def __init__(self, row=None):
         self.events: list = []
         self.taken = 0
+        # A row every query returns, for stores that read what they fetch.
+        self.row = row
 
     @asynccontextmanager
     async def connection(self):
         self.taken += 1
-        yield FakeConnection(self.events)
+        yield FakeConnection(self.events, self.row)
 
 
 def sample_value(hint):
@@ -96,13 +111,35 @@ def sample_value(hint):
         return sample_value(next(a for a in typing.get_args(hint) if a is not type(None)))
     if hint is AuditEvent:
         return AuditEvent("acme", "k1", "answer", "a", 1, "U1", "agent:a")
+    if hint is AgentVersion:
+        return SAMPLE_AGENT
     origin = typing.get_origin(hint)
     args = typing.get_args(hint)
+    if origin is dict:
+        return {}
     if origin is list:
         return [sample_value(args[0])]
     if origin is tuple:
         return tuple(sample_value(a) for a in args)
     raise AssertionError(f"no sample value for {hint}")
+
+
+SAMPLE_AGENT = parse_agents_config(agents_dict()).agents["it-helper"]
+# The agent store parses what it stores and what it reads back, so it is given a
+# real definition and a real row.
+AGENT_ROW = (
+    "acme",
+    "it-helper",
+    1,
+    "pending",
+    agent_definition(SAMPLE_AGENT),
+    "U1",
+    None,
+    "U1",
+    None,
+    None,
+    None,
+)
 
 
 def public_methods(cls):
@@ -116,7 +153,7 @@ def public_methods(cls):
 def test_store_classes_are_all_covered():
     # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
     found = set()
-    for module in (stores, knowledge_store, audit):
+    for module in (stores, knowledge_store, audit, agent_store):
         for name, cls in inspect.getmembers(module, inspect.isclass):
             if name.startswith("Postgres") and cls.__module__ == module.__name__:
                 found.add(cls)
@@ -127,7 +164,7 @@ async def test_every_postgres_store_method_sets_tenant_first():
     checked = 0
     for cls in POSTGRES_STORES:
         for name in public_methods(cls):
-            pool = FakePool()
+            pool = FakePool(AGENT_ROW if cls is PostgresAgentStore else None)
             method = getattr(cls(pool), name)
             hints = typing.get_type_hints(getattr(cls, name))
             kwargs = {
@@ -135,6 +172,10 @@ async def test_every_postgres_store_method_sets_tenant_first():
                 for p in inspect.signature(method).parameters
                 if p != "tenant_id" and p in hints
             }
+            if "definition" in kwargs:
+                kwargs["definition"] = agent_definition(SAMPLE_AGENT)
+            if "agents" in kwargs:
+                kwargs["agents"] = {"it-helper": SAMPLE_AGENT}
             if "tenant_id" in inspect.signature(method).parameters:
                 kwargs["tenant_id"] = "acme"
             await method(**kwargs)
@@ -187,7 +228,11 @@ def rls_tables_forced(sql: str) -> set[str]:
 def test_migration_and_init_db_cover_every_tenant_table():
     tables = tenant_tables(INIT_DB)
     assert len(tables) >= 6
-    assert tables <= rls_tables(MIGRATION) | rls_tables_forced(AUDIT_MIGRATION)
+    assert tables <= (
+        rls_tables(MIGRATION)
+        | rls_tables_forced(AUDIT_MIGRATION)
+        | rls_tables_forced(AGENTS_MIGRATION)
+    )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
     for table in rls_tables_forced(INIT_DB):

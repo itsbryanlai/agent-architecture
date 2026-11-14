@@ -13,6 +13,7 @@ from temporalio.worker import Worker
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_store import seeded_agent_store
 from agentos.config import TASK_QUEUE, ConfigError, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
 from agentos.llm import ScriptedLLMClient
@@ -82,6 +83,7 @@ async def running(raw: dict):
         idem=InMemoryIdempotencyStore(),
         links=InMemoryTaskLinkStore(),
         tool_outputs=InMemoryToolOutputStore(),
+        agent_store=seeded_agent_store(config),
     )
     acts = AgentActivities(
         settings=Settings(),
@@ -92,6 +94,7 @@ async def running(raw: dict):
         llm=h.llm,
         tool_outputs=h.tool_outputs,
         audit=h.audit,
+        agents=h.agent_store,
     )
     worker = Worker(
         wf_env.client,
@@ -485,7 +488,7 @@ async def test_specialist_load_failure_keeps_the_thread_with_the_front_door(fd, 
     async def complete_then_drop_specialist(system, messages, tools):
         response = await complete(system, messages, tools)
         # The specialist disappears from the config after the front door chose it.
-        h.agents.agents.pop("it-helper", None)
+        h.agent_store.set_published_unchecked(TENANT, "it-helper", None)
         return response
 
     h.llm.complete = complete_then_drop_specialist
@@ -507,7 +510,9 @@ async def test_specialist_load_failure_keeps_the_thread_with_the_front_door(fd, 
         if "turn failed" in r.getMessage()
     )
 
-    h.agents.agents["it-helper"] = parse_agents_config(front_door_dict()).agents["it-helper"]
+    h.agent_store.set_published_unchecked(
+        TENANT, "it-helper", front_door_dict()["agents"]["it-helper"]
+    )
     await h.client.get_workflow_handle(CONV_ID).signal(
         ConversationWorkflow.message, message("Ev2", "hello?")
     )
@@ -541,7 +546,9 @@ async def test_second_hand_off_in_a_turn_refused_even_if_specialist_lists_specia
     # Config validation rejects this, so build the config and add it afterwards.
     config_raw = copy.deepcopy(raw)
     async with running(config_raw) as h:
-        h.agents.agents["it-helper"].specialists.append("unlisted")
+        listing = copy.deepcopy(raw["agents"]["it-helper"])
+        listing["specialists"] = ["unlisted"]
+        h.agent_store.set_published_unchecked(TENANT, "it-helper", listing)
         h.llm.queue(
             tool_turn(hand_off_to("it-helper")),
             tool_turn(hand_off_to("unlisted", "tu_h2")),

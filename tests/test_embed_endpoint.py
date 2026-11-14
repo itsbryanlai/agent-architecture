@@ -3,6 +3,7 @@
 import pytest
 from temporalio.exceptions import ApplicationError
 
+from agentos.agent_store import seeded_agent_store
 from agentos.config import AgentsConfig, Settings, TenantsConfig, load_settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.knowledge.embedder import FakeEmbedder, OpenAICompatibleEmbedder
@@ -67,7 +68,7 @@ def activities_for(embedder) -> IndexActivities:
     raw["tenant_id"] = "t1"
     config = parse_agents_config(raw)
     registry = TenantRegistry({"t1": runtime_for(config, FakeSlack(), api)})
-    return IndexActivities(registry, InMemoryKnowledgeStore(), embedder)
+    return IndexActivities(registry, InMemoryKnowledgeStore(), embedder, seeded_agent_store(config))
 
 
 async def test_sync_page_client_error_is_non_retryable():

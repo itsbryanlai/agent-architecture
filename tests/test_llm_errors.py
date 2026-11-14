@@ -5,6 +5,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from agentos.activities import AgentActivities, _is_client_error
+from agentos.agent_store import seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.config import Settings
 from agentos.connectors.notion import FakeNotionAPI
@@ -47,6 +48,7 @@ def make_activities(agents, llm):
         llm=llm,
         tool_outputs=InMemoryToolOutputStore(),
         audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(agents),
     )
 
 

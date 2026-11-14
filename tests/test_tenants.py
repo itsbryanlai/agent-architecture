@@ -13,6 +13,7 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_store import seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     ConfigError,
@@ -194,6 +195,7 @@ def two_tenant_gateway(temporal, links=None, slack_secret="x"):
         temporal,
         links or InMemoryTaskLinkStore(),
         SignatureVerifier(slack_secret),
+        agents=seeded_agent_store(*tenants.tenants.values()),
     )
     return TestClient(app)
 
@@ -307,7 +309,16 @@ def test_legacy_webhook_path_only_with_one_tenant(monkeypatch, webhook_tokens):
     temporal = FakeTemporalClient()
     links = InMemoryTaskLinkStore()
     links.links[(GLOBEX, PAGE_ID.replace("-", ""))] = f"{GLOBEX}:task:t1"
-    client = TestClient(create_app(Settings(), one, temporal, links, SignatureVerifier("x")))
+    client = TestClient(
+        create_app(
+            Settings(),
+            one,
+            temporal,
+            links,
+            SignatureVerifier("x"),
+            agents=seeded_agent_store(*one.tenants.values()),
+        )
+    )
 
     event = page_event("ws-g")
     assert (
@@ -355,9 +366,8 @@ async def test_turn_uses_its_tenants_clients_only(two_tenants):
 
 
 async def test_unknown_tenant_activity_fails_non_retryable():
-    registry = TenantRegistry(
-        {TENANT: runtime_for(parse_agents_config(agents_dict()), FakeSlack(), FakeNotionAPI())}
-    )
+    config = parse_agents_config(agents_dict())
+    registry = TenantRegistry({TENANT: runtime_for(config, FakeSlack(), FakeNotionAPI())})
     acts = AgentActivities(
         settings=Settings(),
         registry=registry,
@@ -367,6 +377,7 @@ async def test_unknown_tenant_activity_fails_non_retryable():
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
         audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(config),
     )
     ctx = TurnContext(
         tenant_id="initech",
@@ -399,6 +410,7 @@ def make_acts(*configs):
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
         audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(*configs),
     )
 
 

@@ -89,7 +89,7 @@ class FakeSlack:
 
 
 class ConsoleHarness:
-    def __init__(self, console_url: str = CONSOLE_URL, single_tenant: bool = False):
+    def __init__(self, console_url: str = CONSOLE_URL, single_tenant: bool = False, audience=None):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
@@ -109,6 +109,7 @@ class ConsoleHarness:
             self.audit,
             self.tenants,
             NotionGrantChecker(lambda tenant_id: self.notion),
+            audience,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

@@ -45,7 +45,7 @@ AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_t
 AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
 MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
 SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read_text()
-AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "009_audit_kinds.sql").read_text()
+AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "010_audience.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,

@@ -11,8 +11,7 @@ CREATE TABLE IF NOT EXISTS audience_pauses (
   tenant_id   text        NOT NULL,
   agent_id    text        NOT NULL,
   channel     text        NOT NULL,
-  reason      text        NOT NULL CHECK (reason IN (
-    'guest_joined', 'external_joined', 'channel_shared', 'made_public', 'unverified')),
+  reason      text        NOT NULL CHECK (reason IN ('channel_shared')),
   paused_at   timestamptz NOT NULL DEFAULT now(),
   resumed_by  text,
   resumed_at  timestamptz,

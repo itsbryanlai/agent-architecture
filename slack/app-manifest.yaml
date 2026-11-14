@@ -13,10 +13,8 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
-      - channels:history
       - channels:read
       - chat:write
-      - groups:history
       - groups:read
       - im:history
       - im:read
@@ -30,9 +28,6 @@ settings:
     bot_events:
       - app_mention
       - channel_shared
-      - member_joined_channel
-      - message.channels
-      - message.groups
       - message.im
   interactivity:
     is_enabled: true

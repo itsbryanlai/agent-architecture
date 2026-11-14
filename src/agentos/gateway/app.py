@@ -5,10 +5,9 @@ It acknowledges every request quickly and hands the work to Temporal:
 * ``POST /slack/events``: a DM or an @mention signal-with-starts the thread's
   ConversationWorkflow. Slack retries are harmless, because the workflow drops
   duplicate event IDs.
-  A person joining a channel, a channel shared with another organisation and a private
-  channel made public start an ``AudienceWatchWorkflow`` (one per Slack event ID, never
-  reused), which pauses the agents that answer in that channel when they put a guest or
-  an outside person among its readers.
+  A channel shared with another organisation (``channel_shared``) starts an
+  ``AudienceWatchWorkflow`` (one per Slack event ID, never reused), which pauses the
+  agents that answer in that channel. People joining a channel start nothing.
 * ``POST /slack/interactivity``: Submit / Cancel clicks become a ``decision``
   signal to the task named on the card. The gateway passes on who clicked; the
   task workflow decides whether that person may approve. An Edit click opens a
@@ -52,9 +51,6 @@ from agentos.connectors.notion import normalize_id
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
-    JOINED,
-    PUBLIC,
-    SHARED,
     ApprovalDecision,
     AudienceEvent,
     ConversationRef,
@@ -261,25 +257,15 @@ def create_app(
 def _audience_event(tenant: str, payload: dict, event: dict) -> AudienceEvent | None:
     """The audience event a Slack event is, or None.
 
-    Three things can change who reads an agent's answers in a channel: a person joining
-    (``member_joined_channel``), the channel being shared with another organisation
-    (``channel_shared``) and a private channel being made public, which Slack reports as
-    a ``message`` event with the subtype ``channel_convert_to_public``.
+    Only a channel being shared with another organisation (``channel_shared``) is one.
+    Who joins a channel is the admins' responsibility, so ``member_joined_channel`` falls
+    through to the ordinary handling, which ignores it.
     """
     channel = event.get("channel")
-    if not isinstance(channel, str) or not channel:
+    if event.get("type") != "channel_shared" or not isinstance(channel, str) or not channel:
         return None
-    kind, user = None, None
-    if event.get("type") == "member_joined_channel" and event.get("user"):
-        kind, user = JOINED, event["user"]
-    elif event.get("type") == "channel_shared":
-        kind = SHARED
-    elif event.get("type") == "message" and event.get("subtype") == "channel_convert_to_public":
-        kind = PUBLIC
-    if kind is None:
-        return None
-    event_id = payload.get("event_id") or f"{kind}:{channel}:{user or ''}:{event.get('event_ts')}"
-    return AudienceEvent(tenant, event_id, kind, channel, user)
+    event_id = payload.get("event_id") or f"shared:{channel}:{event.get('event_ts')}"
+    return AudienceEvent(tenant, event_id, channel)
 
 
 async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
@@ -301,10 +287,9 @@ async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
         )
         return
     log.info(
-        "tenant_id=%s workflow_id=%s started audience watch kind=%s",
+        "tenant_id=%s workflow_id=%s started audience watch",
         event.tenant_id,
         workflow_id,
-        event.kind,
     )
 
 

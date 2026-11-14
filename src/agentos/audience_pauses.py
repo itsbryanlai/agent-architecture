@@ -21,18 +21,10 @@ from psycopg_pool import AsyncConnectionPool
 from agentos.stores import tenant_transaction
 
 # Why a channel was paused. These are the only values stored or shown.
-GUEST_JOINED = "guest_joined"
-EXTERNAL_JOINED = "external_joined"
 CHANNEL_SHARED = "channel_shared"
-MADE_PUBLIC = "made_public"
-UNVERIFIED = "unverified"  # a person joined and could not be looked up
 
 REASON_TEXT = {
-    GUEST_JOINED: "a guest joined the channel",
-    EXTERNAL_JOINED: "a person from another workspace joined the channel",
     CHANNEL_SHARED: "the channel was shared with another organisation",
-    MADE_PUBLIC: "the channel was made public",
-    UNVERIFIED: "someone joined the channel and could not be checked",
 }
 
 

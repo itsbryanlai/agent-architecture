@@ -287,18 +287,10 @@ class AuditEvent:
                 raise ValueError("audit hashes must be 64 lowercase hex characters")
 
 
-# What happened in a channel that may change who reads an agent's answers there.
-JOINED = "joined"  # a person joined the channel
-SHARED = "shared"  # the channel was shared with another organisation
-PUBLIC = "public"  # a private channel was made public
-
-
 @dataclass
 class AudienceEvent:
-    """A Slack event about a channel's audience. Travels through Temporal: IDs only."""
+    """A channel being shared with another organisation. Travels through Temporal: IDs only."""
 
     tenant_id: str
     event_id: str
-    kind: str  # JOINED, SHARED or PUBLIC
     channel: str
-    user_id: str | None = None  # who joined; None for the other kinds

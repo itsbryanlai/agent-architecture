@@ -1,4 +1,4 @@
-"""The control-plane API: agents, versions, members, usage, budgets and the audit log, as JSON.
+"""The control-plane API: agents, versions, members, usage, budgets, switches and the audit log, as JSON.
 
 This is a separate app and process from the gateway. The gateway is reachable
 from the internet; this API is not, and must not be. Without sign-in with Slack
@@ -518,6 +518,52 @@ def create_app(
         await deps.plane.remove_budget(tenant_id, actor, agent_id, rid)
         return out({"agent_id": agent_id, "removed": True})
 
+    # --- kill switches ---
+
+    @app.get("/tenants/{tenant_id}/switches")
+    async def switches(tenant_id: Tenant, actor: Actor) -> JSONResponse:
+        """Every switch and its state: all of them for an admin, a creator's agents only."""
+        return out((await deps.plane.switches(tenant_id, actor)).as_dict())
+
+    async def change_switch(
+        tenant_id: str, actor: str, rid: str | None, scope: str, target: str | None, off: bool
+    ) -> JSONResponse:
+        change = deps.plane.turn_off if off else deps.plane.turn_on
+        changed = await change(tenant_id, actor, scope, target, rid)
+        return out({"scope": scope, "target": target, "off": off, "changed": changed})
+
+    @app.put("/tenants/{tenant_id}/switches/all-agents")
+    async def turn_off_all_agents(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "all_agents", None, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/all-agents")
+    async def turn_on_all_agents(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "all_agents", None, False)
+
+    @app.put("/tenants/{tenant_id}/switches/writes")
+    async def turn_off_writes(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "writes", None, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/writes")
+    async def turn_on_writes(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "writes", None, False)
+
+    @app.put("/tenants/{tenant_id}/switches/agents/{agent_id}")
+    async def turn_off_agent(tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str):
+        return await change_switch(tenant_id, actor, rid, "agent", agent_id, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/agents/{agent_id}")
+    async def turn_on_agent(tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str):
+        return await change_switch(tenant_id, actor, rid, "agent", agent_id, False)
+
+    @app.put("/tenants/{tenant_id}/switches/connectors/{connector}")
+    async def turn_off_connector(tenant_id: Tenant, actor: Actor, rid: RequestId, connector: str):
+        return await change_switch(tenant_id, actor, rid, "connector", connector, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/connectors/{connector}")
+    async def turn_on_connector(tenant_id: Tenant, actor: Actor, rid: RequestId, connector: str):
+        return await change_switch(tenant_id, actor, rid, "connector", connector, False)
+
     # --- audit ---
 
     @app.get("/tenants/{tenant_id}/audit")
@@ -557,6 +603,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.members import PostgresMemberStore
     from agentos.sessions import PostgresSessionStore
     from agentos.slack_client import RealSlackPoster
+    from agentos.switches import PostgresSwitchStore
     from agentos.tenants import require_tenant_secret
     from agentos.usage import PostgresUsageStore
 
@@ -600,6 +647,7 @@ async def _real_lifespan(app: FastAPI):
             usage=PostgresUsageStore(pool),
             budgets=PostgresBudgetStore(pool),
             pauses=PostgresPauseStore(pool),
+            switches=PostgresSwitchStore(pool),
         )
         app.state.deps.tenants = tenants
         yield

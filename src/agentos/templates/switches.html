@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "macros.html" import post_button %}
+{% block title %}Switches{% endblock %}
+{% macro row(line, label, what) %}
+  <tr>
+    <td>{{ label }}</td>
+    <td>{% if line.off %}<span class="error">Off</span>{% else %}On{% endif %}</td>
+    <td class="muted">{% if line.off %}turned off by {{ line.switch.turned_off_by }}, {{ line.switch.turned_off_at | stamp }}{% else %}{{ what }}{% endif %}</td>
+    <td>
+      {% if line.off %}
+      {{ post_button(base ~ "/switches/on", ctx.csrf, "Turn on", {"scope": line.scope, "target": line.target}) }}
+      {% else %}
+      <form class="inline" method="post" action="{{ base }}/switches/off">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="scope" value="{{ line.scope }}">
+        <input type="hidden" name="target" value="{{ line.target }}">
+        {% if line.scope in needs_confirm %}<label class="inline"><input type="checkbox" name="confirm" value="yes"> I confirm</label>{% endif %}
+        <button type="submit">Turn off</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+{% endmacro %}
+{% block body %}
+<h1>Switches</h1>
+<p class="muted">Kill switches take effect on the next step, with no restart, and each change is recorded in the audit log. Work already finished is not undone, and nothing turned off is held for later.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<h2>The whole organisation</h2>
+<table>
+  <tr><th>Switch</th><th>State</th><th></th><th></th></tr>
+  {{ row(view.all_agents, "All agents", "Every agent answers.") }}
+  {{ row(view.writes, "All writes", "Agents may draft, and approved writes run.") }}
+  {% for c in view.connectors %}{{ row(c, "Connector: " ~ c.target, "Tool calls, search and indexing run.") }}{% endfor %}
+</table>
+<p class="muted">All agents: every agent replies that it is turned off, and no model is called. All writes: drafting still works, but Submit is refused and an approved write that has not run is refused too. Connector: tool calls return an error, search is refused, and indexing and follow-up polling wait.</p>
+
+<h2>Agents</h2>
+<table>
+  <tr><th>Agent</th><th>State</th><th></th><th></th></tr>
+  {% for line in view.agents %}
+  {% if view.stopped_by.get(line.target) == "all_agents" and not line.off %}
+  <tr><td>{{ line.target }}</td><td><span class="error">Off</span></td><td class="muted">all agents are turned off</td><td>{{ post_button(base ~ "/switches/off", ctx.csrf, "Turn off", {"scope": line.scope, "target": line.target}) }}</td></tr>
+  {% else %}{{ row(line, line.target, "Answering.") }}{% endif %}
+  {% else %}
+  <tr><td colspan="4" class="muted">No agents.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

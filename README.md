@@ -380,6 +380,58 @@ audit insert for `budget_set` is refused:
 docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/012_budgets.sql
 ```
 
+## Kill switches
+
+An admin can turn things off at once, from the console's **Switches** page, through the API,
+or from the host with a command. Each takes effect on the next step, with no restart: every
+check reads the `kill_switches` table again, with no cache, in an activity or in the
+gateway. Nothing turned off is held for later, and work already finished is not undone.
+
+| Switch | What it stops |
+|---|---|
+| An agent | Every turn of that agent gets "<agent name> is turned off by an admin." The model is not called, nothing is billed and no usage row is written. This is checked before the budget. |
+| All agents | The same reply for every agent of the organisation. |
+| A connector (`notion`) | Its tool calls return an error the model passes on, knowledge search refuses, and the approval step of a comment is refused. Page events are dropped, and a full indexing run or its prune step stops with a failure instead of reading or deleting anything. Follow-up polling makes no Notion call and the task keeps watching, so the next poll after the switch is back on carries on. A write approved before the switch went off is refused. |
+| All writes | Read-only mode. Agents can still draft and the approval card is posted. Clicking Submit gets "Writes are turned off by your admin; nothing was changed." in the card's conversation, and the card stays, so Submit works again once writes are back on. A write that was approved before the switch went off, but had not run yet, is refused before the call to Notion: the task ends, tells the requester that nothing was changed and that they can ask again later, and is not held. |
+
+Only admins turn switches off and on, never a creator, not even on their own agent. A
+creator sees the state on the agent's page, read-only. Turning off every agent or all writes
+asks for a tick in the console form. Each change is an audit event, `switch_off` or
+`switch_on`, naming the agent for an agent switch and the scope in `tool`; turning off what
+is already off, or on what is already on, changes and records nothing.
+
+| Request | Does |
+|---|---|
+| `GET /tenants/{t}/switches` | every switch and its state (a creator sees their own agents) |
+| `PUT`, `DELETE /tenants/{t}/switches/agents/{a}` | turn an agent off, on |
+| `PUT`, `DELETE /tenants/{t}/switches/all-agents` | turn every agent off, on |
+| `PUT`, `DELETE /tenants/{t}/switches/connectors/notion` | turn the Notion connector off, on |
+| `PUT`, `DELETE /tenants/{t}/switches/writes` | turn all writes off, on |
+
+The same switches work with the console down:
+
+```bash
+uv run python -m agentos.switches --tenant acme list
+uv run python -m agentos.switches --tenant acme off --agent it-helper
+uv run python -m agentos.switches --tenant acme off --everything   # all agents, writes, Notion
+uv run python -m agentos.switches --tenant acme on --writes
+```
+
+The command reads no Slack identity. It is audited as `operator:<login of the OS account
+running it>`, which the runtime reads, so it cannot be typed or chosen by the model.
+
+Switches need migration `014` (a new install gets the table from `scripts/init_db.sql`). Run
+it before the worker, the gateway and the console run the new code, or the switch reads
+fail and the audit insert for `switch_off` is refused. It keeps every earlier audit kind,
+so run it after `013`:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/014_kill_switches.sql
+```
+
+If a switch cannot be read, the step fails and Temporal retries it; a step is never let
+through unchecked.
+
 ## Upgrading an existing local database
 
 Chat history appends are now idempotent by a per-step key. A database created
@@ -680,6 +732,7 @@ version, adding an existing member), 422 for an invalid definition or request.
 | `POST .../versions/{v}/check-grants` | check the version's Notion database grants against Notion |
 | `GET`, `POST /tenants/{t}/members`; `PATCH`, `DELETE .../members/{user}` | members |
 | `GET /tenants/{t}/budgets` | budgets against this month's spend: the organisation line (admins) and the agents (a creator sees their own) |
+| `GET /tenants/{t}/switches`, `PUT`, `DELETE /tenants/{t}/switches/{agents/a, all-agents, connectors/notion, writes}` | kill switches; see [Kill switches](#kill-switches); changes are admins only |
 | `PUT`, `DELETE /tenants/{t}/budget`; `PUT`, `DELETE /tenants/{t}/agents/{a}/budget` | set or raise (`{amount}` in dollars, at most two decimals) or remove the organisation or an agent budget; admins only |
 | `GET /tenants/{t}/usage?month=YYYY-MM` | usage and cost by agent, team and model for a UTC month (default the current one); a creator sees only their agents |
 | `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
@@ -883,5 +936,6 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
 | `src/agentos/usage.py` | Usage rows, model prices, pricing at record time and the usage report |
 | `src/agentos/budgets.py` | Monthly budgets, the stop before a model call, and the warning levels |
+| `src/agentos/switches.py` | Kill switches: the table, the checks, and the operator command |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

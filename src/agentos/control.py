@@ -50,6 +50,11 @@ the fresh count of the people in that channel, like a publish. Reading the pause
 channels (``paused_channels``) is for admins and the agent's editors. Resuming is audited
 as ``audience_resume``.
 
+Kill switches (see ``switches.py``): an admin turns an agent, every agent, a connector
+or all writes off and on; each change is audited as ``switch_off`` or ``switch_on``. An
+admin reads every switch. A creator reads the state of the agents they created and the
+tenant-wide switches that stop them, and never changes one.
+
 A refused action is not audited yet.
 
 The audit event is recorded after the change, in its own transaction. If the
@@ -107,6 +112,13 @@ from agentos.members import (
 )
 from agentos.models import AuditEvent
 from agentos.slack_client import SlackLookupError
+from agentos.switches import (
+    InMemorySwitchStore,
+    SwitchesView,
+    SwitchStore,
+    read_state,
+    set_switch,
+)
 from agentos.usage import (
     InMemoryUsageStore,
     UsageReport,
@@ -182,7 +194,9 @@ class ControlPlane:
         budgets: BudgetStore | None = None,
         clock: Callable[[], datetime] = utcnow,
         pauses: PauseStore | None = None,
+        switches: SwitchStore | None = None,
     ):
+        self._switches = InMemorySwitchStore() if switches is None else switches
         self._pauses = InMemoryPauseStore() if pauses is None else pauses
         self._audience = audience
         self._usage = InMemoryUsageStore() if usage is None else usage
@@ -337,6 +351,15 @@ class ControlPlane:
         ]
         tenant = BudgetLine.of(None, rows.get(None), spend.tenant) if role == ADMIN else None
         return BudgetsView(label, tenant, lines)
+
+    async def switches(self, tenant_id: str, actor: str) -> SwitchesView:
+        """Every switch and its state. An admin sees every agent; a creator their own."""
+        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        agents = await self._agents.list_agents(tenant_id)
+        if role != ADMIN:
+            agents = [a for a in agents if a.created_by == actor]
+        state = await read_state(self._switches, tenant_id)
+        return SwitchesView.build(state, sorted(a.agent_id for a in agents))
 
     async def check_version_grants(
         self, tenant_id: str, actor: str, agent_id: str, version: int
@@ -706,6 +729,58 @@ class ControlPlane:
             agent_id=agent_id,
             target="0",
             tool="remove",
+            request_id=request_id,
+        )
+
+    # --- kill switches -------------------------------------------------------
+
+    async def turn_off(
+        self,
+        tenant_id: str,
+        actor: str,
+        scope: str,
+        target: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Turn a switch off. Only an admin. True when it was on; off already changes nothing.
+
+        It takes effect on the next step of every worker, with no restart.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        return await self._change_switch(tenant_id, actor, scope, target, True, request_id)
+
+    async def turn_on(
+        self,
+        tenant_id: str,
+        actor: str,
+        scope: str,
+        target: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Turn a switch back on. Only an admin. True when it was off."""
+        await self._require_role(tenant_id, actor, ADMIN)
+        return await self._change_switch(tenant_id, actor, scope, target, False, request_id)
+
+    async def _change_switch(
+        self,
+        tenant_id: str,
+        actor: str,
+        scope: str,
+        target: str | None,
+        off: bool,
+        request_id: str | None,
+    ) -> bool:
+        return await set_switch(
+            self._switches,
+            self._audit,
+            self._agents,
+            tenant_id,
+            scope,
+            target,
+            off=off,
+            actor=actor,
+            identity=f"user:{actor}",
+            at=self._clock(),
             request_id=request_id,
         )
 

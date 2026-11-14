@@ -28,6 +28,7 @@ from agentos.slack_signin import (
     SlackSession,
     SlackSignInError,
 )
+from agentos.switches import InMemorySwitchStore
 from agentos.usage import InMemoryUsageStore
 from tests.conftest import (
     TEAM,
@@ -99,6 +100,7 @@ class ConsoleHarness:
         self.usage = InMemoryUsageStore()
         self.budgets = InMemoryBudgetStore()
         self.pauses = InMemoryPauseStore()
+        self.switches = InMemorySwitchStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -120,6 +122,7 @@ class ConsoleHarness:
             budgets=self.budgets,
             clock=self.clock,
             pauses=self.pauses,
+            switches=self.switches,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

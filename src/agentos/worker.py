@@ -49,6 +49,7 @@ from agentos.stores import (
     PostgresTaskLinkStore,
     PostgresToolOutputStore,
 )
+from agentos.switches import PostgresSwitchStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenants import build_registry
 from agentos.usage import PostgresUsageStore, UsageRecorder, load_prices
@@ -212,6 +213,7 @@ async def main() -> None:
         usage = UsageRecorder(PostgresUsageStore(pool), prices)
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         pauses = PostgresPauseStore(pool)
+        switches = PostgresSwitchStore(pool)
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
         activities = AgentActivities(
@@ -229,6 +231,7 @@ async def main() -> None:
             usage=usage,
             budgets=BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool)),
             pauses=pauses,
+            switches=switches,
         )
         watch = AudienceWatchActivities(
             registry,
@@ -244,7 +247,7 @@ async def main() -> None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
             all_activities += IndexActivities(
-                registry, knowledge, embedder, agent_store, usage
+                registry, knowledge, embedder, agent_store, usage, switches
             ).all()
         client = await build_temporal_client(settings)
         worker = Worker(

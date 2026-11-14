@@ -733,10 +733,14 @@ def kinds_in(sql: str, after: str) -> list[str]:
     return re.findall(r"'(\w+)'", block[: block.index("))")])
 
 
-@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_the_audit_check_keeps_every_kind_and_adds_pause_and_resume(sql):
+@pytest.mark.parametrize(
+    "sql, later",
+    [(MIGRATION, []), (INIT_DB, ["switch_off", "switch_on"])],  # init_db is every migration
+    ids=["migration", "init_db"],
+)
+def test_the_audit_check_keeps_every_kind_and_adds_pause_and_resume(sql, later):
     found = kinds_in(sql, "CHECK (kind IN (")
-    assert sorted(found) == sorted(KINDS_SINCE_010)
+    assert sorted(found) == sorted(KINDS_SINCE_010 + later)
 
 
 def test_the_code_can_write_the_new_kinds():

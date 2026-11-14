@@ -37,7 +37,7 @@ from agentos.agent_store import PENDING, AgentNotFound
 from agentos.audience import AudienceError
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
-from agentos.control import ControlPlane
+from agentos.control import ControlPlane, Forbidden
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.members import ADMIN, CREATOR, ROLES
@@ -64,6 +64,8 @@ log = logging.getLogger("agentos.web_ui")
 CONSOLE_FORM_PREFIXES = ("/ui/", "/logout")
 MAX_FORM_BYTES = 256 * 1024
 AUDIT_PAGE = 50
+# Turning these off stops a whole organisation, so the form asks for a confirmation.
+CONFIRMED_SWITCHES = ("all_agents", "writes")
 
 SKELETON = """\
 name: My agent
@@ -93,6 +95,8 @@ NOTICES = {
     "member-removed": "Member removed.",
     "budget-set": "Budget saved.",
     "budget-removed": "Budget removed.",
+    "switch-off": "Turned off. It takes effect on the next step.",
+    "switch-on": "Turned back on.",
 }
 
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -234,6 +238,9 @@ class WebUI:
         self.route("GET", base + "/usage.csv", self.usage_csv)
         self.route("POST", base + "/budgets", self.set_budget)
         self.route("POST", base + "/budgets/remove", self.remove_budget)
+        self.route("GET", base + "/switches", self.switches)
+        self.route("POST", base + "/switches/off", self.turn_off)
+        self.route("POST", base + "/switches/on", self.turn_on)
 
     # --- plumbing ---------------------------------------------------------------------
 
@@ -493,6 +500,7 @@ class WebUI:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         owner = await self.owner_of(ctx, agent_id)
         budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
+        switches = await ctx.plane.switches(ctx.tenant_id, ctx.user_id)
         can_edit = self.can_edit(ctx, owner)
         return _page(
             "agent.html",
@@ -500,6 +508,8 @@ class WebUI:
             ctx=ctx,
             agent_id=agent_id,
             budget=budgets.line_of(agent_id),
+            stopped_by=switches.stopped_by.get(agent_id),
+            writes_off=switches.writes.off,
             versions=versions,
             can_edit=can_edit,
             paused=await self.paused_of(ctx, agent_id) if can_edit else [],
@@ -711,6 +721,43 @@ class WebUI:
         agent_id = ctx.get("agent_id").strip() or None
         await ctx.plane.remove_budget(ctx.tenant_id, ctx.user_id, agent_id)
         return _redirect(self.base(ctx) + "/usage?done=budget-removed")
+
+    async def switches(
+        self, request: Request, ctx: Ctx, status: int = 200, error: str | None = None
+    ) -> Response:
+        """The kill switches, for admins. A creator reads an agent's state on its own page."""
+        if not ctx.is_admin:
+            raise Forbidden(f"'{ctx.user_id}' may not do this in tenant '{ctx.tenant_id}'")
+        return _page(
+            "switches.html",
+            status,
+            ctx=ctx,
+            view=await ctx.plane.switches(ctx.tenant_id, ctx.user_id),
+            needs_confirm=CONFIRMED_SWITCHES,
+            error=error,
+            notice=self.notice(request),
+            base=self.base(ctx),
+        )
+
+    async def turn_off(self, request: Request, ctx: Ctx) -> Response:
+        """Turning off every agent or all writes also needs the confirm box ticked.
+
+        Only an admin gets the confirm step; anyone else goes straight to the control
+        plane, which refuses them."""
+        scope = ctx.get("scope")
+        if ctx.is_admin and scope in CONFIRMED_SWITCHES and ctx.get("confirm") != "yes":
+            what = "every agent of the organisation" if scope == "all_agents" else "every write"
+            return await self.switches(
+                request, ctx, 422, f"Tick the box to confirm: this stops {what}."
+            )
+        await ctx.plane.turn_off(ctx.tenant_id, ctx.user_id, scope, ctx.get("target").strip())
+        return _redirect(self.base(ctx) + "/switches?done=switch-off")
+
+    async def turn_on(self, request: Request, ctx: Ctx) -> Response:
+        await ctx.plane.turn_on(
+            ctx.tenant_id, ctx.user_id, ctx.get("scope"), ctx.get("target").strip()
+        )
+        return _redirect(self.base(ctx) + "/switches?done=switch-on")
 
     async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
         """The page's aggregates as a download. It only reads, so it is a GET."""

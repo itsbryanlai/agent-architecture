@@ -205,7 +205,7 @@ def test_init_db_allows_every_kind_of_the_latest_migration_and_the_code():
         block = sql[sql.index("kind IN (") :]
         return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
-    latest = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
+    latest = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
     assert kinds_in(latest) == kinds_in(INIT_DB)
     assert set(AUDIT_KINDS) <= kinds_in(INIT_DB)
     assert kinds_in(MIGRATION_010) < kinds_in(INIT_DB)

@@ -27,6 +27,10 @@ Rules kept here:
 * Every action is audited by the activity that does it (see ``agentos.audit``):
   an audit write that fails fails the activity, so Temporal retries it and
   nothing is done without a record. Events hold IDs and hashes, never text.
+* Kill switches (see ``agentos.switches``) are read from the store at every check, with
+  no cache: a turned-off agent answers with a fixed text and calls no model, a turned-off
+  connector fails its tool calls, and turned-off writes refuse an approved write before
+  the external call. The checks live in these activities, never in workflow code.
 * Log lines carry tenant, agent and workflow IDs only, never message text,
   document content or secrets.
 """
@@ -79,6 +83,19 @@ from agentos.models import (
 from agentos.slack_client import SlackLookupError
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
+from agentos.switches import (
+    NOTION,
+    SWITCHED_OFF,
+    WRITE_REFUSED_TEXT,
+    ConnectorOff,
+    InMemorySwitchStore,
+    SwitchStore,
+    WritesOff,
+    agent_off_text,
+    connector_off_text,
+    log_stop,
+    read_state,
+)
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
 from agentos.usage import UsageRecorder
 
@@ -158,8 +175,10 @@ class AgentActivities:
         usage: UsageRecorder | None = None,
         budgets: BudgetGuard | None = None,
         pauses: PauseStore | None = None,
+        switches: SwitchStore | None = None,
     ):
         self.settings = settings
+        self.switches = switches or InMemorySwitchStore()
         self.usage = usage
         self.budgets = budgets
         self.registry = registry
@@ -244,6 +263,48 @@ class AgentActivities:
 
     async def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
+
+    async def _notion_off(self, tenant_id: str) -> bool:
+        """Is Notion turned off for the tenant? Read from the store now, never cached."""
+        return (await read_state(self.switches, tenant_id)).connector_off(NOTION)
+
+    async def _require_notion(self, tenant_id: str, agent_id: str, name: str) -> None:
+        """Stop a Notion call for good while an admin has Notion turned off.
+
+        Non-retryable: a retry within the minute would find it off again. The next
+        attempt of a later step reads the switch afresh.
+        """
+        if await self._notion_off(tenant_id):
+            log.info(
+                "%s refused tenant_id=%s agent_id=%s connector=notion", name, tenant_id, agent_id
+            )
+            raise _non_retryable(ConnectorOff(connector_off_text("notion")))
+
+    async def _require_writes(self, spec: TaskSpec, task_id: str, target: str, idem_key: str):
+        """Refuse an approved write, before any external call, while writes or Notion are off.
+
+        The approval and the refusal are audited (the write as an error), and the
+        failure is non-retryable, so the task ends with the reason and nothing was
+        changed. The requester can ask again later.
+        """
+        ctx = spec.ctx
+        state = await read_state(self.switches, ctx.tenant_id)
+        if state.writes_off:
+            reason: Exception = WritesOff(WRITE_REFUSED_TEXT)
+        elif state.connector_off(NOTION):
+            reason = ConnectorOff(connector_off_text("notion"))
+        else:
+            return
+        log.info(
+            "write refused tenant_id=%s agent_id=%s task_id=%s reason=%s",
+            ctx.tenant_id,
+            ctx.agent_id,
+            task_id,
+            type(reason).__name__,
+        )
+        await self._record_approval(spec, task_id, target)
+        await self._record_write(spec, task_id, idem_key, target, "error")
+        raise _non_retryable(reason)
 
     async def _record(
         self,
@@ -445,6 +506,14 @@ class AgentActivities:
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        # Before the budget and before any model call: an agent or a tenant switched off
+        # answers with a fixed text, bills nothing and records no usage row.
+        switch = (await read_state(self.switches, ctx.tenant_id)).agent_stopped_by(ctx.agent_id)
+        if switch is not None:
+            log_stop(ctx.tenant_id, ctx.agent_id, switch)
+            return LLMResponse(
+                text=agent_off_text(agent.name), tool_calls=[], stop_reason=SWITCHED_OFF
+            )
         if self.budgets is not None:
             # Before any model call: a reached budget answers with a fixed text, bills nothing
             # and records no usage row.
@@ -567,7 +636,11 @@ class AgentActivities:
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
         citations: list[Citation] = []
-        if call.name == "search_knowledge":
+        if await self._notion_off(ctx.tenant_id):
+            # Reading and searching Notion both go through the connector. The model gets
+            # an error it can pass on; nothing is read.
+            text, is_error = connector_off_text("notion"), True
+        elif call.name == "search_knowledge":
             text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
         else:
             text, is_error = await self._read_tool_output(ctx, call)
@@ -703,6 +776,7 @@ class AgentActivities:
         """
         ctx = spec.ctx
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
+        await self._require_notion(ctx.tenant_id, ctx.agent_id, "prepare_comment")
         try:
             connector = await self._connector(ctx.tenant_id, ctx.agent_id)
             item = await connector.resolve_item(spec.payload["item"])
@@ -727,6 +801,7 @@ class AgentActivities:
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         page_id = spec.payload["page_id"]
         idem_key = f"{task_id}:comment"
+        await self._require_writes(spec, task_id, page_id, idem_key)
         await self._record_approval(spec, task_id, page_id)
         try:
             comment_id = await self._connector_for(ctx.tenant_id, agent).add_comment(
@@ -747,6 +822,7 @@ class AgentActivities:
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         database_id = spec.payload["database_id"]
         idem_key = f"{task_id}:create"
+        await self._require_writes(spec, task_id, database_id, idem_key)
         await self._record_approval(spec, task_id, database_id)
         email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
         try:
@@ -772,6 +848,11 @@ class AgentActivities:
     async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
         """Read one item. Takes IDs only: the watch polls this thousands of times."""
         self._log("get_notion_item", tenant_id, agent_id)
+        if await self._notion_off(tenant_id):
+            # Retryable on purpose: the task workflow treats a poll that fails after its
+            # retries as "still watching" and polls again later, while a permanent
+            # failure would end the watch. No Notion call is made.
+            raise ApplicationError(connector_off_text("notion"), type="ConnectorOff")
         try:
             connector = await self._connector(tenant_id, agent_id)
             return await connector.get_item(page_id)

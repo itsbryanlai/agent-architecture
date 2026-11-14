@@ -1,4 +1,4 @@
-"""The control-plane API: agents, versions, members and the audit log, as JSON.
+"""The control-plane API: agents, versions, members, usage and the audit log, as JSON.
 
 This is a separate app and process from the gateway. The gateway is reachable
 from the internet; this API is not, and must not be. Without sign-in with Slack
@@ -441,6 +441,15 @@ def create_app(
         await deps.plane.drop_member(tenant_id, actor, user_id, rid)
         return out({"user_id": user_id, "removed": True})
 
+    # --- usage ---
+
+    @app.get("/tenants/{tenant_id}/usage")
+    async def usage(
+        tenant_id: Tenant, actor: Actor, month: Annotated[str | None, Query()] = None
+    ) -> JSONResponse:
+        """Usage and cost for ``month`` (YYYY-MM, default the current UTC month)."""
+        return out((await deps.plane.usage_report(tenant_id, actor, month)).as_dict())
+
     # --- audit ---
 
     @app.get("/tenants/{tenant_id}/audit")
@@ -477,6 +486,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.members import PostgresMemberStore
     from agentos.sessions import PostgresSessionStore
     from agentos.tenants import require_tenant_secret
+    from agentos.usage import PostgresUsageStore
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -499,6 +509,7 @@ async def _real_lifespan(app: FastAPI):
             PostgresAuditStore(pool),
             tenants,
             NotionGrantChecker(notion_for),
+            usage=PostgresUsageStore(pool),
         )
         app.state.deps.tenants = tenants
         yield

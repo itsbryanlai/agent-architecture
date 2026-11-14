@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Usage{% endblock %}
+{% macro cost(t) -%}
+  {%- if t.unpriced_calls and not t.cost %}no price
+  {%- else %}{{ t.cost | usd }}{% if t.unpriced_calls %} <span class="muted">+ {{ t.unpriced_calls }} call{{ "" if t.unpriced_calls == 1 else "s" }} with no price</span>{% endif %}{% endif -%}
+{%- endmacro %}
+{% macro head(first) -%}
+  <tr><th>{{ first }}</th><th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th>Cost</th></tr>
+{%- endmacro %}
+{% macro numbers(t) -%}
+  <td>{{ t.calls }}</td><td>{{ t.input_tokens }}</td><td>{{ t.output_tokens }}</td><td>{{ t.cache_read_tokens }}</td><td>{{ t.cache_write_tokens }}</td><td>{{ cost(t) }}</td>
+{%- endmacro %}
+{% block body %}
+<h1>Usage</h1>
+<form method="get" action="{{ base }}/usage" class="actions">
+  <label for="month">Month (UTC)</label>
+  <select id="month" name="month">
+    {% for m in months %}<option value="{{ m }}"{% if m == report.month %} selected{% endif %}>{{ m }}</option>{% endfor %}
+    {% if report.month not in months %}<option value="{{ report.month }}" selected>{{ report.month }}</option>{% endif %}
+  </select>
+  <button type="submit">Show</button>
+  <a href="{{ base }}/usage.csv?month={{ report.month }}">Download CSV</a>
+</form>
+<p class="muted">Tokens and US dollars. Cost is worked out when each call is recorded, from the price in effect that day. {% if not ctx.is_admin %}You see the agents you created.{% endif %} Usage is not broken down by person.</p>
+
+<h2>Total{% if ctx.is_admin %} (including embeddings){% endif %}</h2>
+<table>
+  {{ head("All") }}
+  <tr><td>{{ report.month }}</td>{{ numbers(report.total) }}</tr>
+</table>
+
+<h2>By agent</h2>
+<table>
+  <tr><th>Agent</th><th>Team</th><th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th>Cost</th></tr>
+  {% for line in report.by_agent %}
+  <tr><td>{{ line.name }}</td><td>{{ line.team or no_team }}</td>{{ numbers(line.totals) }}</tr>
+  {% else %}
+  <tr><td colspan="8" class="muted">No usage this month.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>By team</h2>
+<table>
+  {{ head("Team") }}
+  {% for line in report.by_team %}
+  <tr><td>{{ line.name or no_team }}</td>{{ numbers(line.totals) }}</tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">No usage this month.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>By model</h2>
+<table>
+  {{ head("Model") }}
+  {% for line in report.by_model %}
+  <tr><td>{{ line.name }}</td>{{ numbers(line.totals) }}</tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">No usage this month.</td></tr>
+  {% endfor %}
+</table>
+
+{% if ctx.is_admin %}
+<h2>Embeddings</h2>
+<p class="muted">Indexing pages for agent knowledge. Billed to the organisation, not to an agent.</p>
+<table>
+  {{ head("Embeddings") }}
+  {% if report.embedding %}
+  <tr><td>{{ report.month }}</td>{{ numbers(report.embedding) }}</tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">No embedding usage this month.</td></tr>
+  {% endif %}
+</table>
+{% endif %}
+{% endblock %}

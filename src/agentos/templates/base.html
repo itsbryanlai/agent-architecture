@@ -38,6 +38,7 @@
   {% set base = "/ui/" ~ (ctx.tenant_id | urlencode) %}
   <nav>
     <a href="{{ base }}/agents">Agents</a>
+    <a href="{{ base }}/usage">Usage</a>
     {% if ctx.is_admin %}
     <a href="{{ base }}/members">Members</a>
     <a href="{{ base }}/audit">Audit</a>

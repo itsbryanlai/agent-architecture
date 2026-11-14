@@ -9,8 +9,8 @@
 # by. `effective_from` is a UTC date; an entry applies from that day until the next
 # entry of the same model starts. Restart the worker after editing this file.
 #
-# No prices are shipped: copy them from your provider's pricing page, and note the
-# date you copied them.
+# Copy prices from your provider's pricing page, and note where and when you copied
+# them. Only the models listed below are priced.
 #
 # prices:
 #   - model: example-model-name

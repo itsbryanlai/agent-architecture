@@ -303,10 +303,10 @@ def test_a_missing_prices_file_is_a_config_error(tmp_path):
         load_prices(tmp_path / "nope.yaml")
 
 
-def test_the_shipped_prices_file_loads_and_invents_no_price():
+def test_the_shipped_prices_file_loads_and_prices_only_the_models_it_names():
     prices = load_prices(REPO / "config" / "prices.yaml")
 
-    assert prices.entries == []
+    assert {e.model for e in prices.entries} == {"qwen3.7-plus", "bge-m3"}
     assert parse_prices({"prices": []}).entries == []
 
 

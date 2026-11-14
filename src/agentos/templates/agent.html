@@ -4,6 +4,10 @@
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a></p>
 <h1>{{ agent_id }}</h1>
+{% if stopped_by == "agent" %}<p class="error">This agent is turned off by an admin and is not answering.</p>
+{% elif stopped_by == "all_agents" %}<p class="error">All agents are turned off by an admin, so this agent is not answering.</p>{% endif %}
+{% if writes_off %}<p class="warn">Writes are turned off by an admin: this agent can draft, but nothing it drafts can be submitted.</p>{% endif %}
+{% if ctx.is_admin %}<p class="muted"><a href="{{ base }}/switches">Switches</a></p>{% endif %}
 {{ budget_alerts(budget, agent_id) }}
 {% if budget and budget.amount is not none %}
 <p class="muted">Monthly budget: {{ budget.spend | usd }} of {{ budget.amount | usd2 }} ({{ budget.percent }}%).</p>

@@ -12,6 +12,7 @@ from agentos.config import ConfigError
 from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.members import InvalidMember, MemberError, MemberNotFound
+from agentos.switches import InvalidSwitch, SwitchError
 
 STATUS_BY_ERROR: dict[type[Exception], int] = {
     Forbidden: 403,
@@ -21,6 +22,8 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     InvalidBudget: 422,
     BudgetNotFound: 404,
     BudgetError: 409,
+    InvalidSwitch: 422,
+    SwitchError: 409,
     AgentStoreError: 409,
     MemberError: 409,
     ConfigError: 422,

@@ -1,6 +1,6 @@
-"""Audience changes are watched: a guest or outside person joining, a channel shared with
-another organisation, or a private channel made public pauses the agents that answer there
-until their owner or an admin confirms the new audience again."""
+"""Audience changes are watched: a channel shared with another organisation (Slack Connect)
+pauses the agents that answer there until their owner or an admin confirms the new audience
+again. Who is added to a channel is the admins' business: a join, of anyone, pauses nothing."""
 
 import copy
 import json
@@ -28,16 +28,8 @@ from agentos.audience import (
     SlackAudienceInspector,
     paused_text,
 )
-from agentos.audience_pauses import (
-    CHANNEL_SHARED,
-    EXTERNAL_JOINED,
-    GUEST_JOINED,
-    MADE_PUBLIC,
-    UNVERIFIED,
-    InMemoryPauseStore,
-    NotPaused,
-)
-from agentos.audience_watch import AudienceWatchActivities
+from agentos.audience_pauses import CHANNEL_SHARED, InMemoryPauseStore, NotPaused
+from agentos.audience_watch import IDENTITY, AudienceWatchActivities
 from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane, Forbidden
@@ -47,9 +39,6 @@ from agentos.llm import ScriptedLLMClient
 from agentos.members import InMemoryMemberStore
 from agentos.models import (
     AUDIT_KINDS,
-    JOINED,
-    PUBLIC,
-    SHARED,
     AudienceEvent,
     ConversationRef,
     InboundMessage,
@@ -148,8 +137,8 @@ class World:
         await self.members.add_member(TENANT, OWNER, "creator", ADMIN)
         await self.members.add_member(TENANT, BYSTANDER, "creator", ADMIN)
 
-    async def event(self, kind: str, channel: str, user: str | None = None, id_: str = "Ev1"):
-        ev = AudienceEvent(TENANT, id_, kind, channel, user)
+    async def event(self, channel: str, id_: str = "Ev1"):
+        ev = AudienceEvent(TENANT, id_, channel)
         return await ActivityEnvironment().run(self.watch.watch_audience_event, ev)
 
     async def paused(self, agent_id: str | None = None):
@@ -159,73 +148,37 @@ class World:
         return self.slack.posts()
 
 
-def joined(user: str):
-    return (JOINED, CHAN, user)
-
-
 # --- what pauses, and what does not -----------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "user, reason",
-    [(GUEST.id, GUEST_JOINED), (SINGLE_GUEST.id, GUEST_JOINED), (EXTERNAL.id, EXTERNAL_JOINED)],
-)
-async def test_a_guest_or_outside_person_joining_pauses_the_agent_in_that_channel_only(
-    user, reason
-):
+async def test_a_channel_share_pauses_the_agents_in_that_channel_only():
     w = World()
-    paused = await w.event(JOINED, CHAN, user)
-    assert paused == ["it-helper"]
+    assert await w.event(CHAN) == ["it-helper"]
     (pause,) = await w.paused()
-    assert (pause.agent_id, pause.channel, pause.reason) == ("it-helper", CHAN, reason)
+    assert (pause.agent_id, pause.channel, pause.reason) == ("it-helper", CHAN, CHANNEL_SHARED)
     assert await w.paused("hr-helper") == []
 
 
 async def test_a_channel_two_agents_serve_pauses_both():
     w = World()
-    assert sorted(await w.event(JOINED, THIRD_CHAN, GUEST.id)) == ["hr-helper", "it-helper"]
+    assert sorted(await w.event(THIRD_CHAN)) == ["hr-helper", "it-helper"]
     assert {(p.agent_id, p.channel) for p in await w.paused()} == {
         ("it-helper", THIRD_CHAN),
         ("hr-helper", THIRD_CHAN),
     }
 
 
-async def test_a_full_member_or_a_bot_joining_changes_nothing():
-    w = World()
-    assert await w.event(JOINED, CHAN, ALICE, "Ev1") == []
-    assert await w.event(JOINED, CHAN, BOT.id, "Ev2") == []
-    assert await w.paused() == []
-    assert w.dms() == []
-    assert [e for e in w.audit.events if e.kind == "audience_pause"] == []
-
-
 async def test_a_channel_no_agent_serves_changes_nothing():
     w = World()
-    assert await w.event(JOINED, "C0NOBODY99", GUEST.id) == []
-    assert await w.event(SHARED, "C0NOBODY99") == []
+    assert await w.event("C0NOBODY99") == []
     assert await w.paused() == []
 
 
-async def test_sharing_a_channel_with_another_organisation_pauses_it():
+async def test_a_share_needs_no_slack_lookup_so_a_failing_slack_does_not_stop_the_pause():
     w = World()
-    assert await w.event(SHARED, CHAN) == ["it-helper"]
-    (pause,) = await w.paused()
-    assert (pause.channel, pause.reason) == (CHAN, CHANNEL_SHARED)
-
-
-async def test_a_private_channel_made_public_pauses_it():
-    w = World()
-    assert await w.event(PUBLIC, OTHER_CHAN) == ["hr-helper"]
-    (pause,) = await w.paused()
-    assert (pause.channel, pause.reason) == (OTHER_CHAN, MADE_PUBLIC)
-
-
-async def test_the_joiner_is_looked_up_fresh_every_time():
-    w = World()
-    await w.event(JOINED, CHAN, ALICE, "Ev1")
-    await w.event(JOINED, CHAN, ALICE, "Ev2")
-    looked_up = [kw for name, kw in w.slack.calls if name == "user_info"]
-    assert looked_up == [{"user_id": ALICE}, {"user_id": ALICE}]
+    w.slack.fail_lookups(SlackLookupError("missing_scope"))
+    assert await w.event(CHAN) == ["it-helper"]
+    assert [name for name, _ in w.slack.calls if name == "user_info"] == []
 
 
 async def test_a_legacy_default_agent_is_paused_in_a_channel_the_file_does_not_map():
@@ -237,7 +190,7 @@ async def test_a_legacy_default_agent_is_paused_in_a_channel_the_file_does_not_m
     w.store = InMemoryAgentStore.seeded(config, by=OWNER)
     w.registry = TenantRegistry({TENANT: runtime_for(config, w.slack, make_fake_notion())})
     w.watch = AudienceWatchActivities(w.registry, w.store, w.members, w.pauses, w.audit, w.idem)
-    assert await w.event(JOINED, "C0UNMAPPED1", GUEST.id) == ["it-helper"]
+    assert await w.event("C0UNMAPPED1") == ["it-helper"]
 
 
 # --- idempotent per event; who is told --------------------------------------------------
@@ -246,8 +199,8 @@ async def test_a_legacy_default_agent_is_paused_in_a_channel_the_file_does_not_m
 async def test_the_same_event_twice_pauses_audits_and_tells_once():
     w = World()
     await w.seed_members()
-    await w.event(JOINED, CHAN, GUEST.id, "Ev1")
-    await w.event(JOINED, CHAN, GUEST.id, "Ev1")
+    await w.event(CHAN, "Ev1")
+    await w.event(CHAN, "Ev1")
     assert len(await w.paused()) == 1
     assert len([e for e in w.audit.events if e.kind == "audience_pause"]) == 1
     told = sorted(p["channel"] for p in w.dms())
@@ -256,31 +209,32 @@ async def test_the_same_event_twice_pauses_audits_and_tells_once():
 
 async def test_a_second_trigger_while_paused_neither_repauses_nor_tells_again():
     w = World()
-    await w.event(JOINED, CHAN, GUEST.id, "Ev1")
+    await w.event(CHAN, "Ev1")
     sent = len(w.dms())
-    await w.event(SHARED, CHAN, None, "Ev2")
+    await w.event(CHAN, "Ev2")
     (pause,) = await w.paused()
-    assert pause.reason == GUEST_JOINED
+    assert pause.reason == CHANNEL_SHARED
     assert len(w.dms()) == sent
+    assert len([e for e in w.audit.events if e.kind == "audience_pause"]) == 1
 
 
 async def test_the_owner_and_every_admin_are_told_once_and_nobody_else():
     w = World()
     await w.seed_members()
-    await w.event(JOINED, CHAN, EXTERNAL.id)
+    await w.event(CHAN)
     posts = w.dms()
     assert sorted(p["channel"] for p in posts) == sorted(
         f"D-{u}" for u in (OWNER, ADMIN, MEMBER_ADMIN)
     )
     for post_ in posts:
         assert f"<#{CHAN}>" in post_["text"] and "IT helper" in post_["text"]
-        assert "outside" in post_["text"].lower() or "another workspace" in post_["text"].lower()
+        assert "another organisation" in post_["text"]
     assert f"D-{BYSTANDER}" not in {p["channel"] for p in posts}
 
 
 async def test_the_notice_carries_the_channel_and_reason_and_no_content():
     w = World()
-    await w.event(SHARED, CHAN)
+    await w.event(CHAN)
     for post_ in w.dms():
         assert post_["thread_ts"] is None
         assert "shared" in post_["text"].lower()
@@ -289,25 +243,25 @@ async def test_the_notice_carries_the_channel_and_reason_and_no_content():
 
 async def test_a_new_pause_after_a_resume_tells_again():
     w = World()
-    await w.event(JOINED, CHAN, GUEST.id, "Ev1")
+    await w.event(CHAN, "Ev1")
     first = len(w.dms())
     await w.plane.resume_channel(TENANT, ADMIN, "it-helper", CHAN, COUNTS)
-    await w.event(JOINED, CHAN, EXTERNAL.id, "Ev2")
+    await w.event(CHAN, "Ev2")
     assert len(w.dms()) == 2 * first
     assert len([e for e in w.audit.events if e.kind == "audience_pause"]) == 2
 
 
 async def test_pausing_is_audited_with_ids_and_the_reason_only():
     w = World()
-    await w.event(JOINED, CHAN, GUEST.id)
+    await w.event(CHAN)
     (event,) = [e for e in w.audit.events if e.kind == "audience_pause"]
     assert (event.agent_id, event.agent_version, event.tool, event.target) == (
         "it-helper",
         1,
-        GUEST_JOINED,
+        CHANNEL_SHARED,
         CHAN,
     )
-    assert event.requester_user_id == GUEST.id
+    assert event.requester_user_id == IDENTITY
     assert event.event_key.startswith(f"{TENANT}:")
     assert event.input_sha256 is None and event.output_sha256 is None
 
@@ -358,7 +312,7 @@ async def start_watch(w: World, ev: AudienceEvent):
 
 async def test_the_event_workflow_pauses_and_a_repeat_of_the_event_is_rejected():
     async with running(World()) as w:
-        ev = AudienceEvent(TENANT, "Ev9", JOINED, CHAN, GUEST.id)
+        ev = AudienceEvent(TENANT, "Ev9", CHAN)
         handle = await start_watch(w, ev)
         assert await handle.result() == ["it-helper"]
         with pytest.raises(WorkflowAlreadyStartedError):
@@ -368,16 +322,6 @@ async def test_the_event_workflow_pauses_and_a_repeat_of_the_event_is_rejected()
 
 async def test_the_workflow_id_names_the_tenant_and_the_event():
     assert ids.audience_event_workflow_id("acme", "Ev9") == "acme:audience-event:Ev9"
-
-
-async def test_a_joiner_who_cannot_be_looked_up_pauses_the_agent_unverified():
-    w = World()
-    w.slack.fail_lookups(SlackLookupError("missing_scope"))
-    async with running(w) as w:
-        handle = await start_watch(w, AudienceEvent(TENANT, "Ev5", JOINED, CHAN, ALICE))
-        assert await handle.result() == ["it-helper"]
-        (pause,) = await w.paused()
-    assert pause.reason == UNVERIFIED
 
 
 # --- enforcement in the turn -------------------------------------------------------------
@@ -416,7 +360,7 @@ def test_the_paused_text_is_fixed_and_escapes_the_agent_name():
 
 async def test_a_paused_channel_refuses_with_the_paused_text_and_runs_nothing():
     async with running(World()) as w:
-        await w.event(SHARED, CHAN)
+        await w.event(CHAN)
         await converse(w, "it-helper", say("Ev1", ALICE, CHAN, "channel"))
         await eventually(lambda: [p for p in w.slack.posts() if p["channel"] == CHAN])
         (post_,) = [p for p in w.slack.posts() if p["channel"] == CHAN]
@@ -437,7 +381,7 @@ async def test_other_channels_and_direct_messages_keep_answering_while_one_is_pa
     llm = ScriptedLLMClient()
     llm.queue(answer("from dm"), answer("from hr"))
     async with running(World(), llm) as w:
-        await w.event(JOINED, CHAN, GUEST.id)
+        await w.event(CHAN)
         await converse(w, "it-helper", say("Ev1", ALICE, "D111", "im", "1700000000.000200"))
         await converse(
             w, "hr-helper", say("Ev2", ALICE, OTHER_CHAN, "channel", "1700000000.000300")
@@ -453,7 +397,7 @@ async def test_a_thread_already_running_in_the_channel_is_paused_too():
     async with running(World(), llm) as w:
         handle = await converse(w, "it-helper", say("Ev1", ALICE, CHAN, "channel"))
         await eventually(lambda: w.slack.updates())
-        await w.event(JOINED, CHAN, EXTERNAL.id)
+        await w.event(CHAN)
         await handle.signal("message", say("Ev2", ALICE, CHAN, "channel"))
         await eventually(lambda: any(p["text"] == PAUSED for p in w.slack.posts()))
         assert len(w.llm.calls) == 1
@@ -463,7 +407,7 @@ async def test_a_resumed_channel_answers_again():
     llm = ScriptedLLMClient()
     llm.queue(answer("back again"))
     async with running(World(), llm) as w:
-        await w.event(JOINED, CHAN, GUEST.id)
+        await w.event(CHAN)
         await w.plane.resume_channel(TENANT, ADMIN, "it-helper", CHAN, COUNTS)
         await converse(w, "it-helper", say("Ev1", ALICE, CHAN, "channel"))
         await eventually(lambda: w.slack.updates())
@@ -473,7 +417,7 @@ async def test_a_resumed_channel_answers_again():
 
 async def test_a_paused_specialist_is_not_offered_and_not_reachable_in_that_channel():
     w = World()
-    await w.event(JOINED, CHAN, GUEST.id)
+    await w.event(CHAN)
     agent = await w.store.published(TENANT, "it-helper")
     decision = await w.checker.decide(TENANT, agent, ALICE, CHAN, "channel")
     assert (decision.allowed, decision.reason) == (False, "paused")
@@ -485,7 +429,7 @@ async def test_a_paused_specialist_is_not_offered_and_not_reachable_in_that_chan
 
 async def test_a_thread_recorded_with_a_paused_refusal_replays():
     async with running(World()) as w:
-        await w.event(SHARED, CHAN)
+        await w.event(CHAN)
         handle = await converse(w, "it-helper", say("Ev1", ALICE, CHAN, "channel"))
         await eventually(lambda: w.slack.posts())
         history = await handle.fetch_history()
@@ -500,7 +444,7 @@ async def test_a_thread_recorded_with_a_paused_refusal_replays():
 async def paused_world() -> World:
     w = World()
     await w.seed_members()
-    await w.event(JOINED, CHAN, GUEST.id)
+    await w.event(CHAN)
     return w
 
 
@@ -569,7 +513,7 @@ async def test_resuming_keeps_the_history_of_the_pause():
 
 async def test_paused_channels_are_read_by_admins_and_the_agents_editors_with_fresh_counts():
     w = await paused_world()
-    await w.event(JOINED, OTHER_CHAN, EXTERNAL.id, "Ev2")
+    await w.event(OTHER_CHAN, "Ev2")
     everything = await w.plane.paused_channels(TENANT, ADMIN)
     assert {(v.pause.agent_id, v.pause.channel) for v in everything} == {
         ("it-helper", CHAN),
@@ -608,7 +552,7 @@ async def console_world():
     config = parse_agents_config(raw)
     seeded = InMemoryAgentStore.seeded(config, by="U_OWNER")
     h.agents._agents.update(seeded._agents)
-    await h.pauses.open_pause(TENANT, "it-helper", CHAN, GUEST_JOINED, datetime.now(UTC))
+    await h.pauses.open_pause(TENANT, "it-helper", CHAN, CHANNEL_SHARED, datetime.now(UTC))
     return h
 
 
@@ -621,7 +565,7 @@ async def test_the_agent_page_shows_the_paused_channel_the_reason_and_fresh_coun
     async with using(c):
         page = (await c.get(AGENT_URL)).text
     assert "Paused channels" in page and CHAN in page
-    assert "guest joined" in page.lower()
+    assert "shared with another organisation" in page
     assert "2 people" in page and "1 guest" in page
     assert 'name="confirm"' in page and f"{AGENT_URL}/channels/{CHAN}/resume" in page
 
@@ -672,7 +616,7 @@ async def test_another_creator_cannot_resume_from_the_console():
 async def test_the_page_escapes_a_channel_id():
     h = await console_world()
     await h.pauses.open_pause(
-        TENANT, "it-helper", "C<script>x</script>", GUEST_JOINED, datetime.now(UTC)
+        TENANT, "it-helper", "C<script>x</script>", CHANNEL_SHARED, datetime.now(UTC)
     )
     c = await h.signed_in(CONSOLE_ADMIN)
     async with using(c):
@@ -714,39 +658,33 @@ def watch_starts(temporal) -> list[dict]:
     return [c for c in temporal.signal_with_starts if c["workflow"] == "AudienceWatchWorkflow"]
 
 
-def test_the_gateway_starts_a_watch_workflow_for_a_member_joining(client, secret, temporal):
-    event = {"type": "member_joined_channel", "user": GUEST.id, "channel": CHAN, "team": TEAM}
+def test_the_gateway_starts_a_watch_workflow_for_a_shared_channel(client, secret, temporal):
+    event = {"type": "channel_shared", "connected_team_id": "T0OTHER", "channel": CHAN}
     assert send(client, secret, event).status_code == 200
     (call,) = watch_starts(temporal)
     assert call["id"] == ids.audience_event_workflow_id(TENANT, "EvW1")
     assert call["task_queue"] == TASK_QUEUE
     assert call["id_reuse_policy"] == WorkflowIDReusePolicy.REJECT_DUPLICATE
-    assert call["arg"] == AudienceEvent(TENANT, "EvW1", JOINED, CHAN, GUEST.id)
+    assert call["arg"] == AudienceEvent(TENANT, "EvW1", CHAN)
 
 
-def test_the_gateway_starts_a_watch_workflow_for_a_shared_channel(client, secret, temporal):
-    event = {"type": "channel_shared", "connected_team_id": "T0OTHER", "channel": CHAN}
+@pytest.mark.parametrize("user", [GUEST.id, SINGLE_GUEST.id, EXTERNAL.id, ALICE])
+def test_the_gateway_accepts_and_ignores_anyone_joining_a_channel(client, secret, temporal, user):
+    event = {"type": "member_joined_channel", "user": user, "channel": CHAN, "team": TEAM}
     assert send(client, secret, event).status_code == 200
-    (call,) = watch_starts(temporal)
-    assert call["arg"] == AudienceEvent(TENANT, "EvW1", SHARED, CHAN, None)
-
-
-def test_the_gateway_starts_a_watch_workflow_for_a_channel_made_public(client, secret, temporal):
-    event = {
-        "type": "message",
-        "subtype": "channel_convert_to_public",
-        "channel": CHAN,
-        "user": ALICE,
-        "ts": "1700000000.000500",
-    }
-    assert send(client, secret, event).status_code == 200
-    (call,) = watch_starts(temporal)
-    assert call["arg"] == AudienceEvent(TENANT, "EvW1", PUBLIC, CHAN, None)
+    assert temporal.signal_with_starts == []
 
 
 def test_other_message_subtypes_and_events_still_start_nothing(client, secret, temporal):
     for event in (
         {"type": "message", "subtype": "channel_join", "channel": CHAN, "user": ALICE, "ts": "1.1"},
+        {
+            "type": "message",
+            "subtype": "channel_convert_to_public",
+            "channel": CHAN,
+            "user": ALICE,
+            "ts": "1.2",
+        },
         {"type": "channel_unshared", "channel": CHAN},
         {"type": "member_left_channel", "user": ALICE, "channel": CHAN},
     ):
@@ -755,13 +693,13 @@ def test_other_message_subtypes_and_events_still_start_nothing(client, secret, t
 
 
 def test_the_gateway_rejects_a_bad_signature_for_a_watch_event(client, secret, temporal):
-    event = {"type": "member_joined_channel", "user": GUEST.id, "channel": CHAN}
+    event = {"type": "channel_shared", "channel": CHAN}
     assert send(client, secret, event, sign="not-the-secret").status_code == 401
     assert temporal.signal_with_starts == []
 
 
 def test_a_workspace_that_is_not_a_tenant_is_ignored(client, secret, temporal):
-    event = {"type": "member_joined_channel", "user": GUEST.id, "channel": CHAN}
+    event = {"type": "channel_shared", "channel": CHAN}
     assert send(client, secret, event, team="T0STRANGER").status_code == 200
     assert temporal.signal_with_starts == []
 
@@ -773,7 +711,7 @@ def test_a_slack_retry_of_the_same_event_is_acknowledged_without_a_second_run(
         raise WorkflowAlreadyStartedError("x", "AudienceWatchWorkflow")
 
     temporal.start_workflow = reject
-    event = {"type": "member_joined_channel", "user": GUEST.id, "channel": CHAN}
+    event = {"type": "channel_shared", "channel": CHAN}
     assert send(client, secret, event).status_code == 200
 
 
@@ -828,6 +766,12 @@ def test_init_db_matches_the_migration_table_block():
     block = MIGRATION[MIGRATION.index("CREATE TABLE IF NOT EXISTS audience_pauses") :]
     block = block[: block.index("ALTER TABLE audit_events")].rstrip()
     assert block in INIT_DB
+
+
+@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
+def test_the_pause_reason_check_allows_only_a_channel_share(sql):
+    block = sql[sql.index("reason      text") :]
+    assert re.findall(r"'(\w+)'", block[: block.index("))")]) == ["channel_shared"]
 
 
 def test_the_audit_and_notice_keys_start_with_the_tenant():

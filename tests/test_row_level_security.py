@@ -180,7 +180,7 @@ AGENT_ROW = (
 AGENT_RECORD_ROW = ("acme", "it-helper", "U1", None)
 MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
 BUDGET_ROW = ("acme", None, Decimal("5.00"), "U1", datetime(2026, 1, 1))
-PAUSE_ROW = ("acme", "it-helper", "C0AAAA111", "guest_joined", datetime(2026, 1, 1), None, None)
+PAUSE_ROW = ("acme", "it-helper", "C0AAAA111", "channel_shared", datetime(2026, 1, 1), None, None)
 SESSION_ROW = ("acme", "U1", "csrf-secret", datetime(2026, 1, 1), datetime(2026, 1, 2))
 
 

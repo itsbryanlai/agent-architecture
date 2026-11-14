@@ -396,8 +396,17 @@ STORE_WRITES = {
     "add_member",
     "set_member_role",
     "remove_member",
+    "open_pause",
+    "close_pause",
 }
-MAY_CALL_WRITES = {"control.py", "agent_store.py", "members.py"}
+# audience_watch.py pauses an agent from a Slack event; resuming is the control plane's.
+MAY_CALL_WRITES = {
+    "control.py",
+    "agent_store.py",
+    "members.py",
+    "audience_pauses.py",
+    "audience_watch.py",
+}
 
 
 def test_only_the_control_plane_and_the_stores_call_the_store_writes():
@@ -427,4 +436,5 @@ def test_the_scan_finds_the_calls_it_is_looking_for():
         for node in ast.walk(ast.parse((SRC / "control.py").read_text()))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
-    assert STORE_WRITES - {"import_agents"} <= calls
+    # The import and opening a pause start outside the control plane (CLI, Slack event).
+    assert STORE_WRITES - {"import_agents", "open_pause"} <= calls

@@ -200,12 +200,15 @@ def test_migration_010_keeps_every_009_kind_and_adds_the_new_ones():
     assert "DROP TABLE" not in MIGRATION_010 and "GRANT" not in MIGRATION_010
 
 
-def test_init_db_and_migration_010_allow_the_same_kinds():
+def test_init_db_allows_every_kind_of_the_latest_migration_and_the_code():
     def kinds_in(sql: str) -> set[str]:
         block = sql[sql.index("kind IN (") :]
         return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
-    assert kinds_in(MIGRATION_010) == kinds_in(INIT_DB) == set(AUDIT_KINDS)
+    latest = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
+    assert kinds_in(latest) == kinds_in(INIT_DB)
+    assert set(AUDIT_KINDS) <= kinds_in(INIT_DB)
+    assert kinds_in(MIGRATION_010) < kinds_in(INIT_DB)
 
 
 # --- the Slack lookups ----------------------------------------------------------------

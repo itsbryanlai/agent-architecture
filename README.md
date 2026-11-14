@@ -29,7 +29,9 @@ working). A request can be edited up to 5 times.
 
 One deployment can serve several tenants (see [Several tenants](#several-tenants)).
 A single tenant is set in `config/agents.yaml`. Every workflow ID, database
-row and log line carries the tenant ID.
+row and log line carries the tenant ID. Agents live in the database (see
+[Agents in the database](#agents-in-the-database)); the YAML file holds the
+tenant's settings and the agents to import once.
 
 ## Prerequisites
 
@@ -81,6 +83,17 @@ misnamed, mistyped or missing property, and prints a `property_ids` block. Paste
 that block into the grant in `config/agents.yaml`. The worker checks the same
 things at startup and refuses to start if anything is wrong or an ID is
 missing. The command exits 1 on any problem.
+
+Import the agents from the YAML file into the database, once, after the
+database has the `006` migration (a fresh `docker compose up` has it):
+
+```bash
+uv run python -m agentos.agent_store import
+```
+
+The worker and the gateway refuse to start while the tenant's `default_agent`
+or a channel's agent has no published version, so run this before them. See
+[Agents in the database](#agents-in-the-database).
 
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
@@ -337,6 +350,14 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 It adds the append-only `audit_events` table (see "Audit log" below). A fresh
 `docker compose up` gets it from `scripts/init_db.sql`.
 
+Agents in the database need `006`, applied the same way, then the one-time
+import (see [Agents in the database](#agents-in-the-database)):
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/006_agents.sql
+uv run python -m agentos.agent_store import
+```
+
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
 built under the old library must be rebuilt. After recreating the container,
@@ -427,6 +448,47 @@ left out. Passages reach the model wrapped in `<source>` tags as data, numbered
 like `[1]`. When the answer cites a number, the runtime adds a Sources line
 with the page's title and link; the model never writes a link.
 
+## Agents in the database
+
+Each agent is stored in Postgres as numbered versions (`agents` and
+`agent_versions`). A version is a `draft` while it is edited, `pending` once it
+is submitted, `published` when an approver publishes it, and `superseded` when
+a later version is published. At most one version of an agent is published, and
+the worker loads that one on every turn, so a draft or a pending version changes
+nothing. A published version never changes; an edit starts a new draft. A
+database trigger enforces this for every role: the definition changes only
+while a version is a draft, and the only moves are draft to pending, pending to
+draft (withdrawn or rejected), pending to published and published to
+superseded. Every publish records the approver. Who may approve is not checked
+yet.
+
+A definition has the shape of one agent block in the YAML file and is parsed by
+the same code, so it is validated the same way. The front-door rules (a
+specialist exists, is not a front door itself, is listed once) hold for a
+tenant's published set: a publish or import that would break them is refused.
+
+Grants are read from the published version when a tool runs, not when the
+worker starts. A grant removed by a new published version applies to the next
+call, including a write that was approved before.
+
+Tenant settings stay in the YAML file: `tenant_id`, `slack_team_id`,
+`default_agent`, `channels`, `notion_workspace_id` and `secrets`. The worker and
+the gateway refuse to start if `default_agent` or a channel names an agent with
+no published version.
+
+The import copies each YAML agent that has no row yet in as a published version
+1 (`import:yaml` is the creator and approver). Running it again skips each
+agent that exists and names it. **After the import, editing the `agents`
+section of the YAML file changes nothing**: the database is the source.
+`check_grants` still reads the YAML file, so run it before the import to get a
+grant's property IDs.
+
+Known gap: a version published after the worker started that adds a Notion page
+grant gets no index schedule and no startup grant check until the worker
+restarts, and a worker started with no page grants has no embedder until it
+restarts. Run `uv run python -m agentos.index_knowledge --schedule` after such a
+publish.
+
 ## Audit log
 
 Every tenant has an append-only record of what its agents did: who asked, which
@@ -479,5 +541,6 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/knowledge/` | Embedder, knowledge store, Notion text extraction and chunking, indexing and search helpers |
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
+| `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |

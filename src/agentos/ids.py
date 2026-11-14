@@ -76,3 +76,19 @@ def audit_audience_refused_key(tenant: str, event_id: str, agent_id: str, target
 def audience_refusal_key(event_id: str, agent_id: str) -> str:
     """The idempotency key of the reply that tells the asker an agent is not open to them."""
     return f"{event_id}:audience:{agent_id}"
+
+
+# Usage row keys. Each names one activity, so an activity that retries records
+# its usage once. Every key starts with the tenant ID.
+
+
+def usage_call_key(tenant: str, workflow_id: str, run_id: str, activity_id: str) -> str:
+    """The model call made by one activity of one workflow run."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}"
+
+
+def usage_embedding_key(
+    tenant: str, workflow_id: str, run_id: str, activity_id: str, scope: str, page_id: str
+) -> str:
+    """The embedding of one page. One activity can sync several pages and scopes."""
+    return f"{tenant}:usage:{workflow_id}:{run_id}:{activity_id}:{scope}:{page_id}"

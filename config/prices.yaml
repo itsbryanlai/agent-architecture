@@ -1,0 +1,22 @@
+# Model prices, in US dollars per million tokens. The usage page costs every model
+# call with the entry in effect on the day the call was recorded, and stores that cost
+# on the row, so changing a price later never rewrites past months. A model with no
+# entry is recorded with its tokens and no cost, and the page shows "no price".
+#
+# Add one entry per model and per price change. All four prices are required: write 0
+# for a kind the model does not bill (an embedding model has no output or cache).
+# `model` is the name the provider reports back, which is what the usage page groups
+# by. `effective_from` is a UTC date; an entry applies from that day until the next
+# entry of the same model starts. Restart the worker after editing this file.
+#
+# No prices are shipped: copy them from your provider's pricing page, and note the
+# date you copied them.
+#
+# prices:
+#   - model: example-model-name
+#     effective_from: 2026-01-01
+#     input: 3.00
+#     output: 15.00
+#     cache_read: 0.30
+#     cache_write: 3.75
+prices: []

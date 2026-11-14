@@ -22,6 +22,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote
@@ -55,6 +56,7 @@ from agentos.slack_signin import (
     read_session_cookie,
     session_cookie_value,
 )
+from agentos.usage import NO_TEAM
 
 log = logging.getLogger("agentos.web_ui")
 
@@ -101,7 +103,19 @@ def _stamp(value: datetime | None) -> str:
     return "" if value is None else value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _usd(value: Decimal) -> str:
+    return f"${value:,.4f}"
+
+
 _env.filters["stamp"] = _stamp
+_env.filters["usd"] = _usd
+
+
+def recent_months(now: datetime, count: int = 12) -> list[str]:
+    """The current UTC month and the ones before it, newest first, as YYYY-MM."""
+    now = now.astimezone(UTC)
+    index = now.year * 12 + now.month - 1
+    return [f"{(i // 12):04d}-{(i % 12) + 1:02d}" for i in range(index, index - count, -1)]
 
 
 # --- definitions as YAML text ----------------------------------------------------------
@@ -205,6 +219,8 @@ class WebUI:
         self.route("POST", base + "/members/{user_id}/role", self.change_role)
         self.route("POST", base + "/members/{user_id}/remove", self.drop_member)
         self.route("GET", base + "/audit", self.audit)
+        self.route("GET", base + "/usage", self.usage)
+        self.route("GET", base + "/usage.csv", self.usage_csv)
 
     # --- plumbing ---------------------------------------------------------------------
 
@@ -616,6 +632,28 @@ class WebUI:
         )
         older = events[-1].seq if len(events) == AUDIT_PAGE else None
         return _page("audit.html", ctx=ctx, events=events, older=older, base=self.base(ctx))
+
+    async def usage(self, request: Request, ctx: Ctx) -> Response:
+        month = request.query_params.get("month") or None
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.user_id, month)
+        return _page(
+            "usage.html",
+            ctx=ctx,
+            report=report,
+            months=recent_months(ctx.now),
+            no_team=NO_TEAM,
+            base=self.base(ctx),
+        )
+
+    async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
+        """The page's aggregates as a download. It only reads, so it is a GET."""
+        month = request.query_params.get("month") or None
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.user_id, month)
+        return Response(
+            report.csv_text(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="usage-{report.month}.csv"'},
+        )
 
 
 NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."

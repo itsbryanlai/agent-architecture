@@ -15,6 +15,8 @@ Roles. A tenant has admins and creators.
 - A creator reads agents, creates agents, and drafts, edits, submits and
   withdraws the versions of an agent they created. An admin may do the same for
   any agent.
+- An admin reads usage and cost for every agent; a creator reads it for the agents
+  they created. Usage is never broken down by requester.
 - A user listed in the tenant YAML ``admins`` is always an admin. Nobody can
   remove or demote that user here, because it is configuration. A user with a
   ``members`` row has that row's role. Anyone else has no role.
@@ -48,6 +50,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -84,6 +87,14 @@ from agentos.members import (
 )
 from agentos.models import AuditEvent
 from agentos.slack_client import SlackLookupError
+from agentos.usage import (
+    InMemoryUsageStore,
+    UsageReport,
+    UsageStore,
+    build_report,
+    month_bounds,
+    utcnow,
+)
 
 
 class Forbidden(Exception):
@@ -129,8 +140,12 @@ class ControlPlane:
         tenants: TenantsConfig,
         grant_checker: GrantChecker,
         audience: AudienceInspector | None = None,
+        usage: UsageStore | None = None,
+        clock: Callable[[], datetime] = utcnow,
     ):
         self._audience = audience
+        self._usage = InMemoryUsageStore() if usage is None else usage
+        self._clock = clock
         self._agents = agents
         self._members = members
         self._audit = audit
@@ -234,6 +249,31 @@ class ControlPlane:
     ) -> list[AuditEvent]:
         await self._require_role(tenant_id, actor, ADMIN)
         return await self._audit.list(tenant_id, limit, before, before_seq)
+
+    async def usage_report(
+        self, tenant_id: str, actor: str, month: str | None = None
+    ) -> UsageReport:
+        """Usage and cost for a UTC calendar month (``YYYY-MM``; default the current one).
+
+        An admin sees every agent and the tenant's embedding usage. A creator sees
+        only the agents they created, which is the agents they may edit. There is no
+        per-person view: no row or total here is grouped by who asked.
+        """
+        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        start, end, label = month_bounds(month, self._clock())
+        groups = await self._usage.totals(tenant_id, start, end)
+        if role != ADMIN:
+            mine = {
+                a.agent_id
+                for a in await self._agents.list_agents(tenant_id)
+                if a.created_by == actor
+            }
+            groups = [g for g in groups if g.agent_id in mine]
+        teams: dict[tuple[str, int], str | None] = {}
+        for agent_id, version in {(g.agent_id, g.agent_version) for g in groups if g.agent_id}:
+            record = await self._agents.get_version(tenant_id, agent_id, version)
+            teams[(agent_id, version)] = None if record is None else (record.agent().team or None)
+        return build_report(label, groups, teams)
 
     async def check_version_grants(
         self, tenant_id: str, actor: str, agent_id: str, version: int

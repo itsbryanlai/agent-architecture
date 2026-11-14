@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -77,6 +78,7 @@ from agentos.slack_client import SlackLookupError
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
 from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
+from agentos.usage import UsageRecorder
 
 log = logging.getLogger("agentos.activities")
 
@@ -101,6 +103,20 @@ def _is_client_error(err: Exception) -> bool:
         if isinstance(status, int) and not isinstance(status, bool):
             return 400 <= status < 500 and status not in (408, 429)
     return False
+
+
+def _activity_ref(fallback_workflow_id: str) -> tuple[str, str, str]:
+    """Workflow ID, run ID and activity ID of the running activity.
+
+    Together they name one activity of one run, and stay the same when Temporal
+    retries it. Outside an activity (a direct call in a test) there is no such
+    name, so a random one stands in and nothing is deduplicated.
+    """
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return fallback_workflow_id, uuid.uuid4().hex, "0"
+    return info.workflow_id, info.workflow_run_id, info.activity_id
 
 
 def hand_off_tool(specialists: list[AgentVersion]) -> dict:
@@ -135,8 +151,10 @@ class AgentActivities:
         knowledge: KnowledgeStore | None = None,
         embedder: Embedder | None = None,
         audience: AudienceChecker | None = None,
+        usage: UsageRecorder | None = None,
     ):
         self.settings = settings
+        self.usage = usage
         self.registry = registry
         self.audience = audience or AudienceChecker(registry, agents)
         self.knowledge = knowledge
@@ -440,7 +458,7 @@ class AgentActivities:
             if specialists:
                 tools = tools + [hand_off_tool(specialists)]
         try:
-            return await self.llm.complete(system, messages, tools)
+            resp = await self.llm.complete(system, messages, tools)
         except Exception as err:
             if _is_client_error(err):
                 # The provider rejected the request (bad key, bad request):
@@ -453,6 +471,17 @@ class AgentActivities:
                 )
                 raise _non_retryable(err) from err
             raise
+        if self.usage is not None:
+            await self.usage.llm_call(
+                tenant_id=ctx.tenant_id,
+                agent_id=ctx.agent_id,
+                agent_version=ctx.agent_version,
+                conversation_id=conversation_id,
+                key=ids.usage_call_key(ctx.tenant_id, *_activity_ref(conversation_id)),
+                usage=resp.usage,
+                fallback_model=self.settings.model,
+            )
+        return resp
 
     @activity.defn(name="post_placeholder")
     async def post_placeholder(self, ctx: TurnContext, idem_key: str) -> str:

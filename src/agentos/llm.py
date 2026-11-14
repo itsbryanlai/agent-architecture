@@ -22,7 +22,7 @@ import copy
 import json
 from typing import Protocol
 
-from agentos.models import LLMResponse, ToolCall
+from agentos.models import LLMResponse, ToolCall, Usage
 
 # Upper bound on tokens the model may generate per call, for every provider.
 MAX_TOKENS = 3072
@@ -71,7 +71,29 @@ def to_llm_response(resp) -> LLMResponse:
     # goes back to the model unchanged on the next call.
     raw = [block.model_dump(mode="json", exclude_none=True) for block in resp.content]
     text = "".join(texts).strip() or None
-    return LLMResponse(text=text, tool_calls=calls, stop_reason=str(resp.stop_reason), content=raw)
+    return LLMResponse(
+        text=text,
+        tool_calls=calls,
+        stop_reason=str(resp.stop_reason),
+        content=raw,
+        usage=_anthropic_usage(resp),
+    )
+
+
+def _count(value) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _anthropic_usage(resp) -> Usage:
+    """Token counts from an Anthropic ``Message``. A count the provider leaves out is 0."""
+    used = getattr(resp, "usage", None)
+    return Usage(
+        input_tokens=_count(getattr(used, "input_tokens", 0)),
+        output_tokens=_count(getattr(used, "output_tokens", 0)),
+        cache_read_tokens=_count(getattr(used, "cache_read_input_tokens", 0)),
+        cache_write_tokens=_count(getattr(used, "cache_creation_input_tokens", 0)),
+        model=getattr(resp, "model", None) or None,
+    )
 
 
 class QwenLLMClient:
@@ -249,7 +271,33 @@ def from_openai_response(resp) -> LLMResponse:
         content.append({"type": "text", "text": text})
     for call in calls:
         content.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.input})
-    return LLMResponse(text=text, tool_calls=calls, stop_reason=stop_reason, content=content)
+    return LLMResponse(
+        text=text,
+        tool_calls=calls,
+        stop_reason=stop_reason,
+        content=content,
+        usage=_openai_usage(resp),
+    )
+
+
+def _openai_usage(resp) -> Usage:
+    """Token counts from a chat completion.
+
+    ``prompt_tokens`` includes the tokens served from the cache, so those are
+    taken out of the input count and reported as cache reads. These endpoints
+    report no cache writes.
+    """
+    used = getattr(resp, "usage", None)
+    prompt = _count(getattr(used, "prompt_tokens", 0))
+    cached = _count(getattr(getattr(used, "prompt_tokens_details", None), "cached_tokens", 0))
+    cached = min(cached, prompt)
+    return Usage(
+        input_tokens=prompt - cached,
+        output_tokens=_count(getattr(used, "completion_tokens", 0)),
+        cache_read_tokens=cached,
+        cache_write_tokens=0,
+        model=getattr(resp, "model", None) or None,
+    )
 
 
 class ScriptedLLMClient:

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Audit{% endblock %}
+{% block body %}
+<h1>Audit log</h1>
+<p class="muted">Newest first. Hashes stand for content that is never stored here.</p>
+<table>
+  <tr><th>#</th><th>When</th><th>Kind</th><th>Outcome</th><th>Requester</th><th>Identity</th><th>Agent</th><th>Approver</th><th>Tool / target</th><th>Input hash</th><th>Output hash</th></tr>
+  {% for e in events %}
+  <tr>
+    <td>{{ e.seq }}</td>
+    <td>{{ e.at | stamp }}</td>
+    <td>{{ e.kind }}</td>
+    <td>{{ e.outcome }}</td>
+    <td>{{ e.requester_user_id }}</td>
+    <td>{{ e.identity }}</td>
+    <td>{% if e.agent_id %}{{ e.agent_id }} v{{ e.agent_version }}{% endif %}</td>
+    <td>{{ e.approver_user_id or "" }}</td>
+    <td>{{ e.tool or "" }} {{ e.target or "" }}</td>
+    <td>{% if e.input_sha256 %}<code title="{{ e.input_sha256 }}">{{ e.input_sha256[:12] }}</code>{% endif %}</td>
+    <td>{% if e.output_sha256 %}<code title="{{ e.output_sha256 }}">{{ e.output_sha256[:12] }}</code>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="11" class="muted">No events.</td></tr>
+  {% endfor %}
+</table>
+{% if older %}<p><a href="{{ base }}/audit?before={{ older }}">Older events</a></p>{% endif %}
+{% endblock %}

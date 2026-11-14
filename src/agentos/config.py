@@ -102,6 +102,12 @@ class Settings:
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
+    # Sign in with Slack for the web console: the Slack app's client ID and secret,
+    # and the public base URL the browser reaches the console at. The console is
+    # configured only when all three are set (see ``slack_signin``).
+    slack_client_id: str | None = None
+    slack_client_secret: str | None = field(default=None, repr=False)
+    console_url: str | None = None
 
     def require(self, name: str) -> str:
         """Return a required setting, or fail with a message naming the variable.
@@ -149,6 +155,9 @@ def load_settings() -> Settings:
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
+        slack_client_id=env.get("SLACK_CLIENT_ID") or None,
+        slack_client_secret=env.get("SLACK_CLIENT_SECRET") or None,
+        console_url=env.get("AGENTOS_CONSOLE_URL") or None,
     )
 
 

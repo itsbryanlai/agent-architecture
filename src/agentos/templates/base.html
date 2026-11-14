@@ -1,0 +1,57 @@
+{% from "macros.html" import post_button %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Console{% endblock %} - Agent console</title>
+<style>
+  :root { color-scheme: light dark; --line: #8884; --muted: #777; --accent: #2b5fd9; --bad: #b3261e; --ok: #1e7b34; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; }
+  header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; padding: .6rem 1rem; border-bottom: 1px solid var(--line); }
+  header .brand { font-weight: 600; text-decoration: none; color: inherit; }
+  header nav { display: flex; gap: 1rem; flex: 1; }
+  header .who { display: flex; gap: .6rem; align-items: center; color: var(--muted); }
+  main { max-width: 64rem; margin: 0 auto; padding: 1rem; }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  textarea, input[type=text], select { font: inherit; padding: .3rem .5rem; box-sizing: border-box; }
+  textarea { width: 100%; min-height: 22rem; font-family: ui-monospace, monospace; font-size: 13px; }
+  pre { background: #8881; padding: .75rem; overflow-x: auto; font-size: 13px; }
+  button { font: inherit; padding: .3rem .8rem; cursor: pointer; }
+  form.inline { display: inline; margin: 0; }
+  .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
+  .notice { border-left: 4px solid var(--ok); padding: .4rem .8rem; background: #8881; }
+  .error { border-left: 4px solid var(--bad); padding: .4rem .8rem; background: #8881; white-space: pre-wrap; }
+  .muted { color: var(--muted); }
+  .status { font-size: 12px; padding: 0 .4rem; border: 1px solid var(--line); border-radius: 3px; }
+  code { font-family: ui-monospace, monospace; font-size: 13px; }
+  label { display: block; margin: .5rem 0 .2rem; }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Agent console</a>
+  {% if ctx %}
+  {% set base = "/ui/" ~ (ctx.tenant_id | urlencode) %}
+  <nav>
+    <a href="{{ base }}/agents">Agents</a>
+    {% if ctx.is_admin %}
+    <a href="{{ base }}/members">Members</a>
+    <a href="{{ base }}/audit">Audit</a>
+    {% endif %}
+  </nav>
+  <div class="who">
+    <span>{{ ctx.user_id }} ({{ ctx.role }})</span>
+    {{ post_button("/logout", ctx.csrf, "Sign out") }}
+  </div>
+  {% endif %}
+</header>
+<main>
+{% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+{% block body %}{% endblock %}
+</main>
+</body>
+</html>

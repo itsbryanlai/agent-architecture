@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% from "macros.html" import post_button %}
+{% block title %}Members{% endblock %}
+{% block body %}
+<h1>Members</h1>
+<table>
+  <tr><th>User</th><th>Role</th><th>Added by</th><th>Added</th><th></th></tr>
+  {% for a in ctx.config_admins %}
+  <tr><td>{{ a }}</td><td>admin</td><td class="muted" colspan="3">set in the tenant file; change it there</td></tr>
+  {% endfor %}
+  {% for m in members %}
+  <tr>
+    <td>{{ m.user_id }}</td>
+    <td>
+      <form class="inline" method="post" action="{{ base }}/members/{{ m.user_id | urlencode }}/role">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <select name="role">
+          {% for r in roles %}<option value="{{ r }}"{% if r == m.role %} selected{% endif %}>{{ r }}</option>{% endfor %}
+        </select>
+        <button type="submit">Change</button>
+      </form>
+    </td>
+    <td>{{ m.added_by }}</td>
+    <td>{{ m.added_at | stamp }}</td>
+    <td>{{ post_button(base ~ "/members/" ~ (m.user_id | urlencode) ~ "/remove", ctx.csrf, "Remove") }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Add a member</h2>
+<form method="post" action="{{ base }}/members">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <label for="user_id">Slack user ID</label>
+  <input type="text" id="user_id" name="user_id" required>
+  <label for="role">Role</label>
+  <select id="role" name="role">{% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select>
+  <p><button type="submit">Add</button></p>
+</form>
+{% endblock %}

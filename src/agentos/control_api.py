@@ -1,16 +1,21 @@
 """The control-plane API: agents, versions, members and the audit log, as JSON.
 
 This is a separate app and process from the gateway. The gateway is reachable
-from the internet; this API is not, and must not be. It listens on the loopback
-address only and the entry point refuses any other bind. Never point a tunnel at
-its port. Start it with::
+from the internet; this API is not, and must not be. Without sign-in with Slack
+configured it listens on the loopback address only and the entry point refuses any
+other bind. Never point a tunnel at its port in that mode. Start it with::
 
     AGENTOS_CONTROL_ACTOR=<your Slack user ID> uv run python -m agentos.control_api
 
+With ``SLACK_CLIENT_ID``, ``SLACK_CLIENT_SECRET`` and ``AGENTOS_CONSOLE_URL`` set
+the same process also serves the web console (``web_ui.py``), requires a Slack
+sign-in for everything, and may listen beyond loopback.
+
 Who is acting. The acting Slack user ID comes from an ``IdentityProvider``, which
 the process owns; nothing in a request (header, query or body) can set or change
-it. The one provider here is ``LocalOperator``: a single user ID fixed when the
-process starts. A Slack sign-in session will replace it.
+it. There are two: ``LocalOperator``, a single user ID fixed when the process
+starts, and ``SlackSession``, the user of the request's sign-in session. A process
+uses exactly one of them.
 
 What the actor may do is decided only by ``ControlPlane``, from the actor's role
 in the tenant named in the path. This module adds no rule of its own, calls no
@@ -28,6 +33,7 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Protocol
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -35,11 +41,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from agentos.agent_store import AgentNotFound, AgentStoreError
-from agentos.config import ConfigError, TenantsConfig
-from agentos.control import ControlPlane, Forbidden
-from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
-from agentos.members import InvalidMember, MemberError, MemberNotFound
+from agentos.agent_store import AgentNotFound
+from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
+from agentos.control import ControlPlane
+from agentos.control_errors import STATUS_BY_ERROR
+from agentos.grant_checker import GrantProblems
+from agentos.sessions import SessionStore
+from agentos.slack_signin import (
+    CALLBACK_PATH,
+    Console,
+    HttpSlackOidc,
+    SlackSession,
+    sign_in_from_settings,
+)
+from agentos.web_ui import CONSOLE_FORM_PREFIXES, install_web_ui
 
 log = logging.getLogger("agentos.control_api")
 
@@ -48,6 +63,10 @@ DEFAULT_PORT = 8100
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 ACTOR_VARIABLE = "AGENTOS_CONTROL_ACTOR"
 MAX_AUDIT_LIMIT = 200
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; "
+    "frame-ancestors 'none'"
+)
 _SLACK_USER_ID = re.compile(r"[UW][A-Z0-9]{2,}")
 
 
@@ -86,12 +105,19 @@ def operator_from_environment(environ: Mapping[str, str]) -> LocalOperator:
         raise SystemExit(str(err)) from err
 
 
-def check_bind_host(host: str) -> None:
-    """Refuse any host but loopback: this API must never be reachable from outside."""
+def check_bind_host(host: str, sign_in_configured: bool = False) -> None:
+    """Refuse any host but loopback, unless sign-in with Slack is configured.
+
+    Without sign-in every request acts as the fixed operator, so the API must not
+    be reachable from outside. With it, every request needs a session.
+    """
+    if sign_in_configured:
+        return
     if host not in LOOPBACK_HOSTS:
         raise SystemExit(
             f"refusing to listen on '{host}': the control API binds only to "
-            f"{', '.join(LOOPBACK_HOSTS)} until sign-in with Slack exists"
+            f"{', '.join(LOOPBACK_HOSTS)} until sign-in with Slack is configured "
+            "(SLACK_CLIENT_ID, SLACK_CLIENT_SECRET and AGENTOS_CONSOLE_URL)"
         )
 
 
@@ -135,6 +161,8 @@ def _error(status: int, message: str, **extra: Any) -> JSONResponse:
 class ControlDeps:
     plane: ControlPlane | None
     tenants: TenantsConfig | None
+    sessions: SessionStore | None = None
+    console: Console | None = None
 
 
 def create_app(
@@ -143,13 +171,30 @@ def create_app(
     identity: IdentityProvider,
     lifespan: Any = None,
     port: int = DEFAULT_PORT,
+    sessions: SessionStore | None = None,
+    console: Console | None = None,
 ) -> FastAPI:
-    """Build the API. Tests pass fakes; the real process fills ``deps`` on startup."""
-    deps = ControlDeps(plane, tenants)
+    """Build the API. Tests pass fakes; the real process fills ``deps`` on startup.
+
+    With a ``console`` the app also serves the web pages, and ``identity`` should be
+    ``SlackSession()``. The Host and Origin allowlists then include the console URL.
+    """
+    deps = ControlDeps(plane, tenants, sessions, console)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
     allowed_origins = {f"http://{host}" for host in allowed_hosts}
+    if console is not None:
+        allowed_hosts.add(console.sign_in.host)
+        allowed_origins.add(console.sign_in.origin)
+
+    def form_origin_ok(headers: Mapping[str, str]) -> bool:
+        """A form post comes from one of our pages: its Origin, or else its Referer."""
+        origin = headers.get("origin")
+        if origin is not None:
+            return origin in allowed_origins
+        referer = urlsplit(headers.get("referer", ""))
+        return f"{referer.scheme}://{referer.netloc}" in allowed_origins
 
     @app.middleware("http")
     async def local_browser_guard(request: Request, call_next):
@@ -160,6 +205,8 @@ def create_app(
         rebinding), a foreign Origin or a cross-site fetch (CSRF), and a write that is
         not JSON (a form or no-cors post is a simple request; JSON forces a preflight,
         which fails because no CORS is offered). Refusals say nothing about the request.
+        A console form post is the one other write: it must come from our own origin
+        (the route then checks its CSRF token against the session).
         """
         if request.url.path == "/healthz":
             return await call_next(request)
@@ -169,49 +216,46 @@ def create_app(
         origin = headers.get("origin")
         if origin is not None and origin not in allowed_origins:
             return _error(403, "origin not allowed")
-        if headers.get("sec-fetch-site") in ("cross-site", "same-site"):
+        # Slack sends the browser back to the callback from another site; the callback
+        # is protected by its state cookie instead.
+        arrives_from_slack = console is not None and request.url.path == CALLBACK_PATH
+        if headers.get("sec-fetch-site") in ("cross-site", "same-site") and not arrives_from_slack:
             return _error(403, "cross-site requests are not allowed")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             media_type = headers.get("content-type", "").split(";")[0].strip().lower()
-            if media_type != "application/json":
+            is_form = (
+                console is not None
+                and media_type == "application/x-www-form-urlencoded"
+                and request.url.path.startswith(CONSOLE_FORM_PREFIXES)
+            )
+            if is_form:
+                if not form_origin_ok(headers):
+                    return _error(403, "origin not allowed")
+            elif media_type != "application/json":
                 return _error(415, "writes must be sent as application/json")
         return await call_next(request)
 
-    @app.exception_handler(Forbidden)
-    async def forbidden(request: Request, err: Forbidden) -> JSONResponse:
-        return _error(403, str(err))
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        """On every response, refusals included (this middleware is the outermost)."""
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
-    @app.exception_handler(AgentNotFound)
-    async def agent_not_found(request: Request, err: AgentNotFound) -> JSONResponse:
-        return _error(404, str(err))
+    def refusal_handler(status: int):
+        async def handle(request: Request, err: Exception) -> JSONResponse:
+            if isinstance(err, GrantProblems):
+                return _error(status, str(err), grants=jsonable_encoder(err.reports))
+            return _error(status, str(err))
 
-    @app.exception_handler(MemberNotFound)
-    async def member_not_found(request: Request, err: MemberNotFound) -> JSONResponse:
-        return _error(404, str(err))
+        return handle
 
-    @app.exception_handler(InvalidMember)
-    async def invalid_member(request: Request, err: InvalidMember) -> JSONResponse:
-        return _error(422, str(err))
-
-    @app.exception_handler(AgentStoreError)
-    async def wrong_state(request: Request, err: AgentStoreError) -> JSONResponse:
-        return _error(409, str(err))
-
-    @app.exception_handler(MemberError)
-    async def member_conflict(request: Request, err: MemberError) -> JSONResponse:
-        return _error(409, str(err))
-
-    @app.exception_handler(ConfigError)
-    async def invalid_definition(request: Request, err: ConfigError) -> JSONResponse:
-        return _error(422, str(err))
-
-    @app.exception_handler(GrantProblems)
-    async def grant_problems(request: Request, err: GrantProblems) -> JSONResponse:
-        return _error(409, str(err), grants=jsonable_encoder(err.reports))
-
-    @app.exception_handler(GrantCheckUnavailable)
-    async def grants_unreadable(request: Request, err: GrantCheckUnavailable) -> JSONResponse:
-        return _error(502, str(err))
+    for error_type, status in STATUS_BY_ERROR.items():
+        app.add_exception_handler(error_type, refusal_handler(status))
 
     @app.exception_handler(RequestValidationError)
     async def bad_request(request: Request, err: RequestValidationError) -> JSONResponse:
@@ -387,6 +431,9 @@ def create_app(
         next_before = events[-1].seq if len(events) == limit and events else None
         return out({"events": events, "next_before": next_before})
 
+    if console is not None:
+        install_web_ui(app)
+
     return app
 
 
@@ -400,10 +447,11 @@ async def _real_lifespan(app: FastAPI):
 
     from agentos.agent_store import PostgresAgentStore
     from agentos.audit import PostgresAuditStore
-    from agentos.config import load_settings, load_tenants_config
+    from agentos.config import load_tenants_config
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
     from agentos.members import PostgresMemberStore
+    from agentos.sessions import PostgresSessionStore
     from agentos.tenants import require_tenant_secret
 
     logging.basicConfig(level=logging.INFO)
@@ -420,6 +468,7 @@ async def _real_lifespan(app: FastAPI):
                 apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
             return apis[tenant_id]
 
+        app.state.deps.sessions = PostgresSessionStore(pool)
         app.state.deps.plane = ControlPlane(
             PostgresAgentStore(pool),
             PostgresMemberStore(pool),
@@ -433,18 +482,47 @@ async def _real_lifespan(app: FastAPI):
         await pool.close()
 
 
+def build_process_app(
+    host: str, port: int, settings: Settings, environ: Mapping[str, str]
+) -> FastAPI:
+    """The app for this process, or ``SystemExit`` when it may not start as configured.
+
+    With sign-in configured it is the web console behind ``SlackSession`` and may bind
+    any host; the fixed operator is not read. Without it, the loopback-only API acts
+    as the operator named in the environment.
+    """
+    try:
+        sign_in = sign_in_from_settings(settings)
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
+    check_bind_host(host, sign_in_configured=sign_in is not None)
+    if sign_in is None:
+        operator = operator_from_environment(environ)
+        return create_app(None, None, operator, lifespan=_real_lifespan, port=port)
+    slack = HttpSlackOidc(sign_in.client_id, sign_in.client_secret)
+    return create_app(
+        None,
+        None,
+        SlackSession(),
+        lifespan=_real_lifespan,
+        port=port,
+        console=Console(sign_in, slack),
+    )
+
+
 def main() -> None:
     import os
 
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Run the control-plane API on this machine only.")
+    parser = argparse.ArgumentParser(
+        description="Run the control-plane API and web console. Loopback only, unless "
+        "sign-in with Slack is configured."
+    )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
-    check_bind_host(args.host)
-    operator = operator_from_environment(os.environ)
-    app = create_app(None, None, operator, lifespan=_real_lifespan, port=args.port)
+    app = build_process_app(args.host, args.port, load_settings(), os.environ)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

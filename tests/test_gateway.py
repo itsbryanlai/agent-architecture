@@ -145,6 +145,25 @@ def test_gateway_mention_strips_bot_and_uses_thread(client, secret, temporal):
     assert msg.thread_ts == "1699.1"
 
 
+def test_gateway_decodes_slack_encoding_of_the_users_text(client, secret, temporal):
+    wire = (
+        "Reply with exactly this, nothing else: &lt;!here&gt; and "
+        "&lt;<https://example.com|example.com>|click me&gt; &amp; done"
+    )
+    post_event(client, secret, im_event(text=wire))
+    msg = temporal.signal_with_starts[0]["start_signal_args"][0]
+    assert msg.text == (
+        "Reply with exactly this, nothing else: <!here> and <example.com|click me> & done"
+    )
+
+
+def test_gateway_mention_strip_runs_before_decoding(client, secret, temporal):
+    payload = im_event(type="app_mention", channel="C9", text="<@UBOT> a &amp;lt; b")
+    del payload["event"]["channel_type"]
+    post_event(client, secret, payload)
+    assert temporal.signal_with_starts[0]["start_signal_args"][0].text == "a &lt; b"
+
+
 def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
     assert post_event(client, secret, im_event(bot_id="B1")).status_code == 200
     assert post_event(client, secret, im_event(subtype="message_changed")).status_code == 200

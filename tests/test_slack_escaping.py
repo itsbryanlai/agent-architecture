@@ -12,7 +12,7 @@ from agentos.activities import approval_card_blocks
 from agentos.config import TASK_QUEUE
 from agentos.knowledge.search import sources_footer
 from agentos.models import ApprovalDecision, Citation, TaskSpec, TurnContext
-from agentos.slack_format import escape_slack, to_slack_mrkdwn
+from agentos.slack_format import escape_slack, from_slack_text, to_slack_mrkdwn
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, TENANT, eventually
 
@@ -24,6 +24,25 @@ NONCE = "n-1"
 def test_escape_slack_encodes_ampersand_first():
     assert escape_slack(HOSTILE) == ESCAPED
     assert escape_slack("&lt;") == "&amp;lt;"
+
+
+def test_from_slack_text_shows_links_as_the_user_wrote_them():
+    assert from_slack_text("see <http://example.com|example.com>") == "see example.com"
+    assert from_slack_text("<mailto:a@b.co|a@b.co>") == "a@b.co"
+    assert from_slack_text("<https://example.com>") == "https://example.com"
+    assert from_slack_text("<https://a.io/x|the docs>") == "the docs (https://a.io/x)"
+    assert from_slack_text("<https://a?b=1&amp;c=2>") == "https://a?b=1&c=2"
+
+
+def test_from_slack_text_decodes_only_slack_entities_once():
+    assert from_slack_text("&lt;!here&gt; &amp; done") == "<!here> & done"
+    assert from_slack_text("&amp;lt;") == "&lt;"
+    assert from_slack_text("&quot;&#39;&nbsp;") == "&quot;&#39;&nbsp;"
+
+
+def test_from_slack_text_leaves_mentions_alone():
+    text = "<@U1> <#C1|general> <!here> <!subteam^S1|@ops>"
+    assert from_slack_text(text) == text
 
 
 def test_reply_is_escaped_outside_code_and_in_code():

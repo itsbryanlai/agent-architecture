@@ -158,15 +158,26 @@ def create_app(
             channel_kind=channel_kind,
         )
         workflow_id = ids.conversation_id(tenant, channel, thread_ts)
+        # A running thread keeps its own agent: the start argument is ignored
+        # when the workflow exists, and only the signal lands.
+        config = d.tenants.tenants[tenant]
+        agent_id = config.default_agent
+        if channel_kind == "channel":
+            agent_id = config.channels.get(channel, agent_id)
         await d.temporal_client.start_workflow(
             "ConversationWorkflow",
-            ConversationRef(tenant, d.tenants.tenants[tenant].default_agent, channel, thread_ts),
+            ConversationRef(tenant, agent_id, channel, thread_ts),
             id=workflow_id,
             task_queue=TASK_QUEUE,
             start_signal="message",
             start_signal_args=[msg],
         )
-        log.info("tenant_id=%s workflow_id=%s signalled message", tenant, workflow_id)
+        log.info(
+            "tenant_id=%s agent_id=%s workflow_id=%s signalled message",
+            tenant,
+            agent_id,
+            workflow_id,
+        )
         return Response(status_code=200)
 
     @app.post("/slack/interactivity")

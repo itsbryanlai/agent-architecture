@@ -32,6 +32,12 @@ _BOLD_UNDER = re.compile(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
 _STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _ITALIC_STAR = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")
 
+# Slack markup ``<target|label>`` or one of the three entities Slack encodes.
+_SLACK_TOKEN = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>|&(amp|lt|gt);")
+_ENTITY = re.compile(r"&(amp|lt|gt);")
+_ENTITIES = {"amp": "&", "lt": "<", "gt": ">"}
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:(?://)?")
+
 # Private-use marks: a converted bold marker, and a protected span's slot.
 _BOLD = ""
 _SLOT = re.compile("(\\d+)")
@@ -46,6 +52,34 @@ def escape_slack(text: str) -> str:
     mrkdwn block. It is not idempotent: apply it once, at the point of use.
     """
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def from_slack_text(text: str) -> str:
+    """Decode the text of an inbound Slack event back to what the user typed.
+
+    The inverse direction of :func:`escape_slack`. User-typed ``&``, ``<`` and
+    ``>`` arrive as entities, so any real ``<...>`` is Slack markup. Links
+    become their label, or ``label (url)`` when the user gave one; mentions
+    and channel refs stay as markup. One pass, so ``&amp;lt;`` becomes ``&lt;``.
+    """
+
+    def decode(m: re.Match[str]) -> str:
+        if m.group(3):
+            return _ENTITIES[m.group(3)]
+        target = m.group(1)
+        if target[:1] in ("@", "#", "!"):
+            return m.group(0)
+        url = _decode_entities(target)
+        if m.group(2) is None:
+            return url
+        label = _decode_entities(m.group(2))
+        return label if label == _SCHEME.sub("", url) else f"{label} ({url})"
+
+    return _SLACK_TOKEN.sub(decode, text)
+
+
+def _decode_entities(s: str) -> str:
+    return _ENTITY.sub(lambda m: _ENTITIES[m.group(1)], s)
 
 
 def to_slack_mrkdwn(text: str) -> str:

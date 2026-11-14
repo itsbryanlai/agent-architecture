@@ -52,6 +52,7 @@ from agentos.models import (
     ExternalUpdate,
     InboundMessage,
 )
+from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 
 log = logging.getLogger("agentos.gateway")
@@ -151,7 +152,7 @@ def create_app(
         msg = InboundMessage(
             event_id=payload.get("event_id") or f"{channel}:{event['ts']}",
             user_id=event["user"],
-            text=LEADING_MENTION.sub("", event.get("text") or "", count=1),
+            text=from_slack_text(LEADING_MENTION.sub("", event.get("text") or "", count=1)),
             channel=channel,
             thread_ts=thread_ts,
             channel_kind=channel_kind,

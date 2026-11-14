@@ -20,6 +20,11 @@ Rules this workflow keeps:
   TaskWorkflow, which asks the requester to approve before anything is created.
   The task is abandoned (not cancelled) when this conversation closes, because
   the work outlives the conversation.
+* A front door hands a thread to one of its configured specialists with the
+  ``hand_off`` tool. Nothing outside the workflow runs for it. The specialist
+  answers the same message, announces itself, and owns the rest of the thread:
+  the thread's agent is workflow state (``self.ref``) and carries over
+  continue-as-new. A specialist cannot hand off.
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
   workflow goes on to wait for the next message.
@@ -37,7 +42,7 @@ from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from agentos import ids
-    from agentos.activities import READ_TOOLS, AgentActivities
+    from agentos.activities import HAND_OFF_TOOL, READ_TOOLS, AgentActivities
     from agentos.config import AgentVersion
     from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
@@ -51,6 +56,7 @@ with workflow.unsafe.imports_passed_through():
         TurnContext,
         check_field,
     )
+    from agentos.slack_format import escape_slack
     from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY
     from agentos.workflows.task import TaskWorkflow
 
@@ -62,6 +68,10 @@ NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
 TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
 TOOL_NOT_COMPLETED = "The tool call did not complete."
 STEP_LIMIT_REACHED = "step limit reached"
+HAND_OFF_ACCEPTED = "Handed to {agent}. They will answer now."
+HAND_OFF_REFUSED = "{agent} is not one of this agent's specialists."
+HAND_OFF_EXTRA = "Only one hand-off is allowed per response."
+HAND_OFF_PREFIX = "h1:"
 # workflow.patched IDs: each guards a change to the commands a turn issues, so
 # a conversation that is replayed past an older turn still matches its history.
 PATCH_PARTIAL_TOOL_RESULTS = "close-only-failed-tool-calls"
@@ -95,6 +105,9 @@ class ConversationWorkflow:
         # MAX_CITATIONS of them.
         self.next_marker = 1
         self.citations: list[Citation] = []
+        # The thread's agent. It starts as the agent the workflow was started
+        # with and changes once, when a front door hands the thread over.
+        self.ref: ConversationRef | None = None
 
     @workflow.signal(name="message")
     def message(self, m: InboundMessage) -> None:
@@ -116,6 +129,7 @@ class ConversationWorkflow:
         # Temporal applies these type hints only when every parameter was sent.
         # The gateway starts the workflow with ``ref`` alone, so convert here.
         ref = _typed(ConversationRef, ref)
+        self.ref = ref
         inbox = _typed(list[InboundMessage], inbox) if inbox else None
         seen = _typed(list[str], seen) if seen else None
         citations = _typed(list[Citation], citations) if citations else None
@@ -142,13 +156,13 @@ class ConversationWorkflow:
                 # starts this workflow again with signal-with-start.
                 return
             m = self.inbox.popleft()
-            await self._turn(ref, m)
+            await self._turn(m)
 
             if workflow.info().is_continue_as_new_suggested():
                 await workflow.wait_condition(workflow.all_handlers_finished)
                 workflow.continue_as_new(
                     args=[
-                        ref,
+                        self.ref,
                         list(self.inbox),
                         list(self.seen),
                         self.next_marker,
@@ -156,21 +170,28 @@ class ConversationWorkflow:
                     ]
                 )
 
-    async def _turn(self, ref: ConversationRef, m: InboundMessage) -> None:
+    async def _turn(self, m: InboundMessage) -> None:
         """Run one turn. A failed activity is reported, never raised."""
+        ref = self._ref()
         conv_id = ids.conversation_id(ref.tenant_id, ref.channel, ref.thread_ts)
         state = _TurnState()
         try:
-            await self._run_turn(ref, m, conv_id, state)
+            await self._run_turn(m, conv_id, state)
         except ActivityError as err:
-            self._log_failure(ref, err)
+            # A hand-off during the turn changes the thread's agent, so log
+            # and recover as whichever agent was running.
+            self._log_failure(self._ref(), err)
             if state.ctx is None or state.placeholder_ts is None:
                 # No placeholder to replace, so the user would get no reply at
                 # all: post the failure notice as a new message instead.
                 if workflow.patched(PATCH_EARLY_FAILURE_NOTICE):
                     await self._notify_early_failure(ref, m)
                 return
-            await self._recover(ref, conv_id, state)
+            await self._recover(conv_id, state)
+
+    def _ref(self) -> ConversationRef:
+        assert self.ref is not None
+        return self.ref
 
     async def _notify_early_failure(self, ref: ConversationRef, m: InboundMessage) -> None:
         # The agent may be gone from the config, so there may be no agent
@@ -205,8 +226,9 @@ class ConversationWorkflow:
             err.activity_type,
         )
 
-    async def _recover(self, ref: ConversationRef, conv_id: str, state: "_TurnState") -> None:
+    async def _recover(self, conv_id: str, state: "_TurnState") -> None:
         """Leave valid history and tell the user. Each step is best effort."""
+        ref = self._ref()
         ctx = state.ctx
         placeholder_ts = state.placeholder_ts
         assert ctx is not None and placeholder_ts is not None
@@ -252,24 +274,10 @@ class ConversationWorkflow:
         except ActivityError as err:
             self._log_failure(ref, err, "recovery")
 
-    async def _run_turn(
-        self, ref: ConversationRef, m: InboundMessage, conv_id: str, state: "_TurnState"
-    ) -> None:
-        agent: AgentVersion = await workflow.execute_activity_method(
-            AgentActivities.load_agent,
-            args=[ref.tenant_id, ref.agent_id],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
-        ctx = TurnContext(
-            tenant_id=ref.tenant_id,
-            agent_id=ref.agent_id,
-            agent_version=agent.version,
-            requester_user_id=m.user_id,
-            channel=ref.channel,
-            thread_ts=ref.thread_ts,
-            channel_kind=m.channel_kind,
-        )
+    async def _run_turn(self, m: InboundMessage, conv_id: str, state: "_TurnState") -> None:
+        ref = self._ref()
+        agent: AgentVersion = await self._load_agent(ref.tenant_id, ref.agent_id)
+        ctx = self._turn_context(ref, agent, m)
         state.event_id = m.event_id
         await self._append(
             ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]
@@ -283,7 +291,12 @@ class ConversationWorkflow:
         state.ctx = ctx
         state.placeholder_ts = placeholder_ts
 
-        for step in range(agent.max_steps):
+        # Keys of the specialist's appends carry a prefix, so they never
+        # collide with the front door's for the same message.
+        key_prefix = ""
+        step = 0
+        while step < agent.max_steps:
+            key = f"{m.event_id}:{key_prefix}s{step}"
             resp: LLMResponse = await workflow.execute_activity_method(
                 AgentActivities.call_llm,
                 args=[ctx, conv_id],
@@ -295,9 +308,7 @@ class ConversationWorkflow:
                 content = list(resp.content) or [{"type": "text", "text": text}]
                 if not any(b.get("type") == "text" for b in content):
                     content.append({"type": "text", "text": text})
-                await self._append(
-                    ctx, conv_id, f"{m.event_id}:s{step}:assistant", "assistant", content
-                )
+                await self._append(ctx, conv_id, f"{key}:assistant", "assistant", content)
                 state.reply_stored = True
                 await workflow.execute_activity_method(
                     AgentActivities.finalize_reply,
@@ -308,16 +319,19 @@ class ConversationWorkflow:
                 return
 
             await self._append(
-                ctx,
-                conv_id,
-                f"{m.event_id}:s{step}:assistant",
-                "assistant",
-                _assistant_blocks(resp),
+                ctx, conv_id, f"{key}:assistant", "assistant", _assistant_blocks(resp)
             )
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
             state.pending_tool_ids = [call.id for call in resp.tool_calls]
-            if step == agent.max_steps - 1 and workflow.patched(PATCH_STEP_LIMIT):
+            hand_off = _accepted_hand_off(agent, resp.tool_calls)
+            # A hand-off starts nothing outside the workflow and the specialist
+            # has its own step budget, so the last step may still hand off.
+            if (
+                step == agent.max_steps - 1
+                and hand_off is None
+                and workflow.patched(PATCH_STEP_LIMIT)
+            ):
                 # No step is left to use the results, so nothing runs: a write
                 # tool started now would act with nobody to report it.
                 await workflow.execute_activity_method(
@@ -325,7 +339,7 @@ class ConversationWorkflow:
                     args=[
                         ctx.tenant_id,
                         conv_id,
-                        f"{m.event_id}:s{step}:results",
+                        f"{key}:results",
                         [
                             ToolResult(call.id, STEP_LIMIT_REACHED, is_error=True)
                             for call in resp.tool_calls
@@ -338,7 +352,7 @@ class ConversationWorkflow:
                 await self._append(
                     ctx,
                     conv_id,
-                    f"{m.event_id}:s{step}:out-of-steps",
+                    f"{key}:out-of-steps",
                     "assistant",
                     [{"type": "text", "text": OUT_OF_STEPS}],
                 )
@@ -357,7 +371,7 @@ class ConversationWorkflow:
                     self.next_marker += SEARCH_RESULTS
             outcomes = await asyncio.gather(
                 *[
-                    self._dispatch(ctx, agent, conv_id, call, first_marker)
+                    self._dispatch(ctx, agent, conv_id, call, first_marker, hand_off)
                     for call, first_marker in zip(resp.tool_calls, first_markers)
                 ],
                 return_exceptions=True,
@@ -373,7 +387,7 @@ class ConversationWorkflow:
                         args=[
                             ctx.tenant_id,
                             conv_id,
-                            f"{m.event_id}:s{step}:results",
+                            f"{key}:results",
                             [
                                 ToolResult(call.id, TOOL_NOT_COMPLETED, is_error=True)
                                 if isinstance(outcome, BaseException)
@@ -392,11 +406,18 @@ class ConversationWorkflow:
             del self.citations[:-MAX_CITATIONS]
             await workflow.execute_activity_method(
                 AgentActivities.append_tool_results,
-                args=[ctx.tenant_id, conv_id, f"{m.event_id}:s{step}:results", results],
+                args=[ctx.tenant_id, conv_id, f"{key}:results", results],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
             state.pending_tool_ids = []
+
+            if hand_off is not None:
+                agent, ctx = await self._hand_off(m, state, hand_off)
+                key_prefix = HAND_OFF_PREFIX
+                step = 0
+                continue
+            step += 1
 
         await workflow.execute_activity_method(
             AgentActivities.finalize_reply,
@@ -404,6 +425,52 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+
+    async def _load_agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
+        return await workflow.execute_activity_method(
+            AgentActivities.load_agent,
+            args=[tenant_id, agent_id],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+
+    @staticmethod
+    def _turn_context(ref: ConversationRef, agent: AgentVersion, m: InboundMessage) -> TurnContext:
+        return TurnContext(
+            tenant_id=ref.tenant_id,
+            agent_id=ref.agent_id,
+            agent_version=agent.version,
+            requester_user_id=m.user_id,
+            channel=ref.channel,
+            thread_ts=ref.thread_ts,
+            channel_kind=m.channel_kind,
+        )
+
+    async def _hand_off(
+        self, m: InboundMessage, state: "_TurnState", call: ToolCall
+    ) -> tuple[AgentVersion, TurnContext]:
+        """Give the thread to the specialist the front door chose.
+
+        The specialist is loaded before anything is announced or switched, so
+        a specialist that cannot be loaded leaves the thread with the front
+        door. Once the announcement is posted the thread belongs to the
+        specialist: a failure from here on is recovered as the specialist.
+        """
+        ref = self._ref()
+        target = call.input["agent"]
+        specialist = await self._load_agent(ref.tenant_id, target)
+        new_ref = ConversationRef(ref.tenant_id, target, ref.channel, ref.thread_ts)
+        ctx = self._turn_context(new_ref, specialist, m)
+        announcement = escape_slack(f"{specialist.name} here, picking this up.")
+        await workflow.execute_activity_method(
+            AgentActivities.post_in_thread,
+            args=[ctx, announcement, f"{m.event_id}:handoff"],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        self.ref = new_ref
+        state.ctx = ctx
+        return specialist, ctx
 
     async def _append(
         self, ctx: TurnContext, conv_id: str, step_key: str, role: str, content: list
@@ -422,7 +489,18 @@ class ConversationWorkflow:
         conv_id: str,
         call: ToolCall,
         first_marker: int,
+        hand_off: ToolCall | None,
     ) -> ToolResult:
+        if call.name == HAND_OFF_TOOL:
+            # Decided from the response alone: no activity, no state change.
+            # The turn loop switches agents once the results are stored.
+            if call is hand_off:
+                return ToolResult(call.id, HAND_OFF_ACCEPTED.format(agent=call.input["agent"]))
+            if _hand_off_target(agent, call) is None:
+                return ToolResult(
+                    call.id, HAND_OFF_REFUSED.format(agent=_target_text(call)), is_error=True
+                )
+            return ToolResult(call.id, HAND_OFF_EXTRA, is_error=True)
         if call.name in READ_TOOLS:
             return await workflow.execute_activity_method(
                 AgentActivities.run_read_tool,
@@ -507,6 +585,24 @@ def _typed(tp, value):
         return value_to_type(tp, value)
     except TypeError:
         return value
+
+
+def _hand_off_target(agent: AgentVersion, call: ToolCall) -> str | None:
+    """The specialist a ``hand_off`` call names, if this agent may hand to it."""
+    target = call.input.get("agent") if isinstance(call.input, dict) else None
+    if call.name == HAND_OFF_TOOL and isinstance(target, str) and target in agent.specialists:
+        return target
+    return None
+
+
+def _accepted_hand_off(agent: AgentVersion, calls: list[ToolCall]) -> ToolCall | None:
+    """The first valid ``hand_off`` in a response; any later one is refused."""
+    return next((c for c in calls if _hand_off_target(agent, c) is not None), None)
+
+
+def _target_text(call: ToolCall) -> str:
+    target = call.input.get("agent") if isinstance(call.input, dict) else None
+    return str(target)
 
 
 def _assistant_blocks(resp: LLMResponse) -> list[dict]:

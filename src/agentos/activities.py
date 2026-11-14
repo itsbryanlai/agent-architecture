@@ -71,6 +71,7 @@ log = logging.getLogger("agentos.activities")
 
 READ_TOOLS = ("search_items", "my_items", "search_knowledge")
 MAX_LISTED_ITEMS = 20
+HAND_OFF_TOOL = "hand_off"
 
 
 def _non_retryable(err: Exception) -> ApplicationError:
@@ -89,6 +90,23 @@ def _is_client_error(err: Exception) -> bool:
         if isinstance(status, int) and not isinstance(status, bool):
             return 400 <= status < 500 and status not in (408, 429)
     return False
+
+
+def hand_off_tool(specialists: list[AgentVersion]) -> dict:
+    """The tool a front door uses to give the thread to one of its specialists."""
+    listing = "\n".join(f"- {s.agent_id}: {s.name}. {s.description}" for s in specialists)
+    return {
+        "name": HAND_OFF_TOOL,
+        "description": (
+            "Hand this conversation to a specialist agent, who answers the user's message "
+            f"and owns the rest of the thread. Specialists:\n{listing}"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": [s.agent_id for s in specialists]}},
+            "required": ["agent"],
+        },
+    }
 
 
 class AgentActivities:
@@ -307,6 +325,9 @@ class AgentActivities:
             # the model is told to treat what it returns as data.
             tools = tools + [self.knowledge_tool.llm_definition()]
             system = f"{agent.system_prompt}\n\n{KNOWLEDGE_RULES}"
+        if agent.specialists:
+            specialists = [self._agent(ctx.tenant_id, s) for s in agent.specialists]
+            tools = tools + [hand_off_tool(specialists)]
         try:
             return await self.llm.complete(system, messages, tools)
         except Exception as err:

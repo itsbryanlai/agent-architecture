@@ -861,6 +861,9 @@ a channel that a published agent answers in, the agent is **paused in that chann
 
 - the channel is shared with another organisation (Slack Connect).
 
+> **Untested live.** This pause is covered by the automated tests only. It has not been
+> run against a real Slack Connect channel, which needs a paid Slack plan on both sides.
+
 Anyone joining a channel, guests and people from other workspaces included, changes nothing:
 who is added to a channel is the admins' responsibility. A guest or outside person who
 asks the agent is still refused as described under audiences above.

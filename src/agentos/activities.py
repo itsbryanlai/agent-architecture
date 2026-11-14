@@ -59,9 +59,6 @@ from agentos.knowledge.search import (
 from agentos.knowledge.store import KnowledgeStore
 from agentos.llm import LLMClient
 from agentos.models import (
-    HAND_OFF_ANNOUNCEMENT,
-    OUT_OF_STEPS,
-    TURN_FAILED,
     AuditEvent,
     Citation,
     LLMResponse,
@@ -445,6 +442,7 @@ class AgentActivities:
         placeholder_ts: str,
         text: str,
         citations: list[Citation] | None = None,
+        audit_answer: bool = False,
     ) -> None:
         """Post the final reply, with a Sources line when the answer cites pages.
 
@@ -457,12 +455,15 @@ class AgentActivities:
         The model writes Markdown; what is posted is converted to Slack
         mrkdwn. The footer is built from the unconverted text and is already
         mrkdwn.
+
+        ``audit_answer`` is set by the workflow only for a model answer, so
+        notices posted through this path are not recorded as answers.
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
         footer = await self._sources_footer(ctx, text, citations or [])
         slack = self._runtime(ctx.tenant_id).slack
         await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
-        if self._is_model_answer(ctx.tenant_id, text):
+        if audit_answer:
             conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
             await self._record(
                 ctx,
@@ -471,17 +472,6 @@ class AgentActivities:
                 conversation_id=conversation_id,
                 output_sha256=canonical_sha256(text),
             )
-
-    def _is_model_answer(self, tenant_id: str, text: str) -> bool:
-        """False for the notices the runtime posts itself through the reply path.
-
-        The workflow sends the same arguments for an answer, a failure notice
-        and a hand-off announcement, so they are told apart by their text.
-        """
-        if text in (TURN_FAILED, OUT_OF_STEPS):
-            return False
-        names = (a.name for a in self._runtime(tenant_id).config.agents.values())
-        return text not in {HAND_OFF_ANNOUNCEMENT.format(agent=n) for n in names}
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:

@@ -271,7 +271,7 @@ class ConversationWorkflow:
         try:
             await workflow.execute_activity_method(
                 AgentActivities.finalize_reply,
-                args=[ctx, placeholder_ts, TURN_FAILED, []],
+                args=[ctx, placeholder_ts, TURN_FAILED, [], False],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
@@ -316,7 +316,7 @@ class ConversationWorkflow:
                 state.reply_stored = True
                 await workflow.execute_activity_method(
                     AgentActivities.finalize_reply,
-                    args=[ctx, placeholder_ts, text, list(self.citations)],
+                    args=[ctx, placeholder_ts, text, list(self.citations), True],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
                 )
@@ -364,7 +364,7 @@ class ConversationWorkflow:
                 state.reply_stored = True
                 await workflow.execute_activity_method(
                     AgentActivities.finalize_reply,
-                    args=[ctx, placeholder_ts, OUT_OF_STEPS, []],
+                    args=[ctx, placeholder_ts, OUT_OF_STEPS, [], False],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
                 )
@@ -443,7 +443,7 @@ class ConversationWorkflow:
 
         await workflow.execute_activity_method(
             AgentActivities.finalize_reply,
-            args=[ctx, placeholder_ts, OUT_OF_STEPS, []],
+            args=[ctx, placeholder_ts, OUT_OF_STEPS, [], False],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
@@ -500,6 +500,7 @@ class ConversationWorkflow:
                 state.placeholder_ts,
                 HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name),
                 [],
+                False,
             ],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,

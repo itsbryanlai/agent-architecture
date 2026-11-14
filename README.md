@@ -401,12 +401,20 @@ every model call and every embedding; an agent's budget counts that agent's mode
 across all its versions.
 
 - From **80%** the Usage page, and the agent's page, show a warning with the spend, the
-  budget and the percent.
+  budget and the percent. Spend is shown per cost type, side by side: model and embedding,
+  and the total (an agent's line shows model calls only). The Usage page and
+  `GET /tenants/{t}/budgets` carry the same split.
 - At **100%** the agent answers every message with "<agent name> has reached its monthly
   budget. An admin can raise it in the console." and does not call the model, so nothing
   more is billed and no usage row is written. This applies when either the agent's or the
   organisation's budget is reached. Each stopped turn logs one line with the tenant, the
   agent and which budget, and nothing else.
+- At **100% of the organisation budget** indexing stops as well: no page is embedded, and
+  each stopped page logs one line with the organisation, the scope and the budget. Nothing
+  already indexed is removed because of the stop, and the run's summary counts the pages it
+  held back as `deferred`. Indexing resumes by itself when an admin raises or removes the
+  budget (within a minute) or the UTC month changes; the next nightly run, or a page event,
+  catches up. An agent's budget never stops indexing.
 - Admins set, raise and remove budgets on the **Usage** page and through the API; each
   change is an audit event (`budget_set`, with the new amount, or `0` for a removal).
   Creators see the budgets of the agents they created, read-only.
@@ -415,7 +423,8 @@ across all its versions.
   process, plus the calls already running; a raised budget lifts a stop within a minute.
 - A call to a model with no price has no dollar cost, so a budget cannot count it. The
   pages say so, with the number of such calls, whenever a budget is set and the month has
-  any. Add the model to `config/prices.yaml` to bring its calls under the budget.
+  any, per cost type. Add the model to `config/prices.yaml` to bring its calls under the
+  budget.
 - If the worker cannot read the budgets or the spend, the model call fails and Temporal
   retries it; a call is never let through unchecked.
 

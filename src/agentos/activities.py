@@ -105,18 +105,20 @@ def _is_client_error(err: Exception) -> bool:
     return False
 
 
-def _activity_ref(fallback_workflow_id: str) -> tuple[str, str, str]:
-    """Workflow ID, run ID and activity ID of the running activity.
+def _activity_ref(fallback_workflow_id: str) -> tuple[str, str, str, int]:
+    """Workflow ID, run ID, activity ID and attempt number of the running activity.
 
-    Together they name one activity of one run, and stay the same when Temporal
-    retries it. Outside an activity (a direct call in a test) there is no such
-    name, so a random one stands in and nothing is deduplicated.
+    The first three name one activity of one run and stay the same when Temporal
+    retries it. The attempt number tells the tries apart, so each try that the
+    provider answered (and billed) gets its own usage row. Outside an activity (a
+    direct call in a test) there is no such name, so a random one stands in and
+    nothing is deduplicated.
     """
     try:
         info = activity.info()
     except RuntimeError:
-        return fallback_workflow_id, uuid.uuid4().hex, "0"
-    return info.workflow_id, info.workflow_run_id, info.activity_id
+        return fallback_workflow_id, uuid.uuid4().hex, "0", 1
+    return info.workflow_id, info.workflow_run_id, info.activity_id, info.attempt
 
 
 def hand_off_tool(specialists: list[AgentVersion]) -> dict:

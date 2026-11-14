@@ -6,12 +6,13 @@
 -- a later price change never rewrites it. A null cost means the model had no price,
 -- and a null count means the provider did not report it.
 -- The app role can SELECT and INSERT rows; it cannot UPDATE or DELETE one. A repeat of
--- the same usage_key (a retried activity) is ignored by the insert.
+-- the same usage_key (the same activity attempt recorded twice) is ignored by the insert;
+-- each attempt that the provider answered has its own key and its own row.
 -- Run as the owner role. Safe to run more than once.
 
 CREATE TABLE IF NOT EXISTS usage_events (
   tenant_id          text        NOT NULL,
-  usage_key          text        NOT NULL,   -- names the activity that made the call
+  usage_key          text        NOT NULL,   -- names the activity attempt that made the call
   kind               text        NOT NULL CHECK (kind IN ('llm', 'embedding')),
   agent_id           text,
   agent_version      integer,

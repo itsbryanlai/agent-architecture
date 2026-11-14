@@ -313,7 +313,9 @@ Every model call and every embedded page is recorded as a usage row: the tenant,
 the agent and agent version, the model the provider reported, the four token
 counts (input, output, cache read, cache write), the cost, the conversation ID
 for tracing and the time. A row never names the person who asked and never holds
-text. A call is priced when it is recorded, with the entry in effect that day,
+text. Each billed attempt is counted once: if Temporal retries a call whose first
+answer was lost, the provider bills both attempts and both are recorded. A call is
+priced when it is recorded, with the entry in effect that day,
 and the cost is stored on the row, so editing a price later never changes past
 months.
 

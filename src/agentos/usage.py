@@ -11,10 +11,12 @@ cost is stored on the row. A later price change never rewrites a stored cost. A 
 with no price entry is recorded with its tokens and a null cost, which the page shows
 as "no price".
 
-A row is keyed by the activity that made the call (``ids.usage_call_key``). A repeat of
-the same key stores nothing. The activity records the row after the provider has
-answered, so a retry only follows a failed attempt (nothing was recorded) or a lost
-result (the first row is kept), and the app role needs INSERT and SELECT only.
+A row is keyed by the activity attempt that made the call (``ids.usage_call_key``), so
+each attempt the provider answered is counted once. The activity records the row after
+the provider has answered. A failed attempt records nothing. If the result of an
+answered attempt is lost and Temporal retries, the retry calls the provider again and
+is billed again, so it records its own row. Only a repeat of the same key (the same
+attempt recorded twice) stores nothing. The app role needs INSERT and SELECT only.
 
 Recording never fails the turn: ``UsageRecorder`` logs the tenant, the agent and the
 error type, and goes on.

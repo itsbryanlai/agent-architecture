@@ -321,14 +321,21 @@ def test_the_prices_path_is_a_setting_with_an_env_override(monkeypatch):
 # --- keys -------------------------------------------------------------------------------
 
 
-def test_usage_keys_start_with_the_tenant_and_name_the_activity():
-    call = ids.usage_call_key("acme", "acme:conv:C1:1.1", "run-1", "5")
-    embed = ids.usage_embedding_key("acme", "acme:index:s", "run-1", "5", "notion:page:x", "p1")
+def test_usage_keys_start_with_the_tenant_and_name_the_activity_attempt():
+    call = ids.usage_call_key("acme", "acme:conv:C1:1.1", "run-1", "5", 1)
+    embed = ids.usage_embedding_key("acme", "acme:index:s", "run-1", "5", 1, "notion:page:x", "p1")
 
-    assert call == "acme:usage:acme:conv:C1:1.1:run-1:5"
+    assert call == "acme:usage:acme:conv:C1:1.1:run-1:5:1"
     assert embed.startswith("acme:usage:") and "notion:page:x" in embed and embed.endswith("p1")
-    assert ids.usage_call_key("acme", "acme:conv:C1:1.1", "run-1", "6") != call
-    assert ids.usage_call_key("globex", "w", "r", "1") != ids.usage_call_key("acme", "w", "r", "1")
+    assert ids.usage_call_key("acme", "acme:conv:C1:1.1", "run-1", "6", 1) != call
+    assert ids.usage_call_key("acme", "acme:conv:C1:1.1", "run-1", "5", 2) != call
+    assert (
+        ids.usage_embedding_key("acme", "acme:index:s", "run-1", "5", 2, "notion:page:x", "p1")
+        != embed
+    )
+    assert ids.usage_call_key("globex", "w", "r", "1", 1) != ids.usage_call_key(
+        "acme", "w", "r", "1", 1
+    )
 
 
 # --- recording from call_llm ------------------------------------------------------------
@@ -410,7 +417,7 @@ async def test_the_row_names_no_requester(agents):
     assert ALICE not in repr(store.events)
 
 
-async def test_a_retry_of_the_same_activity_does_not_count_twice(agents):
+async def test_the_same_attempt_recorded_twice_counts_once(agents):
     store, recorder = recorder_with()
     llm = ScriptedLLMClient([answer(), answer()])
     acts = make_activities(agents, llm, recorder)
@@ -421,6 +428,21 @@ async def test_a_retry_of_the_same_activity_does_not_count_twice(agents):
 
     assert len(llm.calls) == 2
     assert len(store.events) == 1
+
+
+async def test_each_attempt_that_got_an_answer_is_its_own_row(agents):
+    store, recorder = recorder_with()
+    llm = ScriptedLLMClient([answer(), answer()])
+    acts = make_activities(agents, llm, recorder)
+    first, retry = ActivityEnvironment(), ActivityEnvironment()
+    retry.info = replace(retry.info, attempt=first.info.attempt + 1)
+
+    await first.run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
+    await retry.run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
+
+    assert len(llm.calls) == 2
+    assert len(store.events) == 2
+    assert len({e.usage_key for e in store.events}) == 2
 
 
 async def test_two_calls_of_one_conversation_are_two_rows(agents):
@@ -540,7 +562,7 @@ async def test_an_unchanged_page_embeds_nothing_and_records_nothing():
     assert rows == 1 and len(store.events) == 1
 
 
-async def test_an_embedding_retried_by_the_same_activity_counts_once():
+async def test_an_embedding_recorded_twice_by_the_same_attempt_counts_once():
     store, recorder = recorder_with()
     acts = index_activities(recorder, FakeEmbedder())
     env = ActivityEnvironment()
@@ -551,6 +573,20 @@ async def test_an_embedding_retried_by_the_same_activity_counts_once():
     await env.run(acts.sync_page, TENANT, SCOPE, ROOT_A)
 
     assert len(store.events) == 1
+
+
+async def test_an_embedding_redone_by_a_later_attempt_is_its_own_row():
+    store, recorder = recorder_with()
+    acts = index_activities(recorder, FakeEmbedder())
+    first, retry = ActivityEnvironment(), ActivityEnvironment()
+    retry.info = replace(retry.info, attempt=first.info.attempt + 1)
+
+    await first.run(acts.sync_page, TENANT, SCOPE, ROOT_A)
+    acts.store.pages.clear()
+    acts.store.chunks.clear()
+    await retry.run(acts.sync_page, TENANT, SCOPE, ROOT_A)
+
+    assert len(store.events) == 2
 
 
 async def test_an_endpoint_that_reports_no_tokens_records_null_tokens_and_null_cost():

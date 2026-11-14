@@ -169,15 +169,17 @@ agents:
 - Where a message lands: a DM or a mention in an unmapped channel goes to
   `default_agent`; a mention in a channel listed under `channels` goes straight
   to that agent.
-- The specialist posts "<name> here, picking this up.", answers the same
-  message, and keeps the thread. A new thread starts back at the front door.
+- The front door's "thinking" message becomes "<name> here, picking this up.",
+  and the specialist answers the same message below it and keeps the thread.
+  Anything else the front door asked for in that reply is not run. A new
+  thread starts back at the front door.
 - A specialist cannot hand off, and a thread is handed off at most once. The
   specialist acts with its own grants, and any request it starts carries its
   own agent.
 - A thread idle for seven days closes. A later message in it starts again at
   `default_agent`, which can hand off again.
 - Config errors fail at load: an undefined specialist or channel agent, an
-  agent listing itself, a specialist without a `description`, or a specialist
+  agent listing itself, a specialist listed twice, a specialist without a `description`, or a specialist
   that is itself a front door.
 
 ## Several tenants

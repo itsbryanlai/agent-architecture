@@ -40,6 +40,8 @@ _COLUMNS = (
     "outcome"
 )
 _COLUMN_NAMES = [c.strip() for c in _COLUMNS.split(",")]
+_READ_COLUMNS = _COLUMNS + ", seq"
+_READ_COLUMN_NAMES = _COLUMN_NAMES + ["seq"]
 
 
 def canonical_sha256(value: object) -> str:
@@ -59,9 +61,18 @@ class AuditStore(Protocol):
         ...
 
     async def list(
-        self, tenant_id: str, limit: int = 50, before: datetime | None = None
+        self,
+        tenant_id: str,
+        limit: int = 50,
+        before: datetime | None = None,
+        before_seq: int | None = None,
     ) -> list[AuditEvent]:
-        """A tenant's events, newest first; ``before`` keeps only events older than it."""
+        """A tenant's events, newest first.
+
+        ``before`` keeps only events older than that time. ``before_seq`` keeps
+        only events recorded before the one with that ``seq``, so a reader can
+        page through the log without skipping or repeating an event.
+        """
         ...
 
 
@@ -107,27 +118,34 @@ class PostgresAuditStore:
             )
 
     async def list(
-        self, tenant_id: str, limit: int = 50, before: datetime | None = None
+        self,
+        tenant_id: str,
+        limit: int = 50,
+        before: datetime | None = None,
+        before_seq: int | None = None,
     ) -> list[AuditEvent]:
         _check_limit(limit)
         async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 f"""
-                SELECT {_COLUMNS} FROM audit_events
-                WHERE tenant_id = %s AND (%s::timestamptz IS NULL OR at < %s)
-                ORDER BY at DESC, seq DESC
+                SELECT {_READ_COLUMNS} FROM audit_events
+                WHERE tenant_id = %s
+                  AND (%s::timestamptz IS NULL OR at < %s)
+                  AND (%s::bigint IS NULL OR seq < %s)
+                ORDER BY seq DESC
                 LIMIT %s
                 """,
-                (tenant_id, before, before, limit),
+                (tenant_id, before, before, before_seq, before_seq, limit),
             )
             rows = await cur.fetchall()
-        return [AuditEvent(**dict(zip(_COLUMN_NAMES, row))) for row in rows]
+        return [AuditEvent(**dict(zip(_READ_COLUMN_NAMES, row))) for row in rows]
 
 
 class InMemoryAuditStore:
     def __init__(self) -> None:
         self.events: list[AuditEvent] = []  # in the order recorded
         self._keys: set[tuple[str, str]] = set()
+        self._next_seq = 1
         self._fail_next_record = 0
 
     # Test hook.
@@ -144,16 +162,23 @@ class InMemoryAuditStore:
         if key in self._keys:
             return
         self._keys.add(key)
-        self.events.append(dataclasses.replace(event, at=datetime.now(UTC)))
+        self.events.append(dataclasses.replace(event, at=datetime.now(UTC), seq=self._next_seq))
+        self._next_seq += 1
 
     async def list(
-        self, tenant_id: str, limit: int = 50, before: datetime | None = None
+        self,
+        tenant_id: str,
+        limit: int = 50,
+        before: datetime | None = None,
+        before_seq: int | None = None,
     ) -> list[AuditEvent]:
         _check_limit(limit)
         mine = [
             e
             for e in self.events
-            if e.tenant_id == tenant_id and (before is None or (e.at and e.at < before))
+            if e.tenant_id == tenant_id
+            and (before is None or (e.at and e.at < before))
+            and (before_seq is None or (e.seq is not None and e.seq < before_seq))
         ]
         return list(reversed(mine))[:limit]
 

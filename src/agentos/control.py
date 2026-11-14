@@ -23,6 +23,14 @@ An admin may publish a version they submitted themselves, so a tenant with one
 admin can publish. The ``agent_publish`` event records the submitter as the
 requester and the approver, so a self-approval can be seen.
 
+A publish also checks the version's Notion database grants against the live
+databases, with the tenant's Notion client, and is refused when any grant has a
+problem. The editors of an agent and admins can run the same check by itself.
+
+A caller may pass a ``request_id`` to a write. It is used in place of a random
+value to build the audit event key, so a retry with the same ``request_id``
+records one event. The store's own state check refuses the retried change.
+
 A refused action is not audited yet.
 
 The audit event is recorded after the change, in its own transaction. If the
@@ -36,10 +44,26 @@ from datetime import datetime
 from typing import Any
 
 from agentos import ids
-from agentos.agent_store import AgentRecord, AgentStore, AgentStoreError, AgentVersionRecord
+from agentos.agent_store import (
+    PENDING,
+    AgentNotFound,
+    AgentRecord,
+    AgentStore,
+    AgentVersionRecord,
+)
 from agentos.audit import AuditStore, canonical_sha256
 from agentos.config import TenantsConfig
-from agentos.members import ADMIN, CREATOR, ROLES, MemberError, MemberRecord, MemberStore
+from agentos.grant_checker import GrantChecker, GrantProblems, GrantReport
+from agentos.members import (
+    ADMIN,
+    CREATOR,
+    ROLES,
+    InvalidMember,
+    MemberError,
+    MemberNotFound,
+    MemberRecord,
+    MemberStore,
+)
 from agentos.models import AuditEvent
 
 
@@ -54,11 +78,13 @@ class ControlPlane:
         members: MemberStore,
         audit: AuditStore,
         tenants: TenantsConfig,
+        grant_checker: GrantChecker,
     ):
         self._agents = agents
         self._members = members
         self._audit = audit
         self._tenants = tenants
+        self._grant_checker = grant_checker
 
     # --- roles ---------------------------------------------------------------
 
@@ -82,12 +108,10 @@ class ControlPlane:
     async def _require_editor(self, tenant_id: str, actor: str, agent_id: str) -> None:
         """An admin, or the creator of this agent."""
         role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        if role == ADMIN:
-            return
         agent = await self._agents.get_agent(tenant_id, agent_id)
         if agent is None:
-            raise AgentStoreError(f"agent '{agent_id}' does not exist")
-        if agent.created_by != actor:
+            raise AgentNotFound(f"agent '{agent_id}' does not exist")
+        if role != ADMIN and agent.created_by != actor:
             raise Forbidden(f"'{actor}' did not create agent '{agent_id}'")
 
     async def _admin_count(self, tenant_id: str) -> int:
@@ -109,12 +133,13 @@ class ControlPlane:
         approver: str | None = None,
         target: str | None = None,
         tool: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         """One event. A definition is hashed into ``input_sha256`` and never stored."""
         await self._audit.record(
             AuditEvent(
                 tenant_id=tenant_id,
-                event_key=ids.audit_control_key(tenant_id, kind, uuid.uuid4().hex),
+                event_key=ids.audit_control_key(tenant_id, kind, request_id or uuid.uuid4().hex),
                 kind=kind,
                 agent_id=None if version is None else version.agent_id,
                 agent_version=None if version is None else version.version,
@@ -149,20 +174,40 @@ class ControlPlane:
         return await self._members.list_members(tenant_id)
 
     async def audit_log(
-        self, tenant_id: str, actor: str, limit: int = 50, before: datetime | None = None
+        self,
+        tenant_id: str,
+        actor: str,
+        limit: int = 50,
+        before: datetime | None = None,
+        before_seq: int | None = None,
     ) -> list[AuditEvent]:
         await self._require_role(tenant_id, actor, ADMIN)
-        return await self._audit.list(tenant_id, limit, before)
+        return await self._audit.list(tenant_id, limit, before, before_seq)
+
+    async def check_version_grants(
+        self, tenant_id: str, actor: str, agent_id: str, version: int
+    ) -> list[GrantReport]:
+        """Check a version's Notion database grants. Read-only; editors and admins."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        return await self._grant_checker.check(tenant_id, record.agent())
 
     # --- agents --------------------------------------------------------------
 
     async def add_agent(
-        self, tenant_id: str, actor: str, agent_id: str, definition: dict[str, Any]
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        definition: dict[str, Any],
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         """Create an agent as version 1, a draft, with the actor as its creator."""
         await self._require_role(tenant_id, actor, ADMIN, CREATOR)
         record = await self._agents.create_agent(tenant_id, agent_id, definition, actor)
-        await self._record("agent_create", tenant_id, actor, version=record)
+        await self._record("agent_create", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def new_draft(
@@ -171,11 +216,12 @@ class ControlPlane:
         actor: str,
         agent_id: str,
         from_version: int | None = None,
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         """A new draft copied from ``from_version``, or from the published version."""
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.create_draft(tenant_id, agent_id, actor, from_version)
-        await self._record("agent_draft", tenant_id, actor, version=record)
+        await self._record("agent_draft", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def edit_draft(
@@ -185,42 +231,71 @@ class ControlPlane:
         agent_id: str,
         version: int,
         definition: dict[str, Any],
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.replace_draft(tenant_id, agent_id, version, definition)
-        await self._record("agent_draft", tenant_id, actor, version=record)
+        await self._record("agent_draft", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def submit_version(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.submit(tenant_id, agent_id, version, actor)
-        await self._record("agent_submit", tenant_id, actor, version=record)
+        await self._record("agent_submit", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def withdraw_version(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.withdraw(tenant_id, agent_id, version)
-        await self._record("agent_withdraw", tenant_id, actor, version=record)
+        await self._record(
+            "agent_withdraw", tenant_id, actor, version=record, request_id=request_id
+        )
         return record
 
     async def reject_version(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         """Send a pending version back to draft. Only an admin."""
         await self._require_role(tenant_id, actor, ADMIN)
         record = await self._agents.withdraw(tenant_id, agent_id, version)
-        await self._record("agent_reject", tenant_id, actor, version=record)
+        await self._record("agent_reject", tenant_id, actor, version=record, request_id=request_id)
         return record
 
     async def publish_version(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
     ) -> AgentVersionRecord:
         """Publish a pending version. Only an admin, who may be its submitter."""
         await self._require_role(tenant_id, actor, ADMIN)
+        pending = await self._agents.get_version(tenant_id, agent_id, version)
+        if pending is not None and pending.status == PENDING:
+            # Any other status is refused by the store below, with its own reason.
+            reports = await self._grant_checker.check(tenant_id, pending.agent())
+            if any(report.problems for report in reports):
+                raise GrantProblems(reports)
         record = await self._agents.publish(tenant_id, agent_id, version, actor)
         await self._record(
             "agent_publish",
@@ -229,37 +304,58 @@ class ControlPlane:
             version=record,
             requester=record.submitted_by,
             approver=actor,
+            request_id=request_id,
         )
         return record
 
     # --- members -------------------------------------------------------------
 
-    async def invite_member(self, tenant_id: str, actor: str, user_id: str, role: str) -> None:
+    async def invite_member(
+        self, tenant_id: str, actor: str, user_id: str, role: str, request_id: str | None = None
+    ) -> None:
         await self._require_role(tenant_id, actor, ADMIN)
         if user_id in self._config_admins(tenant_id):
             raise MemberError(f"'{user_id}' is an admin set in the tenant file")
         await self._members.add_member(tenant_id, user_id, role, actor)
-        await self._record("member_add", tenant_id, actor, target=user_id, tool=f"role:{role}")
+        await self._record(
+            "member_add",
+            tenant_id,
+            actor,
+            target=user_id,
+            tool=f"role:{role}",
+            request_id=request_id,
+        )
 
-    async def change_role(self, tenant_id: str, actor: str, user_id: str, role: str) -> None:
+    async def change_role(
+        self, tenant_id: str, actor: str, user_id: str, role: str, request_id: str | None = None
+    ) -> None:
         await self._require_role(tenant_id, actor, ADMIN)
         if role not in ROLES:
-            raise MemberError(f"role must be one of {', '.join(ROLES)}")
+            raise InvalidMember(f"role must be one of {', '.join(ROLES)}")
         current = await self._protected_member(tenant_id, user_id)
         if current.role == role:
             raise MemberError(f"'{user_id}' already has the role {role}")
         if current.role == ADMIN and await self._admin_count(tenant_id) <= 1:
             raise Forbidden("the tenant's last admin cannot be demoted")
         await self._members.set_member_role(tenant_id, user_id, role)
-        await self._record("member_role", tenant_id, actor, target=user_id, tool=f"role:{role}")
+        await self._record(
+            "member_role",
+            tenant_id,
+            actor,
+            target=user_id,
+            tool=f"role:{role}",
+            request_id=request_id,
+        )
 
-    async def drop_member(self, tenant_id: str, actor: str, user_id: str) -> None:
+    async def drop_member(
+        self, tenant_id: str, actor: str, user_id: str, request_id: str | None = None
+    ) -> None:
         await self._require_role(tenant_id, actor, ADMIN)
         current = await self._protected_member(tenant_id, user_id)
         if current.role == ADMIN and await self._admin_count(tenant_id) <= 1:
             raise Forbidden("the tenant's last admin cannot be removed")
         await self._members.remove_member(tenant_id, user_id)
-        await self._record("member_remove", tenant_id, actor, target=user_id)
+        await self._record("member_remove", tenant_id, actor, target=user_id, request_id=request_id)
 
     async def _protected_member(self, tenant_id: str, user_id: str) -> MemberRecord:
         """The member's row, after refusing a YAML admin, who is configuration."""
@@ -267,5 +363,5 @@ class ControlPlane:
             raise Forbidden(f"'{user_id}' is an admin set in the tenant file")
         row = await self._members.get_member(tenant_id, user_id)
         if row is None:
-            raise MemberError(f"'{user_id}' is not a member")
+            raise MemberNotFound(f"'{user_id}' is not a member")
         return row

@@ -30,6 +30,14 @@ class MemberError(ValueError):
     """The change names a member that does not exist, or one that already does."""
 
 
+class MemberNotFound(MemberError):
+    """The change names a user who is not a member."""
+
+
+class InvalidMember(MemberError):
+    """The user ID or the role is not one a member can have."""
+
+
 @dataclass(frozen=True)
 class MemberRecord:
     tenant_id: str
@@ -41,9 +49,9 @@ class MemberRecord:
 
 def check_member(user_id: str, role: str) -> None:
     if not isinstance(user_id, str) or not user_id.strip() or user_id != user_id.strip():
-        raise MemberError("a member needs a Slack user ID")
+        raise InvalidMember("a member needs a Slack user ID")
     if role not in ROLES:
-        raise MemberError(f"role must be one of {', '.join(ROLES)}")
+        raise InvalidMember(f"role must be one of {', '.join(ROLES)}")
 
 
 class MemberStore(Protocol):
@@ -66,8 +74,8 @@ class MemberStore(Protocol):
         ...
 
 
-def _no_member(user_id: str) -> MemberError:
-    return MemberError(f"'{user_id}' is not a member")
+def _no_member(user_id: str) -> MemberNotFound:
+    return MemberNotFound(f"'{user_id}' is not a member")
 
 
 _COLUMNS = "tenant_id, user_id, role, added_by, added_at"

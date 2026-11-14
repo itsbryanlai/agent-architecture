@@ -75,6 +75,10 @@ class AgentStoreError(ValueError):
     """The change is not allowed or names nothing that exists."""
 
 
+class AgentNotFound(AgentStoreError):
+    """The change names an agent or a version that does not exist."""
+
+
 @dataclass(frozen=True)
 class AgentVersionRecord:
     """One stored version of an agent, with its lifecycle."""
@@ -207,7 +211,13 @@ def _validated(agent_id: str, definition: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(definition, dict):
         raise ConfigError(f"agent '{agent_id}': the definition must be a mapping")
     stored = _without_version(definition)
-    parse_agent(agent_id, stored, 1)
+    try:
+        parse_agent(agent_id, stored, 1)
+    except ConfigError:
+        raise
+    except (ValueError, TypeError, AttributeError) as err:
+        # A value of the wrong type (a word where a number goes) is a bad definition too.
+        raise ConfigError(f"agent '{agent_id}': the definition is invalid ({err})") from err
     return stored
 
 
@@ -218,8 +228,8 @@ def _stale(agent_id: str, version: int, published: int) -> AgentStoreError:
     )
 
 
-def _no_such(agent_id: str, version: int) -> AgentStoreError:
-    return AgentStoreError(f"agent '{agent_id}' has no version {version}")
+def _no_such(agent_id: str, version: int) -> AgentNotFound:
+    return AgentNotFound(f"agent '{agent_id}' has no version {version}")
 
 
 def _wrong_status(agent_id: str, version: int, status: str, wanted: str) -> AgentStoreError:

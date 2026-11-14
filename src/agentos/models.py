@@ -238,6 +238,9 @@ class AuditEvent:
     output_sha256: str | None = None
     approver_user_id: str | None = None
     at: datetime | None = None
+    # The store's insertion order, set when the event is read back: it grows with
+    # every event recorded and is what a page of the log continues from.
+    seq: int | None = None
 
     def __post_init__(self) -> None:
         if not self.tenant_id or not self.event_key:

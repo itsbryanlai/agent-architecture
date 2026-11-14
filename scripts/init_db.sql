@@ -312,3 +312,33 @@ DROP POLICY IF EXISTS tenant_isolation ON members;
 CREATE POLICY tenant_isolation ON members
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Web console sessions: one row per signed-in browser, session ID stored as a hash. Same as migration 008.
+CREATE TABLE IF NOT EXISTS sessions (
+  tenant_id    text        NOT NULL,
+  session_hash text        NOT NULL,   -- SHA-256 (hex) of the session ID
+  user_id      text        NOT NULL,   -- Slack user ID
+  csrf_secret  text        NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  expires_at   timestamptz NOT NULL,
+  PRIMARY KEY (tenant_id, session_hash)
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON sessions FROM agentos_app;
+GRANT SELECT, INSERT, DELETE ON sessions TO agentos_app;
+
+ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON sessions;
+CREATE POLICY tenant_isolation ON sessions
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

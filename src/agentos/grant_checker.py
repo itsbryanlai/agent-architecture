@@ -9,8 +9,10 @@ on request for an editor, and refuses a publish when any grant has a problem.
 The check only reads: the schemas of the granted databases and the granted pages.
 A page grant must be readable and not trashed. A transient Notion failure (network
 error, rate limit, server error) is not a grant problem: it raises
-``GrantCheckUnavailable``, so a publish is refused for now but not judged. It uses the tenant's
-own Notion client, because agents run with tenant-level credentials.
+``GrantCheckUnavailable``, so a publish is refused for now but not judged. Any other
+failure (a tenant without its Notion key, a bug) is not a statement about Notion and
+propagates as itself. It uses the tenant's own Notion client, because agents run with
+tenant-level credentials.
 """
 
 from __future__ import annotations
@@ -19,8 +21,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+import httpx
+from notion_client.errors import RequestTimeoutError
+
 from agentos.config import AgentVersion
-from agentos.connectors.notion import NotionAPI, check_grant, check_page_grant, is_unreachable
+from agentos.connectors.notion import NotionAPI, check_grant, check_page_grant
+
+# What the Notion client raises when the request never got an answer: its own
+# timeout, any httpx transport failure, and the OS-level connection errors and
+# timeouts (not every OSError: a file or permission error is a bug, not an outage).
+TRANSPORT_ERRORS = (httpx.TransportError, RequestTimeoutError, ConnectionError, TimeoutError)
 
 
 class GrantCheckUnavailable(Exception):
@@ -60,13 +70,20 @@ class GrantChecker(Protocol):
 def is_transient(err: Exception) -> bool:
     """A failure that may pass: a network error, a rate limit or a server error.
 
-    A 403 or 404 (the page is gone or not shared) and other client errors are
-    permanent: they are problems with the grant, not with Notion.
+    Only these say anything about Notion. A 403 or 404 (the page is gone or not
+    shared) and other client errors are permanent: they are problems with the
+    grant. Anything else (a missing key, a bug) is no statement about Notion and
+    is not transient.
     """
-    if is_unreachable(err):
-        return False
+    if isinstance(err, TRANSPORT_ERRORS):
+        return True
     status = getattr(err, "status", None)
-    return not isinstance(status, int) or status == 429 or status >= 500
+    return isinstance(status, int) and (status == 429 or status >= 500)
+
+
+def _is_grant_problem(err: Exception) -> bool:
+    """A refusal from Notion itself (403, 404, other 4xx): the grant is at fault."""
+    return isinstance(getattr(err, "status", None), int) and not is_transient(err)
 
 
 class _ReadErrors:
@@ -97,27 +114,45 @@ class NotionGrantChecker:
         pages = agent.grants.notion_pages
         if not grants and not pages:
             return []
+        # Outside the try: a missing key is a setup error, not a Notion outage.
+        api = self._api_for(tenant_id)
         try:
-            api = self._api_for(tenant_id)
-            reports = []
-            for grant in grants:
-                result = await check_grant(api, grant, require_ids=True)
-                reports.append(
-                    GrantReport(
-                        grant.name,
-                        grant.id,
-                        problems=list(result.problems),
-                        notes=list(result.notes),
-                    )
-                )
-            for page_grant in pages:
-                seen = _ReadErrors(api)
-                problems = await check_page_grant(seen, page_grant)
-                if any(is_transient(err) for err in seen.errors):
-                    raise seen.errors[0]
-                reports.append(GrantReport(page_grant.name, page_grant.id, "page", problems))
+            return await self._reports(api, grants, pages)
         except Exception as err:
-            raise GrantCheckUnavailable(
-                f"could not read the granted databases and pages from Notion ({type(err).__name__})"
-            ) from err
+            if is_transient(err):
+                raise GrantCheckUnavailable(
+                    "could not read the granted databases and pages from Notion "
+                    f"({type(err).__name__})"
+                ) from err
+            raise
+
+    @staticmethod
+    async def _reports(api: NotionAPI, grants, pages) -> list[GrantReport]:
+        reports = []
+        for grant in grants:
+            try:
+                result = await check_grant(api, grant, require_ids=True)
+            except Exception as err:
+                if not _is_grant_problem(err):
+                    raise
+                what = f"database '{grant.name}' cannot be read with this token"
+                reports.append(
+                    GrantReport(grant.name, grant.id, problems=[f"{what} ({type(err).__name__})"])
+                )
+                continue
+            reports.append(
+                GrantReport(
+                    grant.name,
+                    grant.id,
+                    problems=list(result.problems),
+                    notes=list(result.notes),
+                )
+            )
+        for page_grant in pages:
+            seen = _ReadErrors(api)
+            problems = await check_page_grant(seen, page_grant)
+            for err in seen.errors:
+                if not _is_grant_problem(err):
+                    raise err
+            reports.append(GrantReport(page_grant.name, page_grant.id, "page", problems))
         return reports

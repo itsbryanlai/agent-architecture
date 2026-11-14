@@ -119,8 +119,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
       'agent_withdraw', 'agent_reject', 'agent_publish',
       'member_add', 'member_remove', 'member_role',
       'audience_refused', 'audience_confirm', 'budget_set',
-      'audience_pause', 'audience_resume')),
-  agent_id           text,                   -- null only for a membership event or a tenant-wide budget
+      'audience_pause', 'audience_resume',
+      'switch_off', 'switch_on')),
+  agent_id           text,                   -- null only for a membership event, a tenant-wide budget or switch
   agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked
   identity           text        NOT NULL,   -- whose access was used, e.g. agent:it-helper
@@ -135,7 +136,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
   PRIMARY KEY (tenant_id, event_key),
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
-    kind IN ('member_add', 'member_remove', 'member_role', 'budget_set')
+    kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
+             'switch_off', 'switch_on')
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
@@ -452,5 +454,36 @@ ALTER TABLE audience_pauses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audience_pauses FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON audience_pauses;
 CREATE POLICY tenant_isolation ON audience_pauses
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Kill switches: one row per switch that is off. Same as migration 014.
+CREATE TABLE IF NOT EXISTS kill_switches (
+  tenant_id      text        NOT NULL,
+  scope          text        NOT NULL CHECK (scope IN ('agent', 'all_agents', 'connector', 'writes')),
+  target         text        NOT NULL DEFAULT '',   -- agent ID or connector name; empty otherwise
+  turned_off_by  text        NOT NULL,
+  turned_off_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, scope, target),
+  CONSTRAINT kill_switches_target_matches_scope CHECK (
+    (scope IN ('agent', 'connector')) = (target <> ''))
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON kill_switches FROM agentos_app;
+GRANT SELECT, INSERT, DELETE ON kill_switches TO agentos_app;
+
+ALTER TABLE kill_switches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kill_switches FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON kill_switches;
+CREATE POLICY tenant_isolation ON kill_switches
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

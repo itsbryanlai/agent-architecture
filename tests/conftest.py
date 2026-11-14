@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     TASK_QUEUE,
     AgentsConfig,
@@ -147,6 +148,7 @@ class Harness:
     idem: InMemoryIdempotencyStore
     links: InMemoryTaskLinkStore
     tool_outputs: InMemoryToolOutputStore
+    audit: InMemoryAuditStore = field(default_factory=InMemoryAuditStore)
 
     @property
     def client(self):
@@ -175,6 +177,7 @@ async def harness(agents):
         links=h.links,
         llm=h.llm,
         tool_outputs=h.tool_outputs,
+        audit=h.audit,
     )
     worker = Worker(
         wf_env.client,
@@ -300,6 +303,7 @@ async def kharness():
         links=h.links,
         llm=h.llm,
         tool_outputs=h.tool_outputs,
+        audit=h.audit,
         knowledge=h.knowledge,
         embedder=h.embedder,
     )
@@ -386,6 +390,7 @@ async def two_tenants():
         links=InMemoryTaskLinkStore(),
         llm=h.llm,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
     )
     worker = Worker(
         wf_env.client,

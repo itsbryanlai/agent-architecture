@@ -13,6 +13,7 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     ConfigError,
     Settings,
@@ -365,6 +366,7 @@ async def test_unknown_tenant_activity_fails_non_retryable():
         links=InMemoryTaskLinkStore(),
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
     )
     ctx = TurnContext(
         tenant_id="initech",
@@ -396,6 +398,7 @@ def make_acts(*configs):
         links=InMemoryTaskLinkStore(),
         llm=None,
         tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
     )
 
 

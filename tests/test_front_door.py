@@ -91,6 +91,7 @@ async def running(raw: dict):
         links=h.links,
         llm=h.llm,
         tool_outputs=h.tool_outputs,
+        audit=h.audit,
     )
     worker = Worker(
         wf_env.client,

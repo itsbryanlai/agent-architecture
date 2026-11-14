@@ -699,6 +699,61 @@ The console process now also reads each tenant's Slack bot token (the variable
 `secrets.slack_bot_token_env` names, `SLACK_BOT_TOKEN` by default) to count the people; a
 tenant without it can't publish until it is set.
 
+### Audience changes are watched
+
+An answer posted in a channel is read by everyone in it, including guests and people from
+other Slack workspaces who cannot ask the agent themselves. So when one of these happens in
+a channel that a published agent answers in, the agent is **paused in that channel**:
+
+- a guest (single- or multi-channel) joins, or a person from another workspace joins;
+- the channel is shared with another organisation (Slack Connect);
+- a private channel is made public.
+
+An ordinary full member or a bot joining changes nothing.
+
+**What a paused channel shows.** Every message there gets one fixed reply, "<agent name> is
+paused in this channel until its owner reviews who can see it.", and nothing else runs: no
+model call, no tool. Direct messages and other channels are unaffected. A thread that was
+already running in the channel is paused too, from its next message. The agent's creator and
+the tenant's admins each get a direct message once per pause, naming the agent, the channel
+and the reason, never any content.
+
+**Resuming.** The agent page and the version page list the paused channels with the reason,
+the time and how many people are in each channel now (total, guests, from other workspaces).
+The agent's creator or an admin ticks "I confirm these people may see what this agent says
+here" and presses **Resume**; the counts must still match a fresh read, as at publish.
+Pausing (`audience_pause`) and resuming (`audience_resume`) are audited, and a resumed pause
+stays in the `audience_pauses` table as history. The same trigger while a channel is already
+paused changes nothing.
+
+If the person who joined cannot be looked up in Slack, the agent is paused with the reason
+"someone joined the channel and could not be checked" rather than left answering.
+
+The pauses need migration `013` (a new install gets the table from `scripts/init_db.sql`;
+run it before the worker and the gateway restart, or the audit insert for a pause is
+refused). It also keeps the audit kind `budget_set`, so run it after the budgets migration
+when both are in use:
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/013_audience_watch.sql
+```
+
+**In the Slack app** (api.slack.com/apps), Event Subscriptions → Subscribe to bot events,
+add exactly these, then save and **reinstall the app**:
+
+| Event | Why |
+| --- | --- |
+| `member_joined_channel` | someone joined a channel |
+| `channel_shared` | a channel was shared with another organisation |
+| `message.channels` | a public channel's messages; carries "converted to public" |
+| `message.groups` | a private channel's messages; carries "converted to public" |
+
+(`app_mention` and `message.im` stay.) The new events need the bot scopes `channels:read`,
+`groups:read` (already added for audiences), `channels:history` and `groups:history`. The
+bot only hears about channels it is a member of. Every message in those channels now
+reaches the gateway, which drops all but the one that reports a conversion to public.
+`slack/app-manifest.yaml` lists the same events and scopes.
+
 ## Web console
 
 The same process serves web pages for agents, versions, members, usage and the audit log,

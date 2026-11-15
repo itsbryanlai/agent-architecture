@@ -111,11 +111,63 @@ def test_event_with_type_and_token_field_is_not_a_handshake(
     assert not (saved_path(tmp_path)).exists()
 
 
-def test_handshake_overwrites_an_existing_file(agents, temporal, links, tmp_path, monkeypatch):
+def test_second_handshake_is_refused_and_the_file_unchanged(
+    agents, temporal, links, tmp_path, monkeypatch, caplog
+):
+    """Fails if a second handshake replaces the token file the operator has not deleted."""
     client = make_client(agents, temporal, links, tmp_path, monkeypatch, token=None)
-    post(client, {"verification_token": "old"}, None)
-    post(client, {"verification_token": "new"}, None)
-    assert (saved_path(tmp_path)).read_text() == "new"
+    post(client, {"verification_token": "original-token"}, None)
+    with caplog.at_level(logging.DEBUG):
+        resp = post(client, {"verification_token": "replacement-token"}, None)
+    assert resp.status_code == 409
+    assert (saved_path(tmp_path)).read_text() == "original-token"
+    assert "replacement-token" not in caplog.text
+    assert TENANT in caplog.text
+
+
+def test_handshake_is_accepted_again_once_the_operator_deletes_the_file(
+    agents, temporal, links, tmp_path, monkeypatch
+):
+    """Fails if deleting the file does not reopen the handshake."""
+    client = make_client(agents, temporal, links, tmp_path, monkeypatch, token=None)
+    post(client, {"verification_token": "original-token"}, None)
+    saved_path(tmp_path).unlink()
+    assert post(client, {"verification_token": "replacement-token"}, None).status_code == 200
+    assert saved_path(tmp_path).read_text() == "replacement-token"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"verification_token": "t", "extra": "x"},
+        {"verification_token": ""},
+        {"verification_token": "t" * 1025},
+    ],
+    ids=["extra-key", "empty", "too-long"],
+)
+def test_handshake_with_another_shape_is_refused(
+    agents, temporal, links, tmp_path, monkeypatch, payload
+):
+    """Fails if the handshake accepts a body that is not exactly one sane token."""
+    client = make_client(agents, temporal, links, tmp_path, monkeypatch, token=None)
+    resp = post(client, payload, None)
+    assert resp.status_code == 400
+    assert not saved_path(tmp_path).exists()
+
+
+def test_handshake_refuses_a_symlink_at_the_token_path(
+    agents, temporal, links, tmp_path, monkeypatch
+):
+    """Fails if the handshake writes through a symlink planted at the token path."""
+    client = make_client(agents, temporal, links, tmp_path, monkeypatch, token=None)
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    path = saved_path(tmp_path)
+    path.parent.mkdir()
+    path.symlink_to(target)
+    resp = post(client, {"verification_token": "t"}, None)
+    assert resp.status_code == 409
+    assert target.read_text() == "keep"
 
 
 def test_handshake_refused_when_token_configured(

@@ -18,6 +18,7 @@ from agentos.control_api import (
     MAX_AUDIT_LIMIT,
     LocalOperator,
     check_bind_host,
+    check_database_for_bind,
     create_app,
     operator_from_environment,
 )
@@ -976,3 +977,33 @@ async def test_a_bug_while_reading_a_page_is_a_500(h):
     async with quiet_client(h.app) as c:
         response = await c.post(t("/agents/it-helper/versions/1/publish"))
     assert response.status_code == 500 and "secret" not in response.text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://agentos_app:agentos_app@db:5432/agentos",
+        "postgresql://agentos_app@db:5432/agentos",
+        "postgresql://agentos_app:@db:5432/agentos",
+        "host=db dbname=agentos user=agentos_app",
+    ],
+    ids=["default", "no-password", "empty-password", "conninfo-no-password"],
+)
+def test_a_public_bind_is_refused_with_a_development_database_password(url):
+    """Fails if the console listens beyond loopback while the database password is a default."""
+    with pytest.raises(SystemExit) as refused:
+        check_database_for_bind("0.0.0.0", url)
+    assert "AGENTOS_DATABASE_URL" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("host", "url"),
+    [
+        ("0.0.0.0", "postgresql://agentos_app:s3cret-value@db:5432/agentos"),
+        ("127.0.0.1", "postgresql://agentos_app:agentos_app@localhost:55432/agentos"),
+    ],
+    ids=["public-with-own-password", "loopback-with-default"],
+)
+def test_the_database_check_passes_when_it_is_safe(host, url):
+    """Fails if the check refuses a loopback bind or a deployment-specific password."""
+    check_database_for_bind(host, url)

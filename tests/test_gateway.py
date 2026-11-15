@@ -12,7 +12,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
-from agentos.gateway.app import create_app
+from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import ALICE, TEAM, TENANT
@@ -204,3 +204,13 @@ def test_gateway_interactivity_stale_card(client, secret, temporal):
 
 def test_gateway_healthz(client):
     assert client.get("/healthz").json() == {"ok": True}
+
+
+@pytest.mark.parametrize("route", ["/slack/events", "/slack/interactivity", "/notion/webhook"])
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+def test_oversized_webhook_body_is_refused_before_anything_else(client, route, chunked):
+    """Fails if a webhook route holds or parses a body over the limit instead of 413."""
+    size = MAX_WEBHOOK_BODY + 1
+    content = (b"x" * 65536 for _ in range(size // 65536 + 1)) if chunked else b"x" * size
+    resp = client.post(route, content=content)
+    assert resp.status_code == 413

@@ -4,6 +4,7 @@ Slack is a fake: no request leaves the process.
 """
 
 import hashlib
+from dataclasses import replace
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -501,7 +502,8 @@ def test_without_sign_in_the_process_is_loopback_and_acts_as_the_operator():
 
 async def test_with_sign_in_the_process_binds_publicly_and_the_fixed_operator_is_off(h):
     for environ in ({}, {"AGENTOS_CONTROL_ACTOR": ROOT}):
-        app = build_process_app("0.0.0.0", 8100, full(), environ)
+        own_database = replace(full(), database_url="postgresql://app:own-password@db/agentos")
+        app = build_process_app("0.0.0.0", 8100, own_database, environ)
         assert app.state.deps.console.sign_in.console_url == CONSOLE_URL
         app.state.deps.tenants = StaticTenants(h.tenants)  # what the real start-up fills in
         app.state.deps.plane = h.plane

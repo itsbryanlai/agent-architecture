@@ -1,9 +1,11 @@
 """History sent to the model is repaired and bounded on every turn."""
 
+import pytest
+
 from agentos import ids
 from agentos.history_view import HISTORY_BUDGET_CHARS, prepare_for_model
 from agentos.models import LLMResponse
-from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.conversation import EMPTY_MESSAGE_REPLY, ConversationWorkflow
 from tests.conftest import TENANT, eventually
 from tests.test_conversation_workflow import CHANNEL, THREAD, inbound, start_conversation
 
@@ -183,3 +185,35 @@ def test_window_never_starts_on_a_message_carrying_tool_results():
     sent = prepare_for_model(messages)
     assert_tool_pairs_valid(sent)
     assert sent[-1]["content"][0]["text"] == "q2"
+
+
+@pytest.mark.parametrize("text", ["", "   \n"], ids=["bare-mention", "whitespace-dm"])
+async def test_message_without_text_gets_a_fixed_reply_and_poisons_nothing(harness, text):
+    """Fails if a bare mention is stored or sent to the model, or the thread stops answering."""
+    h = harness
+    h.llm.queue(LLMResponse(text="Real answer", tool_calls=[], stop_reason="end_turn"))
+    handle = await start_conversation(h, inbound("Ev1", text))
+    await eventually(lambda: [p for p in h.slack.posts() if p["text"] == EMPTY_MESSAGE_REPLY])
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2", "a real question"))
+    await eventually(lambda: h.slack.updates())
+
+    assert h.slack.updates()[0]["text"] == "Real answer"
+    assert len(h.llm.calls) == 1
+    assert [m["content"][0]["text"] for m in h.llm.calls[0]["messages"]] == ["a real question"]
+    stored = await h.history.load(TENANT, CONV_ID)
+    assert all(b["text"].strip() for m in stored for b in m["content"])
+
+
+async def test_empty_text_block_already_stored_is_not_sent(harness):
+    """Fails if a row stored before bare mentions were refused still reaches the model."""
+    h = harness
+    await h.history.append(TENANT, CONV_ID, "old:user", "user", [{"type": "text", "text": ""}])
+    await h.history.append(
+        TENANT, CONV_ID, "old:recover", "assistant", [{"type": "text", "text": "Turn failed"}]
+    )
+    h.llm.queue(LLMResponse(text="Answer", tool_calls=[], stop_reason="end_turn"))
+    await start_conversation(h, inbound("Ev1", "hello"))
+    await eventually(lambda: h.slack.updates())
+
+    sent = h.llm.calls[0]["messages"]
+    assert [(m["role"], m["content"][0]["text"]) for m in sent] == [("user", "hello")]

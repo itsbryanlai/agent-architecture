@@ -175,21 +175,36 @@ _CARD_ROOM = {
 }
 
 
-def check_field(tool_name: str, name: str, value: str) -> str | None:
-    """Why ``value`` may not be this field of ``tool_name``, or None if it fits."""
+def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:
+    """Why ``value`` does not fit, and what the model should do about it."""
     limit = EDITABLE_FIELDS[tool_name][name]
     if len(value) > limit:
         return (
-            f"'{name}' is {len(value)} characters; the limit is {limit}. "
-            "Shorten it and call the tool again."
+            f"'{name}' is {len(value)} characters; the limit is {limit}.",
+            "Shorten it and call the tool again.",
         )
     if len(escape_slack(value)) > _CARD_ROOM[name]:
-        return (
+        what = (
             f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "
-            f"approval card and the result is over its {_CARD_ROOM[name]}-character room. "
-            "Shorten it or use fewer of them, and call the tool again."
+            f"approval card and the result is over its {_CARD_ROOM[name]}-character room."
         )
+        return what, "Shorten it or use fewer of them, and call the tool again."
     return None
+
+
+def check_field(tool_name: str, name: str, value: str) -> str | None:
+    """Why ``value`` may not be this field of ``tool_name``, or None if it fits.
+
+    The message is written for the model, which is told to call the tool again.
+    """
+    problem = _field_problem(tool_name, name, value)
+    return " ".join(problem) if problem else None
+
+
+def field_error(tool_name: str, name: str, value: str) -> str | None:
+    """The same check as :func:`check_field`, worded for a person editing the field."""
+    problem = _field_problem(tool_name, name, value)
+    return problem[0] if problem else None
 
 
 @dataclass

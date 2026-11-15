@@ -93,6 +93,8 @@ PATCH_PARTIAL_TOOL_RESULTS = "close-only-failed-tool-calls"
 PATCH_STEP_LIMIT = "no-tools-on-last-step"
 PATCH_EARLY_FAILURE_NOTICE = "early-failure-notice"
 PATCH_AUDIENCE = "audience-check"
+PATCH_EMPTY_MESSAGE = "empty-message-reply"
+EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
 class _TurnState:
@@ -298,6 +300,16 @@ class ConversationWorkflow:
         ctx = self._turn_context(ref, agent, m)
         state.event_id = m.event_id
         if workflow.patched(PATCH_AUDIENCE) and not await self._audience_allows(agent, ctx, m):
+            return
+        if not m.text.strip() and workflow.patched(PATCH_EMPTY_MESSAGE):
+            # A bare mention: nothing to answer, and an empty text block stored in
+            # history would be rejected by the model on every later call.
+            await workflow.execute_activity_method(
+                AgentActivities.post_in_thread,
+                args=[ctx, EMPTY_MESSAGE_REPLY, ids.empty_message_key(m.event_id, ctx.agent_id)],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
             return
         await self._append(
             ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]

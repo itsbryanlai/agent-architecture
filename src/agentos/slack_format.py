@@ -10,9 +10,14 @@ italic is ``_x_`` (Markdown: ``*x*``), strike is ``~x~``, and headings and
 Slack syntax instead does not hold: it drifts back. So the runtime converts
 what it posts and leaves what it stores alone.
 
-Fenced code blocks and inline code are never changed. Markdown links are left
-as written: the runtime does not turn model-written links into Slack links.
-Numbered lists and citation markers such as ``[1]`` pass through unchanged.
+Each line is cut once into segments: inline code, Markdown link, or plain text.
+Only plain text is converted. Fenced code blocks (several lines, or a whole
+fence on one line) and the code and link segments are escaped but otherwise
+left as written; the runtime does not turn model-written links into Slack
+links. Emphasis may wrap a code or link segment (``**run `x` now**``) but a
+marker inside one is never read. Numbered lists and citation markers such as
+``[1]`` pass through unchanged. Input may hold any character, including the
+private-use ones: nothing is used as an in-band marker.
 
 The conversion is NOT idempotent, and must not be. Markdown ``*x*`` means
 italic while Slack ``*x*`` means bold, so a second pass over converted text
@@ -28,8 +33,11 @@ import re
 _QUOTE_PREFIX = re.compile(r"^(\s*(?:>\s?)+)")
 _HEADING = re.compile(r"^#{1,6} +(.*?)\s*$")
 _BULLET = re.compile(r"^(\s*)[*-] +")
-_CODE_SPAN = re.compile(r"`[^`\n]*`")
-_LINK = re.compile(r"\[[^\]\n]*\]\([^)\n]*\)")
+# A run of backticks closed by a run of the same length; or a Markdown link.
+_PROTECTED = re.compile(
+    r"(?P<code>(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`))"
+    r"|(?P<link>\[[^\]\n]*\]\([^)\n]*\))"
+)
 _BOLD3 = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD_STAR = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _BOLD_UNDER = re.compile(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
@@ -42,9 +50,7 @@ _ENTITY = re.compile(r"&(amp|lt|gt);")
 _ENTITIES = {"amp": "&", "lt": "<", "gt": ">"}
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:(?://)?")
 
-# Private-use marks: a converted bold marker, and a protected span's slot.
-_BOLD = ""
-_SLOT = re.compile("(\\d+)")
+_FILL = "\0"  # stands in the mask for characters that emphasis rules must not touch
 
 
 def escape_slack(text: str) -> str:
@@ -91,46 +97,92 @@ def to_slack_mrkdwn(text: str) -> str:
     out: list[str] = []
     in_fence = False
     for line in text.split("\n"):
-        if line.startswith("```"):
-            in_fence = not in_fence
+        if in_fence:
+            in_fence = not line.startswith("```")
             out.append(escape_slack(line))
-        elif in_fence:
+        elif line.startswith("```"):
+            # A fence that closes on its own line is a whole block already.
+            in_fence = "```" not in line[3:]
             out.append(escape_slack(line))
         else:
             out.append(_convert_line(line))
     return "\n".join(out)
 
 
+class _Text:
+    """Escaped text and a same-length mask that hides what a rule must not touch.
+
+    The mask is a separate string, never mixed into the output: it holds the
+    text of the plain segments, and a filler wherever the text is code, a
+    link, or a marker already written. Rules match on the mask and edit both.
+    """
+
+    def __init__(self, text: str, mask: str) -> None:
+        self.text, self.mask = text, mask
+
+    def sub(self, pattern: re.Pattern[str], parts: tuple[int | str, ...]) -> _Text:
+        """Replace each match by ``parts``: an int is that group, a str is a new marker."""
+        text: list[str] = []
+        mask: list[str] = []
+        pos = 0
+        for m in pattern.finditer(self.mask):
+            text.append(self.text[pos : m.start()])
+            mask.append(self.mask[pos : m.start()])
+            for part in parts:
+                if isinstance(part, int):
+                    text.append(self.text[m.start(part) : m.end(part)])
+                    mask.append(self.mask[m.start(part) : m.end(part)])
+                else:
+                    text.append(part)
+                    mask.append(_FILL * len(part))
+            pos = m.end()
+        text.append(self.text[pos:])
+        mask.append(self.mask[pos:])
+        return _Text("".join(text), "".join(mask))
+
+    def slice(self, start: int, end: int) -> _Text:
+        return _Text(self.text[start:end], self.mask[start:end])
+
+
+def _segments(line: str) -> list[tuple[str, str]]:
+    """Cut a line into ``(kind, text)`` pieces; kind is plain, code or link."""
+    pieces: list[tuple[str, str]] = []
+    pos = 0
+    for m in _PROTECTED.finditer(line):
+        if m.start() > pos:
+            pieces.append(("plain", line[pos : m.start()]))
+        pieces.append(("code" if m.group("code") else "link", m.group(0)))
+        pos = m.end()
+    if pos < len(line):
+        pieces.append(("plain", line[pos:]))
+    return pieces
+
+
 def _convert_line(line: str) -> str:
-    kept: list[str] = []
-
-    def protect(m: re.Match[str]) -> str:
-        kept.append(escape_slack(m.group(0)))
-        return f"{len(kept) - 1}"
-
-    line = _LINK.sub(protect, _CODE_SPAN.sub(protect, line))
-    # A leading ">" is Slack's quote marker; it stays, the rest is escaped.
+    # A leading ">" is Slack's quote marker; it stays, the rest is converted.
     quote = _QUOTE_PREFIX.match(line)
     prefix = quote.group(1) if quote else ""
-    line = prefix + escape_slack(line[len(prefix) :])
+    text = _Text("", "")
+    for kind, piece in _segments(line[len(prefix) :]):
+        escaped = escape_slack(piece)
+        text.text += escaped
+        text.mask += escaped if kind == "plain" else _FILL * len(escaped)
 
-    heading = _HEADING.match(line)
+    heading = _HEADING.match(text.mask)
     if heading:
         # A heading is one bold line; bold inside it would nest, so drop it.
-        inner = _BOLD_STAR.sub(r"\1", heading.group(1))
-        inner = _BOLD_UNDER.sub(r"\1", inner)
-        line = f"{_BOLD}{_inline(inner)}{_BOLD}"
-    else:
-        line = _BULLET.sub(r"\1• ", line)
-        line = _inline(line)
-
-    line = line.replace(_BOLD, "*")
-    return _SLOT.sub(lambda m: kept[int(m.group(1))], line)
+        inner = text.slice(heading.start(1), heading.end(1))
+        inner = inner.sub(_BOLD_STAR, (1,)).sub(_BOLD_UNDER, (1,))
+        text = _inline(inner)
+        return f"{prefix}*{text.text}*"
+    return prefix + _inline(text.sub(_BULLET, (1, "• "))).text
 
 
-def _inline(s: str) -> str:
-    s = _BOLD3.sub(_BOLD + r"\1" + _BOLD, s)
-    s = _BOLD_STAR.sub(_BOLD + r"\1" + _BOLD, s)
-    s = _BOLD_UNDER.sub(_BOLD + r"\1" + _BOLD, s)
-    s = _STRIKE.sub(r"~\1~", s)
-    return _ITALIC_STAR.sub(r"_\1_", s)
+def _inline(t: _Text) -> _Text:
+    return (
+        t.sub(_BOLD3, ("*", 1, "*"))
+        .sub(_BOLD_STAR, ("*", 1, "*"))
+        .sub(_BOLD_UNDER, ("*", 1, "*"))
+        .sub(_STRIKE, ("~", 1, "~"))
+        .sub(_ITALIC_STAR, ("_", 1, "_"))
+    )

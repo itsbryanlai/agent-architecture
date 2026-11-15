@@ -4,8 +4,13 @@ Every method takes the tenant and the ``actor``, a Slack user ID that the caller
 got from a verified identity and never from a request body. A method raises
 ``Forbidden`` when the actor's role does not allow the action, and otherwise
 makes the change and writes one audit event for it. This is the only module
-besides ``agent_store.py`` and ``members.py`` that calls the stores' write
-methods; the write methods are named so that a test can find every call.
+besides the stores themselves that calls their write methods; the write methods are named
+so that a test can find every call. Two things change state without passing through here,
+each on purpose: the host operator's command ``python -m agentos.switches``, which must
+work with the console down and has no tenant file or role to check (it calls the same
+``switches.set_switch`` in its own audited transaction, as ``operator:<login>``), and the
+one-time imports of the YAML file (``agent_store`` and ``tenant_store``), which run
+before any admin exists. Opening a pause is the Slack event handler's (``audience_watch``).
 
 Roles. A tenant has admins and creators.
 
@@ -35,7 +40,15 @@ problem. The editors of an agent and admins can run the same check by itself.
 
 A caller may pass a ``request_id`` to a write. It is used in place of a random
 value to build the audit event key, so a retry with the same ``request_id``
-records one event. The store's own state check refuses the retried change.
+records one event. The store's own state check refuses a retried change, except for a new
+draft, which has no state to refuse it: a retried ``new_draft`` finds the event its first
+attempt recorded and returns that draft instead of creating a second one.
+
+Approving is approving a content. A version carries the SHA-256 of the definition it was
+submitted with (``definition_sha256``). ``publish_version`` takes the hash the approver was
+shown (``reviewed_sha256``) and refuses with ``VersionChanged`` when the version carries
+another, which a withdraw, an edit and a resubmit under the same number produces. The
+``agent_publish`` event records that reviewed hash as its ``input_sha256``.
 
 A publish also checks the version's audience. A channel the tenant file routes to the
 agent must be in the audience, or the publish is refused. When the plane has a Slack
@@ -57,8 +70,11 @@ tenant-wide switches that stop them, and never changes one.
 
 A refused action is not audited yet.
 
-The audit event is recorded after the change, in its own transaction. If the
-audit store fails, the change is kept and the error is raised.
+Every change and its audit event are one unit of work (``unit_of_work.py``): one tenant
+transaction, taken under the tenant's lock, with the change and the event on the same
+connection. If the audit insert fails, the change is rolled back and the error is raised,
+so the retry is not refused as "already done" and records exactly one event. Reads that
+decide a change (the count of admins before a demotion) are made inside the unit.
 """
 
 from __future__ import annotations
@@ -76,7 +92,9 @@ from agentos.agent_store import (
     AgentNotFound,
     AgentRecord,
     AgentStore,
+    AgentStoreError,
     AgentVersionRecord,
+    version_changed,
 )
 from agentos.audience import (
     AudienceCheckUnavailable,
@@ -121,6 +139,7 @@ from agentos.switches import (
     set_switch,
 )
 from agentos.tenant_store import TenantSource, as_source
+from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import (
     InMemoryUsageStore,
     UsageReport,
@@ -197,6 +216,7 @@ class ControlPlane:
         clock: Callable[[], datetime] = utcnow,
         pauses: PauseStore | None = None,
         switches: SwitchStore | None = None,
+        unit_of_work: UnitOfWork | None = None,
     ):
         self._switches = InMemorySwitchStore() if switches is None else switches
         self._pauses = InMemoryPauseStore() if pauses is None else pauses
@@ -209,6 +229,12 @@ class ControlPlane:
         self._audit = audit
         self._tenants = as_source(tenants)
         self._grant_checker = grant_checker
+        # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
+        self._uow = (
+            InMemoryUnitOfWork(agents, members, audit, self._budgets, self._switches, self._pauses)
+            if unit_of_work is None
+            else unit_of_work
+        )
 
     # --- roles ---------------------------------------------------------------
 
@@ -218,9 +244,14 @@ class ControlPlane:
 
     async def role_of(self, tenant_id: str, user_id: str) -> str | None:
         """The user's role: a configured admin is an admin, else the members row, else None."""
-        if user_id in await self._config_admins(tenant_id):
+        return await self._role(tenant_id, user_id, await self._config_admins(tenant_id))
+
+    async def _role(
+        self, tenant_id: str, user_id: str, config_admins: tuple[str, ...], conn: Any = None
+    ) -> str | None:
+        if user_id in config_admins:
             return ADMIN
-        row = await self._members.get_member(tenant_id, user_id)
+        row = await self._members.get_member(tenant_id, user_id, conn=conn)
         return None if row is None else row.role
 
     async def _require_role(self, tenant_id: str, actor: str, *allowed: str) -> str:
@@ -238,9 +269,11 @@ class ControlPlane:
         if role != ADMIN and agent.created_by != actor:
             raise Forbidden(f"'{actor}' did not create agent '{agent_id}'")
 
-    async def _admin_count(self, tenant_id: str) -> int:
-        rows = await self._members.list_members(tenant_id)
-        admins = set(await self._config_admins(tenant_id))
+    async def _admin_count(
+        self, tenant_id: str, config_admins: tuple[str, ...], conn: Any = None
+    ) -> int:
+        rows = await self._members.list_members(tenant_id, conn=conn)
+        admins = set(config_admins)
         admins.update(m.user_id for m in rows if m.role == ADMIN)
         return len(admins)
 
@@ -259,12 +292,20 @@ class ControlPlane:
         target: str | None = None,
         tool: str | None = None,
         request_id: str | None = None,
+        conn: Any = None,
     ) -> None:
-        """One event. A definition is hashed into ``input_sha256`` and never stored."""
+        """One event, on the unit of work's connection. A definition is hashed, never stored.
+
+        ``input_sha256`` is the hash the version was submitted (and so reviewed) with, or the
+        canonical hash of the definition while it is still a draft.
+        """
+        digest = None
+        if version is not None:
+            digest = version.definition_sha256 or canonical_sha256(version.definition)
         await self._audit.record(
             AuditEvent(
                 tenant_id=tenant_id,
-                event_key=ids.audit_control_key(tenant_id, kind, request_id or uuid.uuid4().hex),
+                event_key=self._event_key(tenant_id, kind, request_id),
                 kind=kind,
                 agent_id=agent_id if version is None else version.agent_id,
                 agent_version=None if version is None else version.version,
@@ -272,10 +313,15 @@ class ControlPlane:
                 identity=f"user:{actor}",
                 tool=tool,
                 target=target,
-                input_sha256=None if version is None else canonical_sha256(version.definition),
+                input_sha256=digest,
                 approver_user_id=approver,
-            )
+            ),
+            conn=conn,
         )
+
+    @staticmethod
+    def _event_key(tenant_id: str, kind: str, request_id: str | None) -> str:
+        return ids.audit_control_key(tenant_id, kind, request_id or uuid.uuid4().hex)
 
     # --- reads ---------------------------------------------------------------
 
@@ -455,26 +501,30 @@ class ControlPlane:
             summary = await self._confirmed_channel(tenant_id, pause, confirm_audience)
             c = summary.confirmation()
             counts = f" total={c['total']} guests={c['guests']} external={c['external']}"
-        closed = await self._pauses.close_pause(tenant_id, agent_id, channel, actor, self._clock())
-        if closed is None:
-            raise NotPaused(f"agent '{agent_id}' is not paused in channel '{channel}'")
         published = await self._agents.published(tenant_id, agent_id)
         version = (
             None
             if published is None
             else await self._agents.get_version(tenant_id, agent_id, published.version)
         )
-        if version is not None:
-            await self._record(
-                "audience_resume",
-                tenant_id,
-                actor,
-                version=version,
-                approver=actor,
-                target=f"{channel}{counts}",
-                tool=pause.reason,
-                request_id=request_id,
+        async with self._uow.begin(tenant_id) as conn:
+            closed = await self._pauses.close_pause(
+                tenant_id, agent_id, channel, actor, self._clock(), conn=conn
             )
+            if closed is None:
+                raise NotPaused(f"agent '{agent_id}' is not paused in channel '{channel}'")
+            if version is not None:
+                await self._record(
+                    "audience_resume",
+                    tenant_id,
+                    actor,
+                    version=version,
+                    approver=actor,
+                    target=f"{channel}{counts}",
+                    tool=pause.reason,
+                    request_id=request_id,
+                    conn=conn,
+                )
         return closed
 
     async def _confirmed_channel(
@@ -566,8 +616,13 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         """Create an agent as version 1, a draft, with the actor as its creator."""
         await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        record = await self._agents.create_agent(tenant_id, agent_id, definition, actor)
-        await self._record("agent_create", tenant_id, actor, version=record, request_id=request_id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.create_agent(
+                tenant_id, agent_id, definition, actor, conn=conn
+            )
+            await self._record(
+                "agent_create", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
         return record
 
     async def new_draft(
@@ -578,10 +633,33 @@ class ControlPlane:
         from_version: int | None = None,
         request_id: str | None = None,
     ) -> AgentVersionRecord:
-        """A new draft copied from ``from_version``, or from the published version."""
+        """A new draft copied from ``from_version``, or from the published version.
+
+        With a ``request_id`` the call is idempotent: a retry finds the event the first
+        attempt recorded and returns that draft, so it never makes a second one.
+        """
         await self._require_editor(tenant_id, actor, agent_id)
-        record = await self._agents.create_draft(tenant_id, agent_id, actor, from_version)
-        await self._record("agent_draft", tenant_id, actor, version=record, request_id=request_id)
+        async with self._uow.begin(tenant_id) as conn:
+            if request_id is not None:
+                key = self._event_key(tenant_id, "agent_draft", request_id)
+                seen = await self._audit.get(tenant_id, key, conn=conn)
+                if seen is not None:
+                    first = (
+                        None
+                        if seen.agent_id != agent_id or seen.agent_version is None
+                        else await self._agents.get_version(
+                            tenant_id, agent_id, seen.agent_version, conn=conn
+                        )
+                    )
+                    if first is None:
+                        raise AgentStoreError("this request ID was used for another change")
+                    return first
+            record = await self._agents.create_draft(
+                tenant_id, agent_id, actor, from_version, conn=conn
+            )
+            await self._record(
+                "agent_draft", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
         return record
 
     async def edit_draft(
@@ -594,8 +672,13 @@ class ControlPlane:
         request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
-        record = await self._agents.replace_draft(tenant_id, agent_id, version, definition)
-        await self._record("agent_edit", tenant_id, actor, version=record, request_id=request_id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.replace_draft(
+                tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
         return record
 
     async def submit_version(
@@ -607,8 +690,11 @@ class ControlPlane:
         request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
-        record = await self._agents.submit(tenant_id, agent_id, version, actor)
-        await self._record("agent_submit", tenant_id, actor, version=record, request_id=request_id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.submit(tenant_id, agent_id, version, actor, conn=conn)
+            await self._record(
+                "agent_submit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
         return record
 
     async def withdraw_version(
@@ -620,10 +706,16 @@ class ControlPlane:
         request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
-        record = await self._agents.withdraw(tenant_id, agent_id, version)
-        await self._record(
-            "agent_withdraw", tenant_id, actor, version=record, request_id=request_id
-        )
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.withdraw(tenant_id, agent_id, version, conn=conn)
+            await self._record(
+                "agent_withdraw",
+                tenant_id,
+                actor,
+                version=record,
+                request_id=request_id,
+                conn=conn,
+            )
         return record
 
     async def reject_version(
@@ -636,8 +728,11 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         """Send a pending version back to draft. Only an admin."""
         await self._require_role(tenant_id, actor, ADMIN)
-        record = await self._agents.withdraw(tenant_id, agent_id, version)
-        await self._record("agent_reject", tenant_id, actor, version=record, request_id=request_id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.withdraw(tenant_id, agent_id, version, conn=conn)
+            await self._record(
+                "agent_reject", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
         return record
 
     async def publish_version(
@@ -648,12 +743,24 @@ class ControlPlane:
         version: int,
         request_id: str | None = None,
         confirm_audience: dict[str, int] | None = None,
+        reviewed_sha256: str | None = None,
     ) -> AgentVersionRecord:
-        """Publish a pending version. Only an admin, who may be its submitter."""
+        """Publish a pending version. Only an admin, who may be its submitter.
+
+        ``reviewed_sha256`` is the hash of the definition the admin was shown (the
+        version's ``definition_sha256`` on the page or in the API record). It is refused
+        with ``VersionChanged`` when the version carries another. The console and the API
+        always pass it; without one, the version pending when the checks begin is the one
+        published, and it must still be that one when the change is made.
+        """
         await self._require_role(tenant_id, actor, ADMIN)
         pending = await self._agents.get_version(tenant_id, agent_id, version)
         confirmed: AudienceSummary | None = None
         if pending is not None and pending.status == PENDING:
+            if reviewed_sha256 is None:
+                reviewed_sha256 = pending.definition_sha256
+            elif pending.definition_sha256 != reviewed_sha256:
+                raise version_changed(agent_id, version)
             # Any other status is refused by the store below, with its own reason.
             await self._check_mapped_channels(tenant_id, pending.agent())
             reports = await self._grant_checker.check(tenant_id, pending.agent())
@@ -663,29 +770,34 @@ class ControlPlane:
                 confirmed = await self._confirmed_audience(
                     tenant_id, pending.agent(), confirm_audience
                 )
-        record = await self._agents.publish(tenant_id, agent_id, version, actor)
-        await self._record(
-            "agent_publish",
-            tenant_id,
-            actor,
-            version=record,
-            requester=record.submitted_by,
-            approver=actor,
-            request_id=request_id,
-        )
-        if confirmed is not None:
-            counts = confirmed.confirmation()
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.publish(
+                tenant_id, agent_id, version, actor, reviewed_sha256=reviewed_sha256, conn=conn
+            )
             await self._record(
-                "audience_confirm",
+                "agent_publish",
                 tenant_id,
                 actor,
                 version=record,
                 requester=record.submitted_by,
                 approver=actor,
-                target=f"total={counts['total']} guests={counts['guests']} "
-                f"external={counts['external']}",
                 request_id=request_id,
+                conn=conn,
             )
+            if confirmed is not None:
+                counts = confirmed.confirmation()
+                await self._record(
+                    "audience_confirm",
+                    tenant_id,
+                    actor,
+                    version=record,
+                    requester=record.submitted_by,
+                    approver=actor,
+                    target=f"total={counts['total']} guests={counts['guests']} "
+                    f"external={counts['external']}",
+                    request_id=request_id,
+                    conn=conn,
+                )
         return record
 
     # --- budgets -------------------------------------------------------------
@@ -706,16 +818,18 @@ class ControlPlane:
         amount = parse_amount(amount)
         if agent_id is not None and await self._agents.get_agent(tenant_id, agent_id) is None:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
-        budget = await self._budgets.set_budget(tenant_id, agent_id, amount, actor)
-        await self._record(
-            "budget_set",
-            tenant_id,
-            actor,
-            agent_id=agent_id,
-            target=format(budget.amount, "f"),
-            tool="set",
-            request_id=request_id,
-        )
+        async with self._uow.begin(tenant_id) as conn:
+            budget = await self._budgets.set_budget(tenant_id, agent_id, amount, actor, conn=conn)
+            await self._record(
+                "budget_set",
+                tenant_id,
+                actor,
+                agent_id=agent_id,
+                target=format(budget.amount, "f"),
+                tool="set",
+                request_id=request_id,
+                conn=conn,
+            )
         return budget
 
     async def remove_budget(
@@ -723,16 +837,18 @@ class ControlPlane:
     ) -> None:
         """Lift a budget, so the scope has no limit. Only an admin."""
         await self._require_role(tenant_id, actor, ADMIN)
-        await self._budgets.remove_budget(tenant_id, agent_id)
-        await self._record(
-            "budget_set",
-            tenant_id,
-            actor,
-            agent_id=agent_id,
-            target="0",
-            tool="remove",
-            request_id=request_id,
-        )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._budgets.remove_budget(tenant_id, agent_id, conn=conn)
+            await self._record(
+                "budget_set",
+                tenant_id,
+                actor,
+                agent_id=agent_id,
+                target="0",
+                tool="remove",
+                request_id=request_id,
+                conn=conn,
+            )
 
     # --- kill switches -------------------------------------------------------
 
@@ -784,6 +900,7 @@ class ControlPlane:
             identity=f"user:{actor}",
             at=self._clock(),
             request_id=request_id,
+            uow=self._uow,
         )
 
     # --- members -------------------------------------------------------------
@@ -794,15 +911,17 @@ class ControlPlane:
         await self._require_role(tenant_id, actor, ADMIN)
         if user_id in await self._config_admins(tenant_id):
             raise MemberError(f"'{user_id}' is an admin set in the tenant file")
-        await self._members.add_member(tenant_id, user_id, role, actor)
-        await self._record(
-            "member_add",
-            tenant_id,
-            actor,
-            target=user_id,
-            tool=f"role:{role}",
-            request_id=request_id,
-        )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._members.add_member(tenant_id, user_id, role, actor, conn=conn)
+            await self._record(
+                "member_add",
+                tenant_id,
+                actor,
+                target=user_id,
+                tool=f"role:{role}",
+                request_id=request_id,
+                conn=conn,
+            )
 
     async def change_role(
         self, tenant_id: str, actor: str, user_id: str, role: str, request_id: str | None = None
@@ -810,36 +929,50 @@ class ControlPlane:
         await self._require_role(tenant_id, actor, ADMIN)
         if role not in ROLES:
             raise InvalidMember(f"role must be one of {', '.join(ROLES)}")
-        current = await self._protected_member(tenant_id, user_id)
-        if current.role == role:
-            raise MemberError(f"'{user_id}' already has the role {role}")
-        if current.role == ADMIN and await self._admin_count(tenant_id) <= 1:
-            raise Forbidden("the tenant's last admin cannot be demoted")
-        await self._members.set_member_role(tenant_id, user_id, role)
-        await self._record(
-            "member_role",
-            tenant_id,
-            actor,
-            target=user_id,
-            tool=f"role:{role}",
-            request_id=request_id,
-        )
+        configured = await self._config_admins(tenant_id)
+        async with self._uow.begin(tenant_id) as conn:
+            # Under the tenant's lock: who may act, the count and the change are one decision.
+            if await self._role(tenant_id, actor, configured, conn) != ADMIN:
+                raise Forbidden(f"'{actor}' may not do this in tenant '{tenant_id}'")
+            current = await self._protected_member(tenant_id, user_id, configured, conn)
+            if current.role == role:
+                raise MemberError(f"'{user_id}' already has the role {role}")
+            if current.role == ADMIN and await self._admin_count(tenant_id, configured, conn) <= 1:
+                raise Forbidden("the tenant's last admin cannot be demoted")
+            await self._members.set_member_role(tenant_id, user_id, role, conn=conn)
+            await self._record(
+                "member_role",
+                tenant_id,
+                actor,
+                target=user_id,
+                tool=f"role:{role}",
+                request_id=request_id,
+                conn=conn,
+            )
 
     async def drop_member(
         self, tenant_id: str, actor: str, user_id: str, request_id: str | None = None
     ) -> None:
         await self._require_role(tenant_id, actor, ADMIN)
-        current = await self._protected_member(tenant_id, user_id)
-        if current.role == ADMIN and await self._admin_count(tenant_id) <= 1:
-            raise Forbidden("the tenant's last admin cannot be removed")
-        await self._members.remove_member(tenant_id, user_id)
-        await self._record("member_remove", tenant_id, actor, target=user_id, request_id=request_id)
+        configured = await self._config_admins(tenant_id)
+        async with self._uow.begin(tenant_id) as conn:
+            if await self._role(tenant_id, actor, configured, conn) != ADMIN:
+                raise Forbidden(f"'{actor}' may not do this in tenant '{tenant_id}'")
+            current = await self._protected_member(tenant_id, user_id, configured, conn)
+            if current.role == ADMIN and await self._admin_count(tenant_id, configured, conn) <= 1:
+                raise Forbidden("the tenant's last admin cannot be removed")
+            await self._members.remove_member(tenant_id, user_id, conn=conn)
+            await self._record(
+                "member_remove", tenant_id, actor, target=user_id, request_id=request_id, conn=conn
+            )
 
-    async def _protected_member(self, tenant_id: str, user_id: str) -> MemberRecord:
+    async def _protected_member(
+        self, tenant_id: str, user_id: str, configured: tuple[str, ...], conn: Any = None
+    ) -> MemberRecord:
         """The member's row, after refusing a configured admin, who is configuration."""
-        if user_id in await self._config_admins(tenant_id):
+        if user_id in configured:
             raise Forbidden(f"'{user_id}' is an admin set in the tenant file")
-        row = await self._members.get_member(tenant_id, user_id)
+        row = await self._members.get_member(tenant_id, user_id, conn=conn)
         if row is None:
             raise MemberNotFound(f"'{user_id}' is not a member")
         return row

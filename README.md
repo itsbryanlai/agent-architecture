@@ -545,6 +545,8 @@ come from the database; import them once with
 `uv run python -m agentos.tenant_store import` and `uv run python -m agentos.agent_store import`
 (see [Tenants in the database](#tenants-in-the-database) and
 [Agents in the database](#agents-in-the-database)).
+Migration `017` stores the hash of each submitted definition; a pending version shown
+before it ran must be reopened before it is published.
 
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
@@ -786,8 +788,11 @@ version, adding an existing member), 422 for an invalid definition or request.
 | `GET /tenants/{t}/usage?month=YYYY-MM` | usage and cost by agent, team and model for a UTC month (default the current one); a creator sees only their agents |
 | `GET /tenants/{t}/audit?limit=&before=` | audit log, newest first |
 
-`publish` runs the grant check first (with the tenant's Notion token) and is
-refused with 409 and the problems while any database or page grant has one (a
+`publish` takes the hash of the version you read (`{"definition_sha256": "..."}`, the
+`definition_sha256` of the version record) and is refused with 409 when the version carries
+another, which a withdraw, an edit and a resubmit under the same number produces; a
+publish without it is refused with 422. It runs the grant check next (with the tenant's
+Notion token) and is refused with 409 and the problems while any database or page grant has one (a
 page must be readable and not in the trash). If Notion cannot be read right now
 (a network error, a rate limit, a server error) the answer is 502 and nothing is
 published. A new page grant still gets no index schedule until
@@ -820,7 +825,10 @@ here. Ask <creator> for access." Nothing is read or run for them, and an `audien
 event is audited. If Slack can't be asked, the user sees "I couldn't check whether <agent
 name> is available to you just now. Try again in a few minutes." and the turn is refused.
 
-**Publishing.** The version page shows the audience and, live from Slack, how many people
+**Publishing.** The version page must be current: Publish approves exactly the definition
+the page showed (the form carries its hash), and if the creator has withdrawn, edited and
+resubmitted the version since you opened it, the publish is refused and you reload and
+review it again. The version page shows the audience and, live from Slack, how many people
 can reach the agent (total, guests, from other workspaces). Publishing needs the box "I
 confirm these people may see what this agent can access"; the API's publish takes
 `{"confirm_audience": {"total": 12, "guests": 1, "external": 0}}` and answers 409 when it is
@@ -991,6 +999,7 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/usage.py` | Usage rows, model prices, pricing at record time and the usage report |
 | `src/agentos/budgets.py` | Monthly budgets, the stop before a model call, and the warning levels |
 | `src/agentos/switches.py` | Kill switches: the table, the checks, and the operator command |
+| `src/agentos/unit_of_work.py` | One transaction and the tenant lock for a change and its audit event |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |
 | `scripts/migrate.py` | Applies the migrations a database lacks and records them in `schema_migrations` |

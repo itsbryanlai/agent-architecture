@@ -85,6 +85,21 @@ async def tenant_transaction(pool: AsyncConnectionPool, tenant_id: str):
         yield conn
 
 
+@asynccontextmanager
+async def joined_transaction(pool: AsyncConnectionPool, tenant_id: str, conn=None):
+    """``conn`` when a unit of work passes one, else a transaction of this call's own.
+
+    A store method that a unit of work (``unit_of_work.py``) may include takes an optional
+    ``conn`` and opens its transaction through this, so one method serves both the single
+    change and the change that commits together with its audit event.
+    """
+    if conn is not None:
+        yield conn
+        return
+    async with tenant_transaction(pool, tenant_id) as own:
+        yield own
+
+
 class PostgresHistoryStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool

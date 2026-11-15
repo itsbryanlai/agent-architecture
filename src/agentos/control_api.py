@@ -177,11 +177,15 @@ class AudienceCounts(_Body):
 
 
 class Publish(BaseModel):
-    """The publish body. Fields it does not know are ignored, as publish always did: a
-    publish carried no body, and who acts never comes from one. A misspelt
-    ``confirm_audience`` is therefore not a confirmation, and the publish is refused."""
+    """The publish body. ``definition_sha256`` is the hash of the version the approver was
+    shown (the ``definition_sha256`` of the version record they read); a publish without
+    it is refused, because it would publish whatever is pending when the request lands.
+    Other fields it does not know are ignored, and who acts never comes from a body. A
+    misspelt ``confirm_audience`` is therefore not a confirmation, and the publish is
+    refused."""
 
     model_config = ConfigDict(extra="ignore")
+    definition_sha256: str
     confirm_audience: AudienceCounts | None = None
 
 
@@ -455,9 +459,9 @@ def create_app(
         rid: RequestId,
         agent_id: str,
         version: int,
-        body: Publish | None = None,
+        body: Publish,
     ) -> JSONResponse:
-        confirm = None if body is None or body.confirm_audience is None else body.confirm_audience
+        confirm = body.confirm_audience
         return out(
             await deps.plane.publish_version(
                 tenant_id,
@@ -466,6 +470,7 @@ def create_app(
                 version,
                 rid,
                 None if confirm is None else confirm.model_dump(),
+                reviewed_sha256=body.definition_sha256,
             )
         )
 
@@ -634,6 +639,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.switches import PostgresSwitchStore
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
     from agentos.tenants import require_tenant_secret
+    from agentos.unit_of_work import PostgresUnitOfWork
     from agentos.usage import PostgresUsageStore
 
     logging.basicConfig(level=logging.INFO)
@@ -680,6 +686,7 @@ async def _real_lifespan(app: FastAPI):
             budgets=PostgresBudgetStore(pool),
             pauses=PostgresPauseStore(pool),
             switches=PostgresSwitchStore(pool),
+            unit_of_work=PostgresUnitOfWork(pool),
         )
         app.state.deps.tenants = directory
         yield

@@ -8,6 +8,7 @@
   <tr><th>Created by</th><td>{{ record.created_by }}</td><th>Created</th><td>{{ record.created_at | stamp }}</td></tr>
   <tr><th>Submitted by</th><td>{{ record.submitted_by or "" }}</td><th>Submitted</th><td>{{ record.submitted_at | stamp }}</td></tr>
   <tr><th>Approved by</th><td>{{ record.approved_by or "" }}</td><th>Published</th><td>{{ record.published_at | stamp }}</td></tr>
+  {% if record.definition_sha256 %}<tr><th>Definition hash</th><td colspan="3"><code title="{{ record.definition_sha256 }}">{{ record.definition_sha256[:12] }}</code> <span class="muted">Publishing approves exactly this definition; if it changes you are asked to reload.</span></td></tr>{% endif %}
 </table>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -19,6 +20,7 @@
     {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject") }}
     <form method="post" action="{{ version_url }}/publish">
       <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+      <input type="hidden" name="definition_sha256" value="{{ record.definition_sha256 }}">
       {% if audience.summary %}
       <input type="hidden" name="total" value="{{ audience.summary.total }}">
       <input type="hidden" name="guests" value="{{ audience.summary.guests }}">
@@ -30,7 +32,7 @@
   {% endif %}
   {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
   {% if editor and not is_draft %}
-    {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version}) }}
+    {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version, "request_id": new_token()}) }}
   {% endif %}
 </div>
 

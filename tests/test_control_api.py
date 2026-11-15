@@ -4,6 +4,7 @@ Everything is in memory: the three stores, a fake Notion and a stand-in identity
 """
 
 import ast
+import json
 from pathlib import Path
 
 import httpx
@@ -107,6 +108,12 @@ def t(path: str, tenant: str = TENANT) -> str:
     return f"/tenants/{tenant}{path}"
 
 
+async def seen(h: Harness, agent: str = "it-helper", version: int = 1) -> dict:
+    """The publish body of an admin who read the version just now: the hash it carries."""
+    record = await h.agents.get_version(TENANT, agent, version)
+    return {"definition_sha256": (record and record.definition_sha256) or "none"}
+
+
 def kinds(h: Harness) -> list[str]:
     return [e.kind for e in h.audit.events if e.tenant_id == TENANT]
 
@@ -195,7 +202,9 @@ async def test_the_agent_lifecycle_through_the_api(h):
         await c.post(t("/agents/it-helper/versions/1/submit"))
 
         h.as_user(ADMIN2)
-        published = await c.post(t("/agents/it-helper/versions/1/publish"))
+        published = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert published.status_code == 200
         assert published.json()["status"] == "published"
         assert published.json()["approved_by"] == ADMIN2
@@ -262,7 +271,11 @@ async def test_a_refusal_by_role_is_403(h):
             await c.post(t("/members"), json={"user_id": "U_X", "role": "admin"})
         ).status_code == 403
         await create_pending(h)
-        assert (await c.post(t("/agents/it-helper/versions/1/publish"))).status_code == 403
+        assert (
+            await c.post(
+                t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+            )
+        ).status_code == 403
         h.as_user(OTHER)
         assert (await c.post(t("/agents/it-helper/drafts"))).status_code == 403
         # The last admin cannot be demoted: the control plane's Forbidden, not a conflict.
@@ -297,7 +310,11 @@ async def test_a_wrong_state_is_409(h):
         assert (await c.post(t("/agents"), json=body)).status_code == 201
         assert (await c.post(t("/agents"), json=body)).status_code == 409
         h.as_user(ROOT)
-        assert (await c.post(t("/agents/it-helper/versions/1/publish"))).status_code == 409
+        assert (
+            await c.post(
+                t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+            )
+        ).status_code == 409
         assert (await c.post(t("/agents/it-helper/versions/1/withdraw"))).status_code == 409
         assert (await c.post(t("/agents/it-helper/drafts"))).status_code == 409  # nothing published
         h.as_user(OWNER)
@@ -320,9 +337,15 @@ async def test_a_stale_publish_is_409(h):
         v1 = await c.post(t("/agents/it-helper/drafts"), json={"from_version": 1})
         assert v1.status_code == 201  # version 2
         await c.post(t("/agents/it-helper/versions/2/submit"))
-        assert (await c.post(t("/agents/it-helper/versions/2/publish"))).status_code == 200
+        assert (
+            await c.post(
+                t("/agents/it-helper/versions/2/publish"), json=await seen(h, "it-helper", 2)
+            )
+        ).status_code == 200
         # Version 1 is still pending but older than the published version 2.
-        stale = await c.post(t("/agents/it-helper/versions/1/publish"))
+        stale = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert stale.status_code == 409
 
 
@@ -391,7 +414,7 @@ async def test_no_header_query_or_body_field_changes_the_actor(h):
         publish = await c.post(
             t(f"/agents/it-helper/versions/1/publish?actor={ROOT}"),
             headers=spoof_headers,
-            json=body,
+            json=body | await seen(h),
         )
         assert publish.status_code == 403
         withdraw = await c.post(
@@ -547,7 +570,9 @@ async def test_publish_is_refused_while_a_grant_has_a_problem(h):
     h.notion.set_schema(DB_ID, schema)
     async with h.client() as c:
         h.as_user(ROOT)
-        refused = await c.post(t("/agents/it-helper/versions/1/publish"))
+        refused = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert refused.status_code == 409
         assert refused.json()["grants"][0]["problems"]
         still = await c.get(t("/agents/it-helper/versions/1"))
@@ -555,7 +580,9 @@ async def test_publish_is_refused_while_a_grant_has_a_problem(h):
         assert "agent_publish" not in kinds(h)
 
         h.notion.set_schema(DB_ID, default_schema())
-        allowed = await c.post(t("/agents/it-helper/versions/1/publish"))
+        allowed = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert allowed.status_code == 200
         assert allowed.json()["status"] == "published"
 
@@ -571,7 +598,11 @@ async def test_publish_of_a_draft_is_a_state_conflict_before_any_notion_call(h):
         transport=httpx.ASGITransport(app=app), base_url=BASE, headers=JSON
     ) as c:
         await c.post(t("/agents"), json={"agent_id": "it-helper", "definition": helper_block()})
-        assert (await c.post(t("/agents/it-helper/versions/1/publish"))).status_code == 409
+        assert (
+            await c.post(
+                t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+            )
+        ).status_code == 409
 
 
 async def test_notion_being_unreadable_is_502_and_nothing_is_published(h):
@@ -584,7 +615,9 @@ async def test_notion_being_unreadable_is_502_and_nothing_is_published(h):
     h.notion = Down()
     async with h.client() as c:
         h.as_user(ROOT)
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert response.status_code == 502
         assert "token" not in response.text
         status = await c.get(t("/agents/it-helper/versions/1"))
@@ -606,7 +639,9 @@ async def test_an_agent_without_database_grants_publishes_with_no_notion_call(h)
         await c.post(t("/agents"), json={"agent_id": "plain", "definition": definition})
         await c.post(t("/agents/plain/versions/1/submit"))
         h.as_user(ROOT)
-        response = await c.post(t("/agents/plain/versions/1/publish"))
+        response = await c.post(
+            t("/agents/plain/versions/1/publish"), json=await seen(h, "plain", 1)
+        )
     assert response.status_code == 200
 
 
@@ -789,7 +824,7 @@ async def test_json_writes_pass_with_a_charset_or_an_empty_body(h):
         ok = await c.post(
             t("/agents/it-helper/versions/1/publish"),
             headers={"Content-Type": "application/json; charset=utf-8"},
-            content=b"{}",
+            content=json.dumps(await seen(h)).encode(),
         )
         assert ok.status_code == 200
 
@@ -905,7 +940,9 @@ async def test_a_clean_page_grant_publishes(h):
     h.notion.add_free_page(PAGE_ID, "IT wiki")
     await pending_with_page(h)
     async with h.client() as c:
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
     assert response.status_code == 200
 
 
@@ -913,7 +950,9 @@ async def test_a_trashed_page_grant_refuses_publish(h):
     h.notion.add_free_page(PAGE_ID, "IT wiki", in_trash=True)
     await pending_with_page(h)
     async with h.client() as c:
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert response.status_code == 409
         [bad] = [g for g in response.json()["grants"] if g["problems"]]
         assert bad["kind"] == "page" and "trash" in bad["problems"][0]
@@ -927,7 +966,9 @@ async def test_an_unreadable_page_refuses_publish(h, code):
     await pending_with_page(h)
     h.notion = FailingPages(h.notion, Status(code))
     async with h.client() as c:
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert response.status_code == 409
         assert "cannot be read" in str(response.json()["grants"])
         status = await c.get(t("/agents/it-helper/versions/1"))
@@ -939,7 +980,9 @@ async def test_a_transient_page_failure_is_502_and_does_not_publish(h, error):
     await pending_with_page(h)
     h.notion = FailingPages(h.notion, error)
     async with h.client() as c:
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
         assert response.status_code == 502
         check = await c.post(t("/agents/it-helper/versions/1/check-grants"))
         assert check.status_code == 502
@@ -962,7 +1005,8 @@ async def test_an_unexpected_error_is_a_plain_500_and_nothing_is_published(h):
     async with quiet_client(h.app) as c:
         h.as_user(ROOT)
         for path in ("publish", "check-grants"):
-            response = await c.post(t(f"/agents/it-helper/versions/1/{path}"))
+            body = await seen(h) if path == "publish" else None
+            response = await c.post(t(f"/agents/it-helper/versions/1/{path}"), json=body)
             assert response.status_code == 500
             assert response.json() == {"error": "internal error"}
             assert "secret" not in response.text
@@ -975,7 +1019,9 @@ async def test_a_bug_while_reading_a_page_is_a_500(h):
     await pending_with_page(h)
     h.notion = FailingPages(h.notion, RuntimeError("secret detail inside"))
     async with quiet_client(h.app) as c:
-        response = await c.post(t("/agents/it-helper/versions/1/publish"))
+        response = await c.post(
+            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+        )
     assert response.status_code == 500 and "secret" not in response.text
 
 

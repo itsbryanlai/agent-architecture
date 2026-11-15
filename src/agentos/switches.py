@@ -38,7 +38,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -46,7 +46,8 @@ from agentos import ids
 from agentos.agent_store import AgentNotFound, AgentStore
 from agentos.audit import AuditStore
 from agentos.models import AuditEvent
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
+from agentos.unit_of_work import InMemoryUnitOfWork, PostgresUnitOfWork, UnitOfWork
 from agentos.usage import utcnow
 
 log = logging.getLogger("agentos.switches")
@@ -163,12 +164,15 @@ class SwitchStore(Protocol):
         ...
 
     async def switch_off(
-        self, tenant_id: str, scope: str, target: str, by: str, at: datetime
+        self, tenant_id: str, scope: str, target: str, by: str, at: datetime, conn: Any = None
     ) -> bool:
-        """Turn a switch off. False when it was already off (nothing changes)."""
+        """Turn a switch off. False when it was already off (nothing changes).
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``), here and below.
+        """
         ...
 
-    async def switch_on(self, tenant_id: str, scope: str, target: str) -> bool:
+    async def switch_on(self, tenant_id: str, scope: str, target: str, conn: Any = None) -> bool:
         """Turn a switch back on. False when it was not off."""
         ...
 
@@ -177,6 +181,13 @@ class InMemorySwitchStore:
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str, str], Switch] = {}
 
+    def snapshot(self) -> dict[tuple[str, str, str], Switch]:
+        """The rows as they are now, for ``InMemoryUnitOfWork``."""
+        return dict(self._rows)
+
+    def restore(self, state: dict[tuple[str, str, str], Switch]) -> None:
+        self._rows = dict(state)
+
     async def list(self, tenant_id: str) -> list[Switch]:
         return sorted(
             (s for (t, _, _), s in self._rows.items() if t == tenant_id),
@@ -184,7 +195,7 @@ class InMemorySwitchStore:
         )
 
     async def switch_off(
-        self, tenant_id: str, scope: str, target: str, by: str, at: datetime
+        self, tenant_id: str, scope: str, target: str, by: str, at: datetime, conn: Any = None
     ) -> bool:
         key = (tenant_id, scope, target)
         if key in self._rows:
@@ -192,7 +203,7 @@ class InMemorySwitchStore:
         self._rows[key] = Switch(tenant_id, scope, target, by, at)
         return True
 
-    async def switch_on(self, tenant_id: str, scope: str, target: str) -> bool:
+    async def switch_on(self, tenant_id: str, scope: str, target: str, conn: Any = None) -> bool:
         return self._rows.pop((tenant_id, scope, target), None) is not None
 
 
@@ -212,10 +223,10 @@ class PostgresSwitchStore:
             return [Switch(*row) for row in await cur.fetchall()]
 
     async def switch_off(
-        self, tenant_id: str, scope: str, target: str, by: str, at: datetime
+        self, tenant_id: str, scope: str, target: str, by: str, at: datetime, conn: Any = None
     ) -> bool:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 "INSERT INTO kill_switches (tenant_id, scope, target, turned_off_by, turned_off_at) "
                 "VALUES (%s, %s, %s, %s, %s) "
                 "ON CONFLICT (tenant_id, scope, target) DO NOTHING RETURNING tenant_id",
@@ -223,9 +234,9 @@ class PostgresSwitchStore:
             )
             return await cur.fetchone() is not None
 
-    async def switch_on(self, tenant_id: str, scope: str, target: str) -> bool:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+    async def switch_on(self, tenant_id: str, scope: str, target: str, conn: Any = None) -> bool:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 "DELETE FROM kill_switches "
                 "WHERE tenant_id = %s AND scope = %s AND target = %s RETURNING tenant_id",
                 (tenant_id, scope, target),
@@ -315,36 +326,46 @@ async def set_switch(
     identity: str,
     at: datetime | None = None,
     request_id: str | None = None,
+    uow: UnitOfWork | None = None,
 ) -> bool:
     """Turn a switch off or on and audit the change. True when something changed.
 
     ``actor`` and ``identity`` come from the caller's verified identity: the control
     plane's actor, or the operator of the command line. Turning off what is off, or on
-    what is on, changes nothing and records nothing. The event is recorded after the
-    change, as the control plane does for every change.
+    what is on, changes nothing and records nothing. The change and its event commit in
+    one transaction of ``uow`` (the control plane's, or the command's). Without one the
+    in-memory stores are covered; stores in Postgres need a ``PostgresUnitOfWork``.
     """
     stored = check_switch(scope, target)
     if scope == AGENT and await agents.get_agent(tenant_id, stored) is None:
         raise AgentNotFound(f"agent '{stored}' does not exist")
-    if off:
-        changed = await store.switch_off(tenant_id, scope, stored, actor, at or utcnow())
-    else:
-        changed = await store.switch_on(tenant_id, scope, stored)
-    if changed:
-        kind = "switch_off" if off else "switch_on"
-        await audit.record(
-            AuditEvent(
-                tenant_id=tenant_id,
-                event_key=ids.audit_control_key(tenant_id, kind, request_id or uuid.uuid4().hex),
-                kind=kind,
-                agent_id=stored if scope == AGENT else None,
-                agent_version=None,
-                requester_user_id=actor,
-                identity=identity,
-                tool=scope,
-                target=stored or None,
+    unit = InMemoryUnitOfWork(store, audit) if uow is None else uow
+    async with unit.begin(tenant_id) as conn:
+        if off:
+            changed = await store.switch_off(
+                tenant_id, scope, stored, actor, at or utcnow(), conn=conn
             )
-        )
+        else:
+            changed = await store.switch_on(tenant_id, scope, stored, conn=conn)
+        if changed:
+            kind = "switch_off" if off else "switch_on"
+            await audit.record(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_key=ids.audit_control_key(
+                        tenant_id, kind, request_id or uuid.uuid4().hex
+                    ),
+                    kind=kind,
+                    agent_id=stored if scope == AGENT else None,
+                    agent_version=None,
+                    requester_user_id=actor,
+                    identity=identity,
+                    tool=scope,
+                    target=stored or None,
+                ),
+                conn=conn,
+            )
+    if changed:
         log.info(
             "switch %s tenant_id=%s scope=%s target=%s",
             "off" if off else "on",
@@ -409,6 +430,7 @@ async def run(args: argparse.Namespace) -> int:
                 off=args.command == "off",
                 actor=identity,
                 identity=identity,
+                uow=PostgresUnitOfWork(pool),
             )
             word = "turned " + args.command if changed else f"already {args.command}"
             print(f"{scope} {target or '-'}: {word}")

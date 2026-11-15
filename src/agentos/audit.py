@@ -25,12 +25,12 @@ import hashlib
 import json
 import sys
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
 from agentos.models import AuditEvent
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 
 MAX_LIMIT = 1000
 
@@ -56,8 +56,15 @@ def agent_identity(agent_id: str) -> str:
 
 
 class AuditStore(Protocol):
-    async def record(self, event: AuditEvent) -> None:
-        """Append ``event``. A repeat with the same (tenant_id, event_key) stores nothing."""
+    async def record(self, event: AuditEvent, conn: Any = None) -> None:
+        """Append ``event``. A repeat with the same (tenant_id, event_key) stores nothing.
+
+        With ``conn`` (a unit of work's connection) the event commits with that transaction.
+        """
+        ...
+
+    async def get(self, tenant_id: str, event_key: str, conn: Any = None) -> AuditEvent | None:
+        """The event stored under that key, or None."""
         ...
 
     async def list(
@@ -122,9 +129,18 @@ class PostgresAuditStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
 
-    async def record(self, event: AuditEvent) -> None:
-        async with tenant_transaction(self._pool, event.tenant_id) as conn:
-            await insert_event(conn, event)
+    async def record(self, event: AuditEvent, conn: Any = None) -> None:
+        async with joined_transaction(self._pool, event.tenant_id, conn) as joined:
+            await insert_event(joined, event)
+
+    async def get(self, tenant_id: str, event_key: str, conn: Any = None) -> AuditEvent | None:
+        async with joined_transaction(self._pool, tenant_id, conn) as joined:
+            cur = await joined.execute(
+                f"SELECT {_READ_COLUMNS} FROM audit_events WHERE tenant_id = %s AND event_key = %s",
+                (tenant_id, event_key),
+            )
+            row = await cur.fetchone()
+        return None if row is None else AuditEvent(**dict(zip(_READ_COLUMN_NAMES, row)))
 
     async def list(
         self,
@@ -163,7 +179,19 @@ class InMemoryAuditStore:
         """Make the next ``count`` record calls raise a retryable error, storing nothing."""
         self._fail_next_record = count
 
-    async def record(self, event: AuditEvent) -> None:
+    def snapshot(self) -> tuple[list[AuditEvent], set[tuple[str, str]], int]:
+        """The events as they are now, for ``InMemoryUnitOfWork``."""
+        return list(self.events), set(self._keys), self._next_seq
+
+    def restore(self, state: tuple[list[AuditEvent], set[tuple[str, str]], int]) -> None:
+        self.events, self._keys, self._next_seq = list(state[0]), set(state[1]), state[2]
+
+    async def get(self, tenant_id: str, event_key: str, conn: Any = None) -> AuditEvent | None:
+        return next(
+            (e for e in self.events if (e.tenant_id, e.event_key) == (tenant_id, event_key)), None
+        )
+
+    async def record(self, event: AuditEvent, conn: Any = None) -> None:
         if self._fail_next_record:
             self._fail_next_record -= 1
             raise RuntimeError("simulated audit store outage")

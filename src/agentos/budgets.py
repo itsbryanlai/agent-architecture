@@ -41,7 +41,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from agentos import usage as usage_module
 from agentos.models import LLMResponse
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 from agentos.usage import LLM, UsageGroup, UsageStore, month_bounds, utcnow
 
 log = logging.getLogger("agentos.budgets")
@@ -117,12 +117,20 @@ class BudgetStore(Protocol):
         ...
 
     async def set_budget(
-        self, tenant_id: str, agent_id: str | None, amount: Decimal, updated_by: str
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
     ) -> Budget:
-        """Set or replace the budget of one scope (an agent, or the tenant when None)."""
+        """Set or replace the budget of one scope (an agent, or the tenant when None).
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``), here and below.
+        """
         ...
 
-    async def remove_budget(self, tenant_id: str, agent_id: str | None) -> None:
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
         """Remove a budget, which lifts the limit. ``BudgetNotFound`` when none is set."""
         ...
 
@@ -131,6 +139,13 @@ class InMemoryBudgetStore:
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str | None], Budget] = {}
 
+    def snapshot(self) -> dict[tuple[str, str | None], Budget]:
+        """The rows as they are now, for ``InMemoryUnitOfWork``."""
+        return dict(self._rows)
+
+    def restore(self, state: dict[tuple[str, str | None], Budget]) -> None:
+        self._rows = dict(state)
+
     async def list(self, tenant_id: str) -> list[Budget]:
         return sorted(
             (b for (t, _), b in self._rows.items() if t == tenant_id),
@@ -138,13 +153,18 @@ class InMemoryBudgetStore:
         )
 
     async def set_budget(
-        self, tenant_id: str, agent_id: str | None, amount: Decimal, updated_by: str
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
     ) -> Budget:
         row = Budget(tenant_id, agent_id, amount, updated_by, utcnow())
         self._rows[(tenant_id, agent_id)] = row
         return row
 
-    async def remove_budget(self, tenant_id: str, agent_id: str | None) -> None:
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
         if self._rows.pop((tenant_id, agent_id), None) is None:
             raise _not_found(agent_id)
 
@@ -169,10 +189,15 @@ class PostgresBudgetStore:
             return [Budget(*row) for row in await cur.fetchall()]
 
     async def set_budget(
-        self, tenant_id: str, agent_id: str | None, amount: Decimal, updated_by: str
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
     ) -> Budget:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 f"""
                 INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by)
                 VALUES (%s, %s, %s, %s)
@@ -187,9 +212,9 @@ class PostgresBudgetStore:
             row = await cur.fetchone()
         return Budget(*row)
 
-    async def remove_budget(self, tenant_id: str, agent_id: str | None) -> None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 """
                 DELETE FROM budgets
                 WHERE tenant_id = %s AND scope = %s

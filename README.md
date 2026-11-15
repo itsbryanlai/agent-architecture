@@ -102,11 +102,12 @@ published version, so run these before them. See
 
 Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
-`AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`), `AGENTOS_DATABASE_URL`
-(default `postgresql://agentos_app:agentos_app@localhost:55432/agentos`, the
-local development app role, on the host port 55432 that Compose publishes) and `AGENTOS_CONFIG`
+`AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`) and `AGENTOS_CONFIG`
 (default `config/agents.yaml`; a file for one tenant, or a directory with one
 `*.yaml` per tenant). Only the two import commands and `check_grants` read it.
+`AGENTOS_DATABASE_URL` is required and has no default; see
+[Database and migrations](#database-and-migrations) (Compose publishes Postgres on host
+port 55432).
 
 If you exported `DATABASE_URL` or `TEMPORAL_ADDRESS` for this project before,
 export the `AGENTOS_` names instead: the old ones are now ignored.
@@ -383,7 +384,7 @@ The usage rows need migration `011` (a new install gets the table from
 `scripts/init_db.sql`):
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/011_usage.sql
+uv run python scripts/migrate.py
 ```
 
 The [web console](#web-console) has a **Usage** page: pick a UTC month and see the
@@ -433,7 +434,7 @@ Run it before the worker or the console runs the new code, or the budget reads f
 audit insert for `budget_set` is refused:
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/012_budgets.sql
+uv run python scripts/migrate.py
 ```
 
 ## Kill switches
@@ -482,95 +483,66 @@ fail and the audit insert for `switch_off` is refused. It keeps every earlier au
 so run it after `013`:
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/014_kill_switches.sql
+uv run python scripts/migrate.py
 ```
 
 If a switch cannot be read, the step fails and Temporal retries it; a step is never let
 through unchecked.
 
-## Upgrading an existing local database
+## Database and migrations
 
-Chat history appends are now idempotent by a per-step key. A database created
-before this change needs one migration, `scripts/migrations/001_history_step_key.sql`:
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/001_history_step_key.sql
-```
-
-This is needed only for a database created before this change; a fresh
-`docker compose up` gets the column from `scripts/init_db.sql`.
-
-Tool outputs and knowledge need two more migrations, and Compose now uses a
-Postgres 16 image with pgvector. Recreate the container on the new image (the
-data volume carries over), then apply `002` and `003` the same way as `001`:
+Two passwords come from your shell, never from a file in the repository. Export both
+before `docker compose up` (Compose refuses to start without them) and before the
+migration script:
 
 ```bash
-docker compose up -d postgres
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/002_tool_outputs.sql
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/003_knowledge.sql
+export AGENTOS_OWNER_DB_PASSWORD='<owner password>'   # the role "agentos" that owns the tables
+export AGENTOS_APP_DB_PASSWORD='<app password>'       # the role "agentos_app" the app connects as
+export AGENTOS_DATABASE_URL="postgresql://agentos_app:${AGENTOS_APP_DB_PASSWORD}@localhost:55432/agentos"
 ```
 
-Tenant separation is now also enforced by the database with row-level security.
-Apply `004` as the owner role, `agentos`, the same way:
+`AGENTOS_DATABASE_URL` has no default. The worker, the gateway, the console and the
+command-line tools exit with a message naming it when it is unset. It must name
+`agentos_app`: the table owner and any superuser bypass row-level security, so the app
+never connects as `agentos`.
+
+A new install needs nothing more. On the first start of an empty data directory,
+Compose creates `agentos_app` with `AGENTOS_APP_DB_PASSWORD` and builds the whole
+schema from `scripts/init_db.sql`, which also records every migration as applied.
+
+An existing database is brought up to date with one command, run as the owner role:
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/004_row_level_security.sql
+export AGENTOS_OWNER_DATABASE_URL="postgresql://agentos:${AGENTOS_OWNER_DB_PASSWORD}@localhost:55432/agentos"
+uv run python scripts/migrate.py
 ```
 
-It creates the `agentos_app` role, and the app now connects as `agentos_app`
-by default. The table owner and any superuser bypass row-level security, so the
-app must not connect as `agentos`; use `agentos` only to run migrations. If you
-set `AGENTOS_DATABASE_URL` yourself, point it at `agentos_app`.
+It applies the migrations in `scripts/migrations/` that `schema_migrations` does not list,
+in order, each in its own transaction. It creates `agentos_app` with
+`AGENTOS_APP_DB_PASSWORD` when the role is missing and leaves an existing role's password
+alone; `--set-app-password` resets it to `AGENTOS_APP_DB_PASSWORD`.
 
-The audit log needs `005`, applied as the owner role the same way:
+The worker, the gateway and the console check `schema_migrations` at start-up and
+exit, naming the missing migrations, when the database is behind the code. Run the script
+before restarting them after you pull a change that adds a migration.
+
+A database built before `scripts/migrate.py` existed has the migrations but no record of
+them. Record the ones it has, then run the script for the rest. The earlier migrations
+were written for an empty table and must not be run again over data (`007` narrows a
+constraint that later migrations widened), so this skips them:
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/005_audit_log.sql
+uv run python scripts/migrate.py --baseline 015    # the last migration the database already has
+uv run python scripts/migrate.py
 ```
 
-It adds the append-only `audit_events` table (see "Audit log" below). A fresh
-`docker compose up` gets it from `scripts/init_db.sql`.
-
-Agents in the database need `006`, applied the same way, then the one-time
-import (see [Agents in the database](#agents-in-the-database)):
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/006_agents.sql
-uv run python -m agentos.agent_store import
-```
-
-Members and roles need `007`, applied the same way (see
-[Members and roles](#members-and-roles)).
-
-The web console's sign-in sessions need `008` (see [Web console](#web-console)):
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
-```
-
-Two more audit event kinds, `agent_edit` and `agent_import`, need `009` (run it before
-the control plane saves an edit or the import runs, or the audit insert is refused):
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/009_audit_kinds.sql
-```
-
-Tenants in the database need migration `015` (a new install gets the table and
-its two functions from `scripts/init_db.sql`). Run it as the owner role, then
-import the tenants, **before** the worker, the gateway and the console restart:
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/015_tenants.sql
-uv run python -m agentos.tenant_store import
-```
-
-Agent audiences add two audit event kinds, `audience_refused` and `audience_confirm`, and
-need `010` (run it before the worker starts a turn or an admin publishes, or the audit
-insert is refused):
-
-```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/010_audience.sql
-```
+A migration that adds an audit event kind inserts one row into `audit_kinds` and adds the
+kind to `AUDIT_KINDS` in `src/agentos/models.py`; add its number to `EXPECTED_VERSIONS` in
+`src/agentos/schema_version.py` too. After the first import, the tenants and agents
+come from the database; import them once with
+`uv run python -m agentos.tenant_store import` and `uv run python -m agentos.agent_store import`
+(see [Tenants in the database](#tenants-in-the-database) and
+[Agents in the database](#agents-in-the-database)).
 
 The new image's system library (glibc) is older than the one the previous image
 used, so Postgres may warn about a collation version mismatch, and text indexes
@@ -611,6 +583,17 @@ test-server binary on first use. They never call Claude, Slack or Notion.
 uv run pytest tests/test_ids.py tests/test_config.py tests/test_notion_connector.py \
   tests/test_conversation_workflow.py tests/test_task_workflow.py tests/test_gateway.py -v
 uv run ruff check . && uv run ruff format --check .
+```
+
+The `pg` tier in `tests/pg/` runs the SQL (policies, grants, triggers, every store,
+`init_db.sql` against the migrations, `scripts/migrate.py`) against the Postgres that
+Compose publishes on 127.0.0.1:55432. It builds throwaway databases named
+`agentos_test_<pid>_<n>`, drops them at the end, touches no other database and no
+password, and skips itself when the server is down. The owner connection is
+`AGENTOS_PG_TEST_OWNER_URL` (default `postgresql://agentos:agentos@127.0.0.1:55432/postgres`).
+
+```bash
+uv run pytest tests/pg -v -m pg
 ```
 
 ## Knowledge: indexing and search
@@ -732,8 +715,7 @@ replacing a draft's definition, `agent_submit`, `agent_withdraw`, `agent_reject`
 `agent_publish`, `member_add`, `member_remove`, `member_role`). The one-time YAML
 import writes an `agent_import` event for each agent it inserts, in the same
 transaction (a rerun that skips an agent writes none). Events hold IDs and a hash of the definition, never the
-definition. A refused action is not audited yet. Apply
-`scripts/migrations/007_members.sql` to an existing database.
+definition. A refused action is not audited yet. Run `uv run python scripts/migrate.py` on an existing database.
 
 ## Audit log
 
@@ -889,7 +871,7 @@ refused). It also keeps the audit kind `budget_set`, so run it after the budgets
 when both are in use:
 
 ```bash
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/013_audience_watch.sql
+uv run python scripts/migrate.py
 ```
 
 **In the Slack app** (api.slack.com/apps), Event Subscriptions → Subscribe to bot events,
@@ -923,7 +905,7 @@ export SLACK_CLIENT_ID=...                  # the Slack app's client ID
 export SLACK_CLIENT_SECRET=...              # its client secret
 export AGENTOS_CONSOLE_URL=https://console.example.com   # the public base URL
 export NOTION_TOKEN='<paste here>'          # the tenant's Notion key (its variable, see below)
-docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/008_sessions.sql
+uv run python scripts/migrate.py
 uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
 ```
 
@@ -1008,3 +990,5 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/switches.py` | Kill switches: the table, the checks, and the operator command |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |
+| `scripts/migrate.py` | Applies the migrations a database lacks and records them in `schema_migrations` |
+| `src/agentos/schema_version.py` | The start-up check that the database has every migration the code expects |

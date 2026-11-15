@@ -119,6 +119,7 @@ Knowledge settings, used only when an agent has a Notion page grant:
 |---|---|---|
 | `AGENTOS_EMBED_MODEL` | `text-embedding-v4` | Embedding model served by whichever embedding endpoint is configured. Output is 1024 dimensions, fixed to match the database column |
 | `AGENTOS_EMBED_BASE_URL` | none | An OpenAI-compatible embeddings endpoint of its own, such as a local Ollama. When unset, the Qwen settings are used |
+| `AGENTOS_EMBED_MAX_DISTANCE` | per model | The farthest a chunk may be from the question (cosine distance, 0 to 2) and still reach the model. Defaults: `bge-m3` 0.6 (a starting point from published scores, not measured on your pages), none for other models. Set it to tune the cut-off; an off-topic question gets "No documents this agent can read match that." |
 | `EMBED_API_KEY` | none | Key for that endpoint (secret; export it, never save it). A local Ollama needs none |
 | `QWEN_API_KEY`, `QWEN_BASE_URL` | none | Needed for embeddings, when any agent has a page grant, only if `AGENTOS_EMBED_BASE_URL` is unset |
 
@@ -627,14 +628,54 @@ it):
 uv run python -m agentos.index_knowledge             # one run per granted page, now
 uv run python -m agentos.index_knowledge --wait      # ... and print a summary per run
 uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
+uv run python -m agentos.index_knowledge --confirm-gone  # see "A page that cannot be read"
 ```
 
 Indexing calls the embeddings endpoint, so it **spends embedding credit**;
 pages whose content has not changed since the last run are not embedded again.
 Two agents granted the same page share one run. `--schedule` creates or updates
 one schedule per granted page and deletes the schedules of pages that are no
-longer granted. Pages removed from the tree, trashed or unreachable are removed
-from the index on the next run.
+longer granted. Pages removed from the tree or trashed are removed from the
+index on the next run.
+
+The pages indexed are the granted page, every sub-page beneath it at any depth,
+and the rows of any database placed on those pages (a row is indexed as a page of
+the same grant: its title, its properties as text and its body). Text nested more
+than five levels inside one page (a toggle in a toggle in ...) is not indexed:
+each level costs a Notion call per block that has children, and real pages rarely
+nest that deep. A page unchanged since the last run (same last-edited time, same
+embedding model) is not read again; the run still follows the sub-pages and
+database rows stored for it.
+
+### A page that cannot be read
+
+A page ends a run in one of three states. A page that is trashed or answers 404
+is gone, and it and what hung beneath it leave the index. A page that fails for
+any other lasting reason (403 included, or a request the embedder or Notion
+rejects) keeps what is stored for it and for everything beneath it, and the run
+goes on: one bad page never stops the run. Only a rate limit, a timeout or a
+server error is retried.
+
+If the **granted page itself** is gone, nothing is deleted on that evidence alone.
+The scope is recorded as unhealthy, the agent's creator is told in a direct
+message once (the tenant's admins when the creator cannot be messaged), and its
+index is deleted when three nightly runs in a row find the page gone. A run that
+finds the page again clears the record. To delete it sooner, run
+`uv run python -m agentos.index_knowledge --confirm-gone` (add `--tenant` for one
+tenant); it changes nothing for a scope whose page is back. A page stored while a
+run is going (by a page event) is never deleted by that run.
+
+### Upgrading an existing index
+
+Migration `021_knowledge_health.sql` adds what each page row records (embedding model,
+last-edited time, parent, ancestors, sub-pages) and the scope-health table. Apply it as the
+owner role like the others, then run `uv run python -m agentos.index_knowledge --wait` once:
+until a page row is read again it has no recorded embedding model, so searches skip it. That
+first run reads every page but embeds none, because the content has not changed.
+
+```bash
+docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/021_knowledge_health.sql
+```
 
 ### Keeping the index fresh
 
@@ -656,12 +697,17 @@ To embed on your own machine instead of a hosted endpoint:
    `AGENTOS_EMBED_MODEL=bge-m3`, then restart the worker. No key is needed, and
    the Qwen variables are not used for embeddings.
 4. Changing the embedding model re-embeds every page on the next run, because
-   the content hash includes the model name.
+   the content hash includes the model name. Until a page is re-embedded its
+   old chunks are never searched: each page records the model that embedded it,
+   and a search compares the question only with chunks of the model in use.
 
-The agent's `search_knowledge` tool searches only its own granted pages. Every
-page found is re-checked with Notion before the model sees it (not trashed, still
-under the granted page), so a page moved or deleted since the last run is
-left out. Passages reach the model wrapped in `<source>` tags as data, numbered
+The agent's `search_knowledge` tool searches only its own granted pages. Chunks
+farther from the question than the model's cut-off are dropped, and one page
+gives at most two passages. Every page found is re-checked with Notion before
+the model sees it, at three calls per page however deep it sits: the page itself
+(not trashed, still under the parent it was indexed under), that parent, and the
+granted page. A page moved or deleted since the last run is left out. A page that
+moved together with its whole parent is caught by the nightly run. Passages reach the model wrapped in `<source>` tags as data, numbered
 like `[1]`. When the answer cites a number, the runtime adds a Sources line
 with the page's title and link; the model never writes a link.
 

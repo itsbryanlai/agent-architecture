@@ -193,9 +193,9 @@ def seed_version(conn: psycopg.Connection, tenant: str, agent: str, status: str,
     )
     conn.execute(
         "INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition, "
-        "created_by, submitted_by, approved_by, published_at) "
-        "VALUES (%s, %s, %s, %s, '{}', 'u', 'u', 'u', '2026-01-01')",
-        (tenant, agent, version, status),
+        "created_by, submitted_by, approved_by, published_at, definition_sha256) "
+        "VALUES (%s, %s, %s, %s, '{}', 'u', 'u', 'u', '2026-01-01', %s)",
+        (tenant, agent, version, status, None if status == "draft" else "h"),
     )
 
 
@@ -206,6 +206,12 @@ ALLOWED_MOVES = {
     ("published", "superseded"),
 }
 STATUSES = ("draft", "pending", "published", "superseded")
+# A version has a definition hash exactly when it is not a draft.
+MOVE = "UPDATE agent_versions SET status = %s, definition_sha256 = %s"
+
+
+def hash_for(status: str) -> str | None:
+    return None if status == "draft" else "h"
 
 
 @pytest.mark.parametrize(
@@ -222,11 +228,11 @@ async def test_agent_version_moves_only_along_the_lifecycle(
     move = tenant_transaction(pool, tenant)
     if (start, end) in ALLOWED_MOVES:
         async with move as conn:
-            await conn.execute("UPDATE agent_versions SET status = %s", (end,))
+            await conn.execute(MOVE, (end, hash_for(end)))
     else:
         with pytest.raises(errors.RaiseException):
             async with move as conn:
-                await conn.execute("UPDATE agent_versions SET status = %s", (end,))
+                await conn.execute(MOVE, (end, hash_for(end)))
 
 
 @pytest.mark.parametrize(

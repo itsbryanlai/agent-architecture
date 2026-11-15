@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from urllib.parse import urlparse
 
 from psycopg_pool import AsyncConnectionPool
@@ -55,7 +56,7 @@ from agentos.switches import PostgresSwitchStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
 from agentos.tenants import RegistrySync, build_registry, require_tenant_secret
-from agentos.usage import PostgresUsageStore, UsageRecorder, load_prices
+from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
@@ -171,6 +172,25 @@ async def check_grants_at_startup(
     return summary
 
 
+def startup_price_failure(
+    prices: Prices, prices_path: str, models: list[str], at: datetime | None = None
+) -> str | None:
+    """A message naming each model that has no price entry in effect today, else None.
+
+    A model with no price is recorded with no cost, and a budget then stops its scope
+    because the spend cannot be measured, so the worker refuses to start without one.
+    """
+    when = at or utcnow()
+    missing = [m for m in dict.fromkeys(models) if prices.entry_for(m, when) is None]
+    if not missing:
+        return None
+    names = ", ".join(f"'{m}'" for m in missing)
+    return (
+        f"no price for model {names} in {prices_path} on {when.date()}. Add an entry for "
+        "each (its header says how, and how to match a dated name) and start again."
+    )
+
+
 # How often the worker re-reads the tenants table. Short, because an activity for a
 # tenant the worker does not know yet fails for good.
 TENANT_SYNC_SECONDS = 5.0
@@ -226,6 +246,13 @@ async def main() -> None:
             raise SystemExit(agent_failure)
         published = await published_tenants(agent_store, tenants)
         embedder = build_embedder(settings, published)
+        price_failure = startup_price_failure(
+            prices,
+            settings.prices_path,
+            [settings.model] + ([embedder.model] if embedder is not None else []),
+        )
+        if price_failure:
+            raise SystemExit(price_failure)
         registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
         failures = []
         for tenant_id in registry.tenants():
@@ -249,13 +276,14 @@ async def main() -> None:
                 urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
             )
         knowledge = PostgresKnowledgeStore(pool)
-        usage = UsageRecorder(PostgresUsageStore(pool), prices)
+        budget_guard = BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool))
+        # The guard follows each recorded call, so its cached spend never lags this process's own.
+        usage = UsageRecorder(PostgresUsageStore(pool), prices, listener=budget_guard)
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         pauses = PostgresPauseStore(pool)
         switches = PostgresSwitchStore(pool)
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
-        budget_guard = BudgetGuard(PostgresBudgetStore(pool), PostgresUsageStore(pool))
         activities = AgentActivities(
             settings=settings,
             registry=registry,

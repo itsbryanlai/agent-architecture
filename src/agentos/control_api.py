@@ -40,6 +40,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from psycopg import ProgrammingError
+from psycopg.conninfo import conninfo_to_dict
 from pydantic import BaseModel, ConfigDict
 
 from agentos.agent_store import AgentNotFound
@@ -121,6 +123,30 @@ def check_bind_host(host: str, sign_in_configured: bool = False) -> None:
             f"refusing to listen on '{host}': the control API binds only to "
             f"{', '.join(LOOPBACK_HOSTS)} until sign-in with Slack is configured "
             "(SLACK_CLIENT_ID, SLACK_CLIENT_SECRET and AGENTOS_CONSOLE_URL)"
+        )
+
+
+# Passwords that ship in the repository for local development.
+DEVELOPMENT_DATABASE_PASSWORDS = frozenset({"agentos_app", "agentos"})
+
+
+def check_database_for_bind(host: str, database_url: str) -> None:
+    """Refuse a non-loopback bind while the database password is empty or a development default.
+
+    A console reachable beyond this machine must not sit in front of a database
+    that anyone who has read the repository can open.
+    """
+    if host in LOOPBACK_HOSTS:
+        return
+    try:
+        password = conninfo_to_dict(database_url).get("password") or ""
+    except ProgrammingError:
+        password = ""
+    if not password or password in DEVELOPMENT_DATABASE_PASSWORDS:
+        raise SystemExit(
+            f"refusing to listen on '{host}': the database password in AGENTOS_DATABASE_URL "
+            "is empty or a development default. Set a password of your own in "
+            "AGENTOS_DATABASE_URL before listening beyond loopback."
         )
 
 
@@ -673,6 +699,7 @@ def build_process_app(
     except ConfigError as err:
         raise SystemExit(str(err)) from err
     check_bind_host(host, sign_in_configured=sign_in is not None)
+    check_database_for_bind(host, settings.database_url)
     if sign_in is None:
         operator = operator_from_environment(environ)
         return create_app(None, None, operator, lifespan=_real_lifespan, port=port)

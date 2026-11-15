@@ -130,14 +130,17 @@ def create_app(
     def deps(request: Request) -> GatewayDeps:
         return request.app.state.deps
 
-    async def verified_body(request: Request) -> bytes | None:
-        body = await request.body()
+    async def verified_body(request: Request) -> bytes | Response:
+        """The body of a correctly signed request, else the refusing response."""
+        body = await _read_limited_body(request)
+        if body is None:
+            return Response(status_code=413)
         ok = deps(request).verifier.is_valid(
             body=body,
             timestamp=request.headers.get("X-Slack-Request-Timestamp"),
             signature=request.headers.get("X-Slack-Signature"),
         )
-        return body if ok else None
+        return body if ok else Response(status_code=401)
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -146,8 +149,8 @@ def create_app(
     @app.post("/slack/events")
     async def slack_events(request: Request) -> Response:
         body = await verified_body(request)
-        if body is None:
-            return Response(status_code=401)
+        if isinstance(body, Response):
+            return body
         payload = json.loads(body or b"{}")
         if payload.get("type") == "url_verification":
             return Response(
@@ -215,8 +218,8 @@ def create_app(
     @app.post("/slack/interactivity")
     async def slack_interactivity(request: Request) -> Response:
         body = await verified_body(request)
-        if body is None:
-            return Response(status_code=401)
+        if isinstance(body, Response):
+            return body
         d = deps(request)
         form = parse_qs(body.decode("utf-8"))
         payload = json.loads((form.get("payload") or ["{}"])[0])
@@ -312,6 +315,34 @@ async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
     )
 
 
+# Slack events are a few KB and an interactivity payload (a form submission) well
+# under 100 KB; Notion events are smaller still. 1 MiB leaves ample room and keeps
+# an unauthenticated caller from making the gateway hold a large body.
+MAX_WEBHOOK_BODY = 1024 * 1024
+
+# A Notion verification token is a short opaque string.
+MAX_VERIFICATION_TOKEN = 1024
+
+
+async def _read_limited_body(request: Request) -> bytes | None:
+    """The request body, or None when it is over ``MAX_WEBHOOK_BODY``.
+
+    Read in chunks and abandoned at the limit, so an oversized body is never
+    held whole; this runs before a signature check or any parsing.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_WEBHOOK_BODY:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_WEBHOOK_BODY:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Response:
     """Handle one Notion webhook request for the tenant its URL names.
 
@@ -327,7 +358,9 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
         log.warning("Notion webhook for an unknown tenant tenant_id=%s", tenant)
         return Response(status_code=404)
     token_env = config.secrets.notion_webhook_token_env
-    body = await request.body()
+    body = await _read_limited_body(request)
+    if body is None:
+        return Response(status_code=413)
     signature = request.headers.get("X-Notion-Signature")
     try:
         payload = json.loads(body)
@@ -342,8 +375,15 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
         # carry a signature header, but it cannot be verified: its key is
         # the very token being delivered. The token goes to an owner-only
         # file, never to a log, and the operator pastes it into Notion.
-        # Once a token is configured the handshake is closed, so nobody can
-        # overwrite the file with a value of their own.
+        # The handshake is closed once a token is configured, and also while
+        # the token file exists: the file is created exclusively and never
+        # followed through a symlink, so nobody can replace it with a value
+        # of their own. The operator deletes the file to start over.
+        if set(payload) != {"verification_token"} or not (
+            0 < len(payload["verification_token"]) <= MAX_VERIFICATION_TOKEN
+        ):
+            log.warning("tenant_id=%s Notion webhook handshake refused: malformed body", tenant)
+            return Response(status_code=400)
         if token:
             log.warning(
                 "tenant_id=%s Notion webhook handshake refused: a verification token is "
@@ -353,9 +393,25 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
                 token_env,
             )
             return Response(status_code=409)
-        path = _write_token_file(
-            _token_file(d.settings.notion_token_dir, tenant), str(payload["verification_token"])
-        )
+        try:
+            path = _write_token_file(
+                _token_file(d.settings.notion_token_dir, tenant), payload["verification_token"]
+            )
+        except FileExistsError:
+            log.warning(
+                "tenant_id=%s Notion webhook handshake refused: the token file already "
+                "exists; delete it to accept a new subscription",
+                tenant,
+            )
+            return Response(status_code=409)
+        except OSError:
+            # A symlink at the path (O_NOFOLLOW) or a path we cannot write.
+            log.warning(
+                "tenant_id=%s Notion webhook handshake refused: the token file cannot be "
+                "created safely",
+                tenant,
+            )
+            return Response(status_code=409)
         log.warning(
             "tenant_id=%s Notion webhook verification token written to %s; "
             "paste it into the Notion integration and export it as %s",
@@ -418,15 +474,18 @@ def _token_file(directory: str, tenant: str) -> str:
 
 
 def _write_token_file(configured: str, token: str) -> str:
-    """Write the verification token to an owner-only file; return its path."""
+    """Create the owner-only token file and write the token; return its path.
+
+    Raises ``FileExistsError`` when the path exists (a symlink counts, and is
+    never followed) so an existing token is never replaced.
+    """
     path = os.path.expanduser(configured)
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(token)
-    os.chmod(path, 0o600)
     return path
 
 

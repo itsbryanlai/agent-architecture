@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import stat
 
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
 from temporalio.converter import (
     ActivitySerializationContext,
     DataConverter,
@@ -30,7 +34,7 @@ from agentos.crypto_keys import (
 )
 from agentos.llm import ScriptedLLMClient
 from agentos.models import ConversationRef, InboundMessage, LLMResponse
-from agentos.payload_codec import NoTenantForPayload, TenantPayloadCodec
+from agentos.payload_codec import NoTenantForPayload, PayloadRefused, TenantPayloadCodec
 from agentos.slack_client import FakeSlack
 from agentos.stores import (
     InMemoryHistoryStore,
@@ -69,6 +73,7 @@ def json_payload(text: str) -> Payload:
 
 
 async def test_round_trip_per_tenant(keys):
+    """Fails if a payload is not encrypted under its own tenant's versioned key, or does not decode."""
     codec = TenantPayloadCodec(keys)
     acme = bound(codec, ids.conversation_id("acme", "C1", "1.0"))
     globex = bound(codec, ids.task_id("globex", "u1"))
@@ -78,26 +83,52 @@ async def test_round_trip_per_tenant(keys):
     (acme_2,) = await acme.encode([original])
     (globex_1,) = await globex.encode([original])
 
-    for encrypted, tenant in ((acme_1, "acme"), (acme_2, "acme"), (globex_1, "globex")):
+    for encrypted, key_id in ((acme_1, "acme/v1"), (acme_2, "acme/v1"), (globex_1, "globex/v1")):
         assert encrypted.metadata["encoding"] == b"binary/encrypted"
-        assert encrypted.metadata["encryption-key-id"] == tenant.encode()
+        assert encrypted.metadata["encryption-key-id"] == key_id.encode()
         assert b"hello" not in encrypted.data
     assert acme_1.data != acme_2.data  # a fresh nonce per call
     assert acme_1.data != globex_1.data  # a different key per tenant
-    # Any codec decodes from the tag alone, bound or not.
-    assert await codec.decode([acme_1, globex_1]) == [original, original]
-    assert await acme.decode([acme_2]) == [original]
+    assert await acme.decode([acme_1, acme_2]) == [original, original]
+    assert await globex.decode([globex_1]) == [original]
 
 
-async def test_wrong_tenant_key_cannot_decode(keys):
+async def test_cross_tenant_payload_refused(keys):
+    """Fails if a payload naming another tenant, or forged to name one, is decoded."""
     acme = bound(TenantPayloadCodec(keys), ids.conversation_id("acme", "C1", "1.0"))
-    (encrypted,) = await acme.encode([json_payload("secret")])
+    globex = bound(TenantPayloadCodec(keys), ids.conversation_id("globex", "C1", "1.0"))
+    (from_globex,) = await globex.encode([json_payload("secret")])
 
-    forged = Payload.FromString(encrypted.SerializeToString())
-    forged.metadata["encryption-key-id"] = b"globex"  # decrypt with globex's key
-    with pytest.raises(Exception) as err:
-        await TenantPayloadCodec(keys).decode([forged])
+    with pytest.raises(PayloadRefused) as err:
+        await acme.decode([from_globex])
     assert "secret" not in str(err.value)
+
+    # Re-labelled as acme's, the globex ciphertext does not authenticate either.
+    forged = Payload.FromString(from_globex.SerializeToString())
+    forged.metadata["encryption-key-id"] = b"acme/v1"
+    with pytest.raises(InvalidTag) as forged_err:
+        await acme.decode([forged])
+    assert "secret" not in str(forged_err.value)
+
+
+async def test_payload_moved_to_another_workflow_refused(keys):
+    """Fails if a payload of one workflow decodes inside another workflow of the same tenant."""
+    first = bound(TenantPayloadCodec(keys), ids.conversation_id("acme", "C1", "1.0"))
+    second = bound(TenantPayloadCodec(keys), ids.conversation_id("acme", "C1", "2.0"))
+    (payload,) = await first.encode([json_payload("secret")])
+
+    with pytest.raises(InvalidTag):
+        await second.decode([payload])
+    assert await first.decode([payload]) == [json_payload("secret")]
+
+
+async def test_scheduled_run_decodes_input_encoded_for_the_schedule_action(keys):
+    """Fails if a scheduled run, whose ID carries a timestamp, cannot read its own input."""
+    action_id = ids.index_workflow_id("acme", "all")
+    (payload,) = await bound(TenantPayloadCodec(keys), action_id).encode([json_payload("args")])
+
+    run = bound(TenantPayloadCodec(keys), f"{action_id}-2026-11-16T03:00:00Z")
+    assert await run.decode([payload]) == [json_payload("args")]
 
 
 async def test_encode_without_tenant_fails_closed(keys):
@@ -122,9 +153,75 @@ async def test_encode_without_tenant_fails_closed(keys):
         await bound(codec, "no-tenant-prefix").encode([json_payload("x")])
 
 
-async def test_plaintext_payload_still_decodes(keys):
-    plain = json_payload("from before encryption")
-    assert await TenantPayloadCodec(keys).decode([plain]) == [plain]
+async def test_plaintext_refused_unless_enabled(keys):
+    """Fails if an unencrypted payload is accepted by default, or refused when the setting allows it."""
+    plain = json_payload("injected")
+    workflow_id = ids.conversation_id("acme", "C1", "1.0")
+
+    with pytest.raises(PayloadRefused):
+        await bound(TenantPayloadCodec(keys), workflow_id).decode([plain])
+    allowed = bound(TenantPayloadCodec(keys, allow_plaintext=True), workflow_id)
+    assert await allowed.decode([plain]) == [plain]
+
+
+def legacy_payload(keys: LocalKeyStore, tenant: str, original: Payload) -> Payload:
+    """A payload as written before keys were versioned: bare tenant key ID, tenant as AAD."""
+    nonce = os.urandom(12)
+    data = AESGCM(keys.key(tenant)).encrypt(nonce, original.SerializeToString(), tenant.encode())
+    return Payload(
+        metadata={
+            "encoding": b"binary/encrypted",
+            "encryption-key-id": tenant.encode(),
+            "nonce": nonce,
+        },
+        data=data,
+    )
+
+
+async def test_unversioned_payload_reads_as_v1_for_its_own_tenant_only(keys):
+    """Fails if a pre-versioning payload stops decoding, decodes for another tenant, or is encoded."""
+    original = json_payload("old")
+    old = legacy_payload(keys, "acme", original)
+    acme = bound(TenantPayloadCodec(keys), ids.conversation_id("acme", "C1", "1.0"))
+    globex = bound(TenantPayloadCodec(keys), ids.conversation_id("globex", "C1", "1.0"))
+
+    assert await acme.decode([old]) == [original]
+    with pytest.raises(PayloadRefused):
+        await globex.decode([old])
+    strict = bound(
+        TenantPayloadCodec(keys, allow_legacy=False), ids.conversation_id("acme", "C1", "1.0")
+    )
+    with pytest.raises(PayloadRefused):
+        await strict.decode([old])
+    (fresh,) = await acme.encode([original])
+    assert fresh.metadata["encryption-key-id"] == b"acme/v1"
+
+
+async def test_rotation_encodes_with_newest_and_decodes_every_version(keys, tmp_path):
+    """Fails if rotation changes how old payloads decode or new payloads are not under the new version."""
+    workflow_id = ids.conversation_id("acme", "C1", "1.0")
+    codec = bound(TenantPayloadCodec(keys), workflow_id)
+    (before,) = await codec.encode([json_payload("one")])
+
+    create_key(tmp_path / "keys", "acme", rotate=True)
+    (after,) = await codec.encode([json_payload("two")])
+
+    assert before.metadata["encryption-key-id"] == b"acme/v1"
+    assert after.metadata["encryption-key-id"] == b"acme/v2"
+    assert await codec.decode([before, after]) == [json_payload("one"), json_payload("two")]
+
+
+def test_rotate_needs_an_existing_key_and_never_overwrites(tmp_path, capsys):
+    """Fails if rotate invents a first key, or overwrites a version that exists."""
+    key_dir = tmp_path / "keys"
+    assert tenant_keys_main(["rotate", "acme"], key_dir=str(key_dir)) == 2
+    assert tenant_keys_main(["create", "acme"], key_dir=str(key_dir)) == 0
+    assert tenant_keys_main(["rotate", "acme"], key_dir=str(key_dir)) == 0
+    capsys.readouterr()
+    assert (key_dir / "acme.v2.key").exists()
+    first = (key_dir / "acme.key").read_bytes()
+    assert tenant_keys_main(["create", "acme"], key_dir=str(key_dir)) == 1
+    assert (key_dir / "acme.key").read_bytes() == first
 
 
 def test_key_file_permissions_enforced(tmp_path):
@@ -199,6 +296,24 @@ def all_payloads(message) -> list[Payload]:
     return found
 
 
+def is_sdk_patch_record(event, payload: Payload) -> bool:
+    """True for the markers and search attribute the SDK writes for workflow.patched.
+
+    Temporal core writes these itself, outside the data converter, so no codec can
+    reach them. They hold only the patch IDs from the workflow code.
+    """
+    if event.event_type == EventType.EVENT_TYPE_MARKER_RECORDED:
+        if event.marker_recorded_event_attributes.marker_name != "core_patch":
+            return False
+        return set(json.loads(payload.data)) == {"id", "deprecated"}
+    if event.event_type == EventType.EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES:
+        fields = event.upsert_workflow_search_attributes_event_attributes.search_attributes
+        return payload.metadata.get("type") == b"KeywordList" and list(fields.indexed_fields) == [
+            "TemporalChangeVersion"
+        ]
+    return False
+
+
 async def test_workflow_history_is_encrypted(tmp_path, agents):
     key_dir = tmp_path / "keys"
     create_key(key_dir, TENANT)
@@ -249,11 +364,16 @@ async def test_workflow_history_is_encrypted(tmp_path, agents):
     finally:
         await env.shutdown()
 
-    payloads = [p for event in history.events for p in all_payloads(event)]
+    payloads = []
+    for event in history.events:
+        for payload in all_payloads(event):
+            if is_sdk_patch_record(event, payload):
+                continue
+            payloads.append(payload)
     assert payloads, "expected input and result payloads in the history"
     for payload in payloads:
         assert payload.metadata["encoding"] == b"binary/encrypted"
-        assert payload.metadata["encryption-key-id"] == TENANT.encode()
+        assert payload.metadata["encryption-key-id"] == f"{TENANT}/v1".encode()
     raw = b"".join(event.SerializeToString() for event in history.events)
     assert SECRET_TEXT.encode() not in raw
     assert b"Done, nothing to file." not in raw

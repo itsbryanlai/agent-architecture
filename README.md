@@ -297,7 +297,9 @@ uv run python -m agentos.tenant_store import
 Every payload the platform writes to Temporal (workflow inputs and results,
 signals, queries, activity inputs and results) is encrypted with the key of the
 tenant it belongs to (AES-256-GCM). The tenant comes from the workflow ID, which
-always starts with the tenant ID; a payload with no tenant is never sent.
+always starts with the tenant ID; a payload with no tenant is never sent. Each
+payload also carries its key ID (`<tenant>/v<N>`) and is bound to its workflow ID,
+so a payload from another tenant, or moved to another workflow, is refused.
 
 **Create a key for each tenant before starting the worker or the gateway:**
 
@@ -317,9 +319,23 @@ connect, and refuse to start with a one-line summary naming each missing or
 unsafe key file and the command that creates it. Errors and failure messages in
 the history are encrypted too.
 
-Workflows that started before encryption was turned on still read: payloads
-without the encrypted tag pass through unchanged. New payloads are always
-encrypted.
+**Rotate a tenant's key** with:
+
+```bash
+uv run python -m agentos.tenant_keys rotate <tenant_id>
+```
+
+This adds `<tenant_id>.v2.key` (then `.v3.key`, and so on) beside the first
+one. New payloads use the newest version from the next one written; every older
+version stays in the directory so histories written under it still read. Copy
+the new file to every host that runs the worker, the gateway or
+`index_knowledge` before rotating on any of them, and never delete an old
+version while a history written under it is kept.
+
+Payloads written before keys were versioned (key ID without `/v<N>`) still read,
+as version 1 of their own tenant. A payload with no encrypted tag is refused. To
+read a history written before encryption existed, start that process with
+`AGENTOS_ALLOW_PLAINTEXT_PAYLOADS=1`, then unset it.
 
 The Temporal web UI shows these payloads as encrypted until a codec server is
 added (a later change). Every process that connects to Temporal (worker,
@@ -328,7 +344,8 @@ so each needs the keys it will use.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AGENTOS_KEY_DIR` | `~/.agentos/keys` | Directory of per-tenant key files, `<tenant_id>.key` |
+| `AGENTOS_KEY_DIR` | `~/.agentos/keys` | Directory of per-tenant key files, `<tenant_id>.key` and `<tenant_id>.v<N>.key` |
+| `AGENTOS_ALLOW_PLAINTEXT_PAYLOADS` | off | Accept payloads that were never encrypted (old histories only) |
 
 ## Model provider
 

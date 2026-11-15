@@ -87,6 +87,10 @@ class Settings:
     # Where each tenant's payload encryption key file lives. A leading "~" is
     # expanded when the key is read. Holds a directory name, never a key.
     key_dir: str = DEFAULT_KEY_DIR
+    # Lets the payload codec read payloads that were never encrypted (a history
+    # from before encryption). Off by default: with Temporal reachable, a
+    # plaintext payload would otherwise be accepted as genuine.
+    allow_plaintext_payloads: bool = False
     anthropic_api_key: str | None = field(default=None, repr=False)
     qwen_api_key: str | None = field(default=None, repr=False)
     llm_provider: str = DEFAULT_LLM_PROVIDER
@@ -150,6 +154,7 @@ def load_settings() -> Settings:
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token_dir=env.get("AGENTOS_NOTION_TOKEN_DIR") or DEFAULT_NOTION_TOKEN_DIR,
         key_dir=env.get("AGENTOS_KEY_DIR") or DEFAULT_KEY_DIR,
+        allow_plaintext_payloads=_parse_flag(env.get("AGENTOS_ALLOW_PLAINTEXT_PAYLOADS")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         qwen_api_key=env.get("QWEN_API_KEY"),
         llm_provider=provider,

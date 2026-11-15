@@ -701,7 +701,7 @@ async def _real_lifespan(app: FastAPI):
                 if config is None:
                     raise KeyError(tenant_id)
                 slack_clients[tenant_id] = RealSlackPoster(
-                    require_tenant_secret(config, "slack_bot_token_env")
+                    require_tenant_secret(config, "slack_bot_token_env"), tenant_id=tenant_id
                 )
             return slack_clients[tenant_id]
 

@@ -1,6 +1,8 @@
 """Per-tenant encryption keys, kept in owner-only files outside the repo.
 
-A key is 32 random bytes, base64-encoded, in ``<directory>/<tenant_id>.key``.
+A key is 32 random bytes, base64-encoded, in ``<directory>/<tenant_id>.key``
+(version 1) or ``<directory>/<tenant_id>.vN.key`` (a later version, made by
+rotating). New payloads use the newest version; older ones stay readable.
 ``LocalKeyStore`` is the only place that reads one. It is the seam where a
 cloud key service replaces local files later.
 
@@ -41,24 +43,75 @@ def _check_tenant(tenant_id: str) -> None:
         raise TenantKeyError(f"'{tenant_id}' is not a valid tenant ID")
 
 
+def key_id(tenant_id: str, version: int) -> str:
+    """The ID a payload carries for a key: ``tenant/vN``."""
+    return f"{tenant_id}/v{version}"
+
+
+def parse_key_id(raw: str) -> tuple[str, int, bool]:
+    """Split a payload's key ID into (tenant, version, legacy).
+
+    An ID without a version (``tenant``) was written before keys were
+    versioned; it names version 1 and is marked legacy. Raises ``TenantKeyError``
+    for anything that is neither form.
+    """
+    tenant, sep, version = raw.partition("/")
+    if not sep:
+        _check_tenant(tenant)
+        return tenant, 1, True
+    if not (version.startswith("v") and version[1:].isdigit() and int(version[1:]) >= 1):
+        raise TenantKeyError(f"'{raw}' is not a valid key ID")
+    _check_tenant(tenant)
+    return tenant, int(version[1:]), False
+
+
 class LocalKeyStore:
+    """Keys by tenant and version. Version 1 is ``<tenant>.key``, version N is ``<tenant>.vN.key``."""
+
     def __init__(self, directory: str | Path):
         self._directory = Path(directory).expanduser()
-        self._cache: dict[str, bytes] = {}
+        self._cache: dict[tuple[str, int], bytes] = {}
 
     def __repr__(self) -> str:
         return f"LocalKeyStore({str(self._directory)!r})"
 
-    def path(self, tenant_id: str) -> Path:
+    def path(self, tenant_id: str, version: int = 1) -> Path:
         _check_tenant(tenant_id)
-        return self._directory / f"{tenant_id}.key"
+        name = f"{tenant_id}.key" if version == 1 else f"{tenant_id}.v{version}.key"
+        return self._directory / name
 
-    def key(self, tenant_id: str) -> bytes:
+    def versions(self, tenant_id: str) -> list[int]:
+        """The versions the tenant has a key file for, ascending."""
+        _check_tenant(tenant_id)
+        found: set[int] = set()
+        if self.path(tenant_id).exists():
+            found.add(1)
+        try:
+            names = [p.name for p in self._directory.iterdir()]
+        except FileNotFoundError:
+            names = []
+        prefix = f"{tenant_id}.v"
+        for name in names:
+            if name.startswith(prefix) and name.endswith(".key"):
+                number = name[len(prefix) : -len(".key")]
+                if number.isdigit() and int(number) >= 2:
+                    found.add(int(number))
+        return sorted(found)
+
+    def latest_version(self, tenant_id: str) -> int:
+        """The version new payloads are encrypted with. Raises if the tenant has no key."""
+        found = self.versions(tenant_id)
+        if not found:
+            # Raises the same "no key, create one" error as a direct read.
+            self.key(tenant_id, 1)
+        return found[-1]
+
+    def key(self, tenant_id: str, version: int = 1) -> bytes:
         """The tenant's 256-bit key. Raises ``TenantKeyError`` if it can't be used safely."""
-        cached = self._cache.get(tenant_id)
+        cached = self._cache.get((tenant_id, version))
         if cached is not None:
             return cached
-        path = self.path(tenant_id)
+        path = self.path(tenant_id, version)
         try:
             mode = stat.S_IMODE(path.stat().st_mode)
         except FileNotFoundError:
@@ -82,20 +135,33 @@ class LocalKeyStore:
                 f"key file {path} for tenant '{tenant_id}' holds {len(key)} bytes, "
                 f"expected {KEY_BYTES}"
             )
-        self._cache[tenant_id] = key
+        self._cache[(tenant_id, version)] = key
         return key
 
 
-def create_key(directory: str | Path, tenant_id: str) -> Path:
+def create_key(directory: str | Path, tenant_id: str, *, rotate: bool = False) -> Path:
     """Write a new random key for the tenant and return its path.
 
-    Never overwrites: the file is created exclusively, so an existing key
-    raises ``KeyExists`` and stays as it was.
+    Without ``rotate`` this creates version 1 and an existing key raises
+    ``KeyExists``. With ``rotate`` it creates the next version after the
+    newest one (the tenant must already have a key); older versions stay, so
+    payloads written under them still decode. Files are created exclusively,
+    so an existing key is never overwritten.
     """
     import secrets
 
     store = LocalKeyStore(directory)
-    path = store.path(tenant_id)
+    if rotate:
+        existing = store.versions(tenant_id)
+        if not existing:
+            raise TenantKeyError(
+                f"tenant '{tenant_id}' has no key to rotate; "
+                f"create one with: uv run python -m agentos.tenant_keys create {tenant_id}"
+            )
+        version = existing[-1] + 1
+    else:
+        version = 1
+    path = store.path(tenant_id, version)
     directory = path.parent
     if not directory.exists():
         directory.mkdir(parents=True, mode=KEY_DIR_MODE)
@@ -120,7 +186,8 @@ def check_keys(keys: LocalKeyStore, tenant_ids: Iterable[str]) -> list[str]:
     problems = []
     for tenant_id in tenant_ids:
         try:
-            keys.key(tenant_id)
+            for version in keys.versions(tenant_id) or [1]:
+                keys.key(tenant_id, version)
         except TenantKeyError as e:
             problems.append(str(e))
     return problems

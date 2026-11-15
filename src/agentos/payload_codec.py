@@ -8,18 +8,28 @@ content.
 
 Rules enforced here:
 
-* A payload is always encrypted (AES-256-GCM, a fresh random nonce, the tenant
-  ID as associated data) with the key of its own tenant.
+* A payload is always encrypted (AES-256-GCM, a fresh random nonce, the
+  workflow ID as associated data) with the newest key of its own tenant. Its
+  key ID is ``tenant/vN``.
 * If no tenant can be derived, encoding fails. Nothing is ever sent unencrypted.
-* Decoding needs only the key ID in the payload's own metadata. A payload
-  without the encrypted tag is passed through, so histories written before
-  encryption still read.
+* Decoding checks the payload's key ID against the tenant the codec is bound
+  to, not the other way round: a payload naming another tenant is refused, as
+  is one moved to another workflow (the associated data would not match). A
+  codec with no workflow bound refuses every encrypted payload.
+* A tenant may hold several key versions (see ``crypto_keys``); decoding
+  accepts any version the tenant still has.
+* A payload without the encrypted tag is refused unless the codec was built
+  with ``allow_plaintext=True`` (a setting, off by default).
+* Payloads written before keys were versioned carry the bare tenant ID as key
+  ID and the tenant ID as associated data. They decode as version 1 while
+  ``allow_legacy`` is on, which is the default. Nothing is ever encoded that way.
 * Keys come from the key store and never appear in logs, errors or ``repr``.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from typing import Self
 
@@ -34,7 +44,7 @@ from temporalio.converter import (
 )
 
 from agentos.config import TENANT_ID_PATTERN
-from agentos.crypto_keys import LocalKeyStore
+from agentos.crypto_keys import LocalKeyStore, TenantKeyError, key_id, parse_key_id
 
 ENCRYPTED_ENCODING = b"binary/encrypted"
 KEY_ID_METADATA = "encryption-key-id"
@@ -42,8 +52,23 @@ NONCE_METADATA = "nonce"
 NONCE_BYTES = 12
 
 
+# Temporal starts a scheduled run under the schedule action's workflow ID plus
+# "-" and the nominal time. The input was encoded under the action's own ID, so
+# the suffix is dropped before the ID is used as associated data.
+_SCHEDULED_RUN_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def associated_data(workflow_id: str) -> bytes:
+    """The bytes a payload of this workflow is authenticated against."""
+    return _SCHEDULED_RUN_SUFFIX.sub("", workflow_id).encode()
+
+
 class NoTenantForPayload(RuntimeError):
     """A payload was about to be encoded with no tenant to encrypt it for."""
+
+
+class PayloadRefused(RuntimeError):
+    """A payload was not decoded: wrong tenant, wrong workflow, plaintext or unbound."""
 
 
 def tenant_from_workflow_id(workflow_id: str | None) -> str | None:
@@ -55,9 +80,20 @@ def tenant_from_workflow_id(workflow_id: str | None) -> str | None:
 
 
 class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
-    def __init__(self, keys: LocalKeyStore, tenant_id: str | None = None):
+    def __init__(
+        self,
+        keys: LocalKeyStore,
+        tenant_id: str | None = None,
+        workflow_id: str | None = None,
+        *,
+        allow_plaintext: bool = False,
+        allow_legacy: bool = True,
+    ):
         self._keys = keys
         self._tenant_id = tenant_id
+        self._workflow_id = workflow_id
+        self._allow_plaintext = allow_plaintext
+        self._allow_legacy = allow_legacy
 
     def __repr__(self) -> str:
         return f"TenantPayloadCodec(tenant_id={self._tenant_id!r})"
@@ -66,26 +102,35 @@ class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
         workflow_id: str | None = None
         if isinstance(context, (WorkflowSerializationContext, ActivitySerializationContext)):
             workflow_id = context.workflow_id
-        # A context with no usable workflow ID gives an unbound codec: it can
-        # still decode, and it refuses to encode.
-        return type(self)(self._keys, tenant_from_workflow_id(workflow_id))
+        tenant = tenant_from_workflow_id(workflow_id)
+        # A context with no usable workflow ID gives an unbound codec: it
+        # refuses to encode, and refuses every encrypted payload.
+        return type(self)(
+            self._keys,
+            tenant,
+            workflow_id if tenant else None,
+            allow_plaintext=self._allow_plaintext,
+            allow_legacy=self._allow_legacy,
+        )
 
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
-        if self._tenant_id is None:
+        if self._tenant_id is None or self._workflow_id is None:
             raise NoTenantForPayload(
                 "refusing to send a payload: no tenant could be derived from its workflow ID"
             )
         tenant = self._tenant_id
-        aead = AESGCM(self._keys.key(tenant))
+        version = self._keys.latest_version(tenant)
+        aead = AESGCM(self._keys.key(tenant, version))
+        aad = associated_data(self._workflow_id)
         out: list[Payload] = []
         for payload in payloads:
             nonce = os.urandom(NONCE_BYTES)
-            ciphertext = aead.encrypt(nonce, payload.SerializeToString(), tenant.encode())
+            ciphertext = aead.encrypt(nonce, payload.SerializeToString(), aad)
             out.append(
                 Payload(
                     metadata={
                         "encoding": ENCRYPTED_ENCODING,
-                        KEY_ID_METADATA: tenant.encode(),
+                        KEY_ID_METADATA: key_id(tenant, version).encode(),
                         NONCE_METADATA: nonce,
                     },
                     data=ciphertext,
@@ -97,10 +142,25 @@ class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
         out: list[Payload] = []
         for payload in payloads:
             if payload.metadata.get("encoding") != ENCRYPTED_ENCODING:
+                if not self._allow_plaintext:
+                    raise PayloadRefused("refusing an unencrypted payload")
                 out.append(payload)
                 continue
-            key_id = payload.metadata[KEY_ID_METADATA].decode()
-            aead = AESGCM(self._keys.key(key_id))
-            plain = aead.decrypt(payload.metadata[NONCE_METADATA], payload.data, key_id.encode())
+            if self._tenant_id is None or self._workflow_id is None:
+                raise PayloadRefused("refusing an encrypted payload: no workflow bound")
+            try:
+                tenant, version, legacy = parse_key_id(payload.metadata[KEY_ID_METADATA].decode())
+            except (KeyError, UnicodeDecodeError, TenantKeyError):
+                raise PayloadRefused("refusing a payload with a malformed key ID") from None
+            if tenant != self._tenant_id:
+                raise PayloadRefused(
+                    f"refusing a payload for tenant '{tenant}' in a workflow of "
+                    f"tenant '{self._tenant_id}'"
+                )
+            if legacy and not self._allow_legacy:
+                raise PayloadRefused("refusing a payload with an unversioned key ID")
+            aad = tenant.encode() if legacy else associated_data(self._workflow_id)
+            aead = AESGCM(self._keys.key(tenant, version))
+            plain = aead.decrypt(payload.metadata[NONCE_METADATA], payload.data, aad)
             out.append(Payload.FromString(plain))
         return out

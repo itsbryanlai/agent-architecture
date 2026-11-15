@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audience_pauses import InMemoryPauseStore
@@ -46,11 +48,22 @@ OTHER = "U_OTHER"  # a creator who owns nothing
 OUTSIDER = "U_OUTSIDER"  # no role
 
 
-def id_token(claims: dict) -> str:
-    def part(value: dict) -> str:
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+SIGNING_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+SIGNING_KID = "test-key-1"
 
-    return f"{part({'alg': 'none'})}.{part(claims)}.signature"
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def id_token(claims: dict, key=SIGNING_KEY, kid: str = SIGNING_KID) -> str:
+    """An RS256 ID token signed with ``key``; the harness's Slack publishes ``SIGNING_KEY``."""
+    signing_input = (
+        f"{_b64(json.dumps({'alg': 'RS256', 'kid': kid}).encode())}"
+        f".{_b64(json.dumps(claims).encode())}"
+    )
+    signature = key.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+    return f"{signing_input}.{_b64(signature)}"
 
 
 class Clock:
@@ -75,6 +88,9 @@ class FakeSlack:
         self.team = TEAM
         self.nonce = ""
         self.overrides: dict = {}
+
+    async def signing_key(self, kid: str):
+        return SIGNING_KEY.public_key() if kid == SIGNING_KID else None
 
     async def exchange_code(self, code: str, redirect_uri: str) -> dict:
         self.calls.append((code, redirect_uri))

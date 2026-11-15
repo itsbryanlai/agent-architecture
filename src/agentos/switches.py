@@ -24,16 +24,22 @@ same switches with the console down::
     uv run python -m agentos.switches --tenant acme off --everything
     uv run python -m agentos.switches --tenant acme on --writes
 
-The command is audited as ``operator:<login of the OS account running it>``, a value the
-runtime reads and nobody types.
+The command is audited as ``operator:<login of the OS account running it>``. The login
+comes from the account database for the process's real user ID, not from ``LOGNAME`` or
+``USER``, which anyone can set for one command.
+
+The command needs only the database URL and the tenant ID it is given. It does not read
+the tenants table, so it still works when that table is unreadable, which is when it is
+most needed.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import logging
+import os
+import pwd
 import sys
 import uuid
 from dataclasses import dataclass
@@ -45,6 +51,7 @@ from psycopg_pool import AsyncConnectionPool
 from agentos import ids
 from agentos.agent_store import AgentNotFound, AgentStore
 from agentos.audit import AuditStore
+from agentos.config import TENANT_ID_PATTERN
 from agentos.models import AuditEvent
 from agentos.stores import joined_transaction, tenant_transaction
 from agentos.unit_of_work import InMemoryUnitOfWork, PostgresUnitOfWork, UnitOfWork
@@ -380,8 +387,12 @@ async def set_switch(
 
 
 def operator_identity() -> str:
-    """Who runs the command: the login of the OS account, read by the runtime."""
-    return f"operator:{getpass.getuser()}"
+    """Who runs the command: the login of the OS account that owns the process.
+
+    Read from the account database by user ID. ``getpass.getuser()`` is not used: it
+    returns ``LOGNAME`` or ``USER`` first, and anyone can set those for one command.
+    """
+    return f"operator:{pwd.getpwuid(os.getuid()).pw_name}"
 
 
 def _targets(args: argparse.Namespace) -> list[tuple[str, str | None]]:
@@ -396,21 +407,22 @@ def _targets(args: argparse.Namespace) -> list[tuple[str, str | None]]:
     return [(WRITES, None)]
 
 
-async def run(args: argparse.Namespace) -> int:
-    from agentos.agent_store import PostgresAgentStore
-    from agentos.audit import PostgresAuditStore
-    from agentos.config import load_settings
-    from agentos.tenant_store import load_stored_tenants
+async def execute(
+    args: argparse.Namespace,
+    store: SwitchStore,
+    audit: AuditStore,
+    agents: AgentStore,
+    uow: UnitOfWork | None = None,
+) -> int:
+    """Run one parsed command against the given stores. Reads no tenant list.
 
-    settings = load_settings()
-    tenants = await load_stored_tenants(settings.require("database_url"))
-    if args.tenant not in tenants.tenants:
-        print(f"unknown tenant '{args.tenant}'; configured: {', '.join(tenants.tenants)}")
+    ``uow`` is the unit of work the change and its audit event commit in; the default is
+    the in-memory one ``set_switch`` builds over ``store`` and ``audit``.
+    """
+    if not TENANT_ID_PATTERN.fullmatch(args.tenant):
+        print(f"'{args.tenant}' is not a valid tenant ID")
         return 2
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
-    await pool.open()
     try:
-        store = PostgresSwitchStore(pool)
         if args.command == "list":
             rows = await store.list(args.tenant)
             for row in rows:
@@ -422,24 +434,42 @@ async def run(args: argparse.Namespace) -> int:
         for scope, target in _targets(args):
             changed = await set_switch(
                 store,
-                PostgresAuditStore(pool),
-                PostgresAgentStore(pool),
+                audit,
+                agents,
                 args.tenant,
                 scope,
                 target,
                 off=args.command == "off",
                 actor=identity,
                 identity=identity,
-                uow=PostgresUnitOfWork(pool),
+                uow=uow,
             )
             word = "turned " + args.command if changed else f"already {args.command}"
             print(f"{scope} {target or '-'}: {word}")
     except (AgentNotFound, SwitchError) as err:
         print(f"refused: {err}")
         return 1
+    return 0
+
+
+async def run(args: argparse.Namespace) -> int:
+    from agentos.agent_store import PostgresAgentStore
+    from agentos.audit import PostgresAuditStore
+    from agentos.config import load_settings
+
+    settings = load_settings()
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    await pool.open()
+    try:
+        return await execute(
+            args,
+            PostgresSwitchStore(pool),
+            PostgresAuditStore(pool),
+            PostgresAgentStore(pool),
+            PostgresUnitOfWork(pool),
+        )
     finally:
         await pool.close()
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:

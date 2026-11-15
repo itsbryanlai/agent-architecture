@@ -228,3 +228,16 @@ def test_verify_signature_unit():
     assert not verify_notion_signature(body, good.removeprefix("sha256="), TOKEN)
     assert not verify_notion_signature(body, None, TOKEN)
     assert not verify_notion_signature(body, "", TOKEN)
+
+
+@pytest.mark.parametrize("header", [None, "", "no-prefix", "sha1=abcd", "sha256=bad"])
+def test_the_signature_is_computed_even_for_a_header_that_cannot_match(header):
+    """Fails if a missing or mis-prefixed header returns before the HMAC, so its timing differs."""
+    calls = []
+
+    def counting_mac(key, msg, digest):
+        calls.append(key)
+        return hmac.new(key, msg, digest)
+
+    assert not verify_notion_signature(b"{}", header, TOKEN, mac=counting_mac)
+    assert len(calls) == 1

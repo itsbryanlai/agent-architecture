@@ -121,7 +121,7 @@ def test_migrate_applies_017_over_rows_and_backfills_them(databases: Databases):
                 (version, status, f'{{"n": {version}}}'),
             )
         applied = migrate.migrate(conn, files, log=lambda _line: None)
-        assert applied == ["017"]
+        assert applied == ["017", "018"]
         rows = conn.execute(
             "SELECT status, definition_sha256, "
             "encode(sha256(convert_to(definition::text, 'UTF8')), 'hex') "

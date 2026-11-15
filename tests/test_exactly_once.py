@@ -3,7 +3,7 @@
 import asyncio
 import json
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from temporalio.exceptions import ApplicationError
@@ -14,6 +14,7 @@ from agentos.config import TASK_QUEUE
 from agentos.connectors.notion import comment_ref
 from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
+from agentos.stores import InMemoryExternalWriteStore
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, ALICE_NOTION, DB_ID, TEAM, TENANT, eventually, title_prop
 
@@ -116,6 +117,42 @@ async def test_a_retry_waits_out_a_search_that_lags_the_write(harness):
 
     assert len(h.notion.all_pages(DB_ID)) == 1
     assert item.page_id == h.notion.all_pages(DB_ID)[0]["id"]
+
+
+async def test_an_attempt_whose_lease_was_taken_over_writes_nothing(harness):
+    """Fails if an attempt that lost its lease during the marker query still creates the page."""
+    h = harness
+    skew = {"by": timedelta(0)}
+    h.acts.writes = InMemoryExternalWriteStore(clock=lambda: datetime.now(UTC) + skew["by"])
+    task_id = ids.task_id(TENANT, "stale")
+    reached, go = asyncio.Event(), asyncio.Event()
+    original = h.notion.query_database
+
+    async def slow_first_query(*args, **kwargs):
+        found = await original(*args, **kwargs)
+        h.notion.query_database = original  # only attempt A is slow
+        reached.set()
+        await go.wait()
+        return found
+
+    h.notion.query_database = slow_first_query
+    stale = asyncio.create_task(run(h.acts.create_notion_item, create_spec(), task_id))
+    await reached.wait()
+    skew["by"] = timedelta(minutes=5)  # A's lease has run out
+    hang = h.notion.hang_after_write()
+    taker = asyncio.create_task(run(h.acts.create_notion_item, create_spec(), task_id))
+    await hang.reached.wait()  # B holds the lease and has created the page
+
+    go.set()
+    with pytest.raises(ApplicationError) as lost:
+        await stale
+    hang.release()
+    item = await taker
+
+    assert lost.value.type == "WriteInProgress"
+    assert len(h.notion.all_pages(DB_ID)) == 1
+    assert h.notion.count("create_page") == 1
+    assert await run(h.acts.create_notion_item, create_spec(), task_id) == item
 
 
 # --- what lands in Notion is what the card showed ---------------------------------------

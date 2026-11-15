@@ -21,6 +21,7 @@ carries only the reference, never the text a tool read.
 from __future__ import annotations
 
 import copy
+import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -192,40 +193,54 @@ class PostgresIdempotencyStore:
 class WriteClaim:
     """The outcome of ``ExternalWriteStore.claim``.
 
-    ``claimed``: the caller holds the lease and may write. ``issued`` is true when
-    an earlier attempt got as far as sending the write, so its result may exist in
-    the target system even though none was stored. ``done``: the write finished and
-    ``result_ref`` is its stored result. ``busy``: another attempt holds a live
-    lease; the caller must write nothing and try again later.
+    ``claimed``: the caller holds the lease, named by ``token``, and may write. ``issued``
+    is true when an earlier attempt got as far as sending the write, so its result may
+    exist in the target system even though none was stored. ``done``: the write finished
+    and ``result_ref`` is its stored result. ``busy``: another attempt holds a live lease;
+    the caller must write nothing and try again later.
     """
 
     status: Literal["claimed", "done", "busy"]
     issued: bool = False
     result_ref: str | None = None
+    token: str = ""
 
 
 class ExternalWriteStore(Protocol):
     """Who may write to an external system for one key, and what the write returned.
 
     One row per (tenant, key). A write goes ``claimed`` (a lease is held) to
-    ``issued`` (the write was sent) to ``done`` (its result is stored). The
-    store holds only keys and a small result reference, never content.
+    ``issued`` (the write was sent) to ``done`` (its result is stored). Every claim
+    mints a new token. A step taken with a token that is no longer the row's current
+    one (the lease ran out and another attempt took over) changes nothing. The store
+    holds only keys and a small result reference, never content.
     """
 
     async def claim(self, tenant_id: str, idem_key: str, lease_seconds: float) -> WriteClaim:
         """Take the key, or take it over once its lease has expired, in one step."""
         ...
 
-    async def mark_issued(self, tenant_id: str, idem_key: str, lease_seconds: float) -> None:
-        """Record that the write is about to be sent, and extend the lease."""
+    async def mark_issued(
+        self, tenant_id: str, idem_key: str, token: str, lease_seconds: float
+    ) -> bool:
+        """Record that the write is about to be sent, and extend the lease.
+
+        False when ``token`` no longer holds the lease: the caller must not write.
+        """
         ...
 
-    async def complete(self, tenant_id: str, idem_key: str, result_ref: str) -> str:
-        """Store the result; the first one stored wins and is returned."""
+    async def complete(
+        self, tenant_id: str, idem_key: str, token: str, result_ref: str
+    ) -> str | None:
+        """Store the result for the holder of ``token``; the first one stored wins.
+
+        Returns the stored result, or None when ``token`` does not hold the lease and
+        nothing is stored yet.
+        """
         ...
 
-    async def release(self, tenant_id: str, idem_key: str) -> None:
-        """End the caller's lease now, keeping what is known about the write."""
+    async def release(self, tenant_id: str, idem_key: str, token: str) -> None:
+        """End the lease now if ``token`` still holds it, keeping what is known."""
         ...
 
     async def result(self, tenant_id: str, idem_key: str) -> str | None:
@@ -238,21 +253,23 @@ class PostgresExternalWriteStore:
         self._pool = pool
 
     async def claim(self, tenant_id: str, idem_key: str, lease_seconds: float) -> WriteClaim:
+        token = uuid.uuid4().hex
         async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
-                INSERT INTO external_writes (tenant_id, idem_key, state, lease_until)
-                VALUES (%s, %s, 'claimed', now() + make_interval(secs => %s))
+                INSERT INTO external_writes (tenant_id, idem_key, state, lease_until, lease_token)
+                VALUES (%s, %s, 'claimed', now() + make_interval(secs => %s), %s)
                 ON CONFLICT (tenant_id, idem_key) DO UPDATE
-                  SET lease_until = EXCLUDED.lease_until, updated_at = now()
+                  SET lease_until = EXCLUDED.lease_until, lease_token = EXCLUDED.lease_token,
+                      updated_at = now()
                   WHERE external_writes.state <> 'done' AND external_writes.lease_until <= now()
                 RETURNING state
                 """,
-                (tenant_id, idem_key, lease_seconds),
+                (tenant_id, idem_key, lease_seconds, token),
             )
             row = await cur.fetchone()
             if row is not None:
-                return WriteClaim("claimed", issued=row[0] == "issued")
+                return WriteClaim("claimed", issued=row[0] == "issued", token=token)
             cur = await conn.execute(
                 "SELECT state, result_ref FROM external_writes WHERE tenant_id = %s AND idem_key = %s",
                 (tenant_id, idem_key),
@@ -262,42 +279,49 @@ class PostgresExternalWriteStore:
                 return WriteClaim("done", result_ref=result_ref)
             return WriteClaim("busy")
 
-    async def mark_issued(self, tenant_id: str, idem_key: str, lease_seconds: float) -> None:
+    async def mark_issued(
+        self, tenant_id: str, idem_key: str, token: str, lease_seconds: float
+    ) -> bool:
         async with tenant_transaction(self._pool, tenant_id) as conn:
-            await conn.execute(
+            cur = await conn.execute(
                 """
                 UPDATE external_writes
                 SET state = 'issued', lease_until = now() + make_interval(secs => %s),
                     updated_at = now()
-                WHERE tenant_id = %s AND idem_key = %s AND state <> 'done'
+                WHERE tenant_id = %s AND idem_key = %s AND lease_token = %s
+                  AND state <> 'done' AND lease_until > now()
                 """,
-                (lease_seconds, tenant_id, idem_key),
+                (lease_seconds, tenant_id, idem_key, token),
             )
+            return cur.rowcount == 1
 
-    async def complete(self, tenant_id: str, idem_key: str, result_ref: str) -> str:
+    async def complete(
+        self, tenant_id: str, idem_key: str, token: str, result_ref: str
+    ) -> str | None:
         async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                 UPDATE external_writes
                 SET state = 'done', result_ref = %s, lease_until = now(), updated_at = now()
-                WHERE tenant_id = %s AND idem_key = %s AND state <> 'done'
+                WHERE tenant_id = %s AND idem_key = %s AND lease_token = %s AND state <> 'done'
                 """,
-                (result_ref, tenant_id, idem_key),
+                (result_ref, tenant_id, idem_key, token),
             )
             cur = await conn.execute(
                 "SELECT result_ref FROM external_writes WHERE tenant_id = %s AND idem_key = %s",
                 (tenant_id, idem_key),
             )
-            return (await cur.fetchone())[0]
+            row = await cur.fetchone()
+            return row[0] if row else None
 
-    async def release(self, tenant_id: str, idem_key: str) -> None:
+    async def release(self, tenant_id: str, idem_key: str, token: str) -> None:
         async with tenant_transaction(self._pool, tenant_id) as conn:
             await conn.execute(
                 """
                 UPDATE external_writes SET lease_until = now(), updated_at = now()
-                WHERE tenant_id = %s AND idem_key = %s AND state <> 'done'
+                WHERE tenant_id = %s AND idem_key = %s AND lease_token = %s AND state <> 'done'
                 """,
-                (tenant_id, idem_key),
+                (tenant_id, idem_key, token),
             )
 
     async def result(self, tenant_id: str, idem_key: str) -> str | None:
@@ -448,36 +472,51 @@ class InMemoryExternalWriteStore:
 
     async def claim(self, tenant_id: str, idem_key: str, lease_seconds: float) -> WriteClaim:
         now = self._clock()
+        token = uuid.uuid4().hex
         row = self.rows.get((tenant_id, idem_key))
         if row is None:
             self.rows[(tenant_id, idem_key)] = {
                 "state": "claimed",
                 "result_ref": None,
                 "lease_until": now + timedelta(seconds=lease_seconds),
+                "token": token,
             }
-            return WriteClaim("claimed")
+            return WriteClaim("claimed", token=token)
         if row["state"] == "done":
             return WriteClaim("done", result_ref=row["result_ref"])
         if row["lease_until"] > now:
             return WriteClaim("busy")
         row["lease_until"] = now + timedelta(seconds=lease_seconds)
-        return WriteClaim("claimed", issued=row["state"] == "issued")
+        row["token"] = token
+        return WriteClaim("claimed", issued=row["state"] == "issued", token=token)
 
-    async def mark_issued(self, tenant_id: str, idem_key: str, lease_seconds: float) -> None:
-        row = self.rows[(tenant_id, idem_key)]
-        if row["state"] != "done":
-            row["state"] = "issued"
-            row["lease_until"] = self._clock() + timedelta(seconds=lease_seconds)
-
-    async def complete(self, tenant_id: str, idem_key: str, result_ref: str) -> str:
-        row = self.rows[(tenant_id, idem_key)]
-        if row["state"] != "done":
-            row.update(state="done", result_ref=result_ref, lease_until=self._clock())
-        return row["result_ref"]
-
-    async def release(self, tenant_id: str, idem_key: str) -> None:
+    def _holds(self, tenant_id: str, idem_key: str, token: str) -> dict | None:
         row = self.rows.get((tenant_id, idem_key))
-        if row is not None and row["state"] != "done":
+        return row if row and row["token"] == token and row["state"] != "done" else None
+
+    async def mark_issued(
+        self, tenant_id: str, idem_key: str, token: str, lease_seconds: float
+    ) -> bool:
+        row = self._holds(tenant_id, idem_key, token)
+        now = self._clock()
+        if row is None or row["lease_until"] <= now:
+            return False
+        row["state"] = "issued"
+        row["lease_until"] = now + timedelta(seconds=lease_seconds)
+        return True
+
+    async def complete(
+        self, tenant_id: str, idem_key: str, token: str, result_ref: str
+    ) -> str | None:
+        row = self._holds(tenant_id, idem_key, token)
+        if row is not None:
+            row.update(state="done", result_ref=result_ref, lease_until=self._clock())
+        stored = self.rows.get((tenant_id, idem_key))
+        return stored["result_ref"] if stored else None
+
+    async def release(self, tenant_id: str, idem_key: str, token: str) -> None:
+        row = self._holds(tenant_id, idem_key, token)
+        if row is not None:
             row["lease_until"] = self._clock()
 
     async def result(self, tenant_id: str, idem_key: str) -> str | None:

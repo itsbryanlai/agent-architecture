@@ -24,6 +24,7 @@ from agentos.members import MemberError, MemberNotFound, PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
 from agentos.stores import (
+    PostgresExternalWriteStore,
     PostgresHistoryStore,
     PostgresIdempotencyStore,
     PostgresTaskLinkStore,
@@ -378,3 +379,77 @@ async def test_import_inserts_new_agents_with_their_audit_record(pool, tenant: s
     assert (await store.published(tenant, "it-helper")).version == 1
     events = await PostgresAuditStore(pool).list(tenant)
     assert [(e.kind, e.agent_id) for e in events] == [("agent_import", "it-helper")]
+
+
+async def test_external_writes_lease_busy_takeover_and_first_result_wins(pool, tenant: str):
+    """Fails if a live lease can be claimed, a take-over forgets the write was issued, a
+    second result replaces the first, or a done write can be claimed again."""
+    store = PostgresExternalWriteStore(pool)
+    first = await store.claim(tenant, "k", 60)
+    assert (first.status, first.issued) == ("claimed", False)
+    assert (await store.claim(tenant, "k", 60)).status == "busy"
+    assert await store.mark_issued(tenant, "k", first.token, 60) is True
+    await store.release(tenant, "k", first.token)
+    second = await store.claim(tenant, "k", 60)
+    assert (second.status, second.issued) == ("claimed", True)
+    assert second.token != first.token
+    assert await store.result(tenant, "k") is None
+    assert await store.complete(tenant, "k", second.token, "ref-1") == "ref-1"
+    assert await store.complete(tenant, "k", second.token, "ref-2") == "ref-1"
+    done = await store.claim(tenant, "k", 60)
+    assert (done.status, done.result_ref) == ("done", "ref-1")
+    assert await store.result(tenant, "k") == "ref-1"
+
+
+async def test_external_writes_ignore_a_token_whose_lease_was_taken_over(pool, tenant: str):
+    """Fails if an attempt that lost its lease can end the new holder's lease, mark a
+    write, or store a result."""
+    store = PostgresExternalWriteStore(pool)
+    stale = await store.claim(tenant, "k", 0)  # a lease that is already over
+    holder = await store.claim(tenant, "k", 60)
+    assert holder.status == "claimed"
+
+    await store.release(tenant, "k", stale.token)
+    assert await store.mark_issued(tenant, "k", stale.token, 60) is False
+    assert await store.complete(tenant, "k", stale.token, "stale-ref") is None
+    assert (await store.claim(tenant, "k", 60)).status == "busy"  # the holder's lease stands
+    assert await store.mark_issued(tenant, "k", holder.token, 60) is True
+    assert await store.complete(tenant, "k", holder.token, "ref") == "ref"
+
+
+async def test_external_writes_are_per_tenant_and_a_done_result_never_changes(
+    pool, tenant: str, other_tenant: str
+):
+    """Fails if another tenant sees or claims the row, or a done row's result is rewritten."""
+    store = PostgresExternalWriteStore(pool)
+    claim = await store.claim(tenant, "k", 60)
+    await store.complete(tenant, "k", claim.token, "ref")
+
+    assert await store.result(other_tenant, "k") is None
+    assert (await store.claim(other_tenant, "k", 60)).status == "claimed"
+    async with tenant_transaction(pool, tenant) as conn:
+        cur = await conn.execute(
+            "UPDATE external_writes SET result_ref = 'x' WHERE idem_key = 'k' "
+            "AND lease_token = %s AND state <> 'done'",
+            (claim.token,),
+        )
+        assert cur.rowcount == 0
+    assert await store.result(tenant, "k") == "ref"
+
+
+async def test_external_writes_refuse_delete_and_a_row_for_another_tenant(
+    pool, tenant: str, other_tenant: str
+):
+    """Fails if the app role may delete a row or write one under a tenant it is not set to."""
+    store = PostgresExternalWriteStore(pool)
+    await store.claim(tenant, "k", 60)
+    with pytest.raises(errors.InsufficientPrivilege):
+        async with tenant_transaction(pool, tenant) as conn:
+            await conn.execute("DELETE FROM external_writes")
+    with pytest.raises(errors.InsufficientPrivilege):
+        async with tenant_transaction(pool, tenant) as conn:
+            await conn.execute(
+                "INSERT INTO external_writes (tenant_id, idem_key, state, lease_until, lease_token) "
+                "VALUES (%s, 'x', 'claimed', now(), 't')",
+                (other_tenant,),
+            )

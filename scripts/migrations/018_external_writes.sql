@@ -6,7 +6,9 @@
 -- returns. A second attempt that finds a live lease writes nothing; one that finds a stored
 -- result returns it without calling Notion. state is claimed, issued or done. result_ref is
 -- a small reference to what the write made (a page's ID, title and link; a comment's ID),
--- never chat or document text.
+-- never chat or document text. Each claim gets a fresh lease_token; mark_issued, complete and
+-- release act only for the holder of the current token, so an attempt whose lease was taken
+-- over cannot end the new holder's lease or store a result.
 -- The app role can SELECT, INSERT and UPDATE, never DELETE.
 -- Run as the owner role. Safe to run more than once.
 
@@ -16,6 +18,7 @@ CREATE TABLE IF NOT EXISTS external_writes (
   state       text        NOT NULL CHECK (state IN ('claimed', 'issued', 'done')),
   result_ref  text,
   lease_until timestamptz NOT NULL,
+  lease_token text        NOT NULL,   -- whoever holds the lease; every later step must present it
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, idem_key),

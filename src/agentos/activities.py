@@ -410,18 +410,24 @@ class AgentActivities:
         lease means this one writes nothing and fails with a retryable error. After a
         claim that took over from an attempt that had sent the write, ``find`` is tried
         a few times first, because the target's search can lag. Then the write is marked
-        as about to be sent, sent, and its result stored right away. Any failure ends
+        as about to be sent, sent, and its result stored right away. Every step after the
+        claim presents the claim's token, and the store ignores a token whose lease was
+        taken over: a stale attempt cannot end the new holder's lease, mark a write, or
+        store a result, and one that finds it lost the lease writes nothing. Any failure ends
         the lease at once so the retry does not wait for it, but keeps the mark, so that
         retry looks before it writes.
+
+        The look-before-write window is bounded by ``VISIBILITY_TRIES`` and
+        ``VISIBILITY_INTERVAL`` (and the task's by ``RECONCILE_TRIES`` and
+        ``RECONCILE_INTERVAL``). A target whose search lags a write by longer than that
+        window gets a second item from the retry: that residual risk is accepted, and
+        widening the window is the way to narrow it.
         """
         claim = await self.writes.claim(tenant_id, idem_key, WRITE_LEASE_SECONDS)
         if claim.status == "done":
             return from_ref(claim.result_ref)
         if claim.status == "busy":
-            raise ApplicationError(
-                "another attempt is writing this; trying again shortly",
-                type=WRITE_IN_PROGRESS,
-            )
+            raise self._in_progress()
         try:
             made = None
             for look in range(self.visibility_tries if claim.issued else 1):
@@ -433,13 +439,25 @@ class AgentActivities:
                     break
             if made is None:
                 _beat()
-                await self.writes.mark_issued(tenant_id, idem_key, WRITE_LEASE_SECONDS)
+                if not await self.writes.mark_issued(
+                    tenant_id, idem_key, claim.token, WRITE_LEASE_SECONDS
+                ):
+                    raise self._in_progress()
                 made = await write()
             _beat()
-            return from_ref(await self.writes.complete(tenant_id, idem_key, to_ref(made)))
+            stored = await self.writes.complete(tenant_id, idem_key, claim.token, to_ref(made))
+            if stored is None:
+                raise self._in_progress()
+            return from_ref(stored)
         except Exception:
-            await self.writes.release(tenant_id, idem_key)
+            await self.writes.release(tenant_id, idem_key, claim.token)
             raise
+
+    @staticmethod
+    def _in_progress() -> ApplicationError:
+        return ApplicationError(
+            "another attempt is writing this; trying again shortly", type=WRITE_IN_PROGRESS
+        )
 
     async def _record(
         self,

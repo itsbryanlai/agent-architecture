@@ -653,6 +653,7 @@ CREATE TABLE IF NOT EXISTS external_writes (
   state       text        NOT NULL CHECK (state IN ('claimed', 'issued', 'done')),
   result_ref  text,
   lease_until timestamptz NOT NULL,
+  lease_token text        NOT NULL,   -- whoever holds the lease; every later step must present it
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, idem_key),

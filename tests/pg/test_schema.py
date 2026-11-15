@@ -50,7 +50,7 @@ def test_baseline_then_migrate_reaches_the_same_schema(databases: Databases, db:
         applied = migrate.migrate(
             conn, migrate.migration_files(), baseline="015", log=lambda _line: None
         )
-        assert applied == ["016", "017"]
+        assert applied == ["016", "017", "018"]
         with db.owner() as reference:
             assert catalog.difference(catalog.dump(reference), catalog.dump(conn)) == []
 

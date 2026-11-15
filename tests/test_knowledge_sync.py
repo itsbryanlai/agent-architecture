@@ -2,6 +2,7 @@
 unchanged pages, embedding models and the relevance cut-off."""
 
 import copy
+import logging
 from datetime import UTC, datetime, timedelta
 
 from temporalio.testing import ActivityEnvironment
@@ -15,6 +16,7 @@ from agentos.knowledge.indexing import GONE_RUNS_BEFORE_PRUNE, IndexActivities
 from agentos.knowledge.search import MAX_CHUNKS_PER_PAGE, NO_MATCH
 from agentos.knowledge.store import InMemoryKnowledgeStore, PageSync, PostgresKnowledgeStore
 from agentos.tenants import TenantRegistry, runtime_for
+from agentos.worker import warn_pages_without_model
 from agentos.workflows.indexing import IndexingWorkflow
 from tests.conftest import (
     PAGE_A1,
@@ -480,3 +482,17 @@ async def test_a_pages_chunks_are_inserted_in_one_statement():
 
     inserts = [s for s in pool.conn.statements if "INSERT INTO knowledge_chunks" in s]
     assert len(inserts) == 1
+
+
+async def test_worker_start_warns_about_pages_without_a_model(caplog):
+    """Fails if pages stored before the model column are not reported at start, or a tenant with none is."""
+    store = InMemoryKnowledgeStore()
+    await store.replace_page("acme", "s", "old", "T", "u", "h", [])
+    await store.replace_page("acme", "s", "new", "T", "u", "h", [], PageSync(embed_model="m"))
+    await store.replace_page("globex", "s", "new", "T", "u", "h", [], PageSync(embed_model="m"))
+
+    with caplog.at_level("WARNING"):
+        total = await warn_pages_without_model(store, ["acme", "globex"], logging.getLogger("t"))
+
+    assert total == 1
+    assert [r.getMessage().split()[0] for r in caplog.records] == ["tenant_id=acme"]

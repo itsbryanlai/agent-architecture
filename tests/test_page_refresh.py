@@ -38,6 +38,10 @@ def webhook_secret(monkeypatch):
     monkeypatch.setenv("NOTION_WEBHOOK_VERIFICATION_TOKEN", TOKEN)
 
 
+class ForbiddenError(Exception):
+    status = 403
+
+
 NEW_PAGE = "aaaaaaaa-0000-0000-0000-000000000099"
 PLAIN = lambda page_id: page_id.replace("-", "")
 
@@ -169,6 +173,25 @@ async def test_refresh_removes_page_moved_out_of_root(kharness):
 
     assert (TENANT, SCOPE_A, PLAIN(PAGE_A2)) not in h.knowledge.pages
     assert (TENANT, SCOPE_A, PLAIN(PAGE_A1)) in h.knowledge.pages
+
+
+async def test_refresh_keeps_a_page_notion_refuses_to_show(kharness):
+    """Fails if a 403 on a page event removes the page from the index as if it were gone."""
+    h = kharness
+    await run_index(h)
+    real = h.notion.retrieve_page
+
+    async def refuse(page_id):
+        if PLAIN(page_id) == PLAIN(PAGE_A2):
+            raise ForbiddenError()
+        return await real(page_id)
+
+    h.notion.retrieve_page = refuse
+
+    await refresh(h, PAGE_A2)
+
+    assert (TENANT, SCOPE_A, PLAIN(PAGE_A2)) in h.knowledge.pages
+    assert (TENANT, SCOPE_A, PLAIN(PAGE_A2)) in h.knowledge.chunks
 
 
 async def test_refresh_removes_trashed_page(kharness):

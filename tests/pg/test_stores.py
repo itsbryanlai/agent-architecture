@@ -19,7 +19,7 @@ from agentos.audience_pauses import PostgresPauseStore
 from agentos.audit import PostgresAuditStore
 from agentos.budgets import BudgetNotFound, PostgresBudgetStore
 from agentos.config import ConfigError, parse_agents_config
-from agentos.knowledge.store import PostgresKnowledgeStore
+from agentos.knowledge.store import PageSync, PostgresKnowledgeStore
 from agentos.members import MemberError, MemberNotFound, PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
@@ -114,6 +114,102 @@ async def test_knowledge_store_replaces_pages_and_searches_by_distance(
     assert await store.delete_scope(tenant, "s2") == 1
     assert await store.scopes(tenant) == []
     assert await store.scopes(other_tenant) == ["s1"]
+
+
+async def test_knowledge_page_state_round_trips_and_touch_updates_it(pool, tenant: str):
+    """Fails if the sync columns do not survive a store and read, an upsert keeps stale state, or a touch changes chunks."""
+    store = PostgresKnowledgeStore(pool)
+    sync = PageSync(
+        "m1", "2026-01-01T00:00:00.000Z", "par", ["root", "mid"], ["c1"], ["d1"], ["r1"]
+    )
+    assert await store.page_state(tenant, "s", "p") is None
+
+    await store.replace_page(tenant, "s", "p", "T", "u", "h1", [("a", unit_vector(0))], sync)
+    state = await store.page_state(tenant, "s", "p")
+    assert (state.content_hash, state.sync) == ("h1", sync)
+    assert state.indexed_at.tzinfo is not None
+
+    newer = dataclasses.replace(sync, embed_model="m2", ancestors=["root"], row_page_ids=[])
+    await store.replace_page(tenant, "s", "p", "T", "u", "h2", [("a", unit_vector(0))], newer)
+    assert (await store.page_state(tenant, "s", "p")).sync == newer
+
+    latest = dataclasses.replace(newer, last_edited_time="2026-02-02T00:00:00.000Z")
+    await store.touch_page(tenant, "s", "p", "h3", latest)
+    await store.touch_page(tenant, "s", "missing", "h", latest)
+    state = await store.page_state(tenant, "s", "p")
+    assert (state.content_hash, state.sync) == ("h3", latest)
+    assert await store.page_state(tenant, "s", "missing") is None
+    assert len(await store.search(tenant, ["s"], unit_vector(0), limit=5)) == 1
+
+    await store.replace_page(tenant, "s", "legacy", "T", "u", "h", [])
+    assert await store.count_pages_without_model(tenant) == 1
+
+
+async def test_knowledge_insert_stores_every_chunk_of_a_page_in_order(pool, tenant: str):
+    """Fails if the one multi-row insert drops, reorders or duplicates chunks, or fails for a page without text."""
+    store = PostgresKnowledgeStore(pool)
+    chunks = [(f"chunk {n}", unit_vector(n)) for n in range(7)]
+    await store.replace_page(tenant, "s", "p", "T", "u", "h", chunks)
+    await store.replace_page(tenant, "s", "empty", "T", "u", "h", [])
+
+    hits = await store.search(tenant, ["s"], unit_vector(0), limit=20)
+
+    assert sorted((h.chunk_no, h.text) for h in hits) == [(n, f"chunk {n}") for n in range(7)]
+    assert await store.page_state(tenant, "s", "empty") is not None
+
+
+async def test_knowledge_search_filters_by_model_and_reports_distance_and_position(
+    pool, tenant: str
+):
+    """Fails if a search returns chunks of another embedding model, loses a hit's stored position, or reports a wrong distance."""
+    store = PostgresKnowledgeStore(pool)
+    old = PageSync(embed_model="old", parent_ref="x", ancestors=["root"])
+    new = PageSync(embed_model="new", parent_ref="y", ancestors=["root", "mid"])
+    await store.replace_page(tenant, "s", "old-page", "Old", "u", "h", [("o", unit_vector(0))], old)
+    await store.replace_page(tenant, "s", "new-page", "New", "u", "h", [("n", unit_vector(1))], new)
+
+    only_new = await store.search(tenant, ["s"], unit_vector(0), limit=5, embed_model="new")
+    everything = await store.search(tenant, ["s"], unit_vector(0), limit=5)
+
+    assert [(h.page_id, h.parent_ref, h.ancestors) for h in only_new] == [
+        ("new-page", "y", ["root", "mid"])
+    ]
+    assert only_new[0].distance == pytest.approx(1.0, abs=1e-6)
+    assert [h.page_id for h in everything] == ["old-page", "new-page"]
+    assert everything[0].distance == pytest.approx(0.0, abs=1e-6)
+    assert await store.search(tenant, ["s"], unit_vector(0), limit=5, embed_model="none") == []
+
+
+async def test_knowledge_delete_keeps_pages_stored_since_the_cutoff(pool, tenant: str):
+    """Fails if a delete with indexed_before removes a page stored after that time, or keeps one stored before it."""
+    store = PostgresKnowledgeStore(pool)
+    for page in ("a", "b"):
+        await store.replace_page(tenant, "s", page, "T", "u", "h", [])
+    past = datetime.now(UTC) - timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
+
+    assert await store.delete_pages(tenant, "s", ["a", "b"], indexed_before=past) == 0
+    assert await store.delete_pages(tenant, "s", ["a"], indexed_before=future) == 1
+    assert await store.delete_pages(tenant, "s", ["b"]) == 1
+
+
+async def test_scope_health_counts_each_run_once_and_clears(pool, tenant: str, other_tenant: str):
+    """Fails if one run counts twice, a new run does not count, notification is lost, clearing misses, or tenants share a row."""
+    store = PostgresKnowledgeStore(pool)
+
+    first = await store.record_scope_gone(tenant, "s", "run-1")
+    again = await store.record_scope_gone(tenant, "s", "run-1")
+    second = await store.record_scope_gone(tenant, "s", "run-2")
+    assert (first.consecutive_gone, again.consecutive_gone, second.consecutive_gone) == (1, 1, 2)
+    assert second.notified_at is None
+    await store.mark_scope_notified(tenant, "s")
+    assert (await store.record_scope_gone(tenant, "s", "run-2")).notified_at is not None
+    assert (await store.record_scope_gone(other_tenant, "s", "run-1")).consecutive_gone == 1
+
+    await store.clear_scope_health(tenant, "s")
+
+    assert (await store.record_scope_gone(tenant, "s", "run-3")).consecutive_gone == 1
+    assert (await store.record_scope_gone(other_tenant, "s", "run-1")).consecutive_gone == 1
 
 
 def audit_event(tenant: str, key: str, **fields) -> AuditEvent:

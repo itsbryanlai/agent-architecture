@@ -27,6 +27,8 @@ SEEDS = {
     "knowledge_chunks": "INSERT INTO knowledge_chunks "
     "(tenant_id, scope, page_id, chunk_no, text, embedding) "
     f"VALUES (%(t)s, 's', 'p', 0, 'x', {VECTOR})",
+    "knowledge_scope_health": "INSERT INTO knowledge_scope_health "
+    "(tenant_id, scope, consecutive_gone, last_run) VALUES (%(t)s, 's', 1, 'r')",
     "audit_events": "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, "
     "agent_version, requester_user_id, identity, outcome) "
     "VALUES (%(t)s, 'e', 'answer', 'a', 1, 'u', 'agent:a', 'ok')",
@@ -61,6 +63,7 @@ PRIVILEGES = {
     "tool_outputs": "SELECT INSERT UPDATE DELETE",
     "knowledge_pages": "SELECT INSERT UPDATE DELETE",
     "knowledge_chunks": "SELECT INSERT UPDATE DELETE",
+    "knowledge_scope_health": "SELECT INSERT UPDATE DELETE",
     "audit_events": "SELECT INSERT",
     "agents": "SELECT INSERT",
     "agent_versions": "SELECT INSERT UPDATE",

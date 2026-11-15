@@ -48,6 +48,14 @@ async def make_pending(h, user=OWNER):
     await h.plane.submit_version(TENANT, user, "it-helper", 1)
 
 
+async def shown(h, action: str) -> dict[str, str]:
+    """The hidden field an admin's publish form carries: the hash of the version just shown."""
+    if action != "publish":
+        return {}
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    return {"definition_sha256": record.definition_sha256}
+
+
 async def status_of_version(h, version=1) -> str:
     return (await h.agents.get_version(TENANT, "it-helper", version)).status
 
@@ -217,7 +225,9 @@ async def test_a_creator_creates_edits_and_submits_and_an_admin_publishes(h):
         assert await status_of_version(h) == "pending"
 
         admin_token = await csrf_token(admin)
-        published = await post(admin, f"{VERSION}/publish", admin_token)
+        published = await post(
+            admin, f"{VERSION}/publish", admin_token, **await shown(h, "publish")
+        )
         assert published.status_code == 303
         assert "Published." in (await admin.get(published.headers["location"])).text
 
@@ -411,13 +421,15 @@ async def test_a_refused_publish_shows_the_grant_problems_and_changes_nothing(h)
     c = await h.signed_in(ROOT)
     async with using(c):
         token = await csrf_token(c)
-        refused = await post(c, f"{VERSION}/publish", token)
+        refused = await post(c, f"{VERSION}/publish", token, **await shown(h, "publish"))
         assert refused.status_code == 409
         assert "grant problem" in refused.text and "request_id" in refused.text
         assert "problems found" in refused.text
         assert await status_of_version(h) == "pending"
         h.notion.set_schema(DB_ID, default_schema())
-        assert (await post(c, f"{VERSION}/publish", token)).status_code == 303
+        assert (
+            await post(c, f"{VERSION}/publish", token, **await shown(h, "publish"))
+        ).status_code == 303
     assert await status_of_version(h) == "published"
 
 
@@ -437,7 +449,7 @@ async def test_notion_being_unreachable_is_a_503_page_with_a_message(h, path):
     h.notion = Down()
     c = await h.signed_in(ROOT)
     async with using(c):
-        response = await post(c, f"{VERSION}/{path}", await csrf_token(c))
+        response = await post(c, f"{VERSION}/{path}", await csrf_token(c), **await shown(h, path))
     assert response.status_code == 503
     assert NOTION_DOWN in html.unescape(response.text)
     assert "token" not in response.text and "boom" not in response.text
@@ -478,7 +490,7 @@ async def test_an_unexpected_error_is_a_plain_500_page(h, path):
     h.notion = Buggy()
     c = await h.signed_in(ROOT)
     async with using(c):
-        response = await post(c, f"{VERSION}/{path}", await csrf_token(c))
+        response = await post(c, f"{VERSION}/{path}", await csrf_token(c), **await shown(h, path))
     assert response.status_code == 500
     assert "Internal error." in response.text
     assert "secret" not in response.text and "RuntimeError" not in response.text

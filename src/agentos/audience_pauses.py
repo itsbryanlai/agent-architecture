@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 
 # Why a channel was paused. These are the only values stored or shown.
 CHANNEL_SHARED = "channel_shared"
@@ -44,8 +44,13 @@ class PauseRecord:
 
 
 class PauseStore(Protocol):
-    async def get_active(self, tenant_id: str, agent_id: str, channel: str) -> PauseRecord | None:
-        """The agent's active pause in the channel, or None."""
+    async def get_active(
+        self, tenant_id: str, agent_id: str, channel: str, conn: Any = None
+    ) -> PauseRecord | None:
+        """The agent's active pause in the channel, or None.
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``), here and below.
+        """
         ...
 
     async def list_active(self, tenant_id: str, agent_id: str | None = None) -> list[PauseRecord]:
@@ -59,7 +64,7 @@ class PauseStore(Protocol):
         ...
 
     async def close_pause(
-        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime
+        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime, conn: Any = None
     ) -> PauseRecord | None:
         """Mark the active pause resumed; None when there is none."""
         ...
@@ -72,9 +77,11 @@ class PostgresPauseStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
 
-    async def get_active(self, tenant_id: str, agent_id: str, channel: str) -> PauseRecord | None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+    async def get_active(
+        self, tenant_id: str, agent_id: str, channel: str, conn: Any = None
+    ) -> PauseRecord | None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 f"SELECT {_COLUMNS} FROM audience_pauses "
                 "WHERE tenant_id = %s AND agent_id = %s AND channel = %s AND resumed_at IS NULL",
                 (tenant_id, agent_id, channel),
@@ -111,10 +118,10 @@ class PostgresPauseStore:
         return PauseRecord(*row)
 
     async def close_pause(
-        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime
+        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime, conn: Any = None
     ) -> PauseRecord | None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 "UPDATE audience_pauses SET resumed_by = %s, resumed_at = %s "
                 "WHERE tenant_id = %s AND agent_id = %s AND channel = %s AND resumed_at IS NULL "
                 f"RETURNING {_COLUMNS}",
@@ -128,6 +135,13 @@ class InMemoryPauseStore:
     def __init__(self) -> None:
         self._rows: list[PauseRecord] = []
 
+    def snapshot(self) -> list[PauseRecord]:
+        """The rows as they are now, for ``InMemoryUnitOfWork``."""
+        return list(self._rows)
+
+    def restore(self, state: list[PauseRecord]) -> None:
+        self._rows = list(state)
+
     @property
     def history(self) -> list[PauseRecord]:
         """Every pause that has been resumed, in the order they were opened."""
@@ -140,7 +154,9 @@ class InMemoryPauseStore:
                 return i
         return None
 
-    async def get_active(self, tenant_id: str, agent_id: str, channel: str) -> PauseRecord | None:
+    async def get_active(
+        self, tenant_id: str, agent_id: str, channel: str, conn: Any = None
+    ) -> PauseRecord | None:
         i = self._active(tenant_id, agent_id, channel)
         return None if i is None else self._rows[i]
 
@@ -167,7 +183,7 @@ class InMemoryPauseStore:
         return record
 
     async def close_pause(
-        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime
+        self, tenant_id: str, agent_id: str, channel: str, by: str, at: datetime, conn: Any = None
     ) -> PauseRecord | None:
         i = self._active(tenant_id, agent_id, channel)
         if i is None:

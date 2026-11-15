@@ -17,8 +17,10 @@ as text.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -120,6 +122,8 @@ def _usd2(value: Decimal) -> str:
 
 
 _env.filters["stamp"] = _stamp
+# A one-time token for a form that must not repeat, such as a new draft.
+_env.globals["new_token"] = lambda: uuid.uuid4().hex
 _env.globals["pause_reason"] = lambda code: REASON_TEXT.get(code, code)
 _env.filters["usd"] = _usd
 _env.filters["usd2"] = _usd2
@@ -559,7 +563,9 @@ class WebUI:
     async def new_draft(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
         raw = ctx.get("from_version").strip()
         from_version = int(raw) if raw.isdigit() else None
-        record = await ctx.plane.new_draft(ctx.tenant_id, ctx.user_id, agent_id, from_version)
+        record = await ctx.plane.new_draft(
+            ctx.tenant_id, ctx.user_id, agent_id, from_version, _form_request_id(ctx)
+        )
         return _redirect(self.version_url(ctx, agent_id, record.version, "draft"))
 
     async def version(self, request: Request, ctx: Ctx, agent_id: str, version: int) -> Response:
@@ -654,6 +660,9 @@ class WebUI:
         extra = {}
         if action == "publish":
             extra["confirm_audience"] = _audience_confirmation(ctx)
+            # The hash of the version the approver's page showed; the plane refuses a
+            # different one. A form without it is refused as a changed version.
+            extra["reviewed_sha256"] = ctx.get("definition_sha256").strip() or "none"
         try:
             await call(ctx.tenant_id, ctx.user_id, agent_id, version, **extra)
         except AudienceError as err:
@@ -797,6 +806,18 @@ def _audience_confirmation(ctx: Ctx) -> dict[str, int] | None:
     if not all(value.isdigit() and len(value) < 9 for value in counts.values()):
         return None
     return {name: int(value) for name, value in counts.items()}
+
+
+def _form_request_id(ctx: Ctx) -> str | None:
+    """The audit nonce for a form that carries a one-time token, or None without one.
+
+    The token is made when the page is rendered, so a double click or a resent form is one
+    request. It is hashed with the signed-in user, so no token is another user's.
+    """
+    token = ctx.get("request_id").strip()
+    if not (token.isalnum() and 16 <= len(token) <= 64):
+        return None
+    return hashlib.sha256(f"{ctx.user_id}\n{token}".encode()).hexdigest()
 
 
 def _same(a: str, b: str) -> bool:

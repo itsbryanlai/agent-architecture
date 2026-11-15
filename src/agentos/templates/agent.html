@@ -29,7 +29,7 @@
 {{ paused_channels(paused, agent_url ~ "/channels", ctx.csrf) }}
 {% if can_edit %}
 <div class="actions">
-  {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version") }}
+  {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version", {"request_id": new_token()}) }}
 </div>
 {% endif %}
 {% endblock %}

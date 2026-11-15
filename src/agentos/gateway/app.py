@@ -58,6 +58,7 @@ from agentos.models import (
     EditRequest,
     ExternalUpdate,
     InboundMessage,
+    field_error,
 )
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
@@ -80,6 +81,7 @@ NOTION_PAGE_EVENTS = {
 }
 EDIT_ACTION = "task_edit"
 EDIT_CALLBACK = "task_edit"
+STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
 FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
 MULTILINE_FIELDS = {"details", "comment"}
 
@@ -502,7 +504,11 @@ def _edit_view(task_id: str, draft: DraftView) -> dict:
 
 
 async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Response:
-    """Handle the saved Edit form: reject empty values, else signal ``edit``."""
+    """Handle the saved Edit form: keep the form open on a bad value, else signal ``edit``.
+
+    A value is bad when it is empty or does not fit once escaped, and the whole form is
+    stale when the draft has moved on. Only a valid edit reaches the workflow.
+    """
     view = payload.get("view") or {}
     if view.get("callback_id") != EDIT_CALLBACK:
         return Response(status_code=200)
@@ -524,6 +530,24 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         if not text:
             errors[block_id] = "This can't be empty."
         fields[block_id] = text
+    if errors:
+        return Response(
+            content=json.dumps({"response_action": "errors", "errors": errors}),
+            media_type="application/json",
+        )
+    draft = await _query_draft(d, tenant, task_id)
+    if draft is None:
+        errors = {next(iter(fields), ""): "This request is no longer open."}
+    elif nonce != draft.nonce:
+        errors = {next(iter(fields), ""): STALE_EDIT}
+    elif not draft.editable:
+        errors = {next(iter(fields), ""): "This request can no longer be edited."}
+    else:
+        # The workflow checks every field again; this is the same check, shown here.
+        for name, value in fields.items():
+            known = name in EDITABLE_FIELDS[draft.tool_name]
+            if known and (message := field_error(draft.tool_name, name, value)):
+                errors[name] = message
     if errors:
         return Response(
             content=json.dumps({"response_action": "errors", "errors": errors}),

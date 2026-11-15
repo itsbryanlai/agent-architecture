@@ -58,7 +58,6 @@ from agentos.usage import (
     build_report,
     load_prices,
     month_bounds,
-    parse_prices,
 )
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, agents_dict, make_fake_notion
 from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, using
@@ -303,11 +302,57 @@ def test_a_missing_prices_file_is_a_config_error(tmp_path):
         load_prices(tmp_path / "nope.yaml")
 
 
-def test_the_shipped_prices_file_loads_and_prices_only_the_models_it_names():
-    prices = load_prices(REPO / "config" / "prices.yaml")
+def test_the_prices_loader_reads_aliases_and_refuses_one_claimed_twice(tmp_path):
+    """Fails if aliases are not read from the file, or an alias two models claim is accepted."""
+    prices = load_prices(write_prices(tmp_path, [entry(aliases=["m-latest"])]))
+    assert prices.entry_for("m-latest", NOV).model == "m"
+    both = [entry(aliases=["x"]), entry(model="n", aliases=["x"])]
+    with pytest.raises(ConfigError, match="belongs to both"):
+        load_prices(write_prices(tmp_path, both))
+    with pytest.raises(ConfigError, match="also listed as a model"):
+        load_prices(write_prices(tmp_path, [entry(), entry(model="n", aliases=["m"])]))
 
-    assert {e.model for e in prices.entries} == {"qwen3.7-plus", "bge-m3"}
-    assert parse_prices({"prices": []}).entries == []
+
+@pytest.mark.parametrize(
+    ("reported", "listed"),
+    [
+        ("qwen3.7-plus", "qwen3.7-plus"),
+        ("qwen-plus-latest", "qwen3.7-plus"),
+        ("qwen3.7-plus-2026-11-01", "qwen3.7-plus"),
+        ("gemini-2-2026-11-01", None),
+        ("qwen3.7plus", None),
+        ("qwen3.7-turbo", "qwen3.7"),
+        ("qwen3.7", "qwen3.7"),
+    ],
+    ids=["exact", "alias", "dated suffix", "no match", "no dash", "shorter prefix", "exact short"],
+)
+def test_a_reported_model_name_matches_exact_then_alias_then_longest_prefix(reported, listed):
+    """Fails if matching prefers the wrong entry or prices a name that merely starts alike."""
+    prices = Prices(
+        [
+            PriceEntry("qwen3.7", date(2026, 1, 1), D(1), D(1), D(1), D(1)),
+            PriceEntry(
+                "qwen3.7-plus",
+                date(2026, 1, 1),
+                D(2),
+                D(2),
+                D(2),
+                D(2),
+                aliases=("qwen-plus-latest",),
+            ),
+        ]
+    )
+
+    entry_ = prices.entry_for(reported, NOV)
+
+    assert (entry_.model if entry_ else None) == listed
+
+
+def test_the_longest_prefix_wins_over_a_shorter_one():
+    """Fails if a dated name of a longer model is priced with the shorter model's entry."""
+    prices = Prices([price("a", i="1"), price("a-b", i="2")])
+
+    assert prices.entry_for("a-b-2026", NOV).model == "a-b"
 
 
 def test_the_prices_path_is_a_setting_with_an_env_override(monkeypatch):
@@ -482,17 +527,56 @@ class BrokenStore(InMemoryUsageStore):
         raise RuntimeError("usage database is down: SECRET-TEXT")
 
 
-async def test_a_recording_failure_does_not_fail_the_turn_and_logs_no_content(agents, caplog):
-    _, recorder = recorder_with(store=BrokenStore())
+async def no_wait(_seconds):
+    return None
+
+
+class FlakyStore(InMemoryUsageStore):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+        self.tries = 0
+
+    async def record(self, event):
+        self.tries += 1
+        if self.tries <= self.failures:
+            raise RuntimeError("usage database is down: SECRET-TEXT")
+        await super().record(event)
+
+
+async def test_an_insert_that_fails_twice_then_succeeds_stores_one_row(agents, caplog):
+    """Fails if a database blip drops a paid call's usage or stores it twice."""
+    store = FlakyStore(failures=2)
+    recorder = UsageRecorder(store, Prices([price("m")]), Clock(), sleep=no_wait)
+    acts = make_activities(agents, ScriptedLLMClient([answer()]), recorder)
+
+    with caplog.at_level(logging.WARNING):
+        await ActivityEnvironment().run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
+
+    assert store.tries == 3 and len(store.events) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_an_insert_that_always_fails_logs_an_error_and_marks_spend_unknown(agents, caplog):
+    """Fails if a dropped row is silent, logs content, or leaves the budget blind to the call."""
+    from agentos.budgets import BudgetGuard, InMemoryBudgetStore
+
+    store = FlakyStore(failures=99)
+    budgets = InMemoryBudgetStore()
+    guard = BudgetGuard(budgets, store, Clock())
+    await budgets.set_budget(TENANT, "it-helper", D("1000"), ROOT)
+    recorder = UsageRecorder(store, Prices([price("m")]), Clock(), guard, no_wait)
     acts = make_activities(agents, ScriptedLLMClient([answer()]), recorder)
 
     with caplog.at_level(logging.WARNING):
         resp = await ActivityEnvironment().run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
 
-    assert resp.text == "done"
-    line = next(r.getMessage() for r in caplog.records if "usage" in r.getMessage())
-    assert TENANT in line and "it-helper" in line and "RuntimeError" in line
+    assert resp.text == "done" and store.events == []
+    [line] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    for needle in (TENANT, "it-helper", "model=m", "input_tokens=1000", "RuntimeError"):
+        assert needle in line
     assert "SECRET-TEXT" not in line and "done" not in line
+    assert await guard.stopped_by(TENANT, "it-helper") == "unpriced"
 
 
 async def test_a_failed_provider_call_records_nothing(agents):
@@ -1039,3 +1123,126 @@ def test_a_team_in_a_definition_survives_the_agent_store():
     record = asyncio.run(store.create_agent(TENANT, "x", definition, "U1"))
 
     assert record.agent().team == "IT"
+
+
+# --- reprice ------------------------------------------------------------------------------
+
+
+from agentos.usage_reprice import reprice
+from agentos.worker import startup_price_failure
+
+
+async def unpriced_store():
+    store = InMemoryUsageStore()
+    await store.record(event("u1", "a1", model="m-2026-11", cost=None, tokens=(1_000_000, 0, 0, 0)))
+    await store.record(event("u2", "a1", model="other", cost=None))
+    await store.record(event("p1", "a1", model="m", cost="1"))
+    return store
+
+
+async def test_reprice_prices_the_row_totals_include_it_and_the_stop_clears():
+    """Fails if an adjustment is not counted in totals, or does not lift the unknown-spend stop."""
+    from agentos.budgets import BudgetGuard, InMemoryBudgetStore
+
+    store, audit = await unpriced_store(), InMemoryAuditStore()
+    budgets = InMemoryBudgetStore()
+    await budgets.set_budget(TENANT, None, D("100"), ROOT)
+    start, end, _ = month_bounds("2026-11", NOV)
+    assert (await store.totals(TENANT, start, end))[0].unpriced_calls >= 1
+
+    result = await reprice(
+        store,
+        audit,
+        Prices([price("m", i="3")]),
+        TENANT,
+        "2026-11",
+        write=True,
+        identity="operator:x",
+        now=NOV,
+    )
+
+    assert result.stored == 1 and result.unpriceable == {"other": 1}
+    groups = await store.totals(TENANT, start, end)
+    assert sum(g.cost for g in groups) == D("4")
+    assert sum(g.unpriced_calls for g in groups) == 1
+    [ev] = audit.events
+    assert (ev.kind, ev.agent_id, ev.tenant_id) == ("usage_repriced", None, TENANT)
+    assert ev.target == "2026-11 rows=1" and ev.requester_user_id == "operator:x"
+    again = await reprice(
+        store,
+        audit,
+        Prices([price("m", i="3")]),
+        TENANT,
+        "2026-11",
+        write=True,
+        identity="o",
+        now=NOV,
+    )
+    assert again.adjustments == [] and len(audit.events) == 1
+    guard = BudgetGuard(budgets, store, Clock())
+    assert await guard.stopped_by(TENANT, "a1") == "unpriced"  # "other" is still unpriced
+    assert len(store.adjustments) == 1
+
+
+async def test_reprice_is_a_dry_run_unless_told_to_write():
+    """Fails if the default run writes an adjustment or an audit event."""
+    store, audit = await unpriced_store(), InMemoryAuditStore()
+
+    result = await reprice(
+        store, audit, Prices([price("m")]), TENANT, "2026-11", write=False, identity="o", now=NOV
+    )
+
+    assert len(result.adjustments) == 1 and result.stored == 0
+    assert store.adjustments == {} and audit.events == []
+
+
+async def test_reprice_leaves_other_tenants_and_months_alone():
+    """Fails if a reprice of one tenant and month prices rows of another."""
+    store, audit = await unpriced_store(), InMemoryAuditStore()
+
+    other_month = await reprice(
+        store, audit, Prices([price("m")]), TENANT, "2026-10", write=True, identity="o", now=NOV
+    )
+    other_tenant = await reprice(
+        store, audit, Prices([price("m")]), "globex", "2026-11", write=True, identity="o", now=NOV
+    )
+
+    assert other_month.adjustments == [] == other_tenant.adjustments
+    assert store.adjustments == {}
+
+
+def test_the_reprice_command_names_the_variable_it_needs(monkeypatch, capsys):
+    """Fails if the command runs without an owner URL, or prints anything but the variable name."""
+    from agentos.usage_reprice import main
+
+    monkeypatch.delenv("MY_OWNER_URL", raising=False)
+
+    code = main(["reprice", "--tenant", "acme", "--month", "2026-11", "--url-var", "MY_OWNER_URL"])
+
+    assert code == 2 and "MY_OWNER_URL is not set" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("models", "named"),
+    [(["m"], None), (["m", "missing"], "missing"), (["m-2026-01-01"], None), (["nope"], "nope")],
+    ids=["priced", "embedder missing", "dated name", "chat missing"],
+)
+def test_the_worker_refuses_to_start_without_a_price_for_a_model(models, named):
+    """Fails if the worker starts with a configured model that has no price, or names the wrong one."""
+    failure = startup_price_failure(Prices([price("m")]), "config/prices.yaml", models, NOV)
+
+    if named is None:
+        assert failure is None
+    else:
+        assert f"'{named}'" in failure and "config/prices.yaml" in failure
+
+
+async def test_an_embedding_with_no_reported_count_is_free_only_at_a_zero_price():
+    """Fails if an unreported count under a zero price is unpriced, or under a real price is free."""
+    free, paid = InMemoryUsageStore(), InMemoryUsageStore()
+    for store, p in ((free, price("e", i="0", o="0", cr="0", cw="0")), (paid, price("e", i="1"))):
+        await UsageRecorder(store, Prices([p]), Clock()).embedding(
+            tenant_id=TENANT, key="k", model="e", billed=None
+        )
+
+    assert free.events[0].cost == D(0) and paid.events[0].cost is None

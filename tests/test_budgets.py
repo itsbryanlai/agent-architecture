@@ -3,6 +3,7 @@
 Fakes only: scripted model, in-memory stores, a fake Slack sign-in, a clock the test sets.
 """
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -152,12 +153,66 @@ async def test_only_this_utc_month_counts_and_it_starts_over_on_the_first():
     assert await guard.stopped_by(TENANT, "it-helper") is None
 
 
-async def test_unpriced_rows_cannot_reach_a_dollar_budget():
+@pytest.mark.parametrize("scope", ["it-helper", None], ids=["agent budget", "tenant budget"])
+async def test_a_budgeted_scope_with_an_unpriced_call_is_stopped_not_treated_as_free(scope):
+    """Fails if a call with no price lets a scope with a budget keep spending unseen."""
     guard, budgets, usage = make_guard()
-    await budgets.set_budget(TENANT, "it-helper", D("1"), ROOT)
+    await budgets.set_budget(TENANT, scope, D("1000"), ROOT)
+    await usage.record(usage_row("1", cost=None))
+
+    assert await guard.stopped_by(TENANT, "it-helper") == "unpriced"
+    assert await guard.tenant_stopped(TENANT) is (scope is None)
+
+
+async def test_the_unpriced_stop_has_its_own_reply_and_reason():
+    """Fails if an unknown-spend stop says the budget is reached, or carries the wrong reason."""
+    guard, budgets, usage = make_guard()
+    await budgets.set_budget(TENANT, "it-helper", D("1000"), ROOT)
+    await usage.record(usage_row("1", cost=None))
+
+    resp = await guard.stop_response(TENANT, "it-helper", "IT Helper")
+
+    assert resp.text == (
+        "IT Helper's spending can't be measured this month, so it is paused. "
+        "An admin can check prices in the console."
+    )
+    assert resp.stop_reason == "spend_unknown" and resp.tool_calls == []
+
+
+async def test_raising_the_budget_does_not_clear_an_unpriced_stop_but_a_price_does():
+    """Fails if a bigger budget lifts the unknown-spend stop, or an adjustment does not."""
+    from agentos.usage import Adjustment
+
+    clock = Clock()
+    guard, budgets, usage = make_guard(clock=clock)
+    await budgets.set_budget(TENANT, "it-helper", D("5"), ROOT)
+    await usage.record(usage_row("1", cost=None))
+    assert await guard.stopped_by(TENANT, "it-helper") == "unpriced"
+
+    await budgets.set_budget(TENANT, "it-helper", D("5000"), ROOT)
+    clock.now += timedelta(seconds=61)
+    assert await guard.stopped_by(TENANT, "it-helper") == "unpriced"
+
+    await usage.adjust(TENANT, [Adjustment("1", D("1"), "m", NOV.date())])
+    clock.now += timedelta(seconds=61)
+    assert await guard.stopped_by(TENANT, "it-helper") is None
+
+
+async def test_no_budget_means_an_unpriced_call_stops_nothing():
+    """Fails if a scope with no budget is stopped by unpriced rows."""
+    guard, _, usage = make_guard()
     await usage.record(usage_row("1", cost=None))
 
     assert await guard.stopped_by(TENANT, "it-helper") is None
+
+
+async def test_indexing_stops_for_the_tenant_scope_when_spend_is_unknown():
+    """Fails if an unpriced call under a tenant budget still lets pages be embedded."""
+    guard, budgets, usage = make_guard()
+    await budgets.set_budget(TENANT, None, D("1000"), ROOT)
+    await usage.record(usage_row("e", kind="embedding", cost=None))
+
+    assert await guard.tenant_stopped(TENANT) is True
 
 
 async def test_another_tenants_spend_and_budget_are_not_seen():
@@ -619,6 +674,10 @@ async def test_the_usage_page_says_the_budget_cannot_see_unpriced_calls(h):
     text = text_of(await page(h, ROOT))
 
     assert "1 model call has no price" in text and "cannot count" in text
+    assert "mine is paused" in text or "is paused until" in text
+    body = (await api(h, ROOT, "GET", f"/tenants/{TENANT}/budgets")).json()
+    line = next(x for x in body["agents"] if x["agent_id"] == "mine")
+    assert line["stop_reason"] == "spend_unknown"
 
 
 async def test_no_unpriced_warning_when_no_budget_is_set_or_every_call_is_priced(h):
@@ -984,3 +1043,64 @@ async def test_unpriced_calls_are_warned_per_cost_type(h):
     assert [(k.kind, k.unpriced_calls) for k in view.tenant.kinds] == [("llm", 2), ("embedding", 1)]
     assert "2 model calls have no price" in text
     assert "1 embedding call has no price" in text
+
+
+# --- the cache: single flight, immediate increments, unmetered calls -------------------
+
+
+class CountingUsage(InMemoryUsageStore):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    async def totals(self, tenant_id, start, end):
+        self.reads += 1
+        await asyncio.sleep(0)
+        return await super().totals(tenant_id, start, end)
+
+
+async def test_concurrent_checks_after_expiry_share_one_aggregate_read():
+    """Fails if N checks that find the cache expired each run the month's GROUP BY."""
+    budgets, usage = InMemoryBudgetStore(), CountingUsage()
+    guard = BudgetGuard(budgets, usage, Clock(), ttl_seconds=60)
+    await budgets.set_budget(TENANT, "it-helper", D("5"), ROOT)
+
+    await asyncio.gather(*(guard.stopped_by(TENANT, "it-helper") for _ in range(10)))
+
+    assert usage.reads == 1
+
+
+async def test_a_recorded_cost_raises_the_cached_spend_at_once():
+    """Fails if a call recorded inside the cache window is not counted until the cache expires."""
+    guard, budgets, usage = make_guard()
+    recorder = UsageRecorder(usage, Prices([price("m", i="1000000", o="0", cr="0", cw="0")]))
+    recorder.clock = Clock()
+    recorder.listener = guard
+    await budgets.set_budget(TENANT, "it-helper", D("5"), ROOT)
+    assert await guard.stopped_by(TENANT, "it-helper") is None
+
+    await recorder.llm_call(
+        tenant_id=TENANT,
+        agent_id="it-helper",
+        agent_version=1,
+        conversation_id="c",
+        key="k",
+        usage=Usage(5, 0, 0, 0, "m"),
+        fallback_model="m",
+    )
+
+    assert await guard.stopped_by(TENANT, "it-helper") == "agent"
+
+
+async def test_a_call_whose_row_was_lost_makes_the_agent_unmeasured_for_the_window():
+    """Fails if a paid call dropped on a database failure leaves the budget blind to it."""
+    clock = Clock()
+    guard, budgets, _ = make_guard(clock=clock)
+    await budgets.set_budget(TENANT, "it-helper", D("1000"), ROOT)
+    assert await guard.stopped_by(TENANT, "it-helper") is None
+
+    guard.note_recorded(usage_row("lost"), stored=False)
+
+    assert await guard.stopped_by(TENANT, "it-helper") == "unpriced"
+    clock.now += timedelta(seconds=61)
+    assert await guard.stopped_by(TENANT, "it-helper") is None

@@ -7,21 +7,28 @@ No budget means no limit.
 
 ``BudgetGuard`` is asked by ``call_llm`` before the provider is called. When the month's
 spend has reached a budget the activity answers with a fixed text and calls no model, so
-nothing is billed and no usage row is written. The spend comes from the usage rows, read
-at most once per ``ttl_seconds`` per tenant in each process. A turn that starts inside
-that window does not see rows written since the read, so the overspend a budget can allow
-is what the tenant spends in one window per worker process, plus the calls already in
-flight. A raised budget takes up to one window to lift a stop for the same reason.
+nothing is billed and no usage row is written. The spend comes from the usage rows (and
+their adjustments), read by one aggregate query per tenant at a time per process, at most
+once per ``ttl_seconds``: concurrent checks after the cache expires wait for that one read.
+Each cost the recorder stores is added to the cached figure at once (``note_recorded``), so
+one process never lets the window's own calls go uncounted. What the cache can still miss
+is spend from other worker processes and a call's cost before it returns. A call's cost is
+unknown until the provider answers, so one large call can take a scope past its budget by
+that call's own cost, and so can every call in flight when the budget is reached. The bound
+on overspend is therefore: the other processes' spend in one window, plus the calls in
+flight, plus one call's cost. A raised budget takes up to one window to lift a stop.
 
-A cost that is null (a model with no price) cannot be added to a dollar amount. Those rows
-are counted in ``Spend.unpriced_calls`` so a page can say the budget cannot see them; they
-are never summed as zero silently. Spend and unpriced counts are also kept per cost type
-(``usage.KIND_LABELS``), so a budget line shows model and embedding spend side by side.
+Unknown spend is not zero spend. A scope with a budget is stopped, with its own fixed reply,
+when any of its rows this month has no price (``Spend.unpriced_calls``), or when a call's
+row could not be stored (``note_recorded``, for the cache window). Raising the budget does not
+clear it; pricing the rows does (``python -m agentos.usage reprice``). Spend and unpriced
+counts are also kept per cost type (``usage.KIND_LABELS``), so a budget line shows model and
+embedding spend side by side.
 
 Indexing asks ``BudgetGuard.tenant_stopped`` before each embedding call. It is the same
 cached read as the turn check, so a page can be embedded up to one window per worker process
 after the budget was reached, plus the pages already in flight. Embedding costs are small
-next to that overspend.
+next to that overspend. The tenant scope's unpriced stop stops indexing the same way.
 
 If the budgets or the spend cannot be read, the check raises. The activity fails and
 Temporal retries it, so a read failure never lets a call through unchecked.
@@ -29,11 +36,12 @@ Temporal retries it, so a read failure never lets a call through unchecked.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
@@ -42,13 +50,15 @@ from psycopg_pool import AsyncConnectionPool
 from agentos import usage as usage_module
 from agentos.models import LLMResponse
 from agentos.stores import joined_transaction, tenant_transaction
-from agentos.usage import LLM, UsageGroup, UsageStore, month_bounds, utcnow
+from agentos.usage import LLM, UsageEvent, UsageGroup, UsageStore, month_bounds, utcnow
 
 log = logging.getLogger("agentos.budgets")
 
 STOP_REASON = "budget_reached"
+SPEND_UNKNOWN = "spend_unknown"  # the stop reason when spend cannot be measured
 AGENT = "agent"
 TENANT = "tenant"
+UNPRICED = "unpriced"  # what ``stopped_by`` returns when a budgeted scope's spend is unknown
 WARN_PERCENT = 80
 CENTS = Decimal("0.01")
 MAX_AMOUNT = Decimal("9999999999.99")
@@ -64,6 +74,13 @@ _BAD_AMOUNT = (
 
 def stop_text(agent_name: str) -> str:
     return f"{agent_name} has reached its monthly budget. An admin can raise it in the console."
+
+
+def unpriced_stop_text(agent_name: str) -> str:
+    return (
+        f"{agent_name}'s spending can't be measured this month, so it is paused. "
+        "An admin can check prices in the console."
+    )
 
 
 class BudgetError(ValueError):
@@ -292,13 +309,16 @@ class MonthSpend:
     def of(self, agent_id: str) -> Spend:
         return self.agents.get(agent_id, Spend())
 
+    def add(self, group: UsageGroup) -> None:
+        self.tenant.add(group)
+        if group.kind in AGENT_KINDS and group.agent_id is not None:
+            self.agents.setdefault(group.agent_id, Spend()).add(group)
+
 
 def month_spend(groups: list[UsageGroup]) -> MonthSpend:
     spend = MonthSpend()
     for g in groups:
-        spend.tenant.add(g)
-        if g.kind in AGENT_KINDS and g.agent_id is not None:
-            spend.agents.setdefault(g.agent_id, Spend()).add(g)
+        spend.add(g)
     return spend
 
 
@@ -356,8 +376,15 @@ class BudgetLine:
 
     @property
     def cannot_see_unpriced(self) -> bool:
-        """A budget is set and some of the month's calls have no price, so it cannot count them."""
+        """A budget is set and some of the month's calls have no price, so the scope is stopped."""
         return self.amount is not None and self.unpriced_calls > 0
+
+    @property
+    def stop_reason(self) -> str | None:
+        """Why the scope is stopped by its budget: the limit is reached, or spend is unknown."""
+        if self.level == STOPPED:
+            return STOP_REASON
+        return SPEND_UNKNOWN if self.cannot_see_unpriced else None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -366,6 +393,7 @@ class BudgetLine:
             "spend": format(self.spend.normalize(), "f"),
             "percent": self.percent,
             "level": self.level,
+            "stop_reason": self.stop_reason,
             "unpriced_calls": self.unpriced_calls,
             "kinds": [k.as_dict() for k in self.kinds],
             "updated_by": self.updated_by,
@@ -416,34 +444,83 @@ class BudgetGuard:
         self.clock = clock
         self.ttl_seconds = ttl_seconds
         self._cache: dict[str, _Cached] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        # (tenant, agent or None for the tenant) -> until when a call of it went unmetered
+        self._unmetered: dict[tuple[str, str | None], datetime] = {}
 
     def forget(self) -> None:
         self._cache.clear()
+        self._unmetered.clear()
+
+    def note_recorded(self, event: UsageEvent, stored: bool) -> None:
+        """Follow a recorded call: add its cost to the cached figure now, or mark the scope.
+
+        A row that could not be stored makes its agent's and its tenant's spend unknown for
+        one cache window (in this process only): the checks stop a budgeted scope until then.
+        """
+        now = self.clock()
+        if not stored:
+            until = now + timedelta(seconds=self.ttl_seconds)
+            self._unmetered[(event.tenant_id, None)] = until
+            if event.agent_id is not None:
+                self._unmetered[(event.tenant_id, event.agent_id)] = until
+            return
+        cached = self._cache.get(event.tenant_id)
+        if cached is None or cached.month_start != month_bounds(None, now)[0]:
+            return
+        cached.spend.add(
+            UsageGroup(
+                event.kind,
+                event.agent_id,
+                event.agent_version,
+                event.model,
+                calls=1,
+                cost=event.cost or Decimal(0),
+                unpriced_calls=1 if event.cost is None else 0,
+            )
+        )
+
+    def _unknown(self, tenant_id: str, agent_id: str | None, cached: _Cached) -> bool:
+        """True when the scope's spend cannot be measured: unpriced rows, or an unmetered call."""
+        spend = cached.spend.tenant if agent_id is None else cached.spend.of(agent_id)
+        until = self._unmetered.get((tenant_id, agent_id))
+        return spend.unpriced_calls > 0 or (until is not None and self.clock() < until)
 
     async def stopped_by(self, tenant_id: str, agent_id: str) -> str | None:
-        """``"agent"`` or ``"tenant"`` when that budget is reached, else None.
+        """``"agent"`` or ``"tenant"`` when that budget is reached, ``"unpriced"`` when a
+        budgeted scope's spend cannot be measured, else None.
 
-        The agent's budget is named first when both are reached.
+        The agent's budget is named first when both are reached; a reached budget before an
+        unknown spend.
         """
         cached = await self._read(tenant_id)
-        limit = cached.budgets.get(agent_id)
-        if limit is not None and cached.spend.of(agent_id).cost >= limit:
+        agent_limit = cached.budgets.get(agent_id)
+        tenant_limit = cached.budgets.get(None)
+        if agent_limit is not None and cached.spend.of(agent_id).cost >= agent_limit:
             return AGENT
-        limit = cached.budgets.get(None)
-        if limit is not None and cached.spend.tenant.cost >= limit:
+        if tenant_limit is not None and cached.spend.tenant.cost >= tenant_limit:
             return TENANT
+        if agent_limit is not None and self._unknown(tenant_id, agent_id, cached):
+            return UNPRICED
+        if tenant_limit is not None and self._unknown(tenant_id, None, cached):
+            return UNPRICED
         return None
 
     async def tenant_stopped(self, tenant_id: str) -> bool:
-        """True when the tenant-wide budget is reached. Agent budgets never count here."""
+        """True when the tenant-wide budget is reached or its spend is unknown.
+
+        Agent budgets never count here.
+        """
         cached = await self._read(tenant_id)
         limit = cached.budgets.get(None)
-        return limit is not None and cached.spend.tenant.cost >= limit
+        return limit is not None and (
+            cached.spend.tenant.cost >= limit or self._unknown(tenant_id, None, cached)
+        )
 
     async def stop_response(
         self, tenant_id: str, agent_id: str, agent_name: str
     ) -> LLMResponse | None:
-        """The fixed answer when a budget is reached, else None. Logs ids only."""
+        """The fixed answer when a budget is reached or spend is unknown, else None. Logs ids only."""
         reached = await self.stopped_by(tenant_id, agent_id)
         if reached is None:
             return None
@@ -453,21 +530,39 @@ class BudgetGuard:
             agent_id,
             reached,
         )
+        if reached == UNPRICED:
+            return LLMResponse(
+                text=unpriced_stop_text(agent_name), tool_calls=[], stop_reason=SPEND_UNKNOWN
+            )
         return LLMResponse(text=stop_text(agent_name), tool_calls=[], stop_reason=STOP_REASON)
+
+    def _fresh(self, tenant_id: str, now: datetime, month_start: datetime) -> _Cached | None:
+        cached = self._cache.get(tenant_id)
+        if (
+            cached is not None
+            and cached.month_start == month_start
+            and 0 <= (now - cached.fetched_at).total_seconds() < self.ttl_seconds
+        ):
+            return cached
+        return None
 
     async def _read(self, tenant_id: str) -> _Cached:
         now = self.clock()
         start, end, _ = month_bounds(None, now)
-        cached = self._cache.get(tenant_id)
-        if (
-            cached is not None
-            and cached.month_start == start
-            and 0 <= (now - cached.fetched_at).total_seconds() < self.ttl_seconds
-        ):
+        cached = self._fresh(tenant_id, now, start)
+        if cached is not None:
             return cached
-        limits = {b.agent_id: b.amount for b in await self.budgets.list(tenant_id)}
-        spend = MonthSpend()
-        if limits:
-            spend = month_spend(await self.usage.totals(tenant_id, start, end))
-        cached = self._cache[tenant_id] = _Cached(now, start, limits, spend)
-        return cached
+        # One aggregate read per tenant at a time: a check that finds the cache expired while
+        # another is reading waits, then uses what that read stored.
+        async with self._locks.setdefault(tenant_id, asyncio.Lock()):
+            now = self.clock()
+            start, end, _ = month_bounds(None, now)
+            cached = self._fresh(tenant_id, now, start)
+            if cached is not None:
+                return cached
+            limits = {b.agent_id: b.amount for b in await self.budgets.list(tenant_id)}
+            spend = MonthSpend()
+            if limits:
+                spend = month_spend(await self.usage.totals(tenant_id, start, end))
+            cached = self._cache[tenant_id] = _Cached(now, start, limits, spend)
+            return cached

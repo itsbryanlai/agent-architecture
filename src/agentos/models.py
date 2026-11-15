@@ -249,6 +249,8 @@ AUDIENCE_AUDIT_KINDS = (
 BUDGET_AUDIT_KINDS = ("budget_set",)
 # A kill switch belongs to an agent or to the whole tenant, not to a version of an agent.
 SWITCH_AUDIT_KINDS = ("switch_off", "switch_on")
+# A reprice of a month's unpriced usage belongs to the tenant, run by an owner from the command line.
+USAGE_AUDIT_KINDS = ("usage_repriced",)
 AUDIT_KINDS = (
     ("answer", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
@@ -256,6 +258,7 @@ AUDIT_KINDS = (
     + AUDIENCE_AUDIT_KINDS
     + BUDGET_AUDIT_KINDS
     + SWITCH_AUDIT_KINDS
+    + USAGE_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -297,9 +300,10 @@ class AuditEvent:
             raise ValueError("an audit event needs a tenant_id and an event_key")
         if self.kind not in AUDIT_KINDS:
             raise ValueError(f"invalid audit kind {self.kind!r}")
-        if self.kind not in MEMBER_AUDIT_KINDS + BUDGET_AUDIT_KINDS + SWITCH_AUDIT_KINDS and (
-            not self.agent_id or self.agent_version is None
-        ):
+        tenant_wide = (
+            MEMBER_AUDIT_KINDS + BUDGET_AUDIT_KINDS + SWITCH_AUDIT_KINDS + USAGE_AUDIT_KINDS
+        )
+        if self.kind not in tenant_wide and (not self.agent_id or self.agent_version is None):
             raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")
         if self.outcome not in AUDIT_OUTCOMES:
             raise ValueError(f"invalid audit outcome {self.outcome!r}")

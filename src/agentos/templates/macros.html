@@ -11,7 +11,7 @@
 {% macro budget_alerts(line, name) -%}
 {% if line and line.level == "warning" %}<p class="warn">{{ name }} has used {{ line.percent }}% of its monthly budget ({{ line.spend | usd }} of {{ line.amount | usd2 }}: {{ kind_split(line) }}).</p>{% endif %}
 {% if line and line.level == "stopped" %}{% if line.agent_id is none %}<p class="error">{{ name }} has reached its monthly budget. No agent is answering and indexing is paused. An admin can raise it.</p>{% else %}<p class="error">{{ name }} has reached its monthly budget and is not answering. An admin can raise it.</p>{% endif %}{% endif %}
-{% if line and line.amount is not none %}{% for k in line.kinds if k.unpriced_calls %}<p class="warn">{{ k.unpriced_calls }} {{ k.label | lower }} call{{ "" if k.unpriced_calls == 1 else "s" }} {{ "has" if k.unpriced_calls == 1 else "have" }} no price this month, so the budget for {{ name }} cannot count {{ "it" if k.unpriced_calls == 1 else "them" }}.</p>{% endfor %}{% endif %}
+{% if line and line.amount is not none %}{% for k in line.kinds if k.unpriced_calls %}<p class="error">{{ k.unpriced_calls }} {{ k.label | lower }} call{{ "" if k.unpriced_calls == 1 else "s" }} {{ "has" if k.unpriced_calls == 1 else "have" }} no price this month, so the budget for {{ name }} cannot count {{ "it" if k.unpriced_calls == 1 else "them" }}. {% if line.agent_id is none %}No agent is answering and indexing is paused{% else %}{{ name }} is paused{% endif %} until the price is added to <code>config/prices.yaml</code> and the month is repriced (see the README).</p>{% endfor %}{% endif %}
 {%- endmacro %}
 
 {% macro paused_channels(paused, resume_base, csrf) -%}

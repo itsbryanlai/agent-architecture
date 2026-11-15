@@ -14,6 +14,7 @@ from agentos.control import ControlPlane, Forbidden
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
+from agentos.schema_version import EXPECTED_VERSIONS
 from agentos.stores import tenant_transaction
 from agentos.switches import PostgresSwitchStore
 from agentos.unit_of_work import PostgresUnitOfWork
@@ -121,7 +122,7 @@ def test_migrate_applies_017_over_rows_and_backfills_them(databases: Databases):
                 (version, status, f'{{"n": {version}}}'),
             )
         applied = migrate.migrate(conn, files, log=lambda _line: None)
-        assert applied == ["017", "018", "021"]
+        assert applied == [v for v in EXPECTED_VERSIONS if v >= "017"]
         rows = conn.execute(
             "SELECT status, definition_sha256, "
             "encode(sha256(convert_to(definition::text, 'UTF8')), 'hex') "

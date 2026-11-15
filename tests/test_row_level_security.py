@@ -38,7 +38,7 @@ from agentos.config import (
     parse_agents_config,
 )
 from agentos.knowledge import store as knowledge_store
-from agentos.knowledge.store import PostgresKnowledgeStore
+from agentos.knowledge.store import PageSync, PostgresKnowledgeStore
 from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
@@ -66,6 +66,9 @@ BUDGETS_MIGRATION = (ROOT / "scripts" / "migrations" / "012_budgets.sql").read_t
 WATCH_MIGRATION = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
 SWITCHES_MIGRATION = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
 TENANTS_MIGRATION = (ROOT / "scripts" / "migrations" / "015_tenants.sql").read_text()
+KNOWLEDGE_HEALTH_MIGRATION = (
+    ROOT / "scripts" / "migrations" / "021_knowledge_health.sql"
+).read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -149,6 +152,8 @@ def sample_value(hint):
         return AuditEvent("acme", "k1", "answer", "a", 1, "U1", "agent:a")
     if hint is AgentVersion:
         return SAMPLE_AGENT
+    if hint is PageSync:
+        return PageSync(embed_model="m", ancestors=["root"])
     if hint is UsageEvent:
         return UsageEvent(
             tenant_id="acme", usage_key="k", kind="llm", agent_id="a", agent_version=1, model="m"
@@ -187,6 +192,11 @@ MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
 BUDGET_ROW = ("acme", None, Decimal("5.00"), "U1", datetime(2026, 1, 1))
 PAUSE_ROW = ("acme", "it-helper", "C0AAAA111", "channel_shared", datetime(2026, 1, 1), None, None)
 SESSION_ROW = ("acme", "U1", "csrf-secret", datetime(2026, 1, 1), datetime(2026, 1, 2))
+# Reads of the knowledge store that unpack their row: page_state and record_scope_gone.
+KNOWLEDGE_ROWS = {
+    "page_state": ("h", datetime(2026, 1, 1), "m", "", "", [], [], [], []),
+    "record_scope_gone": (1, datetime(2026, 1, 1), None),
+}
 
 
 def row_for(cls, method_name):
@@ -201,6 +211,8 @@ def row_for(cls, method_name):
         return None
     if cls is PostgresBudgetStore:
         return BUDGET_ROW
+    if cls is PostgresKnowledgeStore:
+        return KNOWLEDGE_ROWS.get(method_name)
     if cls is PostgresAgentStore:
         return AGENT_RECORD_ROW if method_name in ("get_agent", "list_agents") else AGENT_ROW
     return None
@@ -316,6 +328,7 @@ def test_migration_and_init_db_cover_every_tenant_table():
         | rls_tables_forced(WATCH_MIGRATION)
         | rls_tables_forced(SWITCHES_MIGRATION)
         | rls_tables_forced(TENANTS_MIGRATION)
+        | rls_tables_forced(KNOWLEDGE_HEALTH_MIGRATION)
     )
     # init_db.sql carries the same block, after the tables it protects.
     assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)

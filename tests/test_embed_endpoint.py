@@ -1,14 +1,13 @@
 """The configurable embedding endpoint, and how indexing treats embedder errors."""
 
 import pytest
-from temporalio.exceptions import ApplicationError
 
 from agentos.agent_store import seeded_agent_store
 from agentos.config import AgentsConfig, Settings, TenantsConfig, load_settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.ids import knowledge_scope
 from agentos.knowledge.embedder import FakeEmbedder, OpenAICompatibleEmbedder
-from agentos.knowledge.indexing import IndexActivities
+from agentos.knowledge.indexing import FAILED, IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.slack_client import FakeSlack
 from agentos.tenants import TenantRegistry, runtime_for
@@ -70,14 +69,14 @@ def activities_for(embedder) -> IndexActivities:
     return IndexActivities(registry, InMemoryKnowledgeStore(), embedder, seeded_agent_store(config))
 
 
-async def test_sync_page_client_error_is_non_retryable():
+async def test_sync_page_client_error_marks_the_page_failed():
+    """Fails if a page the embedder refuses for good raises, stopping the run, or is stored."""
     acts = activities_for(FailingEmbedder(404))
-    with pytest.raises(ApplicationError) as caught:
-        await acts.sync_page(with_pages().tenant_id, knowledge_scope(ROOT), ROOT)
-    assert caught.value.non_retryable is True
-    # It came from the embedder, not from a revoked-grant check.
-    assert caught.value.type == "RuntimeError"
-    assert "embedder said no" in str(caught.value)
+
+    result = await acts.sync_page(with_pages().tenant_id, knowledge_scope(ROOT), ROOT)
+
+    assert result.status == FAILED
+    assert acts.store.pages == {}
 
 
 async def test_sync_page_server_error_is_retried():

@@ -78,6 +78,11 @@ def audience_refusal_key(event_id: str, agent_id: str) -> str:
     return f"{event_id}:audience:{agent_id}"
 
 
+def empty_message_key(event_id: str, agent_id: str) -> str:
+    """The idempotency key of the reply that asks for a question after a message with no text."""
+    return f"{event_id}:empty:{agent_id}"
+
+
 # Usage row keys. Each names one attempt of one activity: a retry that calls the
 # provider again is billed again, so it gets its own row, while the same attempt
 # recorded twice stores one. Every key starts with the tenant ID.

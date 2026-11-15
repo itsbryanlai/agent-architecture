@@ -1,18 +1,16 @@
-"""Row-level security: the store side (every call sets the tenant first) and the SQL text.
+"""Row-level security, store side: every call sets the tenant first.
 
-The policies themselves are checked against a real Postgres outside this suite.
+The policies, grants and triggers themselves run against a real Postgres in tests/pg.
 """
 
 import hashlib
 import inspect
-import re
 import types
 import typing
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
 
@@ -32,7 +30,6 @@ from agentos.audience_pauses import PostgresPauseStore
 from agentos.audit import PostgresAuditStore
 from agentos.budgets import PostgresBudgetStore
 from agentos.config import (
-    DEFAULT_DATABASE_URL,
     AgentVersion,
     agent_definition,
     parse_agents_config,
@@ -54,18 +51,7 @@ from agentos.usage import PostgresUsageStore, UsageEvent
 from tests.conftest import agents_dict
 
 ROOT = Path(__file__).resolve().parent.parent
-INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
-MIGRATION = (ROOT / "scripts" / "migrations" / "004_row_level_security.sql").read_text()
-AUDIT_MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
-AGENTS_MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
-MEMBERS_MIGRATION = (ROOT / "scripts" / "migrations" / "007_members.sql").read_text()
-SESSIONS_MIGRATION = (ROOT / "scripts" / "migrations" / "008_sessions.sql").read_text()
-AUDIT_KINDS_MIGRATION = (ROOT / "scripts" / "migrations" / "010_audience.sql").read_text()
 USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text()
-BUDGETS_MIGRATION = (ROOT / "scripts" / "migrations" / "012_budgets.sql").read_text()
-WATCH_MIGRATION = (ROOT / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
-SWITCHES_MIGRATION = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
-TENANTS_MIGRATION = (ROOT / "scripts" / "migrations" / "015_tenants.sql").read_text()
 
 POSTGRES_STORES = [
     PostgresHistoryStore,
@@ -282,108 +268,6 @@ async def test_tenant_transaction_rejects_empty_tenant():
     assert pool.events == []
 
 
-def tenant_tables(sql: str) -> set[str]:
-    tables = set()
-    for match in re.finditer(
-        r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)\s*\((.*?)\n\);", sql, re.DOTALL | re.IGNORECASE
-    ):
-        if re.search(r"^\s*tenant_id\s", match.group(2), re.MULTILINE):
-            tables.add(match.group(1))
-    return tables
-
-
-def rls_tables(sql: str) -> set[str]:
-    match = re.search(r"FOREACH t IN ARRAY ARRAY\[(.*?)\]", sql, re.DOTALL)
-    assert match, "no RLS table list found"
-    return set(re.findall(r"'(\w+)'", match.group(1)))
-
-
-def rls_tables_forced(sql: str) -> set[str]:
-    return set(re.findall(r"ALTER TABLE (\w+) FORCE ROW LEVEL SECURITY", sql))
-
-
-def test_migration_and_init_db_cover_every_tenant_table():
-    tables = tenant_tables(INIT_DB)
-    assert len(tables) >= 6
-    assert tables <= (
-        rls_tables(MIGRATION)
-        | rls_tables_forced(AUDIT_MIGRATION)
-        | rls_tables_forced(AGENTS_MIGRATION)
-        | rls_tables_forced(MEMBERS_MIGRATION)
-        | rls_tables_forced(SESSIONS_MIGRATION)
-        | rls_tables_forced(USAGE_MIGRATION)
-        | rls_tables_forced(BUDGETS_MIGRATION)
-        | rls_tables_forced(WATCH_MIGRATION)
-        | rls_tables_forced(SWITCHES_MIGRATION)
-        | rls_tables_forced(TENANTS_MIGRATION)
-    )
-    # init_db.sql carries the same block, after the tables it protects.
-    assert tables <= rls_tables(INIT_DB) | rls_tables_forced(INIT_DB)
-    for table in rls_tables_forced(INIT_DB):
-        assert INIT_DB.index(f"CREATE TABLE IF NOT EXISTS {table}") < INIT_DB.index(
-            f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"
-        ), table
-    block_start = INIT_DB.index("FOREACH t IN ARRAY")
-    for table in tables & rls_tables(INIT_DB):
-        created = re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\b", INIT_DB)
-        assert created and created.start() < block_start, table
-    assert "FORCE ROW LEVEL SECURITY" in INIT_DB
-    assert "NOBYPASSRLS" in INIT_DB
-
-
-def test_default_database_url_uses_app_role():
-    assert urlparse(DEFAULT_DATABASE_URL).username == "agentos_app"
-
-
-@pytest.mark.parametrize("sql", [MEMBERS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_members_sql_is_tenant_scoped_and_lets_the_app_role_delete(sql):
-    assert "PRIMARY KEY (tenant_id, user_id)" in sql
-    assert "CHECK (role IN ('admin', 'creator'))" in sql
-    assert "ALTER TABLE members ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE members FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON members" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON members FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON members TO agentos_app" in sql
-
-
-def test_init_db_matches_the_members_migration_and_widens_the_audit_log():
-    block = MEMBERS_MIGRATION[MEMBERS_MIGRATION.index("CREATE TABLE IF NOT EXISTS members") :]
-    block = block[: block.index("ALTER TABLE audit_events")].rstrip()
-    assert block in INIT_DB
-    kinds = [
-        *("agent_create", "agent_draft", "agent_submit", "agent_withdraw"),
-        *("agent_reject", "agent_publish", "member_add", "member_remove", "member_role"),
-    ]
-    for kind in kinds:
-        assert f"'{kind}'" in MEMBERS_MIGRATION
-        assert f"'{kind}'" in INIT_DB
-    assert "ALTER COLUMN agent_id DROP NOT NULL" in MEMBERS_MIGRATION
-    assert "ALTER COLUMN agent_version DROP NOT NULL" in MEMBERS_MIGRATION
-    assert "audit_events_agent_required" in INIT_DB
-
-
-@pytest.mark.parametrize("sql", [SESSIONS_MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_sessions_sql_is_tenant_scoped_and_never_updated_by_the_app_role(sql):
-    assert "PRIMARY KEY (tenant_id, session_hash)" in sql
-    assert "ALTER TABLE sessions ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE sessions FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON sessions" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON sessions FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT, DELETE ON sessions TO agentos_app" in sql
-    assert "UPDATE ON sessions" not in sql
-    # The session ID itself has no column: only its hash is stored.
-    assert "session_hash" in sql and "session_id" not in sql
-
-
-def test_init_db_matches_the_sessions_migration():
-    block = SESSIONS_MIGRATION[SESSIONS_MIGRATION.index("CREATE TABLE IF NOT EXISTS sessions") :]
-    assert block.rstrip() in INIT_DB
-
-
 async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash():
     pool = FakePool(SESSION_ROW)
     store = PostgresSessionStore(pool)
@@ -402,37 +286,6 @@ async def test_session_store_queries_are_tenant_scoped_and_store_only_the_hash()
     assert "expires_at > %s" in selected[1]
 
 
-@pytest.mark.parametrize("sql", [SWITCHES_MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_every_audit_kind_the_code_can_write_is_allowed_by_the_sql(sql):
-    from agentos.models import AUDIT_KINDS
-
-    assert "agent_edit" in AUDIT_KINDS and "agent_import" in AUDIT_KINDS
-    for kind in AUDIT_KINDS:
-        assert f"'{kind}'" in sql, kind
-
-
-def test_the_audit_kinds_migration_only_widens_the_check_and_is_rerunnable():
-    sql = AUDIT_KINDS_MIGRATION
-    assert "ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_kind_check" in sql
-    assert "ADD CONSTRAINT audit_events_kind_check CHECK (kind IN (" in sql
-    # The new kinds name an agent, so the existing rule already covers them.
-    assert "audit_events_agent_required" not in sql
-    assert "DROP NOT NULL" not in sql and "DROP TABLE" not in sql and "GRANT" not in sql
-    # Every kind migration 007 allowed is still allowed.
-    old = MEMBERS_MIGRATION[MEMBERS_MIGRATION.index("audit_events_kind_check") :]
-    old = old[: old.index("));")]
-    for kind in re.findall(r"'(\w+)'", old):
-        assert f"'{kind}'" in sql, kind
-
-
-def test_init_db_has_the_same_audit_kinds_as_the_migration():
-    def kinds_in(sql: str, after: str) -> set[str]:
-        block = sql[sql.index(after) :]
-        return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
-
-    assert kinds_in(SWITCHES_MIGRATION, "kind IN (") == kinds_in(INIT_DB, "CHECK (kind IN (")
-
-
 async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert():
     pool = FakePool(AGENT_ROW)
     store = PostgresAgentStore(pool)
@@ -449,32 +302,11 @@ async def test_the_postgres_import_audits_in_the_same_transaction_as_the_insert(
     assert pool.events[-1] == ("commit",)
 
 
-@pytest.mark.parametrize("sql", [USAGE_MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_usage_sql_is_tenant_scoped_append_only_for_the_app_role_and_indexed_by_month(sql):
-    assert "PRIMARY KEY (tenant_id, usage_key)" in sql
-    assert "ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE usage_events FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON usage_events" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON usage_events FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT ON usage_events TO agentos_app" in sql
-    assert "UPDATE ON usage_events" not in sql and "DELETE ON usage_events" not in sql
-    assert "ON usage_events (tenant_id, at)" in sql
-    assert "CHECK (kind IN ('llm', 'embedding'))" in sql
-    assert "cost_usd" in sql and "numeric" in sql
-
-
 def test_a_usage_row_has_no_requester_column_and_no_content_column():
     columns = USAGE_MIGRATION[USAGE_MIGRATION.index("CREATE TABLE") :]
     columns = columns[: columns.index("\n);")]
     for word in ("user", "requester", "text_body", "content", "prompt"):
         assert word not in columns
-
-
-def test_init_db_matches_the_usage_migration():
-    block = USAGE_MIGRATION[USAGE_MIGRATION.index("CREATE TABLE IF NOT EXISTS usage_events") :]
-    assert block.rstrip() in INIT_DB
 
 
 async def test_the_usage_insert_ignores_a_repeat_and_names_the_tenant():

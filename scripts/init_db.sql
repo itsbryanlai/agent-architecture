@@ -1,5 +1,7 @@
--- Every table starts its primary key with tenant_id: the skeleton runs one
--- tenant by configuration, but the data is already shaped for many.
+-- Every table that holds a tenant's rows starts its primary key with tenant_id: the
+-- skeleton runs one tenant by configuration, but the data is already shaped for many.
+-- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
+-- This file equals migrations 000 to 016 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -9,9 +11,12 @@ CREATE TABLE conversation_messages (
   role            text        NOT NULL,   -- 'user' | 'assistant'
   content         jsonb       NOT NULL,   -- Anthropic content blocks
   created_at      timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, conversation_id, seq),
-  UNIQUE (tenant_id, conversation_id, step_key)
+  PRIMARY KEY (tenant_id, conversation_id, seq)
 );
+
+-- A repeated append of the same step finds this index and stores nothing. Same as migration 001.
+CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_step_key
+  ON conversation_messages (tenant_id, conversation_id, step_key);
 
 CREATE TABLE idempotency_records (
   tenant_id  text        NOT NULL,
@@ -78,7 +83,7 @@ CREATE INDEX IF NOT EXISTS knowledge_chunks_embedding
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -105,6 +110,21 @@ BEGIN
 END
 $$;
 
+-- The audit event kinds, one row each. A migration that adds a kind adds a row. Same as migration 016.
+CREATE TABLE IF NOT EXISTS audit_kinds (
+  kind text PRIMARY KEY
+);
+
+INSERT INTO audit_kinds (kind) VALUES
+  ('answer'), ('tool_call'), ('hand_off'), ('approval'), ('write'),
+  ('agent_create'), ('agent_draft'), ('agent_edit'), ('agent_import'), ('agent_submit'),
+  ('agent_withdraw'), ('agent_reject'), ('agent_publish'),
+  ('member_add'), ('member_remove'), ('member_role'),
+  ('audience_refused'), ('audience_confirm'), ('budget_set'),
+  ('audience_pause'), ('audience_resume'),
+  ('switch_off'), ('switch_on')
+ON CONFLICT DO NOTHING;
+
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
 -- never content. The app role can INSERT and SELECT only. Same as migration 005.
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -112,15 +132,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
   tenant_id          text        NOT NULL,
   event_key          text        NOT NULL,   -- names the event; repeats are ignored
   at                 timestamptz NOT NULL DEFAULT now(),
-  kind               text        NOT NULL
-    CHECK (kind IN (
-      'answer', 'tool_call', 'hand_off', 'approval', 'write',
-      'agent_create', 'agent_draft', 'agent_edit', 'agent_import', 'agent_submit',
-      'agent_withdraw', 'agent_reject', 'agent_publish',
-      'member_add', 'member_remove', 'member_role',
-      'audience_refused', 'audience_confirm', 'budget_set',
-      'audience_pause', 'audience_resume',
-      'switch_off', 'switch_on')),
+  kind               text        NOT NULL CONSTRAINT audit_events_kind_fkey
+    REFERENCES audit_kinds (kind),
   agent_id           text,                   -- null only for a membership event, a tenant-wide budget or switch
   agent_version      integer,
   requester_user_id  text        NOT NULL,   -- Slack user who asked
@@ -163,13 +176,13 @@ CREATE TRIGGER audit_events_no_truncate
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
 
 GRANT USAGE ON SCHEMA public TO agentos_app;
-REVOKE ALL ON audit_events FROM agentos_app;
+REVOKE ALL ON audit_events, audit_kinds FROM agentos_app;
 GRANT INSERT, SELECT ON audit_events TO agentos_app;
 
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
@@ -265,7 +278,7 @@ CREATE TRIGGER agent_versions_guard
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -302,7 +315,7 @@ CREATE TABLE IF NOT EXISTS members (
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -332,7 +345,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -373,7 +386,7 @@ CREATE INDEX IF NOT EXISTS usage_events_by_month ON usage_events (tenant_id, at)
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -395,16 +408,15 @@ CREATE TABLE IF NOT EXISTS budgets (
   agent_id    text,                          -- null is the tenant-wide budget
   amount_usd  numeric(12, 2) NOT NULL CHECK (amount_usd > 0),
   updated_by  text          NOT NULL,
-  updated_at  timestamptz   NOT NULL DEFAULT now()
+  updated_at  timestamptz   NOT NULL DEFAULT now(),
+  scope       text          GENERATED ALWAYS AS (COALESCE(agent_id, '')) STORED,
+  CONSTRAINT budgets_pkey PRIMARY KEY (tenant_id, scope)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS budgets_one_per_scope
-  ON budgets (tenant_id, (COALESCE(agent_id, '')));
 
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -440,7 +452,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS audience_pauses_one_active
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -471,7 +483,7 @@ CREATE TABLE IF NOT EXISTS kill_switches (
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;
@@ -521,7 +533,7 @@ CREATE TRIGGER tenants_touch BEFORE UPDATE ON tenants
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_directory') THEN
     CREATE ROLE agentos_directory NOLOGIN NOSUPERUSER NOBYPASSRLS;
@@ -566,3 +578,17 @@ REVOKE ALL ON FUNCTION tenant_for_slack_team(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION list_tenants() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION tenant_for_slack_team(text) TO agentos_app;
 GRANT EXECUTE ON FUNCTION list_tenants() TO agentos_app;
+
+-- Which migrations this database has had. Same as migration 000. A new install has them all.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     text        PRIMARY KEY,   -- the number in the migration's file name
+  applied_at  timestamptz NOT NULL DEFAULT now()
+);
+
+REVOKE ALL ON schema_migrations FROM agentos_app;
+GRANT SELECT ON schema_migrations TO agentos_app;
+
+INSERT INTO schema_migrations (version) VALUES
+  ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016')
+ON CONFLICT DO NOTHING;

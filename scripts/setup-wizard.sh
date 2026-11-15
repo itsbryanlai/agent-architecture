@@ -118,7 +118,12 @@ pause
 stage "Start Postgres and Temporal"
 say "This runs: docker compose up -d"
 note "Postgres on localhost:55432, Temporal on localhost:7233 (web UI on http://localhost:8233)."
-if confirm "Start them now?"; then
+note "Compose needs two database passwords exported in this shell (you choose them; the wizard never reads them):"
+step "export AGENTOS_OWNER_DB_PASSWORD='<choose one>'   AGENTOS_APP_DB_PASSWORD='<choose one>'"
+if [[ -z "${AGENTOS_OWNER_DB_PASSWORD:-}" || -z "${AGENTOS_APP_DB_PASSWORD:-}" ]]; then
+  warn "one of them is not exported, so Compose cannot start Postgres yet"
+  TODO+=("Export AGENTOS_OWNER_DB_PASSWORD and AGENTOS_APP_DB_PASSWORD, then: docker compose up -d")
+elif confirm "Start them now?"; then
   docker compose up -d
   ok "services started"
 else
@@ -220,8 +225,11 @@ say ""
 say "Tenant settings live in the database. This imports the tenant section of"
 say "config/agents.yaml into the tenants table (a tenant already there is skipped):"
 step "uv run python -m agentos.tenant_store import"
-note "Needs Postgres from stage 2. No secret is involved."
-if confirm "Import the tenant now?"; then
+note "Needs Postgres from stage 2 and AGENTOS_DATABASE_URL exported (see the README, Database and migrations)."
+if [[ -z "${AGENTOS_DATABASE_URL:-}" ]]; then
+  warn "AGENTOS_DATABASE_URL is not exported, so the import cannot run yet"
+  TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+elif confirm "Import the tenant now?"; then
   if uv run python -m agentos.tenant_store import; then
     ok "tenant imported"
   else

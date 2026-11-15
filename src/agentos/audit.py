@@ -202,7 +202,7 @@ async def run(tenant: str, limit: int, before: datetime | None) -> int:
     from agentos.config import load_settings
 
     settings = load_settings()
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     try:
         for event in await PostgresAuditStore(pool).list(tenant, limit, before):

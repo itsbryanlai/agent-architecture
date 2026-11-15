@@ -628,6 +628,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
     from agentos.members import PostgresMemberStore
+    from agentos.schema_version import require_current_schema
     from agentos.sessions import PostgresSessionStore
     from agentos.slack_client import RealSlackPoster
     from agentos.switches import PostgresSwitchStore
@@ -637,9 +638,10 @@ async def _real_lifespan(app: FastAPI):
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     try:
+        await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         if failure := notion_key_failure(await startup_tenants(directory)):
             raise SystemExit(failure)

@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS usage_events_by_month ON usage_events (tenant_id, at)
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;

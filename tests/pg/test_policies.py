@@ -40,6 +40,9 @@ SEEDS = {
     "VALUES (%(t)s, 'h', 'u', 'c', now() + interval '1 hour')",
     "usage_events": "INSERT INTO usage_events (tenant_id, usage_key, kind, model) "
     "VALUES (%(t)s, 'k', 'embedding', 'm')",
+    "usage_adjustments": "INSERT INTO usage_adjustments "
+    "(tenant_id, usage_key, cost_usd, price_model, price_effective_from) "
+    "VALUES (%(t)s, 'k', 1, 'm', '2026-11-01')",
     "budgets": "INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by) "
     "VALUES (%(t)s, NULL, 10, 'u')",
     "audience_pauses": "INSERT INTO audience_pauses (tenant_id, agent_id, channel, reason) "
@@ -49,6 +52,9 @@ SEEDS = {
     "tenants": "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) "
     "VALUES (%(t)s, 'T-' || %(t)s, 'a')",
 }
+
+# Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
+OWNER_WRITTEN = {"usage_adjustments"}
 
 # What the app role may do, per table (the other three privileges are never granted).
 PRIVILEGES = {
@@ -64,6 +70,7 @@ PRIVILEGES = {
     "members": "SELECT INSERT UPDATE DELETE",
     "sessions": "SELECT INSERT DELETE",
     "usage_events": "SELECT INSERT",
+    "usage_adjustments": "SELECT",
     "budgets": "SELECT INSERT UPDATE DELETE",
     "audience_pauses": "SELECT INSERT UPDATE",
     "kill_switches": "SELECT INSERT DELETE",
@@ -108,7 +115,11 @@ async def test_every_tenant_table_shows_a_tenant_only_its_own_rows(
     third = f"{tenant}-x"
     failures = []
     for t in (tenant, other_tenant):
-        for statement in SEEDS.values():
+        for table, statement in SEEDS.items():
+            if table in OWNER_WRITTEN:
+                with db.owner() as owner:
+                    owner.execute(statement, {"t": t})
+                continue
             async with tenant_transaction(pool, t) as conn:
                 await conn.execute(statement, {"t": t})
     for table, seed in SEEDS.items():

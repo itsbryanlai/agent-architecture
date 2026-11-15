@@ -126,6 +126,11 @@ class KnowledgeStore(Protocol):
         """Every scope that has stored pages for the tenant."""
         ...
 
+    async def count_pages_without_model(self, tenant_id: str) -> int:
+        """Stored pages that record no embedding model (indexed before models were kept).
+        A search skips them until an indexing run reads them again."""
+        ...
+
     async def delete_scope(self, tenant_id: str, scope: str) -> int:
         """Delete every page (and chunk) of one scope; return how many pages."""
         ...
@@ -307,6 +312,15 @@ class PostgresKnowledgeStore:
             )
             return [scope for (scope,) in await cur.fetchall()]
 
+    async def count_pages_without_model(self, tenant_id: str) -> int:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                "SELECT count(*) FROM knowledge_pages WHERE tenant_id = %s AND embed_model = ''",
+                (tenant_id,),
+            )
+            (count,) = await cur.fetchone()
+            return count
+
     async def delete_scope(self, tenant_id: str, scope: str) -> int:
         async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
@@ -482,6 +496,13 @@ class InMemoryKnowledgeStore:
 
     async def scopes(self, tenant_id: str) -> list[str]:
         return sorted({sc for (tenant, sc, _) in self.pages if tenant == tenant_id})
+
+    async def count_pages_without_model(self, tenant_id: str) -> int:
+        return sum(
+            1
+            for (tenant, _, _), (_, sync) in self.states.items()
+            if tenant == tenant_id and not sync.embed_model
+        )
 
     async def delete_scope(self, tenant_id: str, scope: str) -> int:
         return await self.delete_pages(

@@ -111,6 +111,26 @@ def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | Non
     )
 
 
+async def warn_pages_without_model(store, tenant_ids, logger) -> int:
+    """Log a warning per tenant that has indexed pages with no recorded embedding model.
+
+    Such pages predate the model column. Search skips them until one indexing run
+    (`index_knowledge --wait`) reads them again. Returns the total.
+    """
+    total = 0
+    for tenant_id in tenant_ids:
+        count = await store.count_pages_without_model(tenant_id)
+        if count:
+            logger.warning(
+                "tenant_id=%s knowledge pages=%d have no embedding model and are not searched; "
+                "run `uv run python -m agentos.index_knowledge --wait` once",
+                tenant_id,
+                count,
+            )
+        total += count
+    return total
+
+
 async def check_grants_at_startup(
     api: NotionAPI, agents: AgentsConfig, log: logging.Logger
 ) -> str | None:
@@ -249,6 +269,8 @@ async def main() -> None:
                 urlparse(settings.embed_base_url or settings.qwen_base_url or "").netloc,
             )
         knowledge = PostgresKnowledgeStore(pool)
+        if embedder is not None:
+            await warn_pages_without_model(knowledge, registry.tenants(), log)
         usage = UsageRecorder(PostgresUsageStore(pool), prices)
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         pauses = PostgresPauseStore(pool)

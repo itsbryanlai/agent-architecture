@@ -52,6 +52,9 @@ class PageChecker:
     def __init__(self, api: NotionAPI):
         self._api = api
         self._cache: dict[tuple[str, str], dict | None] = {}
+        # True once a lookup was refused with 403: the page or an ancestor exists but cannot be
+        # read, which is not the same as gone.
+        self.forbidden = False
 
     async def _lookup(self, kind: str, notion_id: str) -> dict | None:
         key = (kind, notion_id)
@@ -64,6 +67,7 @@ class PageChecker:
             except Exception as err:
                 if not is_unreachable(err):
                     raise
+                self.forbidden = self.forbidden or getattr(err, "status", None) == 403
                 self._cache[key] = None
         return self._cache[key]
 

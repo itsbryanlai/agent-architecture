@@ -365,7 +365,8 @@ class IndexActivities:
         For each granted root: a page that is live and still under the root is
         re-read and re-embedded if its content changed (this also indexes a
         newly created page, or one moved in from outside); a page that is no
-        longer under the root, or is trashed, is removed from that scope.
+        longer under the root, or is trashed, is removed from that scope (one Notion answers 403
+        for is kept).
         Only this one page is synced: sub-pages of a newly created or moved-in
         page wait for the next full indexing run. Notion lookups are cached
         for the call by one page checker, and the grants are read once. The result and the
@@ -386,6 +387,11 @@ class IndexActivities:
                 )
                 if synced.status == OK and not synced.budget_stopped:
                     result.indexed.append(scope)
+            elif checker.forbidden:
+                # Notion refused to show the page or a parent (403): it may still be there,
+                # so what is stored stays, as in a full run. Only a 404, a trashed page or a
+                # page moved out of the root removes it.
+                log.info("page kept tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
             elif await self.store.page_state(tenant_id, scope, page_id) is not None:
                 await self.store.delete_pages(tenant_id, scope, [page_id])
                 result.removed.append(scope)

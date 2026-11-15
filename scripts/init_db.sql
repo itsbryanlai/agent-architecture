@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 018 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 021 (019 and 020 are reserved) applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS knowledge_pages (
   url           text        NOT NULL,
   content_hash  text        NOT NULL,
   indexed_at    timestamptz NOT NULL DEFAULT now(),
+  -- Sync state and search checks; see migration 021.
+  embed_model        text   NOT NULL DEFAULT '',
+  last_edited_time   text   NOT NULL DEFAULT '',
+  parent_ref         text   NOT NULL DEFAULT '',
+  ancestors          text[] NOT NULL DEFAULT '{}',
+  child_page_ids     text[] NOT NULL DEFAULT '{}',
+  child_database_ids text[] NOT NULL DEFAULT '{}',
+  row_page_ids       text[] NOT NULL DEFAULT '{}',
   PRIMARY KEY (tenant_id, scope, page_id)
 );
 
@@ -109,6 +117,26 @@ BEGIN
   END LOOP;
 END
 $$;
+
+-- One row per scope whose root page is gone or unshared (migration 021).
+CREATE TABLE IF NOT EXISTS knowledge_scope_health (
+  tenant_id        text        NOT NULL,
+  scope            text        NOT NULL,
+  consecutive_gone integer     NOT NULL,
+  last_run         text        NOT NULL,
+  first_seen       timestamptz NOT NULL DEFAULT now(),
+  notified_at      timestamptz,
+  PRIMARY KEY (tenant_id, scope)
+);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON knowledge_scope_health TO agentos_app;
+
+ALTER TABLE knowledge_scope_health ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_scope_health FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON knowledge_scope_health;
+CREATE POLICY tenant_isolation ON knowledge_scope_health
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 -- The audit event kinds, one row each. A migration that adds a kind adds a row. Same as migration 016.
 CREATE TABLE IF NOT EXISTS audit_kinds (
@@ -682,5 +710,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('021')
 ON CONFLICT DO NOTHING;

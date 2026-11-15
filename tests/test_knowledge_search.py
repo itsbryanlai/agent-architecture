@@ -124,8 +124,12 @@ async def test_search_returns_only_granted_scopes(kharness):
     h = kharness
     await index_both(h)
 
-    it_text, it_result = await search(h, "it-helper", "parental leave sixteen weeks dental")
-    hr_text, hr_result = await search(h, "hr-helper", "reset vpn password laptops batteries")
+    it_text, it_result = await search(
+        h, "it-helper", "parental leave sixteen weeks dental reset vpn password"
+    )
+    hr_text, hr_result = await search(
+        h, "hr-helper", "reset vpn password laptops batteries parental leave sixteen weeks"
+    )
 
     assert "sixteen weeks" not in it_text and "Dental" not in it_text
     assert "VPN" in it_text or "Laptops" in it_text
@@ -138,11 +142,12 @@ async def test_search_returns_only_granted_scopes(kharness):
 async def test_search_drops_trashed_page(kharness):
     h = kharness
     await index_both(h)
-    before, _ = await search(h, "it-helper", "swollen batteries must be reported")
+    query = "swollen batteries must be reported laptops are replaced"
+    before, _ = await search(h, "it-helper", query)
     assert "Swollen batteries" in before
 
     h.notion.trash_page(PAGE_A2)
-    after, result = await search(h, "it-helper", "swollen batteries must be reported")
+    after, result = await search(h, "it-helper", query)
 
     assert "Swollen batteries" not in after
     assert plain(PAGE_A2) not in {c.page_id for c in result.citations}

@@ -288,7 +288,14 @@ async def main() -> None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
             all_activities += IndexActivities(
-                registry, knowledge, embedder, agent_store, usage, switches, budget_guard
+                registry,
+                knowledge,
+                embedder,
+                agent_store,
+                usage,
+                switches,
+                budget_guard,
+                idempotency,
             ).all()
         client = await build_temporal_client(settings)
         tenant_sync = RegistrySync(

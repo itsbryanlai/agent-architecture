@@ -12,7 +12,14 @@ from dataclasses import dataclass, field
 from agentos.connectors.notion import NotionAPI, normalize_id
 
 CHUNK_CHARS = 1200
+# Text nested deeper than this inside one page (a toggle in a toggle in ...) is not indexed.
+# Every level costs one Notion call per block that has children, the limit keeps a page's cost
+# bounded, and real pages rarely nest text past a few levels. It is a limit on blocks inside
+# a page. The depth of the page tree has no limit: sub-pages are walked to any depth.
 MAX_BLOCK_DEPTH = 5
+
+_DATABASE_PARENTS = ("database_id", "data_source_id")
+_PARENT_TYPES = ("page_id", "block_id", *_DATABASE_PARENTS)
 
 TEXT_BLOCKS = (
     "paragraph",
@@ -43,6 +50,10 @@ class PageContent:
     url: str
     blocks: list[TextBlock] = field(default_factory=list)
     child_page_ids: list[str] = field(default_factory=list)
+    child_database_ids: list[str] = field(default_factory=list)
+    last_edited_time: str = ""
+    # The ID of the parent Notion reported (a page, a block or a database), normalized.
+    parent_ref: str = ""
 
 
 def _plain(rich: list[dict] | None) -> str:
@@ -74,26 +85,97 @@ def _block_text(block: dict) -> TextBlock | None:
     return None
 
 
-async def page_text(api: NotionAPI, page_id: str) -> PageContent:
-    """Read a page's title, link, text blocks and sub-page IDs.
+def parent_ref(page: dict) -> str:
+    """The ID of the page's parent as Notion reports it, normalized; empty for a workspace."""
+    parent = page.get("parent") or {}
+    kind = parent.get("type")
+    if kind in _PARENT_TYPES and parent.get(kind):
+        return normalize_id(parent[kind])
+    return ""
 
-    Blocks are read depth first, following ``has_children`` up to depth 5.
-    A ``child_page`` block is returned as a sub-page ID and not read here; any
-    other block type contributes no text. Raises ``PageUnavailable`` for a
-    trashed or archived page.
-    """
+
+def _property_text(prop: dict) -> str:
+    kind = prop.get("type")
+    value = prop.get(kind) if kind else None
+    if value is None:
+        return ""
+    if kind == "rich_text":
+        return _plain(value).strip()
+    if kind in ("select", "status"):
+        return value.get("name", "")
+    if kind == "multi_select":
+        return ", ".join(o.get("name", "") for o in value)
+    if kind == "number":
+        return str(value)
+    if kind == "checkbox":
+        return "yes" if value else "no"
+    if kind == "date":
+        start, end = value.get("start") or "", value.get("end")
+        return f"{start} to {end}" if end else start
+    if kind in ("url", "email", "phone_number"):
+        return str(value)
+    if kind == "people":
+        return ", ".join(p.get("name", "") for p in value if p.get("name"))
+    return ""
+
+
+def row_properties(page: dict) -> list[TextBlock]:
+    """A database row's properties other than its title, one ``Name: value`` line each."""
+    lines: list[TextBlock] = []
+    for name, prop in (page.get("properties") or {}).items():
+        if not isinstance(prop, dict) or prop.get("type") == "title":
+            continue
+        text = _property_text(prop)
+        if text:
+            lines.append(TextBlock("text", f"{name}: {text}"))
+    return lines
+
+
+async def fetch_page(api: NotionAPI, page_id: str) -> dict:
+    """The page object. Raises ``PageUnavailable`` for a trashed or archived page."""
     page = await api.retrieve_page(page_id)
     if page.get("in_trash") or page.get("archived"):
         raise PageUnavailable(normalize_id(page_id))
-    content = PageContent(title=page_title(page), url=page.get("url", ""))
+    return page
+
+
+async def read_page(api: NotionAPI, page_id: str, page: dict) -> PageContent:
+    """A page's title, link, text blocks, sub-page IDs and child database IDs.
+
+    ``page`` is what ``fetch_page`` returned. Blocks are read depth first, following
+    ``has_children`` up to depth 5 (see ``MAX_BLOCK_DEPTH``). A ``child_page`` block is
+    returned as a sub-page ID and a ``child_database`` block as a database ID, and neither
+    is read here; any other block type contributes no text. The page of a database row
+    starts with its properties as text.
+    """
+    ref = parent_ref(page)
+    content = PageContent(
+        title=page_title(page),
+        url=page.get("url", ""),
+        last_edited_time=page.get("last_edited_time", ""),
+        parent_ref=ref,
+    )
+    if (page.get("parent") or {}).get("type") in _DATABASE_PARENTS:
+        content.blocks.extend(row_properties(page))
     await _read_children(api, page_id, 1, content)
     return content
+
+
+async def page_text(api: NotionAPI, page_id: str) -> PageContent:
+    """Read a page's title, link, text blocks and sub-page IDs (see ``read_page``).
+
+    Raises ``PageUnavailable`` for a trashed or archived page.
+    """
+    return await read_page(api, page_id, await fetch_page(api, page_id))
 
 
 async def _read_children(api: NotionAPI, block_id: str, depth: int, out: PageContent) -> None:
     for block in await api.list_child_blocks(block_id):
         if block.get("type") == "child_page":
             out.child_page_ids.append(normalize_id(block["id"]))
+            continue
+        if block.get("type") == "child_database":
+            out.child_database_ids.append(normalize_id(block["id"]))
             continue
         text = _block_text(block)
         if text is not None:

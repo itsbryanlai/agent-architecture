@@ -127,3 +127,8 @@ def audience_pause_notice_key(
 ) -> str:
     """The idempotency key of the direct message that tells one person about one pause."""
     return f"{tenant}:audience-pause-notice:{agent_id}:{channel}:{paused_at}:{recipient}"
+
+
+def scope_gone_notice_key(tenant: str, scope: str, recipient: str, first_seen: str) -> str:
+    """The idempotency key of the direct message that tells one person a scope's root page is gone."""
+    return f"{tenant}:scope-gone-notice:{scope}:{first_seen}:{recipient}"

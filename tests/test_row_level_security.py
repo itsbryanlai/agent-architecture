@@ -4,7 +4,6 @@ The policies, grants and triggers themselves run against a real Postgres in test
 """
 
 import hashlib
-import inspect
 import types
 import typing
 from contextlib import asynccontextmanager
@@ -14,19 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from agentos import (
-    audit,
-)
 from agentos.agent_store import PostgresAgentStore
-from agentos.audience_pauses import PostgresPauseStore
-from agentos.audit import PostgresAuditStore
-from agentos.budgets import PostgresBudgetStore
 from agentos.config import (
     AgentVersion,
     agent_definition,
     parse_agents_config,
 )
-from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
 from agentos.stores import (
@@ -143,34 +135,6 @@ MEMBER_ROW = ("acme", "U1", "admin", "U0", None)
 BUDGET_ROW = ("acme", None, Decimal("5.00"), "U1", datetime(2026, 1, 1))
 PAUSE_ROW = ("acme", "it-helper", "C0AAAA111", "channel_shared", datetime(2026, 1, 1), None, None)
 SESSION_ROW = ("acme", "U1", "csrf-secret", datetime(2026, 1, 1), datetime(2026, 1, 2))
-
-
-def row_for(cls, method_name):
-    """The row a store's reads need, since the fake returns it for every query."""
-    if cls is PostgresMemberStore:
-        return MEMBER_ROW
-    if cls is PostgresSessionStore:
-        return SESSION_ROW
-    if cls is PostgresPauseStore:
-        return PAUSE_ROW
-    if cls is PostgresUsageStore:
-        return None
-    if cls is PostgresBudgetStore:
-        return BUDGET_ROW
-    if cls is PostgresAuditStore and method_name == "get":
-        event = AuditEvent("acme", "k1", "answer", "a", 1, "U1", "agent:a")
-        return tuple(getattr(event, name) for name in audit._READ_COLUMN_NAMES)
-    if cls is PostgresAgentStore:
-        return AGENT_RECORD_ROW if method_name in ("get_agent", "list_agents") else AGENT_ROW
-    return None
-
-
-def public_methods(cls):
-    return [
-        name
-        for name, _ in inspect.getmembers(cls, inspect.iscoroutinefunction)
-        if not name.startswith("_")
-    ]
 
 
 async def test_tenant_transaction_rejects_empty_tenant():

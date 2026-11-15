@@ -1,6 +1,7 @@
 """Comments on items and the Edit button on the approval card."""
 
 import asyncio
+import dataclasses
 import json
 import secrets
 import uuid
@@ -351,6 +352,32 @@ def test_valid_edit_submission_signals_and_closes_modal(agents):
     assert temporal.signals == [
         (TASK_ID, "edit", EditRequest("n-current", ALICE, {"title": "Better", "details": "Fine"}))
     ]
+
+
+@pytest.mark.parametrize(
+    "draft,values,block",
+    [
+        (an_edit_draft(), {"title": "x" * 151, "details": "ok"}, "title"),
+        # 600 characters, 2400 once escaped: over the card's room.
+        (an_edit_draft(), {"title": "ok", "details": "<" * 600}, "details"),
+        (
+            dataclasses.replace(an_edit_draft(), nonce="n-new"),
+            {"title": "a", "details": "b"},
+            "title",
+        ),
+        (an_edit_draft(editable=False), {"title": "a", "details": "b"}, "title"),
+    ],
+    ids=["too-long", "too-long-escaped", "stale-nonce", "no-longer-editable"],
+)
+def test_edit_that_cannot_be_applied_keeps_the_modal_open(agents, draft, values, block):
+    """Fails if a rejected edit closes the form without a message, or still signals the task."""
+    client, sec, temporal, _ = gateway(agents, draft)
+
+    body = post_interaction(client, sec, submission(values)).json()
+
+    assert body["response_action"] == "errors"
+    assert block in body["errors"]
+    assert temporal.signals == []
 
 
 async def test_edit_replaces_draft_and_requires_new_approval(harness):

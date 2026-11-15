@@ -40,6 +40,14 @@ TABLE = [
     (18, "a**b", "a**b"),
     (19, "Line one\n\n**Bold** line two", "Line one\n\n*Bold* line two"),
     (20, "", ""),
+    (21, "\ue0017\ue002 `c` **b** \uf8ff", "\ue0017\ue002 `c` *b* \uf8ff"),
+    (22, "```code **x**```\n**y**", "```code **x**```\n*y*"),
+    (23, "```py\n**x**\n\n**y**\n```\n**z**", "```py\n**x**\n\n**y**\n```\n*z*"),
+    (24, "use `a*b_c` and ``x`y`` *i*", "use `a*b_c` and ``x`y`` _i_"),
+    (25, "**run `x` now**", "*run `x` now*"),
+    (26, "see [a *b*](http://x/_y_) **z**", "see [a *b*](http://x/_y_) *z*"),
+    (27, "## Using `foo` **now**", "*Using `foo` now*"),
+    (28, "> * a & <b>", "> • a &amp; &lt;b&gt;"),
 ]
 
 

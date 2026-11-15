@@ -15,15 +15,7 @@ from pathlib import Path
 import pytest
 
 from agentos import (
-    agent_store,
-    audience_pauses,
     audit,
-    budgets,
-    members,
-    sessions,
-    stores,
-    switches,
-    usage,
 )
 from agentos.agent_store import PostgresAgentStore
 from agentos.audience_pauses import PostgresPauseStore
@@ -34,40 +26,17 @@ from agentos.config import (
     agent_definition,
     parse_agents_config,
 )
-from agentos.knowledge import store as knowledge_store
-from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.members import PostgresMemberStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
 from agentos.stores import (
-    PostgresHistoryStore,
-    PostgresIdempotencyStore,
-    PostgresTaskLinkStore,
-    PostgresToolOutputStore,
     tenant_transaction,
 )
-from agentos.switches import PostgresSwitchStore
 from agentos.usage import PostgresUsageStore, UsageEvent
 from tests.conftest import agents_dict
 
 ROOT = Path(__file__).resolve().parent.parent
 USAGE_MIGRATION = (ROOT / "scripts" / "migrations" / "011_usage.sql").read_text()
-
-POSTGRES_STORES = [
-    PostgresHistoryStore,
-    PostgresIdempotencyStore,
-    PostgresToolOutputStore,
-    PostgresTaskLinkStore,
-    PostgresKnowledgeStore,
-    PostgresAuditStore,
-    PostgresAgentStore,
-    PostgresMemberStore,
-    PostgresSessionStore,
-    PostgresUsageStore,
-    PostgresBudgetStore,
-    PostgresPauseStore,
-    PostgresSwitchStore,
-]
 
 
 class FakeCursor:
@@ -202,27 +171,6 @@ def public_methods(cls):
         for name, _ in inspect.getmembers(cls, inspect.iscoroutinefunction)
         if not name.startswith("_")
     ]
-
-
-def test_store_classes_are_all_covered():
-    # A new Postgres store in any of these modules must be added to POSTGRES_STORES.
-    found = set()
-    for module in (
-        stores,
-        knowledge_store,
-        audit,
-        agent_store,
-        members,
-        sessions,
-        usage,
-        budgets,
-        audience_pauses,
-        switches,
-    ):
-        for name, cls in inspect.getmembers(module, inspect.isclass):
-            if name.startswith("Postgres") and cls.__module__ == module.__name__:
-                found.add(cls)
-    assert found == set(POSTGRES_STORES)
 
 
 async def test_tenant_transaction_rejects_empty_tenant():

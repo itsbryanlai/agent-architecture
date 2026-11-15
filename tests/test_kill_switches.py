@@ -10,6 +10,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import httpx
@@ -72,6 +73,8 @@ from agentos.switches import (
     set_switch,
 )
 from agentos.switches import _targets as cli_targets
+from agentos.switches import execute as cli_execute
+from agentos.switches import run as cli_run
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, Prices, UsageRecorder
 from agentos.workflows.conversation import ConversationWorkflow
@@ -923,7 +926,7 @@ def test_the_command_names_one_scope_per_switch_and_everything_names_them_all():
 
 
 async def test_the_command_turns_a_switch_off_and_on_and_audits_a_runtime_operator(hs, monkeypatch):
-    monkeypatch.setattr("agentos.switches.getpass.getuser", lambda: "ops")
+    monkeypatch.setattr("agentos.switches.pwd.getpwuid", lambda uid: SimpleNamespace(pw_name="ops"))
     identity = operator_identity()
     assert identity == "operator:ops"
 
@@ -954,6 +957,42 @@ async def test_the_command_turns_a_switch_off_and_on_and_audits_a_runtime_operat
     }
     with pytest.raises(AgentNotFound):
         await run(True, AGENT, "ghost")
+
+
+def test_the_operator_is_the_account_not_a_login_variable(monkeypatch):
+    """Fails if LOGNAME or USER, which anyone can set for one command, changes the recorded operator."""
+    before = operator_identity()
+    for name in ("LOGNAME", "USER"):
+        monkeypatch.setenv(name, "forged")
+
+    assert operator_identity() == before != "operator:forged"
+
+
+async def test_the_command_does_not_read_the_tenants_table(hs, monkeypatch, capsys):
+    """Fails if the command line refuses to run when the tenants table cannot be read."""
+
+    class PoolOpened(Exception):
+        pass
+
+    async def unreadable(url):
+        raise AssertionError("the command read the tenants table")
+
+    class Pool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def open(self):
+            raise PoolOpened
+
+    monkeypatch.setattr("agentos.tenant_store.load_stored_tenants", unreadable)
+    monkeypatch.setattr("agentos.switches.AsyncConnectionPool", Pool)
+    args = build_parser().parse_args(["--tenant", TENANT, "off", "--writes"])
+    with pytest.raises(PoolOpened):
+        await cli_run(args)
+
+    assert await cli_execute(args, hs.switches, hs.audit, hs.agents) == 0
+    assert "writes -: turned off" in capsys.readouterr().out
+    assert (await read_state(hs.switches, TENANT)).writes_off
 
 
 def test_a_target_must_fit_its_scope():

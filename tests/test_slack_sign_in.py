@@ -3,20 +3,31 @@
 Slack is a fake: no request leaves the process.
 """
 
+import base64
 import hashlib
+import hmac
+import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from agentos.config import ConfigError, Settings
 from agentos.control_api import build_process_app, check_bind_host
 from agentos.slack_signin import (
     AUTHORIZE_URL,
+    ISSUER,
+    JWKS_URL,
+    TEAM_CLAIM,
     TOKEN_URL,
+    USER_CLAIM,
     HttpSlackOidc,
+    SignInConfig,
     SlackSignInError,
+    identity_from_token_response,
     read_session_cookie,
     sign_in_from_settings,
 )
@@ -28,6 +39,8 @@ from tests.console_harness import (
     OUTSIDER,
     OWNER,
     ROOT,
+    SIGNING_KEY,
+    SIGNING_KID,
     ConsoleHarness,
     csrf_token,
     id_token,
@@ -533,3 +546,98 @@ def test_the_settings_are_read_from_the_three_variables(monkeypatch):
     for name in ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "AGENTOS_CONSOLE_URL"):
         monkeypatch.delenv(name)
     assert sign_in_from_settings(load_settings()) is None
+
+
+# --- the ID token's signature -------------------------------------------------------
+
+NOW = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
+SIGN_IN = SignInConfig(CLIENT_ID, "s", CONSOLE_URL)
+OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def jwks_of(key, kid: str = SIGNING_KID) -> dict:
+    numbers = key.public_key().public_numbers()
+
+    def b64(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return {"keys": [{"kty": "RSA", "alg": "RS256", "use": "sig", "kid": kid,
+                      "n": b64(numbers.n), "e": b64(numbers.e)}]}  # fmt: skip
+
+
+def slack_with_keys(jwks: dict | None = None) -> tuple[HttpSlackOidc, list[httpx.Request]]:
+    fetched: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(request)
+        return httpx.Response(200, json=jwks or jwks_of(SIGNING_KEY))
+
+    return HttpSlackOidc("cid", "s", httpx.MockTransport(handler)), fetched
+
+
+def claims(**changes) -> dict:
+    base = {
+        "iss": ISSUER,
+        "aud": CLIENT_ID,
+        "exp": int(NOW.timestamp()) + 300,
+        "nonce": "n" * 32,
+        USER_CLAIM: ROOT,
+        TEAM_CLAIM: TEAM,
+    }
+    return {**base, **changes}
+
+
+def hs256_token(secret: bytes) -> str:
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    signing_input = (
+        f"{b64(json.dumps({'alg': 'HS256', 'kid': SIGNING_KID}).encode())}"
+        f".{b64(json.dumps(claims()).encode())}"
+    )
+    mac = hmac.new(secret, signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{b64(mac)}"
+
+
+def unsigned_token() -> str:
+    def b64(value: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return f"{b64({'alg': 'none', 'kid': SIGNING_KID})}.{b64(claims())}."
+
+
+async def identity_of(token: str, oidc: HttpSlackOidc):
+    return await identity_from_token_response({"id_token": token}, SIGN_IN, "n" * 32, NOW, oidc)
+
+
+async def test_an_id_token_signed_with_slacks_published_key_is_accepted_and_keys_are_cached():
+    """Fails if a token signed with the published key is refused, or every sign-in refetches keys."""
+    oidc, fetched = slack_with_keys()
+
+    first = await identity_of(id_token(claims()), oidc)
+    await identity_of(id_token(claims()), oidc)
+
+    assert (first.user_id, first.team_id) == (ROOT, TEAM)
+    assert [str(r.url) for r in fetched] == [JWKS_URL]
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        id_token(claims(), key=OTHER_KEY),
+        id_token(claims(), kid="not-published"),
+        id_token(claims(aud="someone-else")),
+        id_token(claims(exp=int(NOW.timestamp()) - 1)),
+        unsigned_token(),
+        hs256_token(b"anything"),
+        # The classic confusion: an HMAC keyed with the public key's own bytes.
+        hs256_token(json.dumps(jwks_of(SIGNING_KEY)).encode()),
+    ],
+    ids=["wrong-key", "unknown-kid", "wrong-aud", "expired", "alg-none", "hs256", "hs256-pubkey"],
+)
+async def test_an_id_token_that_is_forged_or_fails_a_claim_check_is_refused(token):
+    """Fails if a token with a bad signature, algorithm, audience or expiry names a user."""
+    oidc, _ = slack_with_keys()
+    with pytest.raises(SlackSignInError):
+        await identity_of(token, oidc)

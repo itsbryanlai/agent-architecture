@@ -393,7 +393,22 @@ model, with an `effective_from` date; a model can have several entries. The file
 ships empty, with a commented example, because prices come from your provider's
 pricing page. A model with no entry is recorded with its tokens and no cost, and
 the page shows "no price". The worker reads the file when it starts, so restart it
-after an edit, and refuses to start if the file is malformed.
+after an edit, and refuses to start if the file is malformed or has no price for the
+configured chat model (or the embedding model, when one is in use). An entry may list
+`aliases:` (other exact names) and a dated name such as `qwen3.7-plus-2026-11-01` matches
+the entry `qwen3.7-plus`.
+
+To price a month whose rows were recorded without a price (a model added late, a dated
+name, a price file fixed after the fact), fix the file, then run as the database owner:
+
+    export AGENTOS_OWNER_DATABASE_URL=postgresql://<owner>:<password>@localhost:55432/agentos
+    uv run python -m agentos.usage reprice --tenant <id> --month 2026-11        # dry run
+    uv run python -m agentos.usage reprice --tenant <id> --month 2026-11 --yes  # write
+
+It appends one `usage_adjustments` row per row it can now price (the stored rows never
+change), audits the run as `usage_repriced`, and needs migration `019`. `--url-var NAME`
+names another variable for the URL. A row whose provider never reported its token counts
+can only be priced when the price of that kind is 0.
 
 An agent may carry an optional `team: IT` label in its definition (up to 64
 characters). The usage page sums cost per team across its agents; agents without
@@ -439,13 +454,18 @@ across all its versions.
 - Admins set, raise and remove budgets on the **Usage** page and through the API; each
   change is an audit event (`budget_set`, with the new amount, or `0` for a removal).
   Creators see the budgets of the agents they created, read-only.
-- The worker reads the month's spend at most once a minute per organisation. The most a
-  budget can be overspent is what the organisation spends in one such minute on each worker
-  process, plus the calls already running; a raised budget lifts a stop within a minute.
-- A call to a model with no price has no dollar cost, so a budget cannot count it. The
-  pages say so, with the number of such calls, whenever a budget is set and the month has
-  any, per cost type. Add the model to `config/prices.yaml` to bring its calls under the
-  budget.
+- The worker reads the month's spend at most once a minute per organisation, in one
+  query however many turns ask at once, and adds each call it records to that figure at
+  once. The most a budget can be overspent is what the other worker processes spend in one
+  minute, plus the calls already running, plus the cost of one call (a call's cost is
+  unknown until it returns); a raised budget lifts a stop within a minute.
+- Spend that cannot be measured is not zero. When a budget is set and the month has a call
+  with no price, that agent (or, for the organisation budget, every agent and indexing) is
+  paused with its own reply ("... spending can't be measured this month ..."), and the
+  pages and API say why, per cost type. Raising the budget does not lift it. Add the price
+  to `config/prices.yaml`, restart the worker, and reprice the month (see Usage above).
+  The same pause covers a call whose usage row could not be saved after three tries (also
+  logged at error level with the token counts), for one minute, in that worker process.
 - If the worker cannot read the budgets or the spend, the model call fails and Temporal
   retries it; a call is never let through unchecked.
 

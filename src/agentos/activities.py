@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import timedelta
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -909,6 +910,13 @@ class AgentActivities:
                 err.transient,
             )
             if err.transient:
+                if err.retry_after is not None:
+                    # Slack said when to come back; Temporal waits that long, not its backoff.
+                    raise ApplicationError(
+                        str(err),
+                        type="SlackLookupError",
+                        next_retry_delay=timedelta(seconds=err.retry_after),
+                    ) from err
                 raise
             raise ApplicationError(str(err), type="SlackLookupError", non_retryable=True) from err
         if not decision.allowed:

@@ -7,8 +7,11 @@ calls for tests.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
+
+log = logging.getLogger(__name__)
 
 # Slack API errors that pass by themselves: a rate limit, or a Slack-side failure.
 TRANSIENT_SLACK_ERRORS = frozenset(
@@ -17,15 +20,28 @@ TRANSIENT_SLACK_ERRORS = frozenset(
 PAGE_SIZE = 200
 # A workspace or channel has at most this many entries read; more is a bug or an abuse.
 MAX_PAGES = 500
+# Rate-limit retries inside one call, each after Slack's Retry-After. A post or an
+# update waits for at most a couple; a read of the whole workspace is many pages
+# long and waits out as many limits as it meets.
+INTERACTIVE_RATE_LIMIT_RETRIES = 2
+BULK_RATE_LIMIT_RETRIES = 20
+# A Retry-After above this is treated as this long.
+MAX_RETRY_AFTER_SECONDS = 600.0
+# A bulk read logs its progress every this many pages.
+PROGRESS_EVERY_PAGES = 10
 
 
 class SlackLookupError(Exception):
-    """A read of Slack's directory failed. ``transient`` says whether a retry may help."""
+    """A read of Slack's directory failed. ``transient`` says whether a retry may help.
 
-    def __init__(self, code: str, transient: bool = False):
+    ``retry_after`` is the seconds Slack asked for in a ``Retry-After`` header, if it did.
+    """
+
+    def __init__(self, code: str, transient: bool = False, retry_after: float | None = None):
         super().__init__(f"Slack lookup failed: {code}")
         self.code = code
         self.transient = transient
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -89,10 +105,36 @@ class SlackPoster(Protocol):
 
 
 class RealSlackPoster:
-    def __init__(self, token: str):
+    """``slack_sdk`` behind the ``SlackPoster`` protocol.
+
+    Three clients share the token. Posts, updates and DMs wait out a rate limit
+    for a couple of retries. Single lookups do not wait: the error carries
+    Slack's ``Retry-After`` so the activity can hand it to Temporal. Reading the
+    whole workspace waits out as many limits as it meets, because failing at
+    page 20 of 25 would only start over.
+    """
+
+    def __init__(self, token: str, tenant_id: str | None = None, base_url: str | None = None):
+        from slack_sdk.http_retry.builtin_async_handlers import AsyncRateLimitErrorRetryHandler
         from slack_sdk.web.async_client import AsyncWebClient
 
-        self._client = AsyncWebClient(token=token)
+        extra = {"base_url": base_url} if base_url else {}
+        self._tenant_id = tenant_id
+        self._client = AsyncWebClient(
+            token=token,
+            retry_handlers=[
+                AsyncRateLimitErrorRetryHandler(max_retry_count=INTERACTIVE_RATE_LIMIT_RETRIES)
+            ],
+            **extra,
+        )
+        self._lookup_client = AsyncWebClient(token=token, retry_handlers=[], **extra)
+        self._bulk_client = AsyncWebClient(
+            token=token,
+            retry_handlers=[
+                AsyncRateLimitErrorRetryHandler(max_retry_count=BULK_RATE_LIMIT_RETRIES)
+            ],
+            **extra,
+        )
 
     async def post_message(self, channel, text, thread_ts=None, blocks=None) -> str:
         kwargs: dict = {"channel": channel, "text": text}
@@ -122,14 +164,14 @@ class RealSlackPoster:
 
     async def user_info(self, user_id: str) -> SlackUser:
         try:
-            resp = await self._client.users_info(user=user_id)
+            resp = await self._lookup_client.users_info(user=user_id)
         except Exception as err:
             raise _lookup_error(err) from err
         return _user_from(resp.get("user") or {})
 
     async def usergroup_members(self, group_id: str) -> list[str]:
         try:
-            resp = await self._client.usergroups_users_list(usergroup=group_id)
+            resp = await self._lookup_client.usergroups_users_list(usergroup=group_id)
         except Exception as err:
             raise _lookup_error(err) from err
         return list(resp.get("users") or [])
@@ -139,7 +181,7 @@ class RealSlackPoster:
         cursor = None
         try:
             for _ in range(MAX_PAGES):
-                resp = await self._client.conversations_members(
+                resp = await self._lookup_client.conversations_members(
                     channel=channel_id, limit=PAGE_SIZE, cursor=cursor
                 )
                 members.extend(resp.get("members") or [])
@@ -154,12 +196,19 @@ class RealSlackPoster:
         users: list[SlackUser] = []
         cursor = None
         try:
-            for _ in range(MAX_PAGES):
-                resp = await self._client.users_list(limit=PAGE_SIZE, cursor=cursor)
+            for page in range(1, MAX_PAGES + 1):
+                resp = await self._bulk_client.users_list(limit=PAGE_SIZE, cursor=cursor)
                 users.extend(_user_from(raw) for raw in resp.get("members") or [])
                 cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
                 if not cursor:
                     return users
+                if page % PROGRESS_EVERY_PAGES == 0:
+                    log.info(
+                        "slack users.list tenant_id=%s pages=%d users=%d",
+                        self._tenant_id,
+                        page,
+                        len(users),
+                    )
         except Exception as err:
             raise _lookup_error(err) from err
         raise SlackLookupError("too_many_pages")
@@ -176,6 +225,23 @@ def _user_from(raw: dict) -> SlackUser:
     )
 
 
+def _retry_after(response) -> float | None:
+    """Seconds from a response's ``Retry-After`` header, capped, or None if absent or odd."""
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = next((v for k, v in headers.items() if str(k).lower() == "retry-after"), None)
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else None
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
 def _lookup_error(err: Exception) -> SlackLookupError:
     """A Slack SDK failure as a ``SlackLookupError``; the error code only, never a token."""
     response = getattr(err, "response", None)
@@ -189,12 +255,13 @@ def _lookup_error(err: Exception) -> SlackLookupError:
         status = getattr(response, "status_code", None)
     if not code:
         code = type(err).__name__
+    retry_after = _retry_after(response)
     transient = (
         code in TRANSIENT_SLACK_ERRORS
         or (isinstance(status, int) and (status == 429 or status >= 500))
         or not hasattr(err, "response")
     )
-    return SlackLookupError(code, transient=transient)
+    return SlackLookupError(code, transient=transient, retry_after=retry_after)
 
 
 class FakeSlack:

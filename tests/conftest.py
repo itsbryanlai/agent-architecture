@@ -29,6 +29,7 @@ from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
 from agentos.slack_client import FakeSlack
 from agentos.stores import (
+    InMemoryExternalWriteStore,
     InMemoryHistoryStore,
     InMemoryIdempotencyStore,
     InMemoryTaskLinkStore,
@@ -155,6 +156,8 @@ class Harness:
     audit: InMemoryAuditStore = field(default_factory=InMemoryAuditStore)
     agent_store: InMemoryAgentStore = field(default_factory=InMemoryAgentStore)
     switches: InMemorySwitchStore = field(default_factory=InMemorySwitchStore)
+    external_writes: InMemoryExternalWriteStore = field(default_factory=InMemoryExternalWriteStore)
+    acts: AgentActivities = None  # type: ignore[assignment]
 
     @property
     def client(self):
@@ -187,7 +190,11 @@ async def harness(agents):
         audit=h.audit,
         agents=h.agent_store,
         switches=h.switches,
+        external_writes=h.external_writes,
     )
+    h.acts = acts
+    # The tests wait for no real seconds: a take-over looks again at once.
+    acts.visibility_interval = 0
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,

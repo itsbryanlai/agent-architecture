@@ -93,7 +93,8 @@ async def test_connector_uses_ids_in_filters_and_create(agents):
     api.set_schema(DB_ID, schema_with(Name="Title", **{"Agent request ID": "Key"}))
     conn = NotionConnector(api, [grant_from(agents)])
 
-    await conn.create_item(DB_ID, "Laptop", "Details", None, "acme:task:1:create")
+    await conn.find_item(DB_ID, "acme:task:1:create")
+    await conn.create_item(DB_ID, "Laptop", "Details", "acme:task:1:create")
 
     query = next(c for n, c in api.calls if n == "query_database")
     assert query["filter"]["property"] == "reqid1"

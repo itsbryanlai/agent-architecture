@@ -73,7 +73,7 @@ async def test_approval_from_wrong_user_or_nonce_ignored(harness):
 async def test_approve_creates_exactly_once_and_survives_retry(harness):
     h = harness
     handle = await start_task(h)
-    h.notion.fail_next_create_after_write()
+    h.notion.fail_after_write()
 
     await approve(h, handle)
     await wait_state(handle, "watching")

@@ -1,6 +1,12 @@
 import pytest
 
-from agentos.connectors.notion import GrantDenied, NotionConnector, UnknownRequester
+from agentos.connectors.notion import (
+    GrantDenied,
+    NotionConnector,
+    NotionUserCache,
+    UnknownItem,
+    UnknownRequester,
+)
 from tests.conftest import (
     ALICE_NOTION,
     BOB_NOTION,
@@ -15,41 +21,31 @@ def connector(api, agents):
     return NotionConnector(api, agents.agents["it-helper"].grants.notion_databases)
 
 
-async def test_grant_denied_makes_no_api_call(agents):
+async def test_create_in_an_ungranted_database_sends_nothing(agents):
+    """Fails if a create naming an ungranted database reaches Notion before the grant check."""
     api = make_fake_notion()
-    page = api.add_page(OTHER_DB_ID, {"Name": title_prop("Secret HR case")})
     conn = connector(api, agents)
 
     with pytest.raises(GrantDenied):
-        await conn.get_item(page["id"])
+        await conn.create_item(OTHER_DB_ID, "x", "y", "acme:task:1:create")
 
-    assert [name for name, _ in api.calls] == ["retrieve_page"]
-    assert api.count("query_database") == 0
-    assert api.count("create_page") == 0
-
-    # A direct call naming an ungranted database is refused before any request.
-    api.calls.clear()
-    with pytest.raises(GrantDenied):
-        await conn.create_item(OTHER_DB_ID, "x", "y", None, "acme:task:1:create")
     assert api.calls == []
 
 
-async def test_create_item_is_idempotent_after_lost_response(agents):
+@pytest.mark.parametrize("method", ["get_item", "resolve_item"])
+async def test_an_ungranted_page_and_a_missing_page_get_the_same_error(agents, method):
+    """Fails if the error tells whether an ungranted page exists."""
     api = make_fake_notion()
+    ungranted = api.add_page(OTHER_DB_ID, {"Name": title_prop("Secret HR case")})
     conn = connector(api, agents)
-    key = "acme:task:abc:create"
 
-    api.fail_next_create_after_write()
-    with pytest.raises(TimeoutError):
-        await conn.create_item(DB_ID, "Laptop battery swelling", "It bulges.", None, key)
+    with pytest.raises(UnknownItem) as denied:
+        await getattr(conn, method)(ungranted["id"])
+    with pytest.raises(UnknownItem) as missing:
+        await getattr(conn, method)("00000000-0000-0000-0000-000000000000")
 
-    item = await conn.create_item(DB_ID, "Laptop battery swelling", "It bulges.", None, key)
-
-    pages = api.all_pages(DB_ID)
-    assert len(pages) == 1
-    assert item.page_id == pages[0]["id"]
-    assert item.title == "Laptop battery swelling"
-    assert api.count("create_page") == 1
+    assert str(denied.value) == str(missing.value)
+    assert api.count("query_database") == 0
 
 
 async def test_my_items_pins_requester(agents):
@@ -79,3 +75,31 @@ async def test_my_items_unknown_requester(agents):
     conn = connector(make_fake_notion(), agents)
     with pytest.raises(UnknownRequester):
         await conn.my_items("nobody@example.com")
+
+
+async def test_a_requester_is_looked_up_once_and_a_miss_is_remembered(agents):
+    """Fails if a lookup pages the Notion user list again for a person already looked up."""
+    api = make_fake_notion()
+    users = NotionUserCache()
+
+    def fresh():
+        return NotionConnector(api, agents.agents["it-helper"].grants.notion_databases, users=users)
+
+    assert await fresh()._notion_user_id("alice@example.com") == ALICE_NOTION
+    assert await fresh()._notion_user_id("alice@example.com") == ALICE_NOTION
+    assert await fresh()._notion_user_id("nobody@example.com") is None
+    assert await fresh()._notion_user_id("nobody@example.com") is None
+
+    assert api.count("list_users") == 1
+
+
+async def test_a_cached_requester_is_looked_up_again_after_the_ttl(agents):
+    """Fails if a cached answer never expires, so a new Notion user is never found."""
+    api = make_fake_notion()
+    now = [0.0]
+    users = NotionUserCache(ttl_seconds=60, clock=lambda: now[0])
+
+    assert await users.user_id(api, "new@example.com") is None
+    api.users.append({"object": "user", "id": "notion-new", "person": {"email": "new@example.com"}})
+    now[0] = 61
+    assert await users.user_id(api, "new@example.com") == "notion-new"

@@ -48,6 +48,9 @@ SEEDS = {
     "VALUES (%(t)s, 'writes', '', 'u')",
     "tenants": "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) "
     "VALUES (%(t)s, 'T-' || %(t)s, 'a')",
+    "external_writes": "INSERT INTO external_writes "
+    "(tenant_id, idem_key, state, lease_until, lease_token) "
+    "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
 }
 
 # What the app role may do, per table (the other three privileges are never granted).
@@ -68,6 +71,7 @@ PRIVILEGES = {
     "audience_pauses": "SELECT INSERT UPDATE",
     "kill_switches": "SELECT INSERT DELETE",
     "tenants": "SELECT INSERT UPDATE",
+    "external_writes": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }

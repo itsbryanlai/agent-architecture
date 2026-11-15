@@ -48,6 +48,21 @@ DEFAULT_NOTION_WEBHOOK_TOKEN_ENV = "NOTION_WEBHOOK_VERIFICATION_TOKEN"
 DEFAULT_EMBED_MODEL = "text-embedding-v4"
 # Must match the vector(1024) column in the knowledge_chunks table.
 EMBED_DIMENSIONS = 1024
+# The farthest a chunk may be from the question (cosine distance: 0 identical, 1 unrelated,
+# 2 opposite) and still be shown to the model, per embedding model. A model not listed has
+# no cut-off, because its distances have not been looked at. ``bge-m3`` is the local model
+# the maintainer runs: published scores put related text mostly above 0.5 similarity and
+# unrelated text below 0.4, so a distance of 0.6 cuts the unrelated and keeps the related.
+# The value is a starting point from those scores, not measured on this deployment's pages;
+# ``AGENTOS_EMBED_MAX_DISTANCE`` overrides it. ``fake-embed`` is the test embedder, whose
+# unrelated texts are at distance 1.
+EMBED_MAX_DISTANCE: dict[str, float] = {"bge-m3": 0.6, "fake-embed": 0.9}
+
+
+def embed_max_distance(model: str, override: float | None = None) -> float | None:
+    """The cut-off for chunks of ``model``, or None when there is none."""
+    return override if override is not None else EMBED_MAX_DISTANCE.get(model)
+
 
 TASK_QUEUE = "agentos-main"
 
@@ -101,6 +116,8 @@ class Settings:
     # Ollama). Unset means the Qwen settings are used.
     embed_base_url: str | None = None
     embed_api_key: str | None = field(default=None, repr=False)
+    # Overrides the cut-off in ``EMBED_MAX_DISTANCE`` for the configured embedding model.
+    embed_max_distance: float | None = None
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
     database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
@@ -139,6 +156,20 @@ def _parse_flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in _TRUE_VALUES
 
 
+def _parse_distance(raw: str | None) -> float | None:
+    if not raw or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0 < value <= 2:
+        raise ConfigError(
+            f"AGENTOS_EMBED_MAX_DISTANCE must be a number above 0 up to 2; got {raw!r}"
+        )
+    return value
+
+
 def load_settings() -> Settings:
     env = os.environ
     provider = _parse_provider(env.get("AGENTOS_LLM_PROVIDER"))
@@ -155,6 +186,7 @@ def load_settings() -> Settings:
         embed_model=env.get("AGENTOS_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
         embed_base_url=env.get("AGENTOS_EMBED_BASE_URL") or None,
         embed_api_key=env.get("EMBED_API_KEY") or None,
+        embed_max_distance=_parse_distance(env.get("AGENTOS_EMBED_MAX_DISTANCE")),
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
         database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,

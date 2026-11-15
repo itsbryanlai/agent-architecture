@@ -50,7 +50,7 @@ from agentos.audience import UNAVAILABLE, AudienceChecker, AudienceDecision
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
-from agentos.config import AgentVersion, Settings
+from agentos.config import AgentVersion, Settings, embed_max_distance
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
     ConnectorError,
@@ -62,10 +62,10 @@ from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
     KNOWLEDGE_RULES,
     SEARCH_CANDIDATES,
-    SEARCH_RESULTS,
     PageChecker,
     cited_markers,
     format_sources,
+    select_passages,
     sources_footer,
 )
 from agentos.knowledge.store import KnowledgeStore
@@ -663,9 +663,10 @@ class AgentActivities:
         """Search the agent's own granted pages and number the passages found.
 
         The scopes come from this agent's page grants, and the store filters by
-        them inside its query. Each page found is then re-checked with Notion
-        (not trashed, still under its granted root) before it can reach the
-        model. The numbered passages are stored as the tool output; only the
+        them inside its query, and only chunks of the embedding model in use count.
+        Chunks beyond the model's distance cut-off are dropped. Each page found is then
+        re-checked with Notion (not trashed, still where it was indexed under its granted
+        root) before it can reach the model. The numbered passages are stored as the tool output; only the
         citation numbers and page IDs go back to the workflow.
         """
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
@@ -681,19 +682,15 @@ class AgentActivities:
             if _is_client_error(err):
                 raise _non_retryable(err) from err
             raise
+        model = self.embedder.model
         hits = await self.knowledge.search(
-            ctx.tenant_id, list(roots), vector, limit=SEARCH_CANDIDATES
+            ctx.tenant_id, list(roots), vector, limit=SEARCH_CANDIDATES, embed_model=model
         )
+        cutoff = embed_max_distance(model, self.settings.embed_max_distance)
+        if cutoff is not None:
+            hits = [hit for hit in hits if hit.distance <= cutoff]
         checker = PageChecker(self._runtime(ctx.tenant_id).notion_api)
-        live: dict[tuple[str, str], bool] = {}
-        kept = []
-        for hit in hits:
-            key = (hit.scope, hit.page_id)
-            if key not in live:
-                live[key] = await checker.under_root(hit.page_id, roots[hit.scope])
-            if live[key]:
-                kept.append(hit)
-        kept = kept[:SEARCH_RESULTS]
+        kept = await select_passages(hits, checker, roots)
         citations = [
             Citation(first_marker + i, hit.scope, hit.page_id) for i, hit in enumerate(kept)
         ]

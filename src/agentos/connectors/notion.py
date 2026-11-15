@@ -22,6 +22,7 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol
 
 from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
@@ -330,6 +331,11 @@ class FakeNotionAPI:
     def set_blocks(self, parent_id: str, blocks: list[dict]) -> None:
         """Replace a page's or block's child blocks (see ``text_block``)."""
         key = normalize_id(parent_id)
+        if key in self.children and key in self.free_pages:
+            # Replacing a page's blocks is an edit: Notion moves the page's edit time.
+            self.free_pages[key]["last_edited_time"] = datetime.now(UTC).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
         self.children[key] = []
         for block in blocks:
             self._attach_block(key, copy.deepcopy(block))
@@ -451,7 +457,10 @@ class FakeNotionAPI:
     async def list_child_blocks(self, block_id: str) -> list[dict]:
         self.calls.append(("list_child_blocks", {"block_id": block_id}))
         key = normalize_id(block_id)
-        if key not in self.free_pages and key not in self.blocks:
+        in_database = any(
+            normalize_id(page_id) == key for pages in self.databases.values() for page_id in pages
+        )
+        if key not in self.free_pages and key not in self.blocks and not in_database:
             raise FakeNotFound(block_id)
         return copy.deepcopy(self.children.get(key, []))
 

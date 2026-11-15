@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS knowledge_pages (
   url           text        NOT NULL,
   content_hash  text        NOT NULL,
   indexed_at    timestamptz NOT NULL DEFAULT now(),
+  -- Sync state and search checks; see migration 021.
+  embed_model        text   NOT NULL DEFAULT '',
+  last_edited_time   text   NOT NULL DEFAULT '',
+  parent_ref         text   NOT NULL DEFAULT '',
+  ancestors          text[] NOT NULL DEFAULT '{}',
+  child_page_ids     text[] NOT NULL DEFAULT '{}',
+  child_database_ids text[] NOT NULL DEFAULT '{}',
+  row_page_ids       text[] NOT NULL DEFAULT '{}',
   PRIMARY KEY (tenant_id, scope, page_id)
 );
 
@@ -104,6 +112,26 @@ BEGIN
   END LOOP;
 END
 $$;
+
+-- One row per scope whose root page is gone or unshared (migration 021).
+CREATE TABLE IF NOT EXISTS knowledge_scope_health (
+  tenant_id        text        NOT NULL,
+  scope            text        NOT NULL,
+  consecutive_gone integer     NOT NULL,
+  last_run         text        NOT NULL,
+  first_seen       timestamptz NOT NULL DEFAULT now(),
+  notified_at      timestamptz,
+  PRIMARY KEY (tenant_id, scope)
+);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON knowledge_scope_health TO agentos_app;
+
+ALTER TABLE knowledge_scope_health ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_scope_health FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON knowledge_scope_health;
+CREATE POLICY tenant_isolation ON knowledge_scope_health
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
 -- never content. The app role can INSERT and SELECT only. Same as migration 005.

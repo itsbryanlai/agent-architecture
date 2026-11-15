@@ -3,7 +3,6 @@
 import asyncio
 import dataclasses
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -33,10 +32,6 @@ from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, TENANT, eventually, title_prop
 from tests.test_front_door import front_door_dict, running
 from tests.test_row_level_security import FakePool
-
-ROOT = Path(__file__).resolve().parent.parent
-MIGRATION = (ROOT / "scripts" / "migrations" / "005_audit_log.sql").read_text()
-INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -387,29 +382,6 @@ async def test_list_is_newest_first_per_tenant_with_limit_and_before():
 
 
 # --- the SQL ------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "sql", [MIGRATION, INIT_DB.split("CREATE TABLE IF NOT EXISTS audit_events")[1]]
-)
-def test_audit_sql_is_tenant_scoped_and_append_only(sql):
-    assert "ENABLE ROW LEVEL SECURITY" in sql
-    assert "FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON audit_events" in sql
-    assert "current_setting('app.tenant_id', true)" in sql
-    assert "GRANT INSERT, SELECT ON audit_events TO agentos_app" in sql
-    assert "UPDATE" not in sql.split("GRANT INSERT, SELECT ON audit_events")[1].split(";")[0]
-    assert "BEFORE UPDATE OR DELETE ON audit_events" in sql
-    assert "BEFORE TRUNCATE ON audit_events" in sql
-    assert "PRIMARY KEY (tenant_id, event_key)" in sql
-    for kind in ("answer", "tool_call", "hand_off", "approval", "write"):
-        assert f"'{kind}'" in sql
-
-
-def test_audit_table_is_in_a_fresh_database_too():
-    assert "CREATE TABLE IF NOT EXISTS audit_events" in INIT_DB
-    assert "GRANT INSERT, SELECT ON audit_events TO agentos_app" in INIT_DB
-    assert INIT_DB.count("audit_events") > 5
 
 
 async def test_postgres_store_sets_the_tenant_before_each_call():

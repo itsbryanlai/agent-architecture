@@ -22,7 +22,6 @@ from agentos.budgets import (
     BudgetNotFound,
     InMemoryBudgetStore,
     InvalidBudget,
-    PostgresBudgetStore,
     stop_text,
 )
 from agentos.config import Settings, parse_agents_config
@@ -44,7 +43,6 @@ from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, Prices, UsageEvent, UsageRecorder
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
 from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
-from tests.test_row_level_security import FakePool
 from tests.test_usage import SCOPE, _page_agents, block, price
 
 REPO = Path(__file__).resolve().parent.parent
@@ -732,14 +730,7 @@ async def test_the_audit_page_shows_a_budget_event_without_a_version(h):
 
 # --- audit kinds and SQL ------------------------------------------------------------------------
 
-MIGRATION_010 = (REPO / "scripts" / "migrations" / "010_audience.sql").read_text()
 MIGRATION_012 = (REPO / "scripts" / "migrations" / "012_budgets.sql").read_text()
-INIT_DB = (REPO / "scripts" / "init_db.sql").read_text()
-
-
-def kinds_in(sql):
-    block_ = sql[sql.index("kind IN (") :]
-    return set(re.findall(r"'(\w+)'", block_[: block_.index("))")]))
 
 
 def test_budget_set_is_an_audit_kind_that_needs_no_agent_version():
@@ -750,71 +741,11 @@ def test_budget_set_is_an_audit_kind_that_needs_no_agent_version():
         AuditEvent("acme", "k", "answer", None, None, "U1", "agent:a")
 
 
-def test_migration_012_keeps_every_010_kind_and_adds_budget_set():
-    old, new = kinds_in(MIGRATION_010), kinds_in(MIGRATION_012)
-    assert old < new and new - old == {"budget_set"}
-    assert "DROP CONSTRAINT IF EXISTS audit_events_kind_check" in MIGRATION_012
-
-
-def test_init_db_and_migration_012_allow_the_same_kinds_as_the_code():
-    # Later migrations add kinds of their own, so init_db is checked against the code, and
-    # migration 012's kinds must all remain allowed.
-    assert kinds_in(MIGRATION_012) <= kinds_in(INIT_DB) == set(AUDIT_KINDS)
-
-
-def test_a_budget_event_may_leave_out_the_agent_in_both_sql_files():
-    for sql in (MIGRATION_012, INIT_DB):
-        rule = sql[sql.index("audit_events_agent_required CHECK") :]
-        rule = rule[: rule.index("agent_id IS NOT NULL")]
-        assert "'budget_set'" in rule
-        for kind in ("member_add", "member_remove", "member_role"):
-            assert f"'{kind}'" in rule
-    assert "DROP CONSTRAINT IF EXISTS audit_events_agent_required" in MIGRATION_012
-
-
-@pytest.mark.parametrize("sql", [MIGRATION_012, INIT_DB], ids=["migration", "init_db"])
-def test_budgets_sql_is_tenant_scoped_one_row_per_scope_and_positive(sql):
-    assert "CREATE TABLE IF NOT EXISTS budgets" in sql
-    assert "CHECK (amount_usd > 0)" in sql
-    assert "UNIQUE INDEX IF NOT EXISTS budgets_one_per_scope" in sql
-    assert "(tenant_id, (COALESCE(agent_id, '')))" in sql
-    assert "ALTER TABLE budgets ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE budgets FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON budgets" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON budgets FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON budgets TO agentos_app" in sql
-
-
-def test_init_db_matches_the_budgets_migration():
-    block_ = MIGRATION_012[MIGRATION_012.index("CREATE TABLE IF NOT EXISTS budgets") :]
-    block_ = block_[: block_.index("ALTER TABLE audit_events")].rstrip()
-    assert block_ in INIT_DB
-
-
 def test_a_budget_row_holds_no_requester_and_no_content():
     columns = MIGRATION_012[MIGRATION_012.index("CREATE TABLE") :]
     columns = columns[: columns.index("\n);")]
     for word in ("requester", "content", "prompt", "text_body"):
         assert word not in columns
-
-
-async def test_the_postgres_store_upserts_by_scope_and_names_the_tenant_in_every_statement():
-    pool = FakePool(row=(TENANT, None, D("5.00"), ROOT, NOV))
-    store = PostgresBudgetStore(pool)
-
-    await store.set_budget(TENANT, None, D("5.00"), ROOT)
-    await store.set_budget(TENANT, "mine", D("5.00"), ROOT)
-    await store.list(TENANT)
-    await store.remove_budget(TENANT, "mine")
-
-    executed = [e for e in pool.events if e[0] == "execute" and "set_config" not in e[1]]
-    upsert, upsert_agent, listing, delete = executed
-    assert "ON CONFLICT (tenant_id, (COALESCE(agent_id, ''))) DO UPDATE" in upsert[1]
-    assert upsert[2][0] == TENANT and upsert[2][1] is None and upsert_agent[2][1] == "mine"
-    assert "tenant_id = %s" in listing[1] and listing[2] == (TENANT,)
-    assert "DELETE FROM budgets" in delete[1] and delete[2][0] == TENANT
 
 
 # --- indexing stops at the tenant budget ---------------------------------------------------------

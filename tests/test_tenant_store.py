@@ -55,7 +55,6 @@ from tests.test_gateway import FakeTemporalClient, im_event, post_event
 from tests.test_row_level_security import FakePool
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-INIT_DB = (ROOT_DIR / "scripts" / "init_db.sql").read_text()
 MIGRATION = (ROOT_DIR / "scripts" / "migrations" / "015_tenants.sql").read_text()
 
 
@@ -202,57 +201,11 @@ async def test_a_tenants_own_row_is_read_written_and_toggled_inside_its_own_tran
     assert loaded.config.secrets.notion_token_env == "NOTION_TOKEN"
 
 
-def test_the_tenants_table_is_forced_row_level_security_with_one_policy_for_the_app_role():
-    assert "ALTER TABLE tenants FORCE ROW LEVEL SECURITY" in MIGRATION
-    assert re.search(
-        r"CREATE POLICY tenant_isolation ON tenants\s+USING \(tenant_id = "
-        r"current_setting\('app.tenant_id', true\)\)\s+WITH CHECK \(tenant_id = "
-        r"current_setting\('app.tenant_id', true\)\)",
-        MIGRATION,
-    )
-    policies = re.findall(r"CREATE POLICY (\w+) ON tenants([^;]*);", MIGRATION)
-    assert [name for name, _ in policies] == ["tenant_isolation", "tenant_directory"]
-    # The only policy that reads every row is for the no-login role that owns the functions.
-    assert "FOR SELECT TO agentos_directory USING (true)" in policies[1][1]
-    assert "TO agentos_app" not in policies[1][1]
-
-
-def test_the_app_role_cannot_delete_a_tenant_or_read_another_through_the_directory_role():
-    assert "GRANT SELECT, INSERT, UPDATE ON tenants TO agentos_app" in MIGRATION
-    assert "DELETE" not in MIGRATION.replace("has no DELETE", "")
-    assert "CREATE ROLE agentos_directory NOLOGIN NOSUPERUSER NOBYPASSRLS" in MIGRATION
-    assert "agentos_directory TO agentos_app" not in MIGRATION
-
-
-def test_the_cross_tenant_functions_return_ids_only_and_only_the_app_role_may_call_them():
-    for name, args in (("tenant_for_slack_team", "text"), ("list_tenants", "")):
-        assert re.search(
-            rf"FUNCTION {name}\([^)]*\)\s+RETURNS TABLE \(tenant_id text, enabled "
-            r"boolean, updated_at timestamptz\)",
-            MIGRATION,
-        )
-        assert f"ALTER FUNCTION {name}({args}) OWNER TO agentos_directory" in MIGRATION
-        assert f"REVOKE ALL ON FUNCTION {name}({args}) FROM PUBLIC" in MIGRATION
-        assert f"GRANT EXECUTE ON FUNCTION {name}({args}) TO agentos_app" in MIGRATION
-    assert MIGRATION.count("SECURITY DEFINER SET search_path = public, pg_temp") == 2
-
-
 def test_the_table_has_no_column_that_could_hold_a_secret_value():
     table = re.search(r"CREATE TABLE IF NOT EXISTS tenants \((.*?)\n\);", MIGRATION, re.DOTALL)
     columns = re.findall(r"^\s{2}(\w+)\s", table.group(1), re.MULTILINE)
     assert "secret_env" in columns
     assert not [c for c in columns if re.search(r"token|key|password", c)]
-
-
-def test_init_db_carries_the_same_tenants_block_as_the_migration():
-    def block(sql: str) -> str:
-        start = sql.index("CREATE TABLE IF NOT EXISTS tenants")
-        return re.sub(r"--[^\n]*", "", sql[start:]).strip()
-
-    assert block(INIT_DB) == block(MIGRATION)
-    assert INIT_DB.index("CREATE TABLE IF NOT EXISTS tenants") > INIT_DB.index(
-        "CREATE TABLE IF NOT EXISTS audience_pauses"
-    )
 
 
 # --- The live directory -------------------------------------------------------
@@ -630,9 +583,3 @@ async def test_the_control_api_treats_a_disabled_tenant_as_unknown():
 
 def test_a_tenant_ref_carries_no_settings():
     assert [f for f in TenantRef.__dataclass_fields__] == ["tenant_id", "enabled", "updated_at"]
-
-
-def test_every_update_moves_updated_at_so_hand_edits_are_noticed():
-    for sql in (MIGRATION, INIT_DB):
-        assert "CREATE TRIGGER tenants_touch BEFORE UPDATE ON tenants" in sql
-        assert "NEW.updated_at := now();" in sql

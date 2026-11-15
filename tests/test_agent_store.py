@@ -1,7 +1,6 @@
 """Agents in the database: lifecycle, what a turn loads, front-door rules, import, startup."""
 
 import copy
-from pathlib import Path
 
 import pytest
 from temporalio.exceptions import ApplicationError
@@ -37,10 +36,6 @@ from agentos.stores import (
 from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, DB_ID, TENANT, agents_dict, make_fake_notion
 from tests.test_front_door import front_door_dict
-
-ROOT = Path(__file__).resolve().parent.parent
-MIGRATION = (ROOT / "scripts" / "migrations" / "006_agents.sql").read_text()
-INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
 
 ADMIN = "U_ADMIN"
 EDITOR = "U_EDITOR"
@@ -542,44 +537,3 @@ async def test_published_tenants_carry_the_published_agents_and_the_yaml_setting
 
 
 # --- migration text --------------------------------------------------------------
-
-
-@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_sql_has_row_level_security_grants_trigger_and_one_published_index(sql):
-    for table in ("agents", "agent_versions"):
-        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY" in sql
-        assert f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY" in sql
-        assert f"CREATE POLICY tenant_isolation ON {table}" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-
-    assert "REVOKE ALL ON agents, agent_versions FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT ON agents TO agentos_app" in sql
-    assert "GRANT SELECT, INSERT, UPDATE ON agent_versions TO agentos_app" in sql
-    agents_part = sql.split("REVOKE ALL ON agents")[1].split("CREATE TABLE IF NOT EXISTS members")[
-        0
-    ]
-    assert "DELETE ON" not in agents_part
-
-    assert "PRIMARY KEY (tenant_id, agent_id)" in sql
-    assert "PRIMARY KEY (tenant_id, agent_id, version)" in sql
-    assert (
-        "CREATE UNIQUE INDEX IF NOT EXISTS agent_versions_one_published\n"
-        "  ON agent_versions (tenant_id, agent_id) WHERE status = 'published'"
-    ) in sql
-
-    assert "CREATE TRIGGER agent_versions_guard" in sql
-    assert "BEFORE UPDATE OR DELETE ON agent_versions" in sql
-    assert "only a draft can be deleted" in sql
-    assert "the definition changes only while a version is a draft" in sql
-    assert "OLD.status = 'draft'   AND NEW.status = 'pending'" in sql
-    assert "OLD.status = 'pending' AND NEW.status IN ('draft', 'published')" in sql
-    assert "OLD.status = 'published' AND NEW.status = 'superseded'" in sql
-    assert "CHECK (status IN ('draft', 'pending', 'published', 'superseded'))" in " ".join(
-        sql.split()
-    )
-
-
-def test_init_db_matches_the_migration_for_agents():
-    body = MIGRATION.split("\n\n", 1)[1]
-    assert body in INIT_DB

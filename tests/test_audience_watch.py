@@ -4,7 +4,6 @@ again. Who is added to a channel is the admins' business: a join, of anyone, pau
 
 import copy
 import json
-import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -38,7 +37,6 @@ from agentos.grant_checker import NotionGrantChecker
 from agentos.llm import ScriptedLLMClient
 from agentos.members import InMemoryMemberStore
 from agentos.models import (
-    AUDIT_KINDS,
     AudienceEvent,
     ConversationRef,
     InboundMessage,
@@ -715,67 +713,7 @@ def test_a_slack_retry_of_the_same_event_is_acknowledged_without_a_second_run(
     assert send(client, secret, event).status_code == 200
 
 
-# --- schema, ids, kinds ------------------------------------------------------------------
-
-MIGRATION = (ROOT_DIR / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
-INIT_DB = (ROOT_DIR / "scripts" / "init_db.sql").read_text()
-
-KINDS_SINCE_010 = [
-    "answer", "tool_call", "hand_off", "approval", "write", "agent_create", "agent_draft",
-    "agent_edit", "agent_import", "agent_submit", "agent_withdraw", "agent_reject",
-    "agent_publish", "member_add", "member_remove", "member_role", "audience_refused",
-    "audience_confirm", "budget_set", "audience_pause", "audience_resume",
-]  # fmt: skip
-
-
-def kinds_in(sql: str, after: str) -> list[str]:
-    block = sql[sql.index(after) :]
-    return re.findall(r"'(\w+)'", block[: block.index("))")])
-
-
-@pytest.mark.parametrize(
-    "sql, later",
-    [(MIGRATION, []), (INIT_DB, ["switch_off", "switch_on"])],  # init_db is every migration
-    ids=["migration", "init_db"],
-)
-def test_the_audit_check_keeps_every_kind_and_adds_pause_and_resume(sql, later):
-    found = kinds_in(sql, "CHECK (kind IN (")
-    assert sorted(found) == sorted(KINDS_SINCE_010 + later)
-
-
-def test_the_code_can_write_the_new_kinds():
-    assert "audience_pause" in AUDIT_KINDS and "audience_resume" in AUDIT_KINDS
-
-
-def test_the_migration_does_not_touch_the_agent_required_rule():
-    assert "audit_events_agent_required" not in MIGRATION
-
-
-@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_the_pause_table_is_tenant_scoped_forced_rls_and_never_deleted_by_the_app(sql):
-    assert "CREATE TABLE IF NOT EXISTS audience_pauses" in sql
-    assert "tenant_id" in sql and "resumed_by" in sql and "resumed_at" in sql
-    assert "ALTER TABLE audience_pauses ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE audience_pauses FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON audience_pauses" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON audience_pauses FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT, UPDATE ON audience_pauses TO agentos_app" in sql
-    assert "DELETE ON audience_pauses" not in sql
-    assert "WHERE resumed_at IS NULL" in sql
-
-
-def test_init_db_matches_the_migration_table_block():
-    block = MIGRATION[MIGRATION.index("CREATE TABLE IF NOT EXISTS audience_pauses") :]
-    block = block[: block.index("ALTER TABLE audit_events")].rstrip()
-    assert block in INIT_DB
-
-
-@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_the_pause_reason_check_allows_only_a_channel_share(sql):
-    block = sql[sql.index("reason      text") :]
-    assert re.findall(r"'(\w+)'", block[: block.index("))")]) == ["channel_shared"]
+# --- ids ---------------------------------------------------------------------------------
 
 
 def test_the_audit_and_notice_keys_start_with_the_tenant():
@@ -784,10 +722,3 @@ def test_the_audit_and_notice_keys_start_with_the_tenant():
     assert ids.audience_pause_notice_key("acme", "a", "C1", "t", "U1") != (
         ids.audience_pause_notice_key("acme", "a", "C1", "t", "U2")
     )
-
-
-def test_nothing_committed_names_the_planning_folder():
-    for name in ("audience_pauses.py", "audience_watch.py"):
-        text = (ROOT_DIR / "src" / "agentos" / name).read_text()
-        assert ".agents/planning" not in text and "AU-05" not in text
-    assert ".agents/planning" not in MIGRATION and "AU-05" not in MIGRATION

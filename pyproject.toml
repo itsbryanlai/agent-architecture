@@ -30,6 +30,9 @@ packages = ["src/agentos"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "pg: runs SQL against a local Postgres (127.0.0.1:55432, throwaway databases); skipped when it is down",
+]
 
 [tool.ruff]
 line-length = 100

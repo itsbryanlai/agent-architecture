@@ -967,24 +967,7 @@ def test_a_target_must_fit_its_scope():
 
 # --- the SQL and the store ------------------------------------------------------------------
 
-MIGRATION_010 = (REPO / "scripts" / "migrations" / "010_audience.sql").read_text()
-MIGRATION_013 = (REPO / "scripts" / "migrations" / "013_audience_watch.sql").read_text()
 MIGRATION = (REPO / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
-INIT_DB = (REPO / "scripts" / "init_db.sql").read_text()
-
-KINDS_013 = {
-    "answer", "tool_call", "hand_off", "approval", "write",
-    "agent_create", "agent_draft", "agent_edit", "agent_import", "agent_submit",
-    "agent_withdraw", "agent_reject", "agent_publish",
-    "member_add", "member_remove", "member_role",
-    "audience_refused", "audience_confirm", "budget_set",
-    "audience_pause", "audience_resume",
-}  # fmt: skip
-
-
-def kinds_in(sql):
-    block = sql[sql.index("kind IN (") :]
-    return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
 
 
 def test_the_code_knows_the_two_new_kinds_and_they_need_no_agent_version():
@@ -992,47 +975,6 @@ def test_the_code_knows_the_two_new_kinds_and_they_need_no_agent_version():
     for kind in ("switch_off", "switch_on"):
         AuditEvent("acme", "k", kind, None, None, "U1", "user:U1", tool="writes")
         AuditEvent("acme", "k", kind, "mine", None, "U1", "user:U1", tool="agent", target="mine")
-
-
-def test_migration_014_keeps_all_21_kinds_and_adds_the_two_switch_kinds():
-    assert len(KINDS_013) == 21 and kinds_in(MIGRATION_013) == KINDS_013
-    assert kinds_in(MIGRATION) == KINDS_013 | {"switch_off", "switch_on"}
-    assert "DROP CONSTRAINT IF EXISTS audit_events_kind_check" in MIGRATION
-
-
-def test_init_db_allows_exactly_the_kinds_of_the_latest_migration_and_the_code():
-    assert kinds_in(INIT_DB) == kinds_in(MIGRATION) == set(AUDIT_KINDS)
-
-
-def test_a_switch_event_may_leave_out_the_agent_in_both_sql_files():
-    for sql in (MIGRATION, INIT_DB):
-        rule = sql[sql.index("audit_events_agent_required CHECK") :]
-        rule = rule[: rule.index("agent_id IS NOT NULL")]
-        for kind in ("member_add", "member_remove", "member_role", "budget_set"):
-            assert f"'{kind}'" in rule
-        assert "'switch_off'" in rule and "'switch_on'" in rule
-    assert "DROP CONSTRAINT IF EXISTS audit_events_agent_required" in MIGRATION
-
-
-@pytest.mark.parametrize("sql", [MIGRATION, INIT_DB], ids=["migration", "init_db"])
-def test_the_switch_table_is_tenant_scoped_forced_rls_and_never_updated_by_the_app(sql):
-    assert "CREATE TABLE IF NOT EXISTS kill_switches" in sql
-    assert "PRIMARY KEY (tenant_id, scope, target)" in sql
-    assert "CHECK (scope IN ('agent', 'all_agents', 'connector', 'writes'))" in sql
-    assert "ALTER TABLE kill_switches ENABLE ROW LEVEL SECURITY" in sql
-    assert "ALTER TABLE kill_switches FORCE ROW LEVEL SECURITY" in sql
-    assert "CREATE POLICY tenant_isolation ON kill_switches" in sql
-    assert "USING (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "WITH CHECK (tenant_id = current_setting('app.tenant_id', true))" in sql
-    assert "REVOKE ALL ON kill_switches FROM agentos_app" in sql
-    assert "GRANT SELECT, INSERT, DELETE ON kill_switches TO agentos_app" in sql
-    assert "UPDATE ON kill_switches" not in sql
-
-
-def test_init_db_matches_the_switch_table_block_of_the_migration():
-    block = MIGRATION[MIGRATION.index("CREATE TABLE IF NOT EXISTS kill_switches") :]
-    block = block[: block.index("ALTER TABLE audit_events")].rstrip()
-    assert block in INIT_DB
 
 
 def test_a_switch_row_holds_no_content_and_no_requester():

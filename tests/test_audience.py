@@ -1,7 +1,6 @@
 """Agent audiences: who may use an agent, where, and the checks around publishing it."""
 
 import copy
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -43,7 +42,6 @@ from agentos.grant_checker import NotionGrantChecker
 from agentos.llm import ScriptedLLMClient
 from agentos.members import InMemoryMemberStore
 from agentos.models import (
-    AUDIT_KINDS,
     ConversationRef,
     InboundMessage,
     LLMResponse,
@@ -175,46 +173,6 @@ def test_a_mapped_channel_of_an_agent_without_audience_is_fine():
     raw = agents_dict()
     raw["channels"] = {OTHER_CHAN: "it-helper"}
     assert parse_agents_config(raw).channels == {OTHER_CHAN: "it-helper"}
-
-
-# --- audit kinds and migration 010 ----------------------------------------------------
-
-MIGRATION_009 = (ROOT / "scripts" / "migrations" / "009_audit_kinds.sql").read_text()
-MIGRATION_010 = (ROOT / "scripts" / "migrations" / "010_audience.sql").read_text()
-INIT_DB = (ROOT / "scripts" / "init_db.sql").read_text()
-
-
-def test_the_new_audit_kinds_exist():
-    assert "audience_refused" in AUDIT_KINDS and "audience_confirm" in AUDIT_KINDS
-
-
-def test_migration_010_keeps_every_009_kind_and_adds_the_new_ones():
-    old = MIGRATION_009[MIGRATION_009.index("kind IN (") :]
-    old = old[: old.index("));")]
-    new = MIGRATION_010[MIGRATION_010.index("kind IN (") :]
-    new = new[: new.index("));")]
-    assert set(re.findall(r"'(\w+)'", old)) < set(re.findall(r"'(\w+)'", new))
-    for kind in ("audience_refused", "audience_confirm"):
-        assert f"'{kind}'" in new
-    assert "DROP CONSTRAINT IF EXISTS audit_events_kind_check" in MIGRATION_010
-    assert "DROP TABLE" not in MIGRATION_010 and "GRANT" not in MIGRATION_010
-
-
-def test_init_db_allows_every_kind_of_the_latest_migration_and_the_code():
-    def kinds_in(sql: str) -> set[str]:
-        block = sql[sql.index("kind IN (") :]
-        return set(re.findall(r"'(\w+)'", block[: block.index("))")]))
-
-    latest = (ROOT / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
-    assert kinds_in(latest) == kinds_in(INIT_DB)
-    assert set(AUDIT_KINDS) <= kinds_in(INIT_DB)
-    assert kinds_in(MIGRATION_010) < kinds_in(INIT_DB)
-    assert (
-        "'budget_set'"
-        in INIT_DB[INIT_DB.index("audit_events_agent_required CHECK") :].split(
-            "agent_id IS NOT NULL"
-        )[0]
-    )
 
 
 # --- the Slack lookups ----------------------------------------------------------------

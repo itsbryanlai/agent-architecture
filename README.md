@@ -104,7 +104,9 @@ Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
 `AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`), `AGENTOS_DATABASE_URL`
 (default `postgresql://agentos_app:agentos_app@localhost:55432/agentos`, the
-local development app role, on the host port 55432 that Compose publishes) and `AGENTOS_CONFIG`
+local development app role, on the host port 55432 that Compose publishes, bound
+to 127.0.0.1 along with Temporal's 7233 and 8233; Temporal keeps its data in the
+`temporal-data` volume) and `AGENTOS_CONFIG`
 (default `config/agents.yaml`; a file for one tenant, or a directory with one
 `*.yaml` per tenant). Only the two import commands and `check_grants` read it.
 
@@ -133,7 +135,8 @@ signature it cannot check, so set it up in this order:
 2. Notion sends a one-time handshake. The gateway writes the verification token
    to a file readable only by you, and logs the path (never the token). The file
    is `notion-webhook-verification-token-<tenant_id>` in `~/.agentos`, unless
-   you set `AGENTOS_NOTION_TOKEN_DIR`.
+   you set `AGENTOS_NOTION_TOKEN_DIR`. While that file exists a second handshake
+   gets 409 and changes nothing: delete the file to subscribe again.
 3. Paste the token from that file into the Notion integration to finish
    subscribing, then export it in the variable the tenant's config names
    (`NOTION_WEBHOOK_VERIFICATION_TOKEN` by default), for example
@@ -948,7 +951,8 @@ A **public URL (a tunnel, a reverse proxy) is allowed only once sign-in is
 configured.** Then the process may listen beyond loopback, the fixed operator
 (`AGENTOS_CONTROL_ACTOR`) is not used and nothing acts without a session, and the
 `Host` allowlist is the host of `AGENTOS_CONSOLE_URL` plus loopback. Point a tunnel
-at this port only in that mode.
+at this port only in that mode. It also refuses to listen beyond loopback while the
+database password in `AGENTOS_DATABASE_URL` is empty or a development default.
 
 How it behaves:
 

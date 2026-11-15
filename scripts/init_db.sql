@@ -566,3 +566,35 @@ REVOKE ALL ON FUNCTION tenant_for_slack_team(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION list_tenants() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION tenant_for_slack_team(text) TO agentos_app;
 GRANT EXECUTE ON FUNCTION list_tenants() TO agentos_app;
+
+-- External writes: which attempt may write to an outside system for one key, and what it returned. Same as migration 018.
+CREATE TABLE IF NOT EXISTS external_writes (
+  tenant_id   text        NOT NULL,
+  idem_key    text        NOT NULL,
+  state       text        NOT NULL CHECK (state IN ('claimed', 'issued', 'done')),
+  result_ref  text,
+  lease_until timestamptz NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, idem_key),
+  CONSTRAINT external_writes_result_when_done CHECK ((state = 'done') = (result_ref IS NOT NULL))
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
+    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON external_writes FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON external_writes TO agentos_app;
+
+ALTER TABLE external_writes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE external_writes FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON external_writes;
+CREATE POLICY tenant_isolation ON external_writes
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));

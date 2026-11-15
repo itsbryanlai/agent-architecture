@@ -122,7 +122,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('member_add'), ('member_remove'), ('member_role'),
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
-  ('switch_off'), ('switch_on')
+  ('switch_off'), ('switch_on'), ('usage_repriced')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
-             'switch_off', 'switch_on')
+             'switch_off', 'switch_on', 'usage_repriced')
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
@@ -399,6 +399,29 @@ ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON usage_events;
 CREATE POLICY tenant_isolation ON usage_events
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- The cost a usage row got after it was recorded, written only by the owner-run reprice command. Same as migration 019.
+CREATE TABLE IF NOT EXISTS usage_adjustments (
+  tenant_id            text           NOT NULL,
+  usage_key            text           NOT NULL,
+  cost_usd             numeric(20, 8) NOT NULL CHECK (cost_usd >= 0),
+  price_model          text           NOT NULL,
+  price_effective_from date           NOT NULL,
+  repriced_at          timestamptz    NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, usage_key),
+  FOREIGN KEY (tenant_id, usage_key) REFERENCES usage_events (tenant_id, usage_key)
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON usage_adjustments FROM agentos_app;
+GRANT SELECT ON usage_adjustments TO agentos_app;
+
+ALTER TABLE usage_adjustments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_adjustments FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON usage_adjustments;
+CREATE POLICY tenant_isolation ON usage_adjustments
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
@@ -681,5 +704,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019')
 ON CONFLICT DO NOTHING;

@@ -16,7 +16,8 @@ The code here is a walking skeleton of that design, built on Temporal
 3. Creating an item starts a `TaskWorkflow`, which DMs the requester an
    approval card. Nothing is filed until they click **Submit**.
 4. Submit creates the Notion item exactly once, even if the worker crashes
-   and retries.
+   and retries: a lease in Postgres lets one attempt write at a time, and an
+   existing database needs `scripts/migrations/018_external_writes.sql`.
 5. The task watches the item's status and posts in the original thread when it
    reaches a "done" value.
 

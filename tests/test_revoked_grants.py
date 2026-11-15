@@ -140,7 +140,9 @@ async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(m
         async def __aexit__(self, *exc):
             return False
 
-    monkeypatch.setattr(index_knowledge, "load_settings", lambda: Settings())
+    monkeypatch.setattr(
+        index_knowledge, "load_settings", lambda: Settings(database_url="postgresql://unused")
+    )
 
     async def load_tenants(_database_url):
         return TenantsConfig.of(cfg)

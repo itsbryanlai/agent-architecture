@@ -45,6 +45,7 @@ from agentos.members import PostgresMemberStore
 from agentos.schema_version import require_current_schema
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
+    PostgresExternalWriteStore,
     PostgresHistoryStore,
     PostgresIdempotencyStore,
     PostgresTaskLinkStore,
@@ -271,6 +272,7 @@ async def main() -> None:
             budgets=budget_guard,
             pauses=pauses,
             switches=switches,
+            external_writes=PostgresExternalWriteStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

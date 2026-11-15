@@ -54,6 +54,7 @@ class SlackUser:
     is_ultra_restricted: bool = False  # a single-channel guest
     deleted: bool = False
     is_bot: bool = False
+    display_name: str = ""
 
     @property
     def is_guest(self) -> bool:
@@ -222,6 +223,7 @@ def _user_from(raw: dict) -> SlackUser:
         is_ultra_restricted=bool(raw.get("is_ultra_restricted")),
         deleted=bool(raw.get("deleted")),
         is_bot=bool(raw.get("is_bot")),
+        display_name=_display_name(raw),
     )
 
 
@@ -240,6 +242,13 @@ def _retry_after(response) -> float | None:
     if seconds < 0:
         return None
     return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+def _display_name(raw: dict) -> str:
+    profile = raw.get("profile") or {}
+    return (
+        profile.get("display_name") or profile.get("real_name") or raw.get("real_name") or ""
+    ).strip()
 
 
 def _lookup_error(err: Exception) -> SlackLookupError:

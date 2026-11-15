@@ -1,0 +1,230 @@
+"""An approved Notion write happens once, whatever the attempts, delays and failures around it."""
+
+import asyncio
+import json
+import uuid
+from datetime import timedelta
+
+import pytest
+from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
+
+from agentos import ids
+from agentos.config import TASK_QUEUE
+from agentos.connectors.notion import comment_ref
+from agentos.models import ApprovalDecision, TaskSpec, TurnContext
+from agentos.slack_client import SlackUser
+from agentos.workflows.task import TaskWorkflow
+from tests.conftest import ALICE, ALICE_NOTION, DB_ID, TEAM, TENANT, eventually, title_prop
+
+NONCE = "nonce-eo"
+DETAILS = "Mine flickers."
+
+
+def create_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {"title": "New monitor", "details": DETAILS, "database_id": DB_ID}
+    return TaskSpec(ctx, "create_item", payload, NONCE)
+
+
+def comment_spec(page_id: str) -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {"page_id": page_id, "comment": "Any update?", "item_title": "Broken VPN"}
+    return TaskSpec(ctx, "add_comment", payload, NONCE)
+
+
+async def run(activity, spec: TaskSpec, task_id: str):
+    return await ActivityEnvironment().run(activity, spec, task_id)
+
+
+async def start_task(h) -> tuple[object, str]:
+    task_id = ids.task_id(TENANT, str(uuid.uuid4()))
+    handle = await h.client.start_workflow(
+        TaskWorkflow.run, create_spec(), id=task_id, task_queue=TASK_QUEUE
+    )
+
+    await wait_state(handle, "awaiting_approval")
+    return handle, task_id
+
+
+async def wait_state(handle, expected: str):
+    async def reached():
+        return await handle.query(TaskWorkflow.state) == expected
+
+    await eventually(reached, timeout=20)
+
+
+async def approve(handle) -> None:
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+
+
+def thread_posts(h, needle: str):
+    return [p for p in h.slack.posts() if p["thread_ts"] and needle in p["text"]]
+
+
+def break_method(obj, name: str, error: Exception, times: int | None = None):
+    """Make ``obj.name`` raise ``error`` ``times`` times (always when None)."""
+    original = getattr(obj, name)
+    left = {"n": times}
+
+    async def wrapper(*args, **kwargs):
+        if left["n"] is None or left["n"] > 0:
+            if left["n"] is not None:
+                left["n"] -= 1
+            raise error
+        return await original(*args, **kwargs)
+
+    setattr(obj, name, wrapper)
+
+
+# --- one attempt at a time -----------------------------------------------------------
+
+
+async def test_a_second_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if an attempt starting while another is mid-write creates a second item."""
+    h = harness
+    task_id = ids.task_id(TENANT, "overlap")
+    hang = h.notion.hang_after_write()
+    first = asyncio.create_task(run(h.acts.create_notion_item, create_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.create_notion_item, create_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    assert h.notion.count("create_page") == 1
+
+    hang.release()
+    item = await first
+    calls_before = len(h.notion.calls)
+    again = await run(h.acts.create_notion_item, create_spec(), task_id)
+
+    assert again == item
+    assert len(h.notion.all_pages(DB_ID)) == 1
+    assert len(h.notion.calls) == calls_before
+
+
+async def test_a_retry_waits_out_a_search_that_lags_the_write(harness):
+    """Fails if a retry that cannot see the page yet writes it again."""
+    h = harness
+    task_id = ids.task_id(TENANT, "lag")
+    h.notion.delay_visibility(2)
+    h.notion.fail_after_write()
+    with pytest.raises(TimeoutError):
+        await run(h.acts.create_notion_item, create_spec(), task_id)
+
+    item = await run(h.acts.create_notion_item, create_spec(), task_id)
+
+    assert len(h.notion.all_pages(DB_ID)) == 1
+    assert item.page_id == h.notion.all_pages(DB_ID)[0]["id"]
+
+
+# --- what lands in Notion is what the card showed ---------------------------------------
+
+
+@pytest.mark.parametrize("matched", [True, False])
+async def test_the_page_is_what_the_card_showed(harness, matched):
+    """Fails if the page body or requester differs from the line the card showed."""
+    h = harness
+    if not matched:
+        h.slack.emails[ALICE] = "stranger@example.net"
+        h.slack.users[ALICE] = SlackUser(ALICE, TEAM, display_name="Alice Stranger")
+    handle, _ = await start_task(h)
+    card = json.dumps(next(p for p in h.slack.posts() if p["blocks"])["blocks"])
+    line = "Requested by Alice Stranger via IT helper"
+
+    await approve(handle)
+    await wait_state(handle, "watching")
+
+    page = h.notion.all_pages(DB_ID)[0]
+    title = "".join(t["text"]["content"] for t in page["properties"]["Name"]["title"])
+    people = page["properties"].get("Requested by", {}).get("people", [])
+    assert title == "New monitor"
+    if matched:
+        assert line not in card and "Added to the page" not in card
+        assert h.notion.read_body(page["id"]) == [DETAILS]
+        assert people == [{"id": ALICE_NOTION}]
+    else:
+        assert line in card
+        assert h.notion.read_body(page["id"]) == [DETAILS, line]
+        assert people == []
+
+
+async def test_requesters_are_looked_up_once_across_tasks(harness):
+    """Fails if each task pages the Notion user list for the same requester again."""
+    h = harness
+    await start_task(h)
+    await start_task(h)
+
+    assert h.notion.count("list_users") == 1
+
+
+# --- retries run out ----------------------------------------------------------------------
+
+
+async def test_when_retries_run_out_after_the_page_exists_the_task_says_filed(harness):
+    """Fails if a task whose write succeeded but whose bookkeeping kept failing says it failed."""
+    h = harness
+    handle, _ = await start_task(h)
+    break_method(h.external_writes, "complete", TimeoutError("database blip"))
+
+    await approve(handle)
+    await h.wf_env.sleep(timedelta(minutes=2))  # past the retries and the reconcile timers
+    await wait_state(handle, "watching")
+
+    assert len(h.notion.all_pages(DB_ID)) == 1
+    assert len(thread_posts(h, "Filed: New monitor")) == 1
+    assert thread_posts(h, "couldn't") == []
+
+
+async def test_when_retries_run_out_and_nothing_can_be_seen_the_task_says_it_cannot_confirm(
+    harness,
+):
+    """Fails if an exhausted write is reported as not filed, or the tracker is not named."""
+    h = harness
+    handle, _ = await start_task(h)
+    break_method(h.notion, "create_page", TimeoutError("notion is slow"))
+
+    await approve(handle)
+    assert await handle.result() == "failed"
+
+    texts = [p["text"] for p in h.slack.posts() if p["thread_ts"]]
+    tracker = f"https://www.notion.so/{DB_ID.replace('-', '')}"
+    assert f"I couldn't confirm whether it was filed; please check {tracker}" in texts
+    assert not any("nothing was filed" in t.lower() for t in texts)
+
+
+# --- comments -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("which", ["another_author", "short_reference"])
+async def test_only_the_integrations_own_comment_with_the_full_reference_counts(harness, which):
+    """Fails if someone else's comment, or a prefix of the reference, stops the comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "comment")
+    ref = comment_ref(f"{task_id}:comment")
+    if which == "another_author":
+        h.notion.add_comment_by(page["id"], f"quoting {ref}", "someone-else")
+    else:
+        h.notion.add_comment_by(page["id"], f"quoting {ref[:12]}", h.notion.bot_id)
+
+    comment_id = await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id)
+
+    mine = [c for c in h.notion.comments[page["id"].replace("-", "")] if c["id"] == comment_id]
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 2
+    assert ref in mine[0]["rich_text"][0]["text"]["content"]
+
+
+async def test_a_comment_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a comment whose response was lost posts it a second time."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "comment-lost")
+    h.notion.delay_visibility(1)
+    h.notion.fail_after_write("comment")
+    with pytest.raises(TimeoutError):
+        await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id)
+
+    await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id)
+
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1

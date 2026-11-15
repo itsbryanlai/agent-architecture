@@ -154,9 +154,10 @@ class NotionItem:
 # item; the approval card shows a field in a section field (2000) or a section's
 # text (3000) behind a bold label, with ``&``, ``<`` and ``>`` encoded.
 NOTION_TEXT_MAX = 2000
-# What a comment's signature ("— <agent name>, ref <8 hex>") may add.
+# What a comment's signature ("— <agent name>, ref <64 hex>") may add: 4 characters
+# before the name, 6 between name and ref, 64 for the ref, so 100 leaves 26 for the name.
 COMMENT_SIGNATURE_MAX = 100
-SIGNATURE_NAME_MAX = 60
+SIGNATURE_NAME_MAX = 26
 
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's

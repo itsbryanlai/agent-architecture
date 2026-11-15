@@ -13,10 +13,14 @@ Rules this workflow keeps:
   window starts again from each edit.
 * A comment may only target a page in a database the agent was granted. That
   is checked before the card is posted and again before the comment is made.
-* Exactly once. The item is created with the idempotency key
-  ``{task_id}:create`` (a comment with ``{task_id}:comment``); the connector
-  looks for that key before writing, so a retried activity finds what it
-  already made.
+* Exactly once, by the write activities and their lease in Postgres (see
+  ``agentos.activities``): one attempt at a time writes, and a retry returns what the
+  earlier attempt stored or finds it by its key (``{task_id}:create``, a comment
+  ``{task_id}:comment``). This workflow adds the last step. When the activity's retries
+  run out, a failure may still hide a write that happened, so the task looks for the
+  item a few times, with timers between, before it speaks. If it is found, the task
+  carries on as filed. If it is not, the task says it could not confirm and points to
+  the tracker. It never says nothing was filed after retries ran out.
 * Logs carry IDs only, never the comment, the title or the details.
 * History stays small: after creation the workflow keeps only the item's page
   ID, title, URL and last status.
@@ -28,6 +32,7 @@ import dataclasses
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
@@ -45,9 +50,22 @@ with workflow.unsafe.imports_passed_through():
         check_field,
     )
     from agentos.slack_format import escape_slack
-    from agentos.workflows import ACTIVITY_TIMEOUT, RETRY
+    from agentos.workflows import (
+        ACTIVITY_TIMEOUT,
+        RECONCILE_INTERVAL,
+        RECONCILE_TRIES,
+        RETRY,
+        WRITE_HEARTBEAT_TIMEOUT,
+        WRITE_TIMEOUT,
+    )
 
 MAX_EDITS = 5
+
+# Histories recorded before the reconcile step ran the write with no heartbeat and
+# reported every exhausted retry as a failure. They replay on that path.
+RECONCILE_PATCH = "reconcile-on-exhaustion"
+# One look per call: this workflow owns the retries, with a timer between.
+RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
 
 STATES = ("awaiting_approval", "executing", "watching", "done", "cancelled", "expired", "failed")
 
@@ -245,20 +263,40 @@ class TaskWorkflow:
         # --- execute exactly once ------------------------------------------------
         self._state = "executing"
         try:
-            item: NotionItem = await self._act(AgentActivities.create_notion_item, spec, task_id)
+            item: NotionItem = await self._act_write(
+                AgentActivities.create_notion_item, spec, task_id
+            )
         except ActivityError as err:
-            reason = _reason(err)
-            await self._try(
-                AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
-            )
-            await self._try(
-                AgentActivities.post_in_thread,
-                ctx,
-                f"I couldn't file '{escape_slack(title)}': {escape_slack(reason)}",
-                f"{task_id}:failed",
-            )
-            self._state = "failed"
-            return self._state
+            found = None
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(AgentActivities.reconcile_notion_item, spec, task_id)
+                if found is None:
+                    tracker = f"https://www.notion.so/{normalize_id(spec.payload['database_id'])}"
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._try(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        f"I couldn't confirm whether it was filed; please check {tracker}",
+                        f"{task_id}:failed",
+                    )
+                    self._state = "failed"
+                    return self._state
+            if found is None:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._try(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    f"I couldn't file '{escape_slack(title)}': {escape_slack(reason)}",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                return self._state
+            item = found
 
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Submitted")
         await self._try(
@@ -350,20 +388,38 @@ class TaskWorkflow:
         self._state = "executing"
         title = spec.payload["item_title"]
         try:
-            await self._act(AgentActivities.add_notion_comment, spec, task_id)
+            await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
-            reason = _reason(err)
-            await self._try(
-                AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
-            )
-            await self._try(
-                AgentActivities.post_in_thread,
-                ctx,
-                f"I couldn't comment on '{escape_slack(title)}': {escape_slack(reason)}",
-                f"{task_id}:failed",
-            )
-            self._state = "failed"
-            return self._state
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_notion_comment, spec, task_id
+                )
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._try(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        "I couldn't confirm whether the comment was posted; "
+                        f"please check {spec.payload['item_url']}",
+                        f"{task_id}:failed",
+                    )
+                    self._state = "failed"
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._try(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    f"I couldn't comment on '{escape_slack(title)}': {escape_slack(reason)}",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                return self._state
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
         await self._try(
             AgentActivities.post_in_thread,
@@ -380,6 +436,40 @@ class TaskWorkflow:
             await self._act(method, *args)
         except ActivityError:
             workflow.logger.warning("activity %s failed after retries; continuing", method.__name__)
+
+    async def _act_write(self, method, *args):
+        """Run an approved write. New histories heartbeat it, so a stuck attempt is cancelled."""
+        if not workflow.patched(RECONCILE_PATCH):
+            return await self._act(method, *args)
+        return await workflow.execute_activity_method(
+            method,
+            args=list(args),
+            start_to_close_timeout=WRITE_TIMEOUT,
+            heartbeat_timeout=WRITE_HEARTBEAT_TIMEOUT,
+            retry_policy=RETRY,
+        )
+
+    async def _reconcile(self, method, spec: TaskSpec, task_id: str):
+        """Look for a write whose retries ran out: a few tries, a timer between them.
+
+        Returns what the activity found, or None when no look found it. A look that fails
+        counts as not found: the answer is then "could not confirm", never "not filed".
+        """
+        for attempt in range(RECONCILE_TRIES):
+            if attempt:
+                await workflow.sleep(RECONCILE_INTERVAL)
+            try:
+                found = await workflow.execute_activity_method(
+                    method,
+                    args=[spec, task_id],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RECONCILE_RETRY,
+                )
+            except ActivityError:
+                continue
+            if found is not None:
+                return found
+        return None
 
     async def _act(self, method, *args):
         return await workflow.execute_activity_method(

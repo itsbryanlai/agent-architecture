@@ -183,7 +183,7 @@ async def test_comment_runs_once_after_lost_response(harness):
     page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
     handle = await start(h, comment_spec(page["id"], "Please prioritise this."))
     await wait_state(handle, "awaiting_approval")
-    h.notion.fail_next_comment_after_write()
+    h.notion.fail_after_write("comment")
 
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
 

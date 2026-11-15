@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 017 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 018 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -646,6 +646,30 @@ REVOKE ALL ON FUNCTION list_tenants() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION tenant_for_slack_team(text) TO agentos_app;
 GRANT EXECUTE ON FUNCTION list_tenants() TO agentos_app;
 
+-- External writes: which attempt may write to an outside system for one key, and what it returned. Same as migration 018.
+CREATE TABLE IF NOT EXISTS external_writes (
+  tenant_id   text        NOT NULL,
+  idem_key    text        NOT NULL,
+  state       text        NOT NULL CHECK (state IN ('claimed', 'issued', 'done')),
+  result_ref  text,
+  lease_until timestamptz NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, idem_key),
+  CONSTRAINT external_writes_result_when_done CHECK ((state = 'done') = (result_ref IS NOT NULL))
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON external_writes FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON external_writes TO agentos_app;
+
+ALTER TABLE external_writes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE external_writes FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON external_writes;
+CREATE POLICY tenant_isolation ON external_writes
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -657,5 +681,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018')
 ON CONFLICT DO NOTHING;

@@ -1,34 +1,55 @@
 """Notion connector.
 
 The agent acts with its own access, never the asker's: every call uses the
-tenant's single Notion integration token, and every call is checked against
-the agent's grants (the database IDs it was given) *before* anything is sent to
-Notion. A call outside the grants raises ``GrantDenied`` and no request goes
-out. Activities turn ``ConnectorError``s into non-retryable failures.
+tenant's single Notion integration token. A call that names a database (a
+search, a create) is checked against the agent's grants (the database IDs it
+was given) *before* anything is sent to Notion; outside the grants it raises
+``GrantDenied`` and no request goes out. A call that names a page by link or
+ID cannot be checked first, because Notion tells a page's database only when
+the page is fetched. It is fetched, its database is checked, and a page that
+is missing, not shared with the integration or not in a granted database all
+raise the same ``UnknownItem``, so the answer never reveals whether an
+ungranted page exists. Activities turn ``ConnectorError``s into non-retryable
+failures.
 
 Requester-scoped reads ("my items") take the requester's email from the
 runtime, which got it from Slack. The LLM never supplies it.
 
-Item creation is exactly-once. Notion has no idempotency key, so every item the
-agent creates carries the key in a hidden text property, and the connector
-queries for that key before creating. A retry after a lost response finds the
-item it already made instead of making a second one.
+Notion has no idempotency key, so a write is made findable instead: every item
+the agent creates carries its key in a hidden text property, and every comment
+ends with a reference derived from its key. The connector offers the pieces
+(``find_item``, ``create_item``, ``find_comment``, ``create_comment``). The
+write activities in ``agentos.activities`` order them, behind a lease in
+Postgres, so that one attempt at a time writes and a retry finds what an
+earlier attempt made. Notion's search can lag behind a write by seconds, which
+is why the lease and the result stored under it, not the search alone, carry
+the guarantee.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import re
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
 from agentos.models import NOTION_TEXT_MAX, SIGNATURE_NAME_MAX, NotionItem
 
+if TYPE_CHECKING:
+    import httpx
+
 LLM_TOOLS = ("search_items", "my_items", "create_item", "add_comment")
+
+# One Notion request may take this long. It stays under the activity timeouts, so a
+# slow Notion fails the attempt, and Temporal's retry policy decides what happens next.
+REQUEST_TIMEOUT_MS = 10_000
 
 
 class ConnectorError(Exception):
@@ -60,6 +81,11 @@ def _page_id_from_ref(ref: str) -> str | None:
     path = (ref or "").strip().split("?")[0].split("#")[0]
     found = _DASHED_ID.findall(path) or _PLAIN_ID.findall(path)
     return normalize_id(found[-1]) if found else None
+
+
+def comment_ref(idem_key: str) -> str:
+    """The reference a comment ends with: the whole digest of its key, never a prefix."""
+    return "ref " + hashlib.sha256(idem_key.encode()).hexdigest()
 
 
 def normalize_id(notion_id: str) -> str:
@@ -100,6 +126,10 @@ class NotionAPI(Protocol):
 
     async def list_users(self) -> list[dict]: ...
 
+    async def bot_user_id(self) -> str:
+        """The ID of the integration's own bot user (the author of its comments)."""
+        ...
+
     async def create_comment(self, page_id: str, text: str) -> dict:
         """Add a comment to a page (needs the "Insert comments" capability)."""
         ...
@@ -125,12 +155,24 @@ class RealNotionAPI:
     The client speaks the Notion API version in which a database holds one or
     more data sources: queries and page creation go through the database's data
     sources, which are looked up once per database.
+
+    One layer owns retries, and it is Temporal's. The SDK's own retries on 429
+    and 5xx are off, and each request has a timeout well under the activity
+    timeout, so a slow Notion fails the attempt instead of keeping it running.
+    ``http_client`` lets a test supply a client with a mocked transport.
     """
 
-    def __init__(self, token: str):
+    def __init__(
+        self,
+        token: str,
+        timeout_ms: int = REQUEST_TIMEOUT_MS,
+        http_client: httpx.AsyncClient | None = None,
+    ):
         from notion_client import AsyncClient
 
-        self._client = AsyncClient(auth=token)
+        self._client = AsyncClient(
+            auth=token, timeout_ms=timeout_ms, retry=False, client=http_client
+        )
         self._data_sources: dict[str, list[str]] = {}
 
     async def _data_source_ids(self, database_id: str) -> list[str]:
@@ -225,6 +267,9 @@ class RealNotionAPI:
             cursor = resp.get("next_cursor")
         return comments
 
+    async def bot_user_id(self) -> str:
+        return (await self._client.users.me())["id"]
+
     async def list_users(self) -> list[dict]:
         users: list[dict] = []
         cursor = None
@@ -261,24 +306,53 @@ class FakeNotionAPI:
         # block by normalized ID, for parent walks.
         self.children: dict[str, list[dict]] = {}
         self.blocks: dict[str, dict] = {}
-        self._fail_next_create = False
-        self._fail_next_comment = False
         self.comments: dict[str, list[dict]] = {}
         self._fail_next_query: Exception | None = None
+        # The body blocks of pages created through ``create_page``, by page ID.
+        self.bodies: dict[str, list[dict]] = {}
+        self.bot_id = "notion-bot"
+        # Injection points for the failures a write meets in production. See the methods.
+        self._fail_after_write = {"create": 0, "comment": 0}
+        self._hang_after_write: dict[str, list[Hang]] = {"create": [], "comment": []}
+        self._visibility_delay = 0
+        self._hidden: dict[str, int] = {}
+        self._hidden_comments: dict[str, int] = {}
 
     # Test hooks.
+
+    def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
+        """The next ``times`` writes of ``kind`` ("create" or "comment") take effect and
+        then raise a timeout, as when the response is lost."""
+        self._fail_after_write[kind] = times
+
+    def hang_after_write(self, kind: str = "create") -> Hang:
+        """The next write of ``kind`` takes effect, then waits until the returned ``Hang``
+        is released. Another write meanwhile runs normally: this is how two attempts
+        overlap."""
+        hang = Hang()
+        self._hang_after_write[kind].append(hang)
+        return hang
+
+    def delay_visibility(self, calls: int) -> None:
+        """A page or comment created from now on is left out of the next ``calls`` queries
+        (``query_database``, ``list_comments``), as when Notion's search lags a write."""
+        self._visibility_delay = calls
+
+    def read_body(self, page_id: str) -> list[str]:
+        """The text of each body block of a page created through ``create_page``."""
+        return [
+            "".join(t["text"]["content"] for t in block[block["type"]]["rich_text"])
+            for block in self.bodies.get(normalize_id(page_id), [])
+        ]
+
+    def add_comment_by(self, page_id: str, text: str, author_id: str) -> dict:
+        """Store a comment written by someone other than the integration."""
+        comment = self._store_comment(page_id, text, author_id)
+        return copy.deepcopy(comment)
 
     def fail_next_query(self, error: Exception) -> None:
         """Make the next query_database raise ``error``."""
         self._fail_next_query = error
-
-    def fail_next_create_after_write(self) -> None:
-        """Make the next create store the page, then raise a timeout."""
-        self._fail_next_create = True
-
-    def fail_next_comment_after_write(self) -> None:
-        """Make the next comment be stored, then raise a timeout."""
-        self._fail_next_comment = True
 
     def add_database(self, database_id: str) -> None:
         self.databases.setdefault(normalize_id(database_id), {})
@@ -412,7 +486,13 @@ class FakeNotionAPI:
         db_key = normalize_id(database_id)
         name = self._name_for_id(db_key, filter["property"]) if filter else None
         pages = self.databases.get(db_key, {}).values()
-        return [copy.deepcopy(p) for p in pages if _matches(p, name, filter)]
+        found = [
+            copy.deepcopy(p)
+            for p in pages
+            if p["id"] not in self._hidden and _matches(p, name, filter)
+        ]
+        self._tick(self._hidden)
+        return found
 
     async def create_page(self, database_id: str, properties: dict, children: list[dict]) -> dict:
         self.calls.append(("create_page", {"database_id": database_id, "properties": properties}))
@@ -426,9 +506,10 @@ class FakeNotionAPI:
             for item in child[child["type"]]["rich_text"]:
                 _check_text_length(item["text"]["content"])
         page = self.add_page(database_id, properties)
-        if self._fail_next_create:
-            self._fail_next_create = False
-            raise TimeoutError("simulated lost response after the page was created")
+        self.bodies[normalize_id(page["id"])] = copy.deepcopy(children)
+        if self._visibility_delay:
+            self._hidden[page["id"]] = self._visibility_delay
+        await self._after_write("create")
         return page
 
     async def retrieve_page(self, page_id: str) -> dict:
@@ -458,20 +539,50 @@ class FakeNotionAPI:
     async def create_comment(self, page_id: str, text: str) -> dict:
         self.calls.append(("create_comment", {"page_id": page_id}))
         _check_text_length(text)
-        comment = {
-            "object": "comment",
-            "id": str(uuid.uuid4()),
-            "rich_text": [_rich({"text": {"content": text}})],
-        }
-        self.comments.setdefault(normalize_id(page_id), []).append(comment)
-        if self._fail_next_comment:
-            self._fail_next_comment = False
-            raise TimeoutError("simulated lost response after the comment was created")
+        comment = self._store_comment(page_id, text, self.bot_id)
+        if self._visibility_delay:
+            self._hidden_comments[comment["id"]] = self._visibility_delay
+        await self._after_write("comment")
         return copy.deepcopy(comment)
 
     async def list_comments(self, page_id: str) -> list[dict]:
         self.calls.append(("list_comments", {"page_id": page_id}))
-        return copy.deepcopy(self.comments.get(normalize_id(page_id), []))
+        found = [
+            copy.deepcopy(c)
+            for c in self.comments.get(normalize_id(page_id), [])
+            if c["id"] not in self._hidden_comments
+        ]
+        self._tick(self._hidden_comments)
+        return found
+
+    async def bot_user_id(self) -> str:
+        self.calls.append(("bot_user_id", {}))
+        return self.bot_id
+
+    def _store_comment(self, page_id: str, text: str, author_id: str) -> dict:
+        comment = {
+            "object": "comment",
+            "id": str(uuid.uuid4()),
+            "created_by": {"object": "user", "id": author_id},
+            "rich_text": [_rich({"text": {"content": text}})],
+        }
+        self.comments.setdefault(normalize_id(page_id), []).append(comment)
+        return comment
+
+    async def _after_write(self, kind: str) -> None:
+        """Run the injected failure of a write that has already taken effect."""
+        if self._hang_after_write[kind]:
+            await self._hang_after_write[kind].pop(0).wait()
+        if self._fail_after_write[kind]:
+            self._fail_after_write[kind] -= 1
+            raise TimeoutError(f"simulated lost response after the {kind} took effect")
+
+    @staticmethod
+    def _tick(hidden: dict[str, int]) -> None:
+        for key in list(hidden):
+            hidden[key] -= 1
+            if hidden[key] <= 0:
+                del hidden[key]
 
     async def list_users(self) -> list[dict]:
         self.calls.append(("list_users", {}))
@@ -520,6 +631,21 @@ class FakeNotionAPI:
                 shaped = copy.deepcopy(value)
             out[name] = {"id": prop_id, **shaped}
         return out
+
+
+class Hang:
+    """A write held open until a test lets it go. ``reached`` is set once it is waiting."""
+
+    def __init__(self) -> None:
+        self.reached = asyncio.Event()
+        self._gate = asyncio.Event()
+
+    def release(self) -> None:
+        self._gate.set()
+
+    async def wait(self) -> None:
+        self.reached.set()
+        await self._gate.wait()
 
 
 class FakeNotFound(KeyError):
@@ -721,7 +847,62 @@ async def check_page_grant(api: NotionAPI, grant: NotionPageGrant) -> list[str]:
     return []
 
 
+# --- Per-tenant directory cache ------------------------------------------------
+
+USER_CACHE_TTL_SECONDS = 600.0
+
+
+class NotionUserCache:
+    """What one tenant's Notion workspace says about people, kept for a while.
+
+    One instance lives in the tenant's runtime, so every connector built for a call
+    shares it. A lookup of a person reads the whole user list once and keeps it
+    as an email-to-ID map until it expires. An email missing from the map is a
+    cached "no match" for the same time, so a requester with no Notion account
+    does not page the user list again on every call. The integration's own bot
+    user ID is kept the same way.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = USER_CACHE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._ttl = ttl_seconds
+        self._clock = clock
+        self._users: dict[str, str] | None = None
+        self._users_until = 0.0
+        self._bot: str | None = None
+        self._bot_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def user_id(self, api: NotionAPI, email: str | None) -> str | None:
+        """The Notion user ID for an email, or None when the workspace has no such person."""
+        if not email:
+            return None
+        key = email.strip().lower()
+        async with self._lock:
+            if self._users is None or self._clock() >= self._users_until:
+                users: dict[str, str] = {}
+                for user in await api.list_users():
+                    person_email = ((user.get("person") or {}).get("email") or "").strip().lower()
+                    if person_email:
+                        users.setdefault(person_email, user["id"])
+                self._users = users
+                self._users_until = self._clock() + self._ttl
+            return self._users.get(key)
+
+    async def bot_id(self, api: NotionAPI) -> str:
+        async with self._lock:
+            if self._bot is None or self._clock() >= self._bot_until:
+                self._bot = await api.bot_user_id()
+                self._bot_until = self._clock() + self._ttl
+            return self._bot
+
+
 # --- Connector ----------------------------------------------------------------
+
+UNKNOWN_PAGE_TEXT = "I couldn't open that Notion page."
 
 
 class NotionConnector:
@@ -730,6 +911,7 @@ class NotionConnector:
         api: NotionAPI,
         grants: list[NotionDatabaseGrant],
         manifest: Manifest | None = None,
+        users: NotionUserCache | None = None,
     ):
         for g in grants:
             missing = g.missing_property_ids()
@@ -741,7 +923,7 @@ class NotionConnector:
         self._api = api
         self._grants = {normalize_id(g.id): g for g in grants}
         self.manifest = manifest or load_manifest(MANIFEST_DIR / "notion.yaml")
-        self._user_ids: dict[str, str | None] = {}
+        self.users = users or NotionUserCache()
 
     @property
     def grants(self) -> list[NotionDatabaseGrant]:
@@ -785,83 +967,102 @@ class NotionConnector:
             items.extend(self._to_item(grant, p) for p in pages)
         return items
 
+    async def find_item(self, database_id: str, idem_key: str) -> NotionItem | None:
+        """The item an earlier attempt created under ``idem_key``, if Notion shows it yet."""
+        grant = self.grant_for(database_id)
+        existing = await self._api.query_database(
+            grant.id, {"property": grant.request_id_prop_id, "rich_text": {"equals": idem_key}}
+        )
+        return self._to_item(grant, existing[0]) if existing else None
+
     async def create_item(
         self,
         database_id: str,
         title: str,
         details: str,
-        requester_email: str | None,
         idem_key: str,
+        notion_user_id: str | None = None,
+        requester_line: str | None = None,
     ) -> NotionItem:
+        """Create the page. It does not look for an earlier one: see ``find_item``.
+
+        ``notion_user_id`` fills the requester property. ``requester_line`` is the
+        sentence "Requested by <name> via <agent>" that goes into the body when the
+        requester has no Notion user. Both come from the runtime, already shown on
+        the approval card.
+        """
         grant = self.grant_for(database_id)
         if max(len(title), len(details)) > NOTION_TEXT_MAX:
             raise ConnectorError(f"The title or details are over Notion's {NOTION_TEXT_MAX}.")
-        existing = await self._api.query_database(
-            grant.id, {"property": grant.request_id_prop_id, "rich_text": {"equals": idem_key}}
-        )
-        if existing:
-            return self._to_item(grant, existing[0])
-
         properties: dict = {
             grant.title_prop_id: {"title": [{"text": {"content": title}}]},
             grant.request_id_prop_id: {"rich_text": [{"text": {"content": idem_key}}]},
         }
-        user_id = await self._notion_user_id(requester_email) if requester_email else None
-        if user_id:
-            properties[grant.requested_by_prop_id] = {"people": [{"id": user_id}]}
+        if notion_user_id:
+            properties[grant.requested_by_prop_id] = {"people": [{"id": notion_user_id}]}
+        texts = [details] + ([requester_line] if requester_line else [])
         children = [
             {
                 "object": "block",
                 "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": details}}]},
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
             }
+            for text in texts
         ]
         page = await self._api.create_page(grant.id, properties, children)
         return self._to_item(grant, page)
 
     async def get_item(self, page_id: str) -> NotionItem:
-        page = await self._api.retrieve_page(page_id)
-        if page.get("in_trash") or page.get("archived"):
-            raise UnknownItem("The item was moved to the trash.")
-        parent_db = (page.get("parent") or {}).get("database_id") or ""
-        grant = self.grant_for(parent_db)
-        return self._to_item(grant, page)
+        """One item of a granted database; see ``resolve_item`` for what is hidden."""
+        return (await self._granted_page(page_id))[1]
 
     async def resolve_item(self, item_ref: str) -> NotionItem:
         """Find the page a link or ID names, and check its database is granted.
 
         The grant is checked from the page's own parent database before the
-        caller may write anything. A page outside the granted databases (or one
-        that is not in a database at all) raises ``GrantDenied``.
+        caller may write anything. A page that is not in a granted database
+        (or not in a database at all) raises the same ``UnknownItem`` as a page
+        that does not exist, so the answer does not say whether it exists.
         """
         page_id = _page_id_from_ref(item_ref)
         if page_id is None:
             raise UnknownItem("I couldn't find a Notion page in that link or ID.")
+        grant, item = await self._granted_page(page_id)
+        item.database_id = grant.id
+        return item
+
+    async def _granted_page(self, page_id: str) -> tuple[NotionDatabaseGrant, NotionItem]:
         try:
             page = await self._api.retrieve_page(page_id)
         except Exception as err:
             if is_unreachable(err):
-                raise UnknownItem("I couldn't open that Notion page.") from err
+                raise UnknownItem(UNKNOWN_PAGE_TEXT) from err
             raise
-        parent_db = (page.get("parent") or {}).get("database_id") or ""
-        grant = self.grant_for(parent_db)
-        item = self._to_item(grant, page)
-        item.database_id = grant.id
-        return item
+        grant = self._grants.get(normalize_id((page.get("parent") or {}).get("database_id") or ""))
+        if grant is None:
+            raise UnknownItem(UNKNOWN_PAGE_TEXT)
+        if page.get("in_trash") or page.get("archived"):
+            raise UnknownItem("The item was moved to the trash.")
+        return grant, self._to_item(grant, page)
 
-    async def add_comment(self, page_id: str, text: str, idem_key: str, agent_name: str) -> str:
-        """Comment on a granted page exactly once; return the comment ID.
+    async def find_comment(self, page_id: str, idem_key: str) -> str | None:
+        """The ID of the comment an earlier attempt made under ``idem_key``, if visible.
 
-        The comment ends with a short ref derived from ``idem_key``. Before
-        posting, the page's comments are searched for that ref, so a retry after
-        a lost response finds the comment it already made.
+        Only comments written by this integration count, and the whole reference must
+        match: anyone else's comment that quotes the reference proves nothing.
         """
-        await self.resolve_item(page_id)
-        ref = "ref " + hashlib.sha256(idem_key.encode()).hexdigest()[:8]
+        ref = comment_ref(idem_key)
+        bot = await self.users.bot_id(self._api)
         for comment in await self._api.list_comments(page_id):
+            if (comment.get("created_by") or {}).get("id") != bot:
+                continue
             if ref in _plain(comment.get("rich_text", [])):
                 return comment["id"]
-        body = f"{text}\n\n— {agent_name[:SIGNATURE_NAME_MAX]}, {ref}"
+        return None
+
+    async def create_comment(self, page_id: str, text: str, idem_key: str, agent_name: str) -> str:
+        """Add the comment, ending with the agent's name and the key's reference."""
+        body = f"{text}\n\n— {agent_name[:SIGNATURE_NAME_MAX]}, {comment_ref(idem_key)}"
         if len(body) > NOTION_TEXT_MAX:
             raise ConnectorError(
                 f"The comment is {len(body)} characters with its signature; "
@@ -871,18 +1072,7 @@ class NotionConnector:
         return created["id"]
 
     async def _notion_user_id(self, email: str | None) -> str | None:
-        if not email:
-            return None
-        key = email.strip().lower()
-        if key not in self._user_ids:
-            match = None
-            for user in await self._api.list_users():
-                person_email = ((user.get("person") or {}).get("email") or "").strip().lower()
-                if person_email and person_email == key:
-                    match = user["id"]
-                    break
-            self._user_ids[key] = match
-        return self._user_ids[key]
+        return await self.users.user_id(self._api, email)
 
     @staticmethod
     def _to_item(grant: NotionDatabaseGrant, page: dict) -> NotionItem:

@@ -30,9 +30,6 @@ import yaml
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
-# The app connects as agentos_app, which cannot bypass row-level security. The
-# password is a local development value, like the Compose one.
-DEFAULT_DATABASE_URL = "postgresql://agentos_app:agentos_app@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
 # Model prices in US dollars per million tokens, used to cost each model call.
 DEFAULT_PRICES_PATH = "config/prices.yaml"
@@ -71,6 +68,10 @@ class ConfigError(ValueError):
     """The agents file or a setting is malformed or incomplete."""
 
 
+# Settings whose variable is not the upper-cased field name.
+_ENV_NAMES = {"database_url": "AGENTOS_DATABASE_URL"}
+
+
 @dataclass(frozen=True)
 class Settings:
     # Secret values are excluded from repr so that logging a Settings object
@@ -102,7 +103,10 @@ class Settings:
     embed_base_url: str | None = None
     embed_api_key: str | None = field(default=None, repr=False)
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
-    database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
+    # The app connects as agentos_app, which cannot bypass row-level security. There is no
+    # default: the URL holds the role's password, which the operator exports and no file
+    # in the repository carries.
+    database_url: str | None = field(default=None, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
     prices_path: str = DEFAULT_PRICES_PATH
     # Sign in with Slack for the web console: the Slack app's client ID and secret,
@@ -119,7 +123,7 @@ class Settings:
         """
         value = getattr(self, name)
         if not value:
-            env_name = name.upper()
+            env_name = _ENV_NAMES.get(name, name.upper())
             raise RuntimeError(
                 f"{env_name} is not set. Export it in the shell that runs this process."
             )
@@ -156,7 +160,7 @@ def load_settings() -> Settings:
         embed_base_url=env.get("AGENTOS_EMBED_BASE_URL") or None,
         embed_api_key=env.get("EMBED_API_KEY") or None,
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
-        database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
+        database_url=env.get("AGENTOS_DATABASE_URL") or None,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
         prices_path=env.get("AGENTOS_PRICES") or DEFAULT_PRICES_PATH,
         slack_client_id=env.get("SLACK_CLIENT_ID") or None,

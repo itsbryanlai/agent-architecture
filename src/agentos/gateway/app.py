@@ -582,6 +582,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings
     from agentos.crypto_keys import LocalKeyStore, startup_key_failure
+    from agentos.schema_version import require_current_schema
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
     from agentos.switches import PostgresSwitchStore
@@ -593,10 +594,11 @@ async def _real_lifespan(app: FastAPI):
     settings = load_settings()
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
     client = await build_temporal_client(settings)
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     agent_store = PostgresAgentStore(pool)
     try:
+        await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
         key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)

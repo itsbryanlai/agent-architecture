@@ -176,7 +176,7 @@ class PostgresBudgetStore:
                 f"""
                 INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by)
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT (tenant_id, (COALESCE(agent_id, ''))) DO UPDATE
+                ON CONFLICT (tenant_id, scope) DO UPDATE
                 SET amount_usd = EXCLUDED.amount_usd,
                     updated_by = EXCLUDED.updated_by,
                     updated_at = now()
@@ -192,7 +192,7 @@ class PostgresBudgetStore:
             cur = await conn.execute(
                 """
                 DELETE FROM budgets
-                WHERE tenant_id = %s AND COALESCE(agent_id, '') = %s
+                WHERE tenant_id = %s AND scope = %s
                 RETURNING tenant_id
                 """,
                 (tenant_id, agent_id or ""),

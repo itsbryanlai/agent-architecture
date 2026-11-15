@@ -42,6 +42,7 @@ from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
+from agentos.schema_version import require_current_schema
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
     PostgresHistoryStore,
@@ -208,9 +209,10 @@ async def main() -> None:
     settings = load_settings()
     llm = build_llm(settings)
     prices = load_prices(settings.prices_path)
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     try:
+        await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
         keys = LocalKeyStore(settings.key_dir)

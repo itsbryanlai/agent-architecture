@@ -462,7 +462,7 @@ async def run_import() -> int:
     except (ConfigError, OSError) as err:
         print(f"cannot read the tenant YAML: {err}")
         return 1
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     failed = False
     try:

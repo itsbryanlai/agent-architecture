@@ -382,11 +382,11 @@ async def run(args: argparse.Namespace) -> int:
     from agentos.tenant_store import load_stored_tenants
 
     settings = load_settings()
-    tenants = await load_stored_tenants(settings.database_url)
+    tenants = await load_stored_tenants(settings.require("database_url"))
     if args.tenant not in tenants.tenants:
         print(f"unknown tenant '{args.tenant}'; configured: {', '.join(tenants.tenants)}")
         return 2
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
     await pool.open()
     try:
         store = PostgresSwitchStore(pool)

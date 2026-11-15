@@ -26,7 +26,7 @@ from agentos.config import (
     TenantsConfig,
     read_secret,
 )
-from agentos.connectors.notion import NotionAPI, normalize_id
+from agentos.connectors.notion import NotionAPI, NotionUserCache, normalize_id
 from agentos.slack_client import SlackPoster
 from agentos.tenant_store import TenantSource
 
@@ -49,6 +49,9 @@ class TenantRuntime:
     # The clients hold tokens, so they stay out of repr.
     slack: SlackPoster = field(repr=False)
     notion_api: NotionAPI = field(repr=False)
+    # What this tenant's Notion workspace says about people. Shared by every connector built
+    # for the tenant, so a requester is looked up once per cache lifetime, not once per call.
+    notion_users: NotionUserCache = field(default_factory=NotionUserCache, repr=False)
 
 
 def runtime_for(config: AgentsConfig, slack: SlackPoster, notion_api: NotionAPI) -> TenantRuntime:

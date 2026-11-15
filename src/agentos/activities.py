@@ -15,6 +15,14 @@ Rules kept here:
   filled in from the Slack event. Requester-scoped tool fields (the person
   whose records are read) are filled in here, never by the LLM.
 * Connector errors that a retry cannot fix become non-retryable failures.
+* An approved Notion write (a new item, a comment) is made exactly once. Notion has no
+  idempotency key and its search lags a write, so Postgres decides which attempt writes:
+  the activity claims the key in ``external_writes`` with a lease, sends the write, and
+  stores the result in the same activity. A retry returns the stored result; an attempt
+  that finds a live lease writes nothing and fails with a retryable "in progress" error;
+  an attempt that takes over from one that may have sent the write looks for it before
+  writing again. The requester's Notion user is resolved when the card is posted, and the
+  line that goes into the page body when there is none is shown on that card.
 * Slack posts are idempotent: the posted ``ts`` is stored under an idempotency
   key, and a repeat call with the same key returns it without posting again.
 * Tool output text is stored by the activity that ran the tool and is put into
@@ -37,9 +45,12 @@ Rules kept here:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -82,7 +93,14 @@ from agentos.models import (
 )
 from agentos.slack_client import SlackLookupError
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
-from agentos.stores import HistoryStore, IdempotencyStore, TaskLinkStore, ToolOutputStore
+from agentos.stores import (
+    ExternalWriteStore,
+    HistoryStore,
+    IdempotencyStore,
+    InMemoryExternalWriteStore,
+    TaskLinkStore,
+    ToolOutputStore,
+)
 from agentos.switches import (
     NOTION,
     SWITCHED_OFF,
@@ -98,12 +116,46 @@ from agentos.switches import (
 )
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
 from agentos.usage import UsageRecorder
+from agentos.workflows import WRITE_LEASE_SECONDS
 
 log = logging.getLogger("agentos.activities")
 
 READ_TOOLS = ("search_items", "my_items", "search_knowledge")
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
+
+# An attempt that takes over from one that may have sent a write looks for the result
+# this many times, this far apart, before it writes again. Notion's search can lag.
+VISIBILITY_TRIES = 4
+VISIBILITY_INTERVAL = 2.5
+# A retryable failure: another attempt holds the lease for this write.
+WRITE_IN_PROGRESS = "WriteInProgress"
+REQUESTER_NAME_MAX = 80
+
+T = TypeVar("T")
+
+
+def _beat() -> None:
+    """Tell Temporal the attempt is alive. A no-op outside an activity (a direct test call)."""
+    try:
+        activity.heartbeat()
+    except RuntimeError:
+        pass
+
+
+def requested_by_line(display_name: str, agent_name: str) -> str:
+    """The sentence a page carries when its requester has no Notion user."""
+    return f"Requested by {display_name[:REQUESTER_NAME_MAX]} via {agent_name[:REQUESTER_NAME_MAX]}"
+
+
+def _item_ref(item: NotionItem) -> str:
+    return json.dumps(
+        {"page_id": item.page_id, "url": item.url, "title": item.title, "status": item.status}
+    )
+
+
+def _item_from_ref(ref: str) -> NotionItem:
+    return NotionItem(**json.loads(ref))
 
 
 def _non_retryable(err: Exception) -> ApplicationError:
@@ -176,8 +228,12 @@ class AgentActivities:
         budgets: BudgetGuard | None = None,
         pauses: PauseStore | None = None,
         switches: SwitchStore | None = None,
+        external_writes: ExternalWriteStore | None = None,
     ):
         self.settings = settings
+        self.writes = external_writes or InMemoryExternalWriteStore()
+        self.visibility_tries = VISIBILITY_TRIES
+        self.visibility_interval = VISIBILITY_INTERVAL
         self.switches = switches or InMemorySwitchStore()
         self.usage = usage
         self.budgets = budgets
@@ -212,6 +268,8 @@ class AgentActivities:
             self.prepare_comment,
             self.add_notion_comment,
             self.create_notion_item,
+            self.reconcile_notion_comment,
+            self.reconcile_notion_item,
             self.get_notion_item,
             self.post_in_thread,
             self.record_hand_off,
@@ -259,7 +317,10 @@ class AgentActivities:
 
     def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
         """A connector limited to the grants of this version of the agent."""
-        return NotionConnector(self._runtime(tenant_id).notion_api, agent.grants.notion_databases)
+        runtime = self._runtime(tenant_id)
+        return NotionConnector(
+            runtime.notion_api, agent.grants.notion_databases, users=runtime.notion_users
+        )
 
     async def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
@@ -305,6 +366,79 @@ class AgentActivities:
         await self._record_approval(spec, task_id, target)
         await self._record_write(spec, task_id, idem_key, target, "error")
         raise _non_retryable(reason)
+
+    async def _requester(self, spec: TaskSpec, task_id: str, agent: AgentVersion) -> dict:
+        """Who asked, as Notion will show it: ``{"notion_user_id", "line"}``.
+
+        Resolved once per task, when the card is posted, and kept: the line the card shows
+        before approval is the line the page gets, and a lookup that changes in between
+        cannot change what was approved. The Notion user is the one whose email matches
+        the Slack profile email, from the tenant's cache. With none, ``line`` is the
+        sentence for the page body and ``notion_user_id`` is None.
+        """
+        ctx = spec.ctx
+        stored = await self.idem.get(ctx.tenant_id, f"{task_id}:requester")
+        if stored is not None:
+            return stored
+        runtime = self._runtime(ctx.tenant_id)
+        email = await runtime.slack.user_email(ctx.requester_user_id)
+        user_id = await runtime.notion_users.user_id(runtime.notion_api, email)
+        line = None
+        if user_id is None:
+            info = await runtime.slack.user_info(ctx.requester_user_id)
+            line = requested_by_line(
+                info.display_name or email or ctx.requester_user_id, agent.name
+            )
+        return await self.idem.put_if_absent(
+            ctx.tenant_id, f"{task_id}:requester", {"notion_user_id": user_id, "line": line}
+        )
+
+    async def _write_once(
+        self,
+        tenant_id: str,
+        idem_key: str,
+        find: Callable[[], Awaitable[T | None]],
+        write: Callable[[], Awaitable[T]],
+        to_ref: Callable[[T], str],
+        from_ref: Callable[[str], T],
+    ) -> T:
+        """Make one external write happen once, however many attempts run it.
+
+        A stored result is returned without touching the target. Otherwise the key is
+        claimed with a lease that outlasts the activity timeout. Another attempt's live
+        lease means this one writes nothing and fails with a retryable error. After a
+        claim that took over from an attempt that had sent the write, ``find`` is tried
+        a few times first, because the target's search can lag. Then the write is marked
+        as about to be sent, sent, and its result stored right away. Any failure ends
+        the lease at once so the retry does not wait for it, but keeps the mark, so that
+        retry looks before it writes.
+        """
+        claim = await self.writes.claim(tenant_id, idem_key, WRITE_LEASE_SECONDS)
+        if claim.status == "done":
+            return from_ref(claim.result_ref)
+        if claim.status == "busy":
+            raise ApplicationError(
+                "another attempt is writing this; trying again shortly",
+                type=WRITE_IN_PROGRESS,
+            )
+        try:
+            made = None
+            for look in range(self.visibility_tries if claim.issued else 1):
+                if look:
+                    _beat()
+                    await asyncio.sleep(self.visibility_interval)
+                made = await find()
+                if made is not None:
+                    break
+            if made is None:
+                _beat()
+                await self.writes.mark_issued(tenant_id, idem_key, WRITE_LEASE_SECONDS)
+                made = await write()
+            _beat()
+            return from_ref(await self.writes.complete(tenant_id, idem_key, to_ref(made)))
+        except Exception:
+            await self.writes.release(tenant_id, idem_key)
+            raise
 
     async def _record(
         self,
@@ -734,10 +868,19 @@ class AgentActivities:
             return existing["ts"]
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
+        line = await self._card_requester_line(spec, task_id, agent)
         dm = await self._runtime(ctx.tenant_id).slack.open_dm(ctx.requester_user_id)
-        blocks = approval_card_blocks(spec, task_id, agent.name, grant.name)
+        blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, requester_line=line)
         text = _card_text(spec, grant.name)
         return await self._post_once(ctx.tenant_id, key, dm, text, None, blocks)
+
+    async def _card_requester_line(
+        self, spec: TaskSpec, task_id: str, agent: AgentVersion
+    ) -> str | None:
+        """The body line the card must show, or None for a comment or a matched requester."""
+        if spec.tool_name == "add_comment":
+            return None
+        return (await self._requester(spec, task_id, agent))["line"]
 
     @activity.defn(name="update_card")
     async def update_card(self, spec: TaskSpec, task_id: str, card_ts: str, text: str) -> None:
@@ -764,7 +907,10 @@ class AgentActivities:
         channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
-        blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, edited=True)
+        line = await self._card_requester_line(spec, task_id, agent)
+        blocks = approval_card_blocks(
+            spec, task_id, agent.name, grant.name, edited=True, requester_line=line
+        )
         await slack.update_message(channel, card_ts, _card_text(spec, grant.name), blocks=blocks)
 
     @activity.defn(name="prepare_comment")
@@ -799,13 +945,21 @@ class AgentActivities:
         ctx = spec.ctx
         self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent)
         page_id = spec.payload["page_id"]
+        text = spec.payload["comment"]
         idem_key = f"{task_id}:comment"
         await self._require_writes(spec, task_id, page_id, idem_key)
         await self._record_approval(spec, task_id, page_id)
         try:
-            comment_id = await self._connector_for(ctx.tenant_id, agent).add_comment(
-                page_id, spec.payload["comment"], idem_key, agent.name
+            await connector.resolve_item(page_id)
+            comment_id = await self._write_once(
+                ctx.tenant_id,
+                idem_key,
+                find=lambda: connector.find_comment(page_id, idem_key),
+                write=lambda: connector.create_comment(page_id, text, idem_key, agent.name),
+                to_ref=lambda comment_id: comment_id,
+                from_ref=lambda ref: ref,
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
@@ -819,19 +973,29 @@ class AgentActivities:
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         ctx = spec.ctx
         self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
-        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent)
         database_id = spec.payload["database_id"]
         idem_key = f"{task_id}:create"
         await self._require_writes(spec, task_id, database_id, idem_key)
         await self._record_approval(spec, task_id, database_id)
-        email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
         try:
-            item = await connector.create_item(
-                database_id=database_id,
-                title=spec.payload["title"],
-                details=spec.payload["details"],
-                requester_email=email,
-                idem_key=idem_key,
+            connector.grant_for(database_id)
+            requester = await self._requester(spec, task_id, agent)
+            item = await self._write_once(
+                ctx.tenant_id,
+                idem_key,
+                find=lambda: connector.find_item(database_id, idem_key),
+                write=lambda: connector.create_item(
+                    database_id,
+                    spec.payload["title"],
+                    spec.payload["details"],
+                    idem_key,
+                    notion_user_id=requester["notion_user_id"],
+                    requester_line=requester["line"],
+                ),
+                to_ref=_item_ref,
+                from_ref=_item_from_ref,
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
@@ -843,6 +1007,48 @@ class AgentActivities:
             spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
         )
         return item
+
+    @activity.defn(name="reconcile_notion_item")
+    async def reconcile_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem | None:
+        """After the create ran out of retries: is the item there? Reads only, one look.
+
+        The task calls this a few times, a few seconds apart. None means this look did not
+        find it, which is not proof that nothing was filed.
+        """
+        ctx = spec.ctx
+        self._log("reconcile_notion_item", ctx.tenant_id, ctx.agent_id)
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        idem_key = f"{task_id}:create"
+        ref = await self.writes.result(ctx.tenant_id, idem_key)
+        item = (
+            _item_from_ref(ref)
+            if ref is not None
+            else await connector.find_item(spec.payload["database_id"], idem_key)
+        )
+        if item is None:
+            return None
+        await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
+        await self._record_write(
+            spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
+        )
+        return item
+
+    @activity.defn(name="reconcile_notion_comment")
+    async def reconcile_notion_comment(self, spec: TaskSpec, task_id: str) -> str | None:
+        """The comment counterpart of ``reconcile_notion_item``: its ID, or None for "not seen"."""
+        ctx = spec.ctx
+        self._log("reconcile_notion_comment", ctx.tenant_id, ctx.agent_id)
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        idem_key = f"{task_id}:comment"
+        page_id = spec.payload["page_id"]
+        comment_id = await self.writes.result(ctx.tenant_id, idem_key)
+        if comment_id is None:
+            await connector.resolve_item(page_id)
+            comment_id = await connector.find_comment(page_id, idem_key)
+        if comment_id is None:
+            return None
+        await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
+        return comment_id
 
     @activity.defn(name="get_notion_item")
     async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
@@ -963,7 +1169,12 @@ def _card_text(spec: TaskSpec, db_name: str) -> str:
 
 
 def approval_card_blocks(
-    spec: TaskSpec, task_id: str, agent_name: str, db_name: str, edited: bool = False
+    spec: TaskSpec,
+    task_id: str,
+    agent_name: str,
+    db_name: str,
+    edited: bool = False,
+    requester_line: str | None = None,
 ) -> list:
     """The approval card: the frozen payload, who it runs as, Submit / Edit / Cancel.
 
@@ -1009,12 +1220,27 @@ def approval_card_blocks(
             ],
         }
         note = "Nothing is filed until you click Submit."
+    if requester_line:
+        # The requester has no Notion user, so the page body carries this line. It is
+        # shown here so that what is approved is what is written.
+        body = [
+            body,
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (f"*Added to the page*\n{escape_slack(requester_line)}"),
+                },
+            },
+        ]
+    else:
+        body = [body]
     context = [{"type": "mrkdwn", "text": f"Will run as the {agent_name} agent. {note}"}]
     if edited:
         context.append({"type": "mrkdwn", "text": "Edited — review and approve again"})
     return [
         head,
-        body,
+        *body,
         {"type": "context", "elements": context},
         {
             "type": "actions",

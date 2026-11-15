@@ -44,6 +44,7 @@ from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
+    PostgresExternalWriteStore,
     PostgresHistoryStore,
     PostgresIdempotencyStore,
     PostgresTaskLinkStore,
@@ -269,6 +270,7 @@ async def main() -> None:
             budgets=budget_guard,
             pauses=pauses,
             switches=switches,
+            external_writes=PostgresExternalWriteStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

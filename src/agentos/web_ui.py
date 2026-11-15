@@ -408,7 +408,9 @@ class WebUI:
             return refused("Slack did not complete the sign-in.")
         try:
             tokens = await console.slack.exchange_code(code, sign_in.redirect_uri)
-            identity = identity_from_token_response(tokens, sign_in, login[1], console.clock())
+            identity = await identity_from_token_response(
+                tokens, sign_in, login[1], console.clock(), console.slack
+            )
         except SlackSignInError as err:
             log.warning("sign-in refused: %s", err)
             return refused("Sign-in could not be completed. Start again.", 503)

@@ -7,10 +7,13 @@ tenant is known (a session row is scoped to a tenant, and the tenant is not know
 until Slack answers). The callback checks the returned ``state`` against that
 cookie, exchanges the code for tokens at Slack's token endpoint over TLS with the
 client secret, and reads the user and workspace from the ``id_token`` that endpoint
-returned. The token is not signature-checked, which OpenID Connect Core 3.1.3.7
-allows for an ID token received directly from the token endpoint over TLS; its
-``iss``, ``aud``, ``exp`` and ``nonce`` are checked. No JWT library is used for
-that reason: one would be a second trust path with nothing to verify against.
+returned. The token's signature is checked against the keys Slack publishes at
+``JWKS_URL`` (RS256 only, looked up by ``kid``, cached for an hour), and its
+``iss``, ``aud``, ``exp`` and ``nonce`` are checked. OpenID Connect Core 3.1.3.7
+would allow skipping the signature for a token that came straight from the token
+endpoint over TLS; it is checked anyway, so one misrouted or replayed response
+cannot name a user. ``cryptography`` does the RSA check; no JWT library is used,
+which keeps the accepted algorithm a single fixed value.
 
 The workspace must map to a tenant, and the user must hold a role in it; only
 then is a session stored. The session cookie is ``<tenant>.<session ID>``: the
@@ -31,6 +34,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -38,6 +42,10 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey, RSAPublicNumbers
 from fastapi import HTTPException, Request
 
 from agentos.config import TENANT_ID_PATTERN, ConfigError, Settings
@@ -46,7 +54,13 @@ log = logging.getLogger("agentos.signin")
 
 AUTHORIZE_URL = "https://slack.com/openid/connect/authorize"
 TOKEN_URL = "https://slack.com/api/openid.connect.token"
+JWKS_URL = "https://slack.com/openid/connect/keys"
 ISSUER = "https://slack.com"
+# How long a fetched key set is trusted, and the shortest wait before fetching again
+# for a key ID not in it (so a forged ID cannot make every sign-in fetch).
+JWKS_TTL_SECONDS = 3600.0
+JWKS_MIN_REFETCH_SECONDS = 60.0
+MIN_RSA_BITS = 2048
 USER_CLAIM = "https://slack.com/user_id"
 TEAM_CLAIM = "https://slack.com/team_id"
 
@@ -144,19 +158,48 @@ class SlackOidc(Protocol):
         """
         ...
 
+    async def signing_key(self, kid: str) -> RSAPublicKey | None:
+        """The public key Slack publishes under this key ID, or None if it has none.
+
+        Raises ``SlackSignInError`` when the key set cannot be fetched.
+        """
+        ...
+
 
 class HttpSlackOidc:
-    """The real client: one POST to Slack's token endpoint, over TLS."""
+    """The real client: one POST to Slack's token endpoint, and Slack's published keys, over TLS."""
 
     def __init__(
         self,
         client_id: str,
         client_secret: str,
         transport: httpx.AsyncBaseTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._client_id = client_id
         self._client_secret = client_secret
         self._transport = transport
+        self._clock = clock
+        self._keys: dict[str, RSAPublicKey] = {}
+        self._fetched_at: float | None = None
+
+    async def signing_key(self, kid: str) -> RSAPublicKey | None:
+        now = self._clock()
+        fresh = self._fetched_at is not None and now - self._fetched_at < JWKS_TTL_SECONDS
+        if fresh and kid in self._keys:
+            return self._keys[kid]
+        if self._fetched_at is None or now - self._fetched_at >= JWKS_MIN_REFETCH_SECONDS:
+            try:
+                async with httpx.AsyncClient(timeout=10.0, transport=self._transport) as http:
+                    response = await http.get(JWKS_URL)
+                body = response.json()
+            except (httpx.HTTPError, ValueError) as err:
+                raise SlackSignInError(f"key fetch failed: {type(err).__name__}") from err
+            if response.status_code != 200:
+                raise SlackSignInError(f"key fetch refused: {response.status_code}")
+            self._keys = _keys_from_jwks(body)
+            self._fetched_at = now
+        return self._keys.get(kid)
 
     async def exchange_code(self, code: str, redirect_uri: str) -> dict[str, Any]:
         form = {
@@ -178,6 +221,34 @@ class HttpSlackOidc:
         return body
 
 
+def _keys_from_jwks(body: object) -> dict[str, RSAPublicKey]:
+    """The RSA keys of a JWKS document by key ID; anything else in it is ignored."""
+    if not isinstance(body, dict) or not isinstance(body.get("keys"), list):
+        raise SlackSignInError("key set is not a JWKS document")
+    found: dict[str, RSAPublicKey] = {}
+    for jwk in body["keys"]:
+        if not isinstance(jwk, dict) or jwk.get("kty") != "RSA":
+            continue
+        kid, n, e = jwk.get("kid"), jwk.get("n"), jwk.get("e")
+        if not isinstance(kid, str) or not isinstance(n, str) or not isinstance(e, str):
+            continue
+        try:
+            key = RSAPublicNumbers(_b64_int(e), _b64_int(n)).public_key()
+        except (binascii.Error, ValueError):
+            continue
+        if key.key_size >= MIN_RSA_BITS:
+            found[kid] = key
+    return found
+
+
+def _b64_int(value: str) -> int:
+    return int.from_bytes(_b64url(value), "big")
+
+
+def _b64url(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
 # --- the id_token ---------------------------------------------------------------------
 
 
@@ -187,28 +258,54 @@ class SlackIdentity:
     team_id: str
 
 
-def _claims(id_token: object) -> dict[str, Any]:
+def _json_part(part: str, what: str) -> dict[str, Any]:
+    try:
+        value = json.loads(_b64url(part))
+    except (binascii.Error, ValueError) as err:
+        raise SlackSignInError(f"id_token {what} is unreadable") from err
+    if not isinstance(value, dict):
+        raise SlackSignInError(f"id_token {what} is not an object")
+    return value
+
+
+async def verify_id_token(id_token: object, oidc: SlackOidc) -> dict[str, Any]:
+    """The claims of an ID token whose RS256 signature checks out against Slack's keys.
+
+    Only ``RS256`` is accepted, whatever the header says; ``none``, the HMAC family
+    and anything else are refused before any key is looked up.
+    """
     if not isinstance(id_token, str):
         raise SlackSignInError("no id_token in the token response")
     parts = id_token.split(".")
     if len(parts) != 3:
         raise SlackSignInError("id_token is not a JWT")
+    header = _json_part(parts[0], "header")
+    if header.get("alg") != "RS256":
+        raise SlackSignInError("id_token is not signed with RS256")
+    kid = header.get("kid")
+    if not isinstance(kid, str) or not kid:
+        raise SlackSignInError("id_token names no signing key")
+    key = await oidc.signing_key(kid)
+    if key is None:
+        raise SlackSignInError("id_token is signed with a key Slack does not publish")
     try:
-        padded = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(padded))
-    except (binascii.Error, ValueError) as err:
-        raise SlackSignInError("id_token payload is unreadable") from err
-    if not isinstance(claims, dict):
-        raise SlackSignInError("id_token payload is not an object")
-    return claims
+        key.verify(
+            _b64url(parts[2]),
+            f"{parts[0]}.{parts[1]}".encode("ascii"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    except (InvalidSignature, binascii.Error, ValueError, UnicodeEncodeError) as err:
+        raise SlackSignInError("id_token signature is not valid") from err
+    return _json_part(parts[1], "payload")
 
 
-def identity_from_token_response(
-    response: dict[str, Any], config: SignInConfig, nonce: str, now: datetime
+async def identity_from_token_response(
+    response: dict[str, Any], config: SignInConfig, nonce: str, now: datetime, oidc: SlackOidc
 ) -> SlackIdentity:
-    """The user and workspace the ID token names, after checking issuer, audience,
-    expiry and nonce. See the module docstring for why the signature is not checked."""
-    claims = _claims(response.get("id_token"))
+    """The user and workspace the ID token names, after checking its signature, issuer,
+    audience, expiry and nonce."""
+    claims = await verify_id_token(response.get("id_token"), oidc)
     if claims.get("iss") != ISSUER:
         raise SlackSignInError("id_token issuer is not Slack")
     audience = claims.get("aud")

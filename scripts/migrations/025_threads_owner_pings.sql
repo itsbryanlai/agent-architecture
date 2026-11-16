@@ -3,12 +3,13 @@
 -- threads has one row per thread that was handed to a specialist: the thread (an ID built
 -- by the code, starting with the tenant ID) and the agent that now owns it. A conversation
 -- workflow that closes after a week of silence and starts again reads the row, so the thread
--- keeps its specialist. A row holds IDs, never message text. The app role can SELECT, INSERT
--- and UPDATE, never DELETE.
+-- keeps its specialist. A row holds IDs, never message text. The app role can SELECT, INSERT,
+-- UPDATE and DELETE (the retention job purges idle threads).
 -- owner_pings has one row per (agent, channel, asker): the UTC day the owner was last
 -- mentioned in the reply that told that person the agent is not open to them. The reply
 -- mentions the owner once a day for each such person and place, so a guest who keeps asking
--- cannot page the owner. It holds IDs and a date. The app role can SELECT, INSERT and UPDATE.
+-- cannot page the owner. It holds IDs and a date. The app role can SELECT, INSERT,
+-- UPDATE and DELETE (the retention job purges mentions older than two days).
 -- Run as the owner role. Safe to run more than once.
 
 CREATE TABLE IF NOT EXISTS threads (
@@ -21,7 +22,7 @@ CREATE TABLE IF NOT EXISTS threads (
 
 GRANT USAGE ON SCHEMA public TO agentos_app;
 REVOKE ALL ON threads FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON threads TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON threads TO agentos_app;
 
 ALTER TABLE threads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE threads FORCE ROW LEVEL SECURITY;
@@ -41,7 +42,7 @@ CREATE TABLE IF NOT EXISTS owner_pings (
 
 GRANT USAGE ON SCHEMA public TO agentos_app;
 REVOKE ALL ON owner_pings FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON owner_pings TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON owner_pings TO agentos_app;
 
 ALTER TABLE owner_pings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE owner_pings FORCE ROW LEVEL SECURITY;

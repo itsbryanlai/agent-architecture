@@ -801,7 +801,7 @@ CREATE TABLE IF NOT EXISTS threads (
 
 GRANT USAGE ON SCHEMA public TO agentos_app;
 REVOKE ALL ON threads FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON threads TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON threads TO agentos_app;
 
 ALTER TABLE threads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE threads FORCE ROW LEVEL SECURITY;
@@ -821,7 +821,7 @@ CREATE TABLE IF NOT EXISTS owner_pings (
 
 GRANT USAGE ON SCHEMA public TO agentos_app;
 REVOKE ALL ON owner_pings FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON owner_pings TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON owner_pings TO agentos_app;
 
 ALTER TABLE owner_pings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE owner_pings FORCE ROW LEVEL SECURITY;
@@ -839,6 +839,94 @@ ALTER TABLE owner_pings DROP CONSTRAINT IF EXISTS owner_pings_agent_id_pattern;
 ALTER TABLE owner_pings ADD CONSTRAINT owner_pings_agent_id_pattern
   CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
 
+-- Content references: text kept out of Temporal history. Same as migration 022.
+CREATE TABLE IF NOT EXISTS inbound_events (
+  tenant_id       text        NOT NULL,
+  event_id        text        NOT NULL,
+  payload         jsonb       NOT NULL,
+  received_at     timestamptz NOT NULL DEFAULT now(),
+  delivered_at    timestamptz,
+  consumed_at     timestamptz,   -- when the content was taken and cleared from payload
+  attempts        integer     NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS inbound_events_pending
+  ON inbound_events (tenant_id, received_at) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS inbound_events_delivered
+  ON inbound_events (tenant_id, delivered_at) WHERE delivered_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS model_steps (
+  tenant_id       text        NOT NULL,
+  conversation_id text        NOT NULL,
+  step_key        text        NOT NULL,
+  stop_reason     text        NOT NULL,
+  content         jsonb       NOT NULL,   -- the assistant content blocks, as the model returned them
+  reply_text      text,                   -- the text a final reply shows; null when the step called tools
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, conversation_id, step_key)
+);
+CREATE INDEX IF NOT EXISTS model_steps_created ON model_steps (tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tool_inputs (
+  tenant_id       text        NOT NULL,
+  conversation_id text        NOT NULL,
+  tool_use_id     text        NOT NULL,
+  input           jsonb       NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, conversation_id, tool_use_id)
+);
+CREATE INDEX IF NOT EXISTS tool_inputs_created ON tool_inputs (tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_drafts (
+  tenant_id  text        NOT NULL,
+  task_id    text        NOT NULL,
+  revision   integer     NOT NULL CHECK (revision >= 1),
+  payload    jsonb       NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, task_id, revision)
+);
+CREATE INDEX IF NOT EXISTS task_drafts_created ON task_drafts (tenant_id, created_at);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+
+REVOKE ALL ON inbound_events FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON inbound_events TO agentos_app;
+REVOKE ALL ON model_steps FROM agentos_app;
+GRANT SELECT, INSERT, DELETE ON model_steps TO agentos_app;
+REVOKE ALL ON tool_inputs FROM agentos_app;
+GRANT SELECT, INSERT, DELETE ON tool_inputs TO agentos_app;
+REVOKE ALL ON task_drafts FROM agentos_app;
+GRANT SELECT, INSERT, DELETE ON task_drafts TO agentos_app;
+
+ALTER TABLE inbound_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inbound_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON inbound_events;
+CREATE POLICY tenant_isolation ON inbound_events
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE model_steps ENABLE ROW LEVEL SECURITY;
+ALTER TABLE model_steps FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON model_steps;
+CREATE POLICY tenant_isolation ON model_steps
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE tool_inputs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tool_inputs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tool_inputs;
+CREATE POLICY tenant_isolation ON tool_inputs
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE task_drafts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_drafts FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON task_drafts;
+CREATE POLICY tenant_isolation ON task_drafts
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -850,5 +938,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('023'), ('024'), ('025')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025')
 ON CONFLICT DO NOTHING;

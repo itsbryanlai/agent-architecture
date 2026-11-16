@@ -76,6 +76,12 @@ class SlackPoster(Protocol):
         self, channel: str, ts: str, text: str, blocks: list[dict] | None = None
     ) -> None: ...
 
+    async def post_ephemeral(
+        self, channel: str, user_id: str, text: str, thread_ts: str | None = None
+    ) -> None:
+        """Show ``text`` to one user in a channel; nobody else sees it."""
+        ...
+
     async def open_dm(self, user_id: str) -> str:
         """Open (or reuse) a DM with the user and return its channel ID."""
         ...
@@ -151,6 +157,12 @@ class RealSlackPoster:
         await self._client.chat_update(
             channel=channel, ts=ts, text=text, blocks=blocks if blocks is not None else []
         )
+
+    async def post_ephemeral(self, channel, user_id, text, thread_ts=None) -> None:
+        kwargs: dict = {"channel": channel, "user": user_id, "text": text}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        await self._client.chat_postEphemeral(**kwargs)
 
     async def open_dm(self, user_id: str) -> str:
         resp = await self._client.conversations_open(users=user_id)
@@ -335,6 +347,14 @@ class FakeSlack:
             ("update_message", {"channel": channel, "ts": ts, "text": text, "blocks": blocks})
         )
 
+    async def post_ephemeral(self, channel, user_id, text, thread_ts=None) -> None:
+        self.calls.append(
+            (
+                "post_ephemeral",
+                {"channel": channel, "user_id": user_id, "text": text, "thread_ts": thread_ts},
+            )
+        )
+
     async def open_dm(self, user_id: str) -> str:
         self.calls.append(("open_dm", {"user_id": user_id}))
         return f"D-{user_id}"
@@ -384,6 +404,9 @@ class FakeSlack:
         """The directory reads made so far."""
         names = {"user_info", "usergroup_members", "channel_members", "list_users"}
         return [(name, kw) for name, kw in self.calls if name in names]
+
+    def ephemerals(self) -> list[dict]:
+        return [kw for name, kw in self.calls if name == "post_ephemeral"]
 
     def views(self) -> list[dict]:
         return [kw for name, kw in self.calls if name == "open_view"]

@@ -1,10 +1,15 @@
 """The ingress gateway.
 
-It acknowledges every request quickly and hands the work to Temporal:
+It acknowledges every request quickly and hands the work to Temporal, without putting what
+people wrote into Temporal history:
 
-* ``POST /slack/events``: a DM or an @mention signal-with-starts the thread's
-  ConversationWorkflow. Slack retries are harmless, because the workflow drops
-  duplicate event IDs.
+* ``POST /slack/events``: a DM or an @mention is stored in Postgres (``inbound_events``) and
+  acknowledged at once, whether or not Temporal is reachable. A relay loop in this process
+  (``agentos.gateway.relay``) then signal-with-starts the thread's ConversationWorkflow with
+  the event ID, retrying with a growing delay until Temporal takes it; the workflow reads
+  the text from Postgres. Slack retries are harmless: an event ID stores one row, and the
+  workflow drops an event ID it has seen. If the event cannot be stored, the gateway answers
+  with an error so that Slack sends it again.
   A channel shared with another organisation (``channel_shared``) starts an
   ``AudienceWatchWorkflow`` (one per Slack event ID, never reused), which pauses the
   agents that answer in that channel. People joining a channel start nothing.
@@ -12,7 +17,11 @@ It acknowledges every request quickly and hands the work to Temporal:
   signal to the task named on the card. The gateway passes on who clicked; the
   task workflow decides whether that person may approve. An Edit click opens a
   form prefilled from the task's current draft (only for the requester, only
-  while the draft is editable); saving the form becomes an ``edit`` signal.
+  while the draft is editable); saving the form stores the values in Postgres and
+  becomes an ``edit`` signal that names them. Slack does not retry a click, so a click is
+  handled before the reply, within ``CLICK_TIMEOUT_SECONDS``; when Temporal or the
+  database does not answer in time, the person is told to try again (an ephemeral
+  message, or an error on the form) and nothing is half done.
 * ``POST /notion/webhook/{tenant_id}``: a page update becomes an
   ``external_update`` signal to the task watching that page. Polling covers
   anything the webhook misses. Events must carry a valid ``X-Notion-Signature``,
@@ -29,10 +38,12 @@ tenant is part of every workflow ID and log line.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -48,16 +59,15 @@ from agentos import ids
 from agentos.agent_store import AgentStore, startup_agent_failure
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
+from agentos.content_store import ContentStore, InMemoryContentStore
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
     ApprovalDecision,
     AudienceEvent,
-    ConversationRef,
     DraftView,
     EditRequest,
     ExternalUpdate,
-    InboundMessage,
     field_error,
 )
 from agentos.slack_format import from_slack_text
@@ -84,6 +94,11 @@ EDIT_CALLBACK = "task_edit"
 STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
 FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
 MULTILINE_FIELDS = {"details", "comment"}
+# Slack wants an answer to a click within 3 seconds and does not repeat it. The click's work
+# gets this long, and the "try again" notice a little less than what is left.
+CLICK_TIMEOUT_SECONDS = 2.0
+NOTICE_TIMEOUT_SECONDS = 0.7
+TRY_AGAIN = "That didn't go through. Please try again in a moment."
 
 
 @dataclass
@@ -102,6 +117,10 @@ class GatewayDeps:
     agents: AgentStore | None = None
     # The kill switches, read afresh at every Submit. None means none is ever off.
     switches: SwitchStore | None = None
+    # Where inbound events and saved edits are kept, and the draft revisions an Edit form shows.
+    content: ContentStore | None = None
+    # Called after an event was stored, so the relay delivers it without waiting for its next pass.
+    on_inbound: Callable[[], None] | None = None
 
 
 def create_app(
@@ -114,6 +133,7 @@ def create_app(
     slack_for: Callable[[str], Any] | None = None,
     agents: AgentStore | None = None,
     switches: SwitchStore | None = None,
+    content: ContentStore | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
@@ -127,6 +147,7 @@ def create_app(
             slack_for,
             agents,
             switches,
+            content or InMemoryContentStore(),
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -184,36 +205,38 @@ def create_app(
 
         channel = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
-        msg = InboundMessage(
-            event_id=payload.get("event_id") or f"{channel}:{event['ts']}",
-            user_id=event["user"],
-            text=from_slack_text(LEADING_MENTION.sub("", event.get("text") or "", count=1)),
-            channel=channel,
-            thread_ts=thread_ts,
-            channel_kind=channel_kind,
-        )
-        workflow_id = ids.conversation_id(tenant, channel, thread_ts)
-        # A running thread keeps its own agent: the start argument is ignored
-        # when the workflow exists, and only the signal lands.
+        event_id = payload.get("event_id") or f"{channel}:{event['ts']}"
         config = await d.tenants.get(tenant)
         if config is None:
             return Response(status_code=200)
+        # A running thread keeps its own agent: the agent named here is the start argument,
+        # which is ignored when the workflow exists.
         agent_id = config.default_agent
         if channel_kind == "channel":
             agent_id = config.channels.get(channel, agent_id)
-        await d.temporal_client.start_workflow(
-            "ConversationWorkflow",
-            ConversationRef(tenant, agent_id, channel, thread_ts),
-            id=workflow_id,
-            task_queue=TASK_QUEUE,
-            start_signal="message",
-            start_signal_args=[msg],
+        if d.content is None:
+            raise RuntimeError("the gateway has no content store to keep inbound events in")
+        stored = await d.content.put_inbound(
+            tenant,
+            event_id,
+            {
+                "kind": "message",
+                "agent_id": agent_id,
+                "user_id": event["user"],
+                "text": from_slack_text(LEADING_MENTION.sub("", event.get("text") or "", count=1)),
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "channel_kind": channel_kind,
+            },
         )
+        if d.on_inbound is not None:
+            d.on_inbound()
         log.info(
-            "tenant_id=%s agent_id=%s workflow_id=%s signalled message",
+            "tenant_id=%s agent_id=%s event_id=%s stored=%s inbound event",
             tenant,
             agent_id,
-            workflow_id,
+            event_id,
+            stored,
         )
         return Response(status_code=200)
 
@@ -231,34 +254,23 @@ def create_app(
             log.warning("ignored interaction from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
         if payload.get("type") == "view_submission":
-            return await _edit_submitted(d, tenant, payload)
+            try:
+                async with asyncio.timeout(CLICK_TIMEOUT_SECONDS):
+                    return await _edit_submitted(d, tenant, payload)
+            except Exception as err:  # noqa: BLE001 - the form stays open with a message
+                log.warning(
+                    "tenant_id=%s edit form not saved error_type=%s", tenant, type(err).__name__
+                )
+                return _form_errors({_first_block(payload): TRY_AGAIN})
         if payload.get("type") != "block_actions":
             return Response(status_code=200)
         clicker = (payload.get("user") or {}).get("id", "")
-        for action in payload.get("actions") or []:
-            if action.get("action_id") == EDIT_ACTION:
-                await _open_edit_form(d, tenant, payload, action, clicker)
-                continue
-            approved = APPROVAL_ACTIONS.get(action.get("action_id"))
-            if approved is None:
-                continue
-            try:
-                value = json.loads(action.get("value") or "{}")
-                task_id, nonce = value["task_id"], value["nonce"]
-            except (ValueError, KeyError, TypeError):
-                log.warning("tenant_id=%s ignored approval click with a bad value", tenant)
-                continue
-            if not task_id.startswith(f"{tenant}:"):
-                log.warning("tenant_id=%s ignored approval click for another tenant", tenant)
-                continue
-            if approved and await _writes_off(d, tenant):
-                # Refused before the workflow hears of the click: the card stays as it
-                # is, so the requester can Submit again once writes are back on.
-                await _tell_writes_off(d, tenant, payload)
-                continue
-            await _signal(
-                d, tenant, task_id, "decision", ApprovalDecision(nonce, clicker, approved)
-            )
+        try:
+            async with asyncio.timeout(CLICK_TIMEOUT_SECONDS):
+                await _handle_actions(d, tenant, payload, clicker)
+        except Exception as err:  # noqa: BLE001 - tell the person, the click is not repeated
+            log.warning("tenant_id=%s click not handled error_type=%s", tenant, type(err).__name__)
+            await _tell_try_again(d, tenant, payload, clicker)
         return Response(status_code=200)
 
     @app.post("/notion/webhook/{tenant_id}")
@@ -276,6 +288,61 @@ def create_app(
         return await _notion_webhook(d, tenant_id, request)
 
     return app
+
+
+async def _handle_actions(d: GatewayDeps, tenant: str, payload: dict, clicker: str) -> None:
+    """Act on the buttons of one click. A failure propagates: the click is told to try again."""
+    for action in payload.get("actions") or []:
+        if action.get("action_id") == EDIT_ACTION:
+            await _open_edit_form(d, tenant, payload, action, clicker)
+            continue
+        approved = APPROVAL_ACTIONS.get(action.get("action_id"))
+        if approved is None:
+            continue
+        try:
+            value = json.loads(action.get("value") or "{}")
+            task_id, nonce = value["task_id"], value["nonce"]
+        except (ValueError, KeyError, TypeError):
+            log.warning("tenant_id=%s ignored approval click with a bad value", tenant)
+            continue
+        if not task_id.startswith(f"{tenant}:"):
+            log.warning("tenant_id=%s ignored approval click for another tenant", tenant)
+            continue
+        if approved and await _writes_off(d, tenant):
+            # Refused before the workflow hears of the click: the card stays as it
+            # is, so the requester can Submit again once writes are back on.
+            await _tell_writes_off(d, tenant, payload)
+            continue
+        await _signal(d, tenant, task_id, "decision", ApprovalDecision(nonce, clicker, approved))
+
+
+def _form_errors(errors: dict[str, str]) -> Response:
+    return Response(
+        content=json.dumps({"response_action": "errors", "errors": errors}),
+        media_type="application/json",
+    )
+
+
+def _first_block(payload: dict) -> str:
+    values = ((payload.get("view") or {}).get("state") or {}).get("values") or {}
+    return next(iter(values), "")
+
+
+async def _tell_try_again(d: GatewayDeps, tenant: str, payload: dict, clicker: str) -> None:
+    """Show the clicker, and only them, that their click did not go through."""
+    channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get(
+        "channel_id"
+    )
+    thread_ts = (payload.get("message") or {}).get("thread_ts")
+    if d.slack_for is None or not channel or not clicker:
+        return
+    try:
+        async with asyncio.timeout(NOTICE_TIMEOUT_SECONDS):
+            await d.slack_for(tenant).post_ephemeral(channel, clicker, TRY_AGAIN, thread_ts)
+    except Exception as err:  # noqa: BLE001 - nothing more can be done for this click
+        log.warning(
+            "tenant_id=%s try-again notice not shown error_type=%s", tenant, type(err).__name__
+        )
 
 
 def _audience_event(tenant: str, payload: dict, event: dict) -> AudienceEvent | None:
@@ -518,7 +585,21 @@ async def _open_edit_form(
     if d.slack_for is None:
         log.warning("tenant_id=%s edit form not opened: no Slack client", tenant)
         return
-    await d.slack_for(tenant).open_view(payload.get("trigger_id", ""), _edit_view(task_id, draft))
+    fields = draft.fields or await _stored_fields(d, tenant, task_id, draft)
+    if not fields:
+        log.warning("tenant_id=%s workflow_id=%s edit form not opened: no draft", tenant, task_id)
+        return
+    await d.slack_for(tenant).open_view(
+        payload.get("trigger_id", ""), _edit_view(task_id, draft, fields)
+    )
+
+
+async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: DraftView) -> dict:
+    """The editable values of the draft revision a task with a stored payload names."""
+    if not draft.revision or d.content is None:
+        return {}
+    stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
+    return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
 async def _query_draft(d: GatewayDeps, tenant: str, task_id: str) -> DraftView | None:
@@ -532,11 +613,11 @@ async def _query_draft(d: GatewayDeps, tenant: str, task_id: str) -> DraftView |
         raise
 
 
-def _edit_view(task_id: str, draft: DraftView) -> dict:
+def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     """The Edit form: one input per editable field, prefilled from the draft."""
     limits = EDITABLE_FIELDS[draft.tool_name]
     blocks = []
-    for name, current in draft.fields.items():
+    for name, current in fields.items():
         blocks.append(
             {
                 "type": "input",
@@ -590,10 +671,7 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
             errors[block_id] = "This can't be empty."
         fields[block_id] = text
     if errors:
-        return Response(
-            content=json.dumps({"response_action": "errors", "errors": errors}),
-            media_type="application/json",
-        )
+        return _form_errors(errors)
     draft = await _query_draft(d, tenant, task_id)
     if draft is None:
         errors = {next(iter(fields), ""): "This request is no longer open."}
@@ -608,12 +686,19 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
             if known and (message := field_error(draft.tool_name, name, value)):
                 errors[name] = message
     if errors:
-        return Response(
-            content=json.dumps({"response_action": "errors", "errors": errors}),
-            media_type="application/json",
-        )
+        return _form_errors(errors)
     clicker = (payload.get("user") or {}).get("id", "")
-    await _signal(d, tenant, task_id, "edit", EditRequest(nonce, clicker, fields))
+    if draft is not None and draft.revision:
+        # The values stay in Postgres; the workflow is told which row holds them.
+        if d.content is None:
+            raise RuntimeError("the gateway has no content store to keep an edit in")
+        edit_id = ids.edit_event_id(uuid.uuid4().hex)
+        await d.content.put_inbound(
+            tenant, edit_id, {"kind": "edit", "task_id": task_id, "fields": fields}, delivered=True
+        )
+        await _signal(d, tenant, task_id, "edit", EditRequest(nonce, clicker, {}, edit_id))
+    else:
+        await _signal(d, tenant, task_id, "edit", EditRequest(nonce, clicker, fields))
     return Response(status_code=200)
 
 
@@ -664,7 +749,9 @@ async def _real_lifespan(app: FastAPI):
 
     from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings
+    from agentos.content_store import PostgresContentStore
     from agentos.crypto_keys import LocalKeyStore, startup_key_failure
+    from agentos.gateway.relay import InboundRelay
     from agentos.schema_version import require_current_schema
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
@@ -680,6 +767,7 @@ async def _real_lifespan(app: FastAPI):
     pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     agent_store = PostgresAgentStore(pool)
+    relay_task: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
@@ -708,6 +796,8 @@ async def _real_lifespan(app: FastAPI):
         # A tenant whose variable is unset is refused at start-up, as before.
         for config in tenants.tenants.values():
             slack_for(config.tenant_id)
+        content = PostgresContentStore(pool)
+        relay = InboundRelay(content, directory, client)
         app.state.deps = GatewayDeps(
             settings,
             directory,
@@ -717,9 +807,16 @@ async def _real_lifespan(app: FastAPI):
             slack_for,
             agent_store,
             switches=PostgresSwitchStore(pool),
+            content=content,
+            on_inbound=relay.wake,
         )
+        # Events stored while the gateway was down, or while Temporal was, are delivered now.
+        relay_task = asyncio.create_task(relay.run(), name="inbound-relay")
         yield
     finally:
+        if relay_task is not None:
+            relay_task.cancel()
+            await asyncio.gather(relay_task, return_exceptions=True)
         await pool.close()
 
 

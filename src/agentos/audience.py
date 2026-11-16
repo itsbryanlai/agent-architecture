@@ -38,6 +38,7 @@ from agentos.audience_pauses import PauseStore
 from agentos.config import AgentsConfig, AgentVersion
 from agentos.slack_client import SlackLookupError, SlackPoster, SlackUser
 from agentos.slack_format import escape_slack
+from agentos.switches import SwitchStore, agent_off_text, read_state
 from agentos.tenants import TenantRegistry
 
 log = logging.getLogger("agentos.audience")
@@ -53,6 +54,7 @@ GUEST = "guest"
 EXTERNAL = "external"
 DEACTIVATED = "deactivated"
 UNAVAILABLE = "unavailable"  # the lookups failed, so the asker was refused
+OFF = "off"  # an admin turned the agent off
 PAUSED = "paused"  # the agent is paused in this channel until its owner confirms the audience
 
 
@@ -184,10 +186,12 @@ class AudienceChecker:
         ttl: float = CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         pauses: PauseStore | None = None,
+        switches: SwitchStore | None = None,
     ):
         self._registry = registry
         self._agents = agents
         self._pauses = pauses
+        self._switches = switches
         self._ttl = ttl
         self._clock = clock
         self._directories: dict[str, SlackDirectory] = {}
@@ -239,10 +243,16 @@ class AudienceChecker:
         channel: str,
         channel_kind: str,
     ) -> list[AgentVersion]:
-        """The agents among ``agents`` this asker may use here; a failed lookup keeps none."""
+        """The agents among ``agents`` this asker may use here; a failed lookup keeps none.
+
+        An agent an admin turned off is never kept, so a thread is not offered to it.
+        """
         published = await self._agents.published_all(tenant_id)
+        state = None if self._switches is None else await read_state(self._switches, tenant_id)
         kept = []
         for agent in agents:
+            if state is not None and state.agent_stopped_by(agent.agent_id) is not None:
+                continue
             try:
                 decision = await self.decide(
                     tenant_id, agent, user_id, channel, channel_kind, published
@@ -295,12 +305,19 @@ def paused_text(agent_name: str) -> str:
     )
 
 
+def no_longer_act_text(agent_name: str) -> str:
+    """What a card says when a pause or a lost audience stopped an approved write."""
+    return f"{agent_name} can no longer act for you here; nothing was changed."
+
+
 def decision_text(agent_name: str, decision: AudienceDecision) -> str:
     """The fixed reply that tells the asker why the turn did not run."""
     if decision.reason == UNAVAILABLE:
         return unavailable_text(agent_name)
     if decision.reason == PAUSED:
         return paused_text(agent_name)
+    if decision.reason == OFF:
+        return agent_off_text(escape_slack(agent_name))
     return refusal_text(agent_name, decision.owner)
 
 

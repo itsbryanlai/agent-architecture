@@ -58,7 +58,7 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.agent_store import AgentStore
-from agentos.audience import UNAVAILABLE, AudienceChecker, AudienceDecision
+from agentos.audience import OFF, UNAVAILABLE, AudienceChecker, AudienceDecision, no_longer_act_text
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
@@ -103,13 +103,12 @@ from agentos.stores import (
     ToolOutputStore,
 )
 from agentos.switches import (
-    NOTION,
     SWITCHED_OFF,
-    WRITE_REFUSED_TEXT,
-    ConnectorOff,
+    AgentOff,
+    Effect,
     InMemorySwitchStore,
     SwitchStore,
-    WritesOff,
+    agent_off_card_text,
     agent_off_text,
     connector_off_text,
     log_stop,
@@ -240,7 +239,9 @@ class AgentActivities:
         self.budgets = budgets
         self.registry = registry
         self.pauses = pauses or InMemoryPauseStore()
-        self.audience = audience or AudienceChecker(registry, agents, pauses=self.pauses)
+        self.audience = audience or AudienceChecker(
+            registry, agents, pauses=self.pauses, switches=self.switches
+        )
         self.knowledge = knowledge
         self.embedder = embedder
         self.knowledge_tool = load_manifest(MANIFEST_DIR / "knowledge.yaml").tools[
@@ -265,6 +266,7 @@ class AgentActivities:
             self.run_read_tool,
             self.post_approval_card,
             self.update_card,
+            self.update_card_line,
             self.refresh_card,
             self.prepare_comment,
             self.add_notion_comment,
@@ -275,6 +277,7 @@ class AgentActivities:
             self.post_in_thread,
             self.record_hand_off,
             self.check_audience,
+            self.check_before_write,
             self.record_audience_refusal,
         ]
 
@@ -326,47 +329,52 @@ class AgentActivities:
     async def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
 
-    async def _notion_off(self, tenant_id: str) -> bool:
-        """Is Notion turned off for the tenant? Read from the store now, never cached."""
-        return (await read_state(self.switches, tenant_id)).connector_off(NOTION)
+    async def _gate_refusal(
+        self, tenant_id: str, agent_id: str, effect: Effect
+    ) -> Exception | None:
+        """Why the agent may not do ``effect`` now, or None. The one place switches are read.
 
-    async def _require_notion(self, tenant_id: str, agent_id: str, name: str) -> None:
-        """Stop a Notion call for good while an admin has Notion turned off.
-
-        Non-retryable: a retry within the minute would find it off again. The next
-        attempt of a later step reads the switch afresh.
+        Every activity that acts for an agent calls this (or ``_gate``) first, so one read
+        of the switches applies the agent, writes and connector scopes that matter to the
+        effect. Read from the store now, never cached. An unreadable switch raises, so the
+        step fails and is retried rather than let through.
         """
-        if await self._notion_off(tenant_id):
+        state = await read_state(self.switches, tenant_id)
+        refusal = state.refusal(agent_id, effect)
+        if refusal is not None:
             log.info(
-                "%s refused tenant_id=%s agent_id=%s connector=notion", name, tenant_id, agent_id
+                "%s refused tenant_id=%s agent_id=%s reason=%s",
+                effect.value,
+                tenant_id,
+                agent_id,
+                type(refusal).__name__,
             )
-            raise _non_retryable(ConnectorOff(connector_off_text("notion")))
+        return refusal
 
-    async def _require_writes(self, spec: TaskSpec, task_id: str, target: str, idem_key: str):
-        """Refuse an approved write, before any external call, while writes or Notion are off.
+    async def _gate(self, tenant_id: str, agent_id: str, effect: Effect) -> None:
+        """Stop for good, before any call, when a switch covers the effect.
+
+        Non-retryable: a retry within the minute would find it off again. The next step
+        reads the switches afresh.
+        """
+        refusal = await self._gate_refusal(tenant_id, agent_id, effect)
+        if refusal is not None:
+            raise _non_retryable(refusal)
+
+    async def _gate_write(self, spec: TaskSpec, task_id: str, target: str, idem_key: str):
+        """Refuse an approved write, before any external call, while a switch covers it.
 
         The approval and the refusal are audited (the write as an error), and the
         failure is non-retryable, so the task ends with the reason and nothing was
         changed. The requester can ask again later.
         """
         ctx = spec.ctx
-        state = await read_state(self.switches, ctx.tenant_id)
-        if state.writes_off:
-            reason: Exception = WritesOff(WRITE_REFUSED_TEXT)
-        elif state.connector_off(NOTION):
-            reason = ConnectorOff(connector_off_text("notion"))
-        else:
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
+        if refusal is None:
             return
-        log.info(
-            "write refused tenant_id=%s agent_id=%s task_id=%s reason=%s",
-            ctx.tenant_id,
-            ctx.agent_id,
-            task_id,
-            type(reason).__name__,
-        )
         await self._record_approval(spec, task_id, target)
         await self._record_write(spec, task_id, idem_key, target, "error")
-        raise _non_retryable(reason)
+        raise _non_retryable(refusal)
 
     async def _requester(self, spec: TaskSpec, task_id: str, agent: AgentVersion) -> dict:
         """Who asked, as Notion will show it: ``{"notion_user_id", "line"}``.
@@ -640,12 +648,12 @@ class AgentActivities:
     @activity.defn(name="call_llm")
     async def call_llm(self, ctx: TurnContext, conversation_id: str) -> LLMResponse:
         self._log("call_llm", ctx.tenant_id, ctx.agent_id)
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         # Before the budget and before any model call: an agent or a tenant switched off
         # answers with a fixed text, bills nothing and records no usage row.
-        switch = (await read_state(self.switches, ctx.tenant_id)).agent_stopped_by(ctx.agent_id)
-        if switch is not None:
-            log_stop(ctx.tenant_id, ctx.agent_id, switch)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if isinstance(refusal, AgentOff):
+            log_stop(ctx.tenant_id, ctx.agent_id, refusal.switch)
             return LLMResponse(
                 text=agent_off_text(agent.name), tool_calls=[], stop_reason=SWITCHED_OFF
             )
@@ -770,10 +778,15 @@ class AgentActivities:
         ``search_knowledge`` uses it, and it returns the citations it numbered.
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
         citations: list[Citation] = []
-        if await self._notion_off(ctx.tenant_id):
-            # Reading and searching Notion both go through the connector. The model gets
-            # an error it can pass on; nothing is read.
+        if isinstance(refusal, AgentOff):
+            # A call dispatched before the agent was turned off. The model gets an error
+            # it can pass on; nothing is read.
+            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            text, is_error = agent_off_text(agent.name), True
+        elif refusal is not None:
+            # Reading and searching Notion both go through the connector.
             text, is_error = connector_off_text("notion"), True
         elif call.name == "search_knowledge":
             text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
@@ -862,6 +875,7 @@ class AgentActivities:
     @activity.defn(name="post_approval_card")
     async def post_approval_card(self, spec: TaskSpec, task_id: str) -> str:
         ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
         self._log("post_approval_card", ctx.tenant_id, ctx.agent_id)
         key = f"{task_id}:card"
         existing = await self.idem.get(ctx.tenant_id, key)
@@ -885,12 +899,25 @@ class AgentActivities:
 
     @activity.defn(name="update_card")
     async def update_card(self, spec: TaskSpec, task_id: str, card_ts: str, text: str) -> None:
+        await self._replace_card(spec, task_id, card_ts, f"{text}: {_subject(spec)}")
+
+    @activity.defn(name="update_card_line")
+    async def update_card_line(self, spec: TaskSpec, task_id: str, card_ts: str, line: str) -> None:
+        """Replace the card with ``line`` as it is.
+
+        A separate activity, not an optional argument of ``update_card``: Temporal decodes
+        by type only when the call carries every argument, so calls already in a history
+        would stop decoding.
+        """
+        await self._replace_card(spec, task_id, card_ts, line)
+
+    async def _replace_card(self, spec: TaskSpec, task_id: str, card_ts: str, text: str) -> None:
         ctx = spec.ctx
         self._log("update_card", ctx.tenant_id, ctx.agent_id)
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         slack = self._runtime(ctx.tenant_id).slack
         channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
-        line = escape_slack(f"{text}: {_subject(spec)}")
+        line = escape_slack(text)
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": line}}]
         await slack.update_message(channel, card_ts, line, blocks=blocks)
 
@@ -902,6 +929,7 @@ class AgentActivities:
         click on an older version of the card no longer matches.
         """
         ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
         self._log("refresh_card", ctx.tenant_id, ctx.agent_id)
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         slack = self._runtime(ctx.tenant_id).slack
@@ -922,8 +950,8 @@ class AgentActivities:
         fails before any card is posted or anything is written.
         """
         ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
-        await self._require_notion(ctx.tenant_id, ctx.agent_id, "prepare_comment")
         try:
             connector = await self._connector(ctx.tenant_id, ctx.agent_id)
             item = await connector.resolve_item(spec.payload["item"])
@@ -945,12 +973,12 @@ class AgentActivities:
     async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
         ctx = spec.ctx
         self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
+        page_id = spec.payload["page_id"]
+        idem_key = f"{task_id}:comment"
+        await self._gate_write(spec, task_id, page_id, idem_key)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
-        page_id = spec.payload["page_id"]
         text = spec.payload["comment"]
-        idem_key = f"{task_id}:comment"
-        await self._require_writes(spec, task_id, page_id, idem_key)
         await self._record_approval(spec, task_id, page_id)
         try:
             await connector.resolve_item(page_id)
@@ -974,11 +1002,11 @@ class AgentActivities:
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         ctx = spec.ctx
         self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
-        connector = self._connector_for(ctx.tenant_id, agent)
         database_id = spec.payload["database_id"]
         idem_key = f"{task_id}:create"
-        await self._require_writes(spec, task_id, database_id, idem_key)
+        await self._gate_write(spec, task_id, database_id, idem_key)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent)
         await self._record_approval(spec, task_id, database_id)
         try:
             connector.grant_for(database_id)
@@ -1017,6 +1045,7 @@ class AgentActivities:
         find it, which is not proof that nothing was filed.
         """
         ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("reconcile_notion_item", ctx.tenant_id, ctx.agent_id)
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         idem_key = f"{task_id}:create"
@@ -1038,6 +1067,7 @@ class AgentActivities:
     async def reconcile_notion_comment(self, spec: TaskSpec, task_id: str) -> str | None:
         """The comment counterpart of ``reconcile_notion_item``: its ID, or None for "not seen"."""
         ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("reconcile_notion_comment", ctx.tenant_id, ctx.agent_id)
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         idem_key = f"{task_id}:comment"
@@ -1054,8 +1084,12 @@ class AgentActivities:
     @activity.defn(name="get_notion_item")
     async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
         """Read one item. Takes IDs only: the watch polls this thousands of times."""
+        refusal = await self._gate_refusal(tenant_id, agent_id, Effect.POLL)
         self._log("get_notion_item", tenant_id, agent_id)
-        if await self._notion_off(tenant_id):
+        if isinstance(refusal, AgentOff):
+            # The agent is off: the task ends the watch, with no post. No Notion call is made.
+            raise _non_retryable(refusal)
+        if refusal is not None:
             # Retryable on purpose: the task workflow treats a poll that fails after its
             # retries as "still watching" and polls again later, while a permanent
             # failure would end the watch. No Notion call is made.
@@ -1091,18 +1125,12 @@ class AgentActivities:
             target=target_agent,
         )
 
-    @activity.defn(name="check_audience")
-    async def check_audience(self, ctx: TurnContext) -> AudienceDecision:
-        """May the requester use this agent in this place? Read-only.
+    async def _audience_decision(self, ctx: TurnContext, agent: AgentVersion) -> AudienceDecision:
+        """May the requester use ``agent`` in this place? A failed lookup raises.
 
-        Asker, place and agent come from ``ctx``, which the runtime built from the Slack
-        event. A transient Slack failure is retried; any failure that survives the
-        retries reaches the workflow as an error, which refuses the turn. On a refusal the
-        decision carries the agent's creator, for the reply to name. A channel where the
-        agent is paused refuses with reason ``paused``, before any Slack lookup.
+        A transient Slack failure is retried (after Slack's own delay when it gave one);
+        a lasting one fails for good.
         """
-        self._log("check_audience", ctx.tenant_id, ctx.agent_id)
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         try:
             decision = await self.audience.decide(
                 ctx.tenant_id, agent, ctx.requester_user_id, ctx.channel, ctx.channel_kind
@@ -1125,10 +1153,58 @@ class AgentActivities:
                     ) from err
                 raise
             raise ApplicationError(str(err), type="SlackLookupError", non_retryable=True) from err
+        return decision
+
+    @activity.defn(name="check_audience")
+    async def check_audience(self, ctx: TurnContext) -> AudienceDecision:
+        """May the requester use this agent in this place? Read-only.
+
+        Asker, place and agent come from ``ctx``, which the runtime built from the Slack
+        event. A transient Slack failure is retried; any failure that survives the
+        retries reaches the workflow as an error, which refuses the turn. On a refusal the
+        decision carries the agent's creator, for the reply to name. A channel where the
+        agent is paused refuses with reason ``paused``, before any Slack lookup.
+        """
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        self._log("check_audience", ctx.tenant_id, ctx.agent_id)
+        if isinstance(refusal, AgentOff):
+            # An agent that is off is not available to anyone: the turn, or a hand-off to it,
+            # is refused with the fixed "turned off" reply.
+            return AudienceDecision(False, OFF)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        decision = await self._audience_decision(ctx, agent)
         if not decision.allowed:
             record = await self.agents.get_agent(ctx.tenant_id, ctx.agent_id)
             decision.owner = None if record is None else record.created_by
         return decision
+
+    @activity.defn(name="check_before_write")
+    async def check_before_write(self, spec: TaskSpec, task_id: str) -> str | None:
+        """Just before an approved write: may the agent still act for the requester here?
+
+        None means go on. Otherwise the line the card shows, and nothing is to be written:
+        the agent was turned off, the agent's channel was paused, or the requester is no
+        longer in the audience of the agent's current published version. A switch that
+        covers the write itself (writes, the connector) is left to the write activity,
+        which says so in its own words. A lookup that fails for good fails the activity.
+        """
+        ctx = spec.ctx
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
+        self._log("check_before_write", ctx.tenant_id, ctx.agent_id)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if isinstance(refusal, AgentOff):
+            line = agent_off_card_text(agent.name)
+        elif not (await self._audience_decision(ctx, agent)).allowed:
+            line = no_longer_act_text(agent.name)
+        else:
+            return None
+        if spec.tool_name == "add_comment":
+            target, idem_key = spec.payload["page_id"], f"{task_id}:comment"
+        else:
+            target, idem_key = spec.payload["database_id"], f"{task_id}:create"
+        await self._record_approval(spec, task_id, target)
+        await self._record_write(spec, task_id, idem_key, target, "error")
+        return line
 
     @activity.defn(name="record_audience_refusal")
     async def record_audience_refusal(

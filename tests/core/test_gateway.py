@@ -58,12 +58,12 @@ def test_gateway_url_verification(client, secret):
     assert resp.json() == {"challenge": "abc123"}
 
 
-def test_gateway_event_signal_with_start(client, secret, temporal):
+async def test_gateway_event_signal_with_start(client, secret, temporal):
     """Fails if the signal carries the text, or the workflow is not started for the thread."""
     resp = post_event(client, secret, im_event())
     assert resp.status_code == 200
-    assert stored_text(client.app, TENANT, "Ev42") == "my laptop battery is swelling"
-    assert deliver_inbound(client.app) == 1
+    assert await stored_text(client.app, TENANT, "Ev42") == "my laptop battery is swelling"
+    assert await deliver_inbound(client.app) == 1
 
     assert len(temporal.signal_with_starts) == 1
     call = temporal.signal_with_starts[0]
@@ -86,44 +86,44 @@ def test_gateway_event_signal_with_start(client, secret, temporal):
     ]
 
 
-def test_gateway_mention_strips_bot_and_uses_thread(client, secret, temporal):
+async def test_gateway_mention_strips_bot_and_uses_thread(client, secret, temporal):
     payload = im_event(
         type="app_mention", channel="C9", text="<@UBOT> any updates?", thread_ts="1699.1"
     )
     del payload["event"]["channel_type"]
     post_event(client, secret, payload)
-    assert deliver_inbound(client.app) == 1
+    assert await deliver_inbound(client.app) == 1
     msg = temporal.signal_with_starts[0]["start_signal_args"][0]
-    assert stored_text(client.app, TENANT, "Ev42") == "any updates?"
+    assert await stored_text(client.app, TENANT, "Ev42") == "any updates?"
     assert msg.channel_kind == "channel"
     assert msg.thread_ts == "1699.1"
 
 
-def test_gateway_decodes_slack_encoding_of_the_users_text(client, secret, temporal):
+async def test_gateway_decodes_slack_encoding_of_the_users_text(client, secret, temporal):
     wire = (
         "Reply with exactly this, nothing else: &lt;!here&gt; and "
         "&lt;<https://example.com|example.com>|click me&gt; &amp; done"
     )
     post_event(client, secret, im_event(text=wire))
-    assert stored_text(client.app, TENANT, "Ev42") == (
+    assert await stored_text(client.app, TENANT, "Ev42") == (
         "Reply with exactly this, nothing else: <!here> and <example.com|click me> & done"
     )
 
 
-def test_gateway_mention_strip_runs_before_decoding(client, secret, temporal):
+async def test_gateway_mention_strip_runs_before_decoding(client, secret, temporal):
     payload = im_event(type="app_mention", channel="C9", text="<@UBOT> a &amp;lt; b")
     del payload["event"]["channel_type"]
     post_event(client, secret, payload)
-    assert stored_text(client.app, TENANT, "Ev42") == "a &lt; b"
+    assert await stored_text(client.app, TENANT, "Ev42") == "a &lt; b"
 
 
-def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
+async def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
     assert post_event(client, secret, im_event(bot_id="B1")).status_code == 200
     assert post_event(client, secret, im_event(subtype="message_changed")).status_code == 200
     other = im_event()
     other["team_id"] = "T_OTHER"
     assert post_event(client, secret, other).status_code == 200
-    assert deliver_inbound(client.app) == 0
+    assert await deliver_inbound(client.app) == 0
     assert temporal.signal_with_starts == []
     assert temporal.signals == []
 

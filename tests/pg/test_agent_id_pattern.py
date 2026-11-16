@@ -19,6 +19,8 @@ COLUMNS = {
     "VALUES (%(t)s, 'e', 'answer', %(a)s, 1, 'u', 'agent:x', 'ok')",
     "usage_events": "INSERT INTO usage_events (tenant_id, usage_key, kind, agent_id, "
     "agent_version, model) VALUES (%(t)s, 'k', 'llm', %(a)s, 1, 'm')",
+    "usage_month_totals": "INSERT INTO usage_month_totals (tenant_id, month, agent_id, kind) "
+    "VALUES (%(t)s, '2026-11-01', %(a)s, 'llm')",
     "budgets": "INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by) "
     "VALUES (%(t)s, %(a)s, 10, 'u')",
     "audience_pauses": "INSERT INTO audience_pauses (tenant_id, agent_id, channel, reason) "

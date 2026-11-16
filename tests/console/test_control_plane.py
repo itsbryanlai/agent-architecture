@@ -313,7 +313,10 @@ async def test_only_an_admin_reads_the_audit_log():
     assert events == await audit.list(TENANT)
 
 
-async def test_each_action_writes_one_event_with_ids_and_a_hash_and_no_definition_text():
+@pytest.fixture
+async def lifecycle():
+    """Every control-plane action once, in order: the audit store, the definition used, and
+    the ``(kind, events it wrote)`` of each step."""
     plane, _, _, audit = await make_plane()
     definition = helper_block()
     steps = [
@@ -330,18 +333,40 @@ async def test_each_action_writes_one_event_with_ids_and_a_hash_and_no_definitio
         ("member_role", plane.change_role(TENANT, ROOT, "U_NEW", "admin")),
         ("member_remove", plane.drop_member(TENANT, ROOT, "U_NEW")),
     ]
-    count = 0
+    written = []
     for kind, step in steps:
+        before = len(audit.events)
         await step
-        # The first publish widens access, so it also records the acknowledgement.
-        count += 2 if kind == "agent_publish" else 1
-        assert len(audit.events) == count, kind
-        assert audit.events[count - (2 if kind == "agent_publish" else 1)].kind == kind
+        written.append((kind, [e.kind for e in audit.events[before:]]))
+    return audit, definition, written
 
+
+async def test_each_action_writes_one_event_of_its_kind(lifecycle):
+    """Fails if an action writes no event, two events, or one of another kind."""
+    _, _, written = lifecycle
+    # The first publish widens access, so it also records the acknowledgement.
+    assert written == [
+        (kind, ["agent_publish", "widening_confirm"] if kind == "agent_publish" else [kind])
+        for kind, _ in written
+    ]
+
+
+async def test_every_event_is_tenant_keyed_unique_and_holds_no_definition_text(lifecycle):
+    """Fails if an event lacks the tenant, repeats another's key, or carries the prompt text."""
+    audit, _, _ = lifecycle
     for event in audit.events:
         assert event.tenant_id == TENANT
         assert event.event_key.startswith(f"{TENANT}:audit:control:{event.kind}:")
         assert PROMPT not in repr(event)
+    assert len({e.event_key for e in audit.events}) == len(audit.events)
+
+
+async def test_agent_events_carry_the_agent_and_the_definition_hash_and_member_events_neither(
+    lifecycle,
+):
+    """Fails if an agent event loses the agent ID or definition hash, or a member event gains them."""
+    audit, definition, _ = lifecycle
+    for event in audit.events:
         if event.kind.startswith(("agent_", "widening_")):
             assert (event.agent_id, event.input_sha256) == (
                 "it-helper",
@@ -349,16 +374,25 @@ async def test_each_action_writes_one_event_with_ids_and_a_hash_and_no_definitio
             )
         else:
             assert (event.agent_id, event.agent_version, event.input_sha256) == (None, None, None)
-    assert len({e.event_key for e in audit.events}) == len(audit.events)
 
-    member_events = audit.events[-3:]
-    assert [(e.target, e.tool) for e in member_events] == [
+
+async def test_member_events_name_the_member_and_the_role(lifecycle):
+    """Fails if a member event does not name who it is about, or the role it set."""
+    audit, _, _ = lifecycle
+    assert [(e.target, e.tool) for e in audit.events[-3:]] == [
         ("U_NEW", "role:creator"),
         ("U_NEW", "role:admin"),
         ("U_NEW", None),
     ]
-    assert audit.events[0].requester_user_id == OWNER
-    assert audit.events[0].identity == f"user:{OWNER}"
+
+
+async def test_events_name_the_acting_user(lifecycle):
+    """Fails if an event records another identity than the user who acted."""
+    audit, _, _ = lifecycle
+    assert (audit.events[0].requester_user_id, audit.events[0].identity) == (
+        OWNER,
+        f"user:{OWNER}",
+    )
     assert audit.events[-1].identity == f"user:{ROOT}"
 
 

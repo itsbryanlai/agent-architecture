@@ -179,13 +179,13 @@ def _helper(**over) -> dict:
     return {**agents_dict()["agents"]["it-helper"], **over}
 
 
-@pytest.mark.parametrize(("given", "limit"), [(None, 2), (1, 1), (10, 10)])
-def test_max_writes_per_turn_defaults_to_two_and_round_trips(given, limit):
-    """Fails if the write limit is lost between the definition and the agent, or a default is stored."""
-    agent = parse_agent("it-helper", _helper(max_writes_per_turn=given), 1)
+@pytest.mark.parametrize("limit", [1, 10])
+def test_max_writes_per_turn_round_trips(limit):
+    """Fails if the write limit is lost between the definition and the agent."""
+    agent = parse_agent("it-helper", _helper(max_writes_per_turn=limit), 1)
 
     assert agent.max_writes_per_turn == limit
-    assert ("max_writes_per_turn" in agent_definition(agent)) == (limit != 2)
+    assert agent_definition(agent)["max_writes_per_turn"] == limit
     assert parse_agent("it-helper", agent_definition(agent), 1) == agent
 
 

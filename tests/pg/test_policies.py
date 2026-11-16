@@ -45,6 +45,8 @@ SEEDS = {
     "usage_adjustments": "INSERT INTO usage_adjustments "
     "(tenant_id, usage_key, cost_usd, price_model, price_effective_from) "
     "VALUES (%(t)s, 'k', 1, 'm', '2026-11-01')",
+    "usage_month_totals": "INSERT INTO usage_month_totals (tenant_id, month, agent_id, kind) "
+    "VALUES (%(t)s, '2026-11-01', '', 'llm')",
     "budgets": "INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by) "
     "VALUES (%(t)s, NULL, 10, 'u')",
     "audience_pauses": "INSERT INTO audience_pauses (tenant_id, agent_id, channel, reason) "
@@ -93,6 +95,7 @@ PRIVILEGES = {
     "sessions": "SELECT INSERT DELETE",
     "usage_events": "SELECT INSERT",
     "usage_adjustments": "SELECT",
+    "usage_month_totals": "SELECT INSERT UPDATE",
     "budgets": "SELECT INSERT UPDATE DELETE",
     "audience_pauses": "SELECT INSERT UPDATE",
     "kill_switches": "SELECT INSERT DELETE",

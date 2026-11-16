@@ -643,7 +643,7 @@ async def test_the_usage_page_says_the_budget_cannot_see_unpriced_calls(h):
     text = text_of(await page(h, ROOT))
 
     assert "1 model call has no price" in text and "cannot count" in text
-    assert "mine is paused" in text or "is paused until" in text
+    assert "mine is paused until the price is added" in text
     body = (await api(h, ROOT, "GET", f"/tenants/{TENANT}/budgets")).json()
     line = next(x for x in body["agents"] if x["agent_id"] == "mine")
     assert line["stop_reason"] == "spend_unknown"
@@ -972,14 +972,14 @@ class CountingUsage(InMemoryUsageStore):
         super().__init__()
         self.reads = 0
 
-    async def totals(self, tenant_id, start, end):
+    async def month_totals(self, tenant_id, start):
         self.reads += 1
         await asyncio.sleep(0)
-        return await super().totals(tenant_id, start, end)
+        return await super().month_totals(tenant_id, start)
 
 
 async def test_concurrent_checks_after_expiry_share_one_aggregate_read():
-    """Fails if N checks that find the cache expired each run the month's GROUP BY."""
+    """Fails if N checks that find the cache expired each read the rollup."""
     budgets, usage = InMemoryBudgetStore(), CountingUsage()
     guard = BudgetGuard(budgets, usage, Clock(), ttl_seconds=60)
     await budgets.set_budget(TENANT, "it-helper", D("5"), ROOT)

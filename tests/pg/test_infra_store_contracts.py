@@ -115,24 +115,35 @@ async def test_tool_outputs_keep_the_first_text_and_read_back_by_id(tool_outputs
     assert await tool_outputs.get_many(tenant, "c", []) == {}
 
 
-async def test_content_store_keeps_the_first_of_everything_it_is_given_twice(content, tenant: str):
-    """Fails if a retry replaces a stored event, model step, tool input or draft revision."""
+async def test_content_store_keeps_the_first_inbound_event_it_is_given_twice(content, tenant: str):
+    """Fails if a retried inbound event replaces the stored one."""
     assert await content.put_inbound(tenant, "Ev1", {"text": "first"}) is True
     assert await content.put_inbound(tenant, "Ev1", {"text": "second"}) is False
     assert await content.get_inbound(tenant, "Ev1") == {"text": "first"}
     assert await content.get_inbound(tenant, "Ev2") is None
 
+
+async def test_content_store_keeps_the_first_model_step_it_is_given_twice(content, tenant: str):
+    """Fails if a retried model step replaces the stored one."""
     one = StoredStep("end_turn", [{"type": "text", "text": "a"}], "a")
     two = StoredStep("tool_use", [{"type": "tool_use", "id": "u", "name": "n", "input": {}}])
     assert await content.put_step(tenant, "c", "k", one) == one
     assert await content.put_step(tenant, "c", "k", two) == one
     assert await content.get_step(tenant, "c", "other") is None
 
+
+async def test_content_store_keeps_the_first_tool_input_it_is_given_twice(content, tenant: str):
+    """Fails if a retried tool call replaces the stored input."""
     await content.put_tool_input(tenant, "c", "u1", {"query": "first"})
     await content.put_tool_input(tenant, "c", "u1", {"query": "second"})
     assert await content.get_tool_input(tenant, "c", "u1") == (True, {"query": "first"})
     assert await content.get_tool_input(tenant, "c", "missing") == (False, None)
 
+
+async def test_content_store_keeps_the_first_draft_of_a_revision_and_stores_the_next(
+    content, tenant: str
+):
+    """Fails if a retry replaces a draft revision, or a new revision is not stored beside it."""
     await content.put_draft(tenant, "t", 1, {"title": "first"})
     await content.put_draft(tenant, "t", 1, {"title": "second"})
     await content.put_draft(tenant, "t", 2, {"title": "edited"})
@@ -164,16 +175,21 @@ async def test_task_link_keeps_the_first_task_for_a_page(task_links, tenant: str
     assert await task_links.task_for_page(tenant, "p") == "task-1"
 
 
-async def test_knowledge_store_replaces_pages_and_searches_by_distance(
-    knowledge, tenant: str, other_tenant: str
-):
-    """Fails if a re-index leaves old chunks, search ignores scope or tenant, or the nearest chunk is not first."""
+async def seeded_fruit(knowledge, tenant: str, other_tenant: str):
     chunks = [("about apples", unit_vector(0)), ("about pears", unit_vector(1))]
     await knowledge.replace_page(tenant, "s1", "p1", "Fruit", "https://n/p1", "h1", chunks)
     await knowledge.replace_page(tenant, "s2", "p2", "Hidden", "https://n/p2", "h2", chunks[:1])
     await knowledge.replace_page(
         other_tenant, "s1", "p3", "Theirs", "https://n/p3", "h3", chunks[:1]
     )
+    return chunks
+
+
+async def test_knowledge_search_is_scoped_to_the_tenant_and_ordered_by_distance(
+    knowledge, tenant: str, other_tenant: str
+):
+    """Fails if search ignores scope or tenant, or the nearest chunk is not first."""
+    await seeded_fruit(knowledge, tenant, other_tenant)
 
     hits = await knowledge.search(tenant, ["s1"], unit_vector(1), limit=5)
     assert [(h.page_id, h.text) for h in hits] == [("p1", "about pears"), ("p1", "about apples")]
@@ -182,7 +198,15 @@ async def test_knowledge_store_replaces_pages_and_searches_by_distance(
     assert await knowledge.search(tenant, [], unit_vector(1), limit=5) == []
     assert len(await knowledge.search(tenant, ["s1", "s2"], unit_vector(0), limit=5)) == 3
 
+
+async def test_reindexing_a_page_replaces_its_chunks_and_details(
+    knowledge, tenant: str, other_tenant: str
+):
+    """Fails if a re-index leaves old chunks, the old hash, or the old title behind."""
+    chunks = await seeded_fruit(knowledge, tenant, other_tenant)
+
     await knowledge.replace_page(tenant, "s1", "p1", "Fruit v2", "https://n/p1", "h1b", chunks[:1])
+
     assert await knowledge.page_hashes(tenant, "s1") == {"p1": "h1b"}
     assert [h.text for h in await knowledge.search(tenant, ["s1"], unit_vector(1), limit=5)] == [
         "about apples"
@@ -190,6 +214,14 @@ async def test_knowledge_store_replaces_pages_and_searches_by_distance(
     assert await knowledge.page_meta(tenant, ["s1"], ["p1", "p2"]) == {
         "p1": ("Fruit v2", "https://n/p1")
     }
+
+
+async def test_deleting_pages_and_scopes_leaves_the_other_tenants_alone(
+    knowledge, tenant: str, other_tenant: str
+):
+    """Fails if a delete misses its rows or reaches another tenant's scope."""
+    await seeded_fruit(knowledge, tenant, other_tenant)
+
     assert sorted(await knowledge.scopes(tenant)) == ["s1", "s2"]
     assert await knowledge.delete_pages(tenant, "s1", ["p1", "nope"]) == 1
     assert await knowledge.delete_scope(tenant, "s2") == 1

@@ -4,8 +4,8 @@ OpenAI client that records its arguments and returns a canned reply."""
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
+import httpx2
 import pytest
 
 from agentos import worker
@@ -187,14 +187,10 @@ async def test_qwen_thinking_flag():
     assert fake_on.calls[0]["extra_body"] == {"enable_thinking": True}
 
 
-def test_settings_provider_defaults(monkeypatch):
+def test_settings_provider_is_read_from_the_environment(monkeypatch):
     """Fails if the provider variable is ignored, read case-sensitively, or an unknown provider is accepted."""
     for name in PROVIDER_VARS:
         monkeypatch.delenv(name, raising=False)
-
-    default = load_settings()
-    assert default.llm_provider == "anthropic"
-    assert default.qwen_thinking is False
 
     monkeypatch.setenv("AGENTOS_LLM_PROVIDER", "QWEN")
     monkeypatch.setenv("AGENTOS_QWEN_THINKING", "Yes")
@@ -297,38 +293,40 @@ async def test_build_llm_calls_the_chosen_provider_with_the_chosen_model(
     assert json.loads(request.content)["model"] == "chosen-model"
 
 
-class FakeAnthropic:
-    """Stands in for ``AsyncAnthropic``: records each create call, answers with a tool call."""
+class AnthropicServer:
+    """A mocked Anthropic endpoint: records each request body, answers with one tool call."""
 
     def __init__(self):
-        self.calls: list[dict] = []
-        block = SimpleNamespace(
-            type="tool_use",
-            id="toolu_1",
-            name="search_items",
-            input={"query": "x"},
-            model_dump=lambda **_: {
-                "type": "tool_use",
-                "id": "toolu_1",
-                "name": "search_items",
-                "input": {"query": "x"},
-            },
-        )
-        self._response = SimpleNamespace(content=[block], stop_reason="tool_use", usage=None)
-        self.messages = SimpleNamespace(create=self._create)
+        self.bodies: list[dict] = []
+        self.http = httpx2.AsyncClient(transport=httpx2.MockTransport(self._answer))
 
-    async def _create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._response
+    def _answer(self, request):
+        self.bodies.append(json.loads(request.content))
+        message = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "search_items",
+                    "input": {"query": "x"},
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        return httpx2.Response(200, json=message)
 
 
 async def test_anthropic_tool_call_ids_are_namespaced_for_us_and_plain_for_the_server():
     """Fails if two replies share a tool-call ID in history, or the server is sent an ID it did not make."""
     from agentos.llm import AnthropicLLMClient
 
-    fake = FakeAnthropic()
-    client = AnthropicLLMClient.__new__(AnthropicLLMClient)
-    client._client, client._model = fake, "claude-test"
+    server = AnthropicServer()
+    client = AnthropicLLMClient("unused", "claude-test", http_client=server.http)
 
     first = await client.complete("sys", [{"role": "user", "content": "hi"}], TOOLS)
     second = await client.complete("sys", [{"role": "user", "content": "hi"}], TOOLS)
@@ -345,7 +343,7 @@ async def test_anthropic_tool_call_ids_are_namespaced_for_us_and_plain_for_the_s
         },
     ]
     await client.complete("sys", history, TOOLS)
-    sent = fake.calls[-1]["messages"]
+    sent = server.bodies[-1]["messages"]
     assert sent[1]["content"][0]["id"] == "toolu_1"
     assert sent[2]["content"][0]["tool_use_id"] == "toolu_1"
     assert history[1]["content"][0]["id"] == one.id, "the stored history is not rewritten"

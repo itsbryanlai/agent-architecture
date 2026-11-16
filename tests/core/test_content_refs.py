@@ -313,7 +313,9 @@ def gateway_client(agents, temporal, secret):
     )
 
 
-def test_slack_is_answered_while_temporal_is_down_and_the_message_arrives_once_it_is_back(agents):
+async def test_slack_is_answered_while_temporal_is_down_and_the_message_arrives_once_it_is_back(
+    agents,
+):
     """Fails if an event is refused or lost while Temporal is down, or delivered twice after."""
     secret = "s3cret"
     temporal = DownTemporal()
@@ -326,13 +328,13 @@ def test_slack_is_answered_while_temporal_is_down_and_the_message_arrives_once_i
     retry = post_event(client, secret, im_event())  # Slack sends the same event again
     assert (first.status_code, retry.status_code) == (200, 200)
 
-    assert asyncio.run(relay.deliver_once()) == 0  # Temporal is down: kept, with a delay
+    assert await relay.deliver_once() == 0  # Temporal is down: kept, with a delay
     assert temporal.signal_with_starts == []
     temporal.up = True
-    assert asyncio.run(relay.deliver_once()) == 0  # still inside the delay
+    assert await relay.deliver_once() == 0  # still inside the delay
     clock[0] += timedelta(seconds=5)
-    assert asyncio.run(relay.deliver_once()) == 1
-    assert asyncio.run(relay.deliver_once()) == 0
+    assert await relay.deliver_once() == 1
+    assert await relay.deliver_once() == 0
     [call] = temporal.signal_with_starts
     assert call["start_signal_args"][0].event_id == "Ev42"
     assert call["start_signal_args"][0].text == ""

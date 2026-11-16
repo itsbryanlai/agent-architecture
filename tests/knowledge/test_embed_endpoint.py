@@ -1,5 +1,8 @@
 """The configurable embedding endpoint, and how indexing treats embedder errors."""
 
+import json
+
+import httpx
 import pytest
 
 from agentos.agent_store import seeded_agent_store
@@ -23,26 +26,58 @@ def with_pages() -> AgentsConfig:
     return parse_agents_config(raw)
 
 
-def test_embedder_uses_own_endpoint_when_set():
-    settings = Settings(embed_base_url="http://localhost:11434/v1", embed_model="bge-m3")
-    embedder = build_embedder(settings, TenantsConfig.of(with_pages()))
+async def embed_one(settings: Settings) -> httpx.Request:
+    """Build the embedder from ``settings``, embed one text, and return the request it sent."""
+    sent: list[httpx.Request] = []
 
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        body = {
+            "object": "list",
+            "model": "m",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.0] * 1024}],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+        }
+        return httpx.Response(200, json=body)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    embedder = build_embedder(settings, TenantsConfig.of(with_pages()), http_client=http)
     assert isinstance(embedder, OpenAICompatibleEmbedder)
-    assert str(embedder._client.base_url).startswith("http://localhost:11434/v1")
-    assert (embedder.model, embedder.dimensions) == ("bge-m3", 1024)
+    await embedder.embed(["a page"])
+    [request] = sent
+    return request
 
 
-def test_embedder_falls_back_to_qwen_settings():
+@pytest.mark.parametrize(
+    ("settings", "url", "model"),
+    [
+        (
+            Settings(embed_base_url="http://localhost:11434/v1", embed_model="bge-m3"),
+            "http://localhost:11434/v1/embeddings",
+            "bge-m3",
+        ),
+        (
+            Settings(qwen_api_key="k", qwen_base_url="http://qwen.test/v1"),
+            "http://qwen.test/v1/embeddings",
+            None,
+        ),
+    ],
+)
+async def test_the_embedder_calls_the_configured_endpoint(settings, url, model):
+    """Fails if the embedder calls another endpoint than AGENTOS_EMBED_BASE_URL, or the Qwen one when that is unset."""
+    request = await embed_one(settings)
+    assert str(request.url) == url
+    if model is not None:
+        assert json.loads(request.content)["model"] == model
+
+
+def test_no_embedder_is_built_without_page_grants_or_without_the_qwen_key():
     """Fails if an embedder is built with no page grants, or without the Qwen key when no endpoint is set."""
     no_pages = TenantsConfig.of(parse_agents_config(agents_dict()))
     assert build_embedder(Settings(), no_pages) is None
 
-    cfg = TenantsConfig.of(with_pages())
     with pytest.raises(RuntimeError, match="QWEN_API_KEY"):
-        build_embedder(Settings(), cfg)
-
-    embedder = build_embedder(Settings(qwen_api_key="k", qwen_base_url="http://qwen.test/v1"), cfg)
-    assert str(embedder._client.base_url).startswith("http://qwen.test/v1")
+        build_embedder(Settings(), TenantsConfig.of(with_pages()))
 
 
 def test_embed_api_key_hidden_from_repr(monkeypatch):

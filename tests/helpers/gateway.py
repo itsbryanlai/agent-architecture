@@ -1,6 +1,5 @@
 """Gateway helpers: a fake Temporal client, signed Slack requests, and running the relay."""
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -67,13 +66,13 @@ def im_event(**overrides) -> dict:
     return {"type": "event_callback", "team_id": TEAM, "event_id": "Ev42", "event": event}
 
 
-def deliver_inbound(app) -> int:
+async def deliver_inbound(app) -> int:
     """Run the relay once over the app's stored events; return how many it delivered."""
     d = app.state.deps
-    return asyncio.run(InboundRelay(d.content, d.tenants, d.temporal_client).deliver_once())
+    return await InboundRelay(d.content, d.tenants, d.temporal_client).deliver_once()
 
 
-def stored_text(app, tenant: str, event_id: str) -> str:
+async def stored_text(app, tenant: str, event_id: str) -> str:
     """The text the gateway kept for an event."""
     d = app.state.deps
-    return asyncio.run(d.content.get_inbound(tenant, event_id))["text"]
+    return (await d.content.get_inbound(tenant, event_id))["text"]

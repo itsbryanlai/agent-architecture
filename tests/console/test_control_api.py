@@ -162,72 +162,102 @@ async def test_an_unknown_tenant_is_404(h):
 # --- agents -------------------------------------------------------------------------
 
 
-async def test_the_agent_lifecycle_through_the_api(h):
+@pytest.fixture
+async def api(h):
+    """A client of the API, signed in as the creator."""
     async with h.client() as c:
         h.as_user(OWNER)
-        made = await c.post(
-            t("/agents"), json={"agent_id": "it-helper", "definition": helper_block()}
-        )
-        assert made.status_code == 201
-        assert made.json()["status"] == "draft"
-        assert made.json()["version"] == 1
+        yield c
 
-        listed = await c.get(t("/agents"))
-        assert [a["agent_id"] for a in listed.json()] == ["it-helper"]
-        assert listed.json()[0]["created_by"] == OWNER
 
-        edited = helper_block()
-        edited["name"] = "IT helper v2"
-        put = await c.put(t("/agents/it-helper/versions/1"), json={"definition": edited})
-        assert put.status_code == 200
-        assert put.json()["definition"]["name"] == "IT helper v2"
+async def submit(c, version: int = 1):
+    return await c.post(t(f"/agents/it-helper/versions/{version}/submit"))
 
-        submitted = await c.post(t("/agents/it-helper/versions/1/submit"))
-        assert submitted.json()["status"] == "pending"
-        withdrawn = await c.post(t("/agents/it-helper/versions/1/withdraw"))
-        assert withdrawn.json()["status"] == "draft"
-        await c.post(t("/agents/it-helper/versions/1/submit"))
 
-        h.as_user(ADMIN2)
-        rejected = await c.post(t("/agents/it-helper/versions/1/reject"))
-        assert rejected.json()["status"] == "draft"
-        h.as_user(OWNER)
-        await c.post(t("/agents/it-helper/versions/1/submit"))
+@pytest.fixture
+async def draft(h, api):
+    """Version 1 of ``it-helper``, created by the creator and still a draft."""
+    made = await api.post(
+        t("/agents"), json={"agent_id": "it-helper", "definition": helper_block()}
+    )
+    assert made.status_code == 201
+    return made
 
-        h.as_user(ADMIN2)
-        published = await c.post(
-            t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
-        )
-        assert published.status_code == 200
-        assert published.json()["status"] == "published"
-        assert published.json()["approved_by"] == ADMIN2
 
-        h.as_user(OWNER)
-        draft = await c.post(t("/agents/it-helper/drafts"), json={"from_version": 1})
-        assert draft.status_code == 201
-        assert draft.json()["version"] == 2
-        again = await c.post(t("/agents/it-helper/drafts"))
-        assert again.status_code == 201
-        assert again.json()["version"] == 3
+@pytest.fixture
+async def pending(draft, api):
+    """Version 1 submitted for review."""
+    assert (await submit(api)).status_code == 200
 
-        versions = await c.get(t("/agents/it-helper/versions"))
-        assert [v["version"] for v in versions.json()] == [3, 2, 1]
-        one = await c.get(t("/agents/it-helper/versions/1"))
-        assert one.json()["status"] == "published"
 
-    assert kinds(h) == [
-        "agent_create",
-        "agent_edit",
-        "agent_submit",
-        "agent_withdraw",
-        "agent_submit",
-        "agent_reject",
-        "agent_submit",
-        "agent_publish",
-        "widening_confirm",
-        "agent_draft",
-        "agent_draft",
-    ]
+async def test_creating_an_agent_makes_a_draft_listed_with_its_creator(h, api, draft):
+    """Fails if a created agent is not a draft version 1, or the list loses its creator."""
+    assert draft.json()["status"] == "draft"
+    assert draft.json()["version"] == 1
+    listed = (await api.get(t("/agents"))).json()
+    assert [(a["agent_id"], a["created_by"]) for a in listed] == [("it-helper", OWNER)]
+    assert kinds(h) == ["agent_create"]
+
+
+async def test_editing_a_draft_replaces_its_definition(h, api, draft):
+    """Fails if an edit to a draft is not stored, or is not audited."""
+    edited = helper_block()
+    edited["name"] = "IT helper v2"
+
+    put = await api.put(t("/agents/it-helper/versions/1"), json={"definition": edited})
+
+    assert put.status_code == 200
+    assert put.json()["definition"]["name"] == "IT helper v2"
+    assert kinds(h)[-1] == "agent_edit"
+
+
+async def test_a_submitted_version_can_be_withdrawn_back_to_a_draft(h, api, draft):
+    """Fails if submit does not make a version pending, or withdraw does not return it to draft."""
+    assert (await submit(api)).json()["status"] == "pending"
+    withdrawn = await api.post(t("/agents/it-helper/versions/1/withdraw"))
+
+    assert withdrawn.json()["status"] == "draft"
+    assert kinds(h)[-2:] == ["agent_submit", "agent_withdraw"]
+
+
+async def test_an_admin_rejecting_a_pending_version_returns_it_to_draft(h, api, pending):
+    """Fails if a rejected version stays pending, or the rejection is not audited."""
+    h.as_user(ADMIN2)
+
+    rejected = await api.post(t("/agents/it-helper/versions/1/reject"))
+
+    assert rejected.json()["status"] == "draft"
+    assert kinds(h)[-1] == "agent_reject"
+
+
+async def test_an_admin_publishing_a_pending_version_records_who_approved_it(h, api, pending):
+    """Fails if publish does not mark the version published by the approving admin, or skips the audit."""
+    h.as_user(ADMIN2)
+
+    published = await api.post(
+        t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1)
+    )
+
+    assert published.status_code == 200
+    assert published.json()["status"] == "published"
+    assert published.json()["approved_by"] == ADMIN2
+    assert kinds(h)[-2:] == ["agent_publish", "widening_confirm"]
+
+
+async def test_new_drafts_of_a_published_agent_take_the_next_numbers_newest_first(h, api, pending):
+    """Fails if a new draft reuses a number, or the version list is not newest first."""
+    h.as_user(ADMIN2)
+    await api.post(t("/agents/it-helper/versions/1/publish"), json=await seen(h, "it-helper", 1))
+    h.as_user(OWNER)
+
+    from_one = await api.post(t("/agents/it-helper/drafts"), json={"from_version": 1})
+    latest = await api.post(t("/agents/it-helper/drafts"))
+
+    assert (from_one.status_code, from_one.json()["version"]) == (201, 2)
+    assert (latest.status_code, latest.json()["version"]) == (201, 3)
+    versions = await api.get(t("/agents/it-helper/versions"))
+    assert [v["version"] for v in versions.json()] == [3, 2, 1]
+    assert (await api.get(t("/agents/it-helper/versions/1"))).json()["status"] == "published"
 
 
 # --- members ------------------------------------------------------------------------

@@ -239,56 +239,67 @@ async def test_an_unexpected_failure_is_a_plain_page_without_details(h):
 # --- the lifecycle through the forms ------------------------------------------------
 
 
-async def test_a_creator_creates_edits_and_submits_and_an_admin_publishes(h):
+async def test_creating_an_agent_through_the_form_makes_a_draft_and_says_so(h):
+    """Fails if the create form redirects elsewhere, shows no notice, or audits another identity."""
     owner = await h.signed_in(OWNER)
-    admin = await h.signed_in(ADMIN2)
-    async with using(owner), using(admin):
-        token = await csrf_token(owner)
+    async with using(owner):
         created = await post(
             owner,
             f"{UI}/agents",
-            token,
+            await csrf_token(owner),
             agent_id="it-helper",
             definition=definition_text(helper_block()),
         )
         assert created.status_code == 303
         assert created.headers["location"] == f"{VERSION}?done=created"
         page = await owner.get(created.headers["location"])
-        assert "Agent created as a draft." in page.text
+    assert "Agent created as a draft." in page.text
+    assert await status_of_version(h) == "draft"
+    assert [(e.kind, e.identity) for e in h.audit.events] == [("agent_create", f"user:{OWNER}")]
 
-        edited = helper_block()
-        edited["max_steps"] = 4
-        saved = await post(owner, f"{VERSION}/edit", token, definition=definition_text(edited))
-        assert saved.status_code == 303
-        stored = await h.agents.get_version(TENANT, "it-helper", 1)
-        assert stored.definition["max_steps"] == 4
 
-        submitted = await post(owner, f"{VERSION}/submit", token)
-        assert submitted.status_code == 303
-        assert await status_of_version(h) == "pending"
+async def test_saving_the_edit_form_replaces_the_draft_definition(h):
+    """Fails if the edit form does not store the posted definition, or audits another identity."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    owner = await h.signed_in(OWNER)
+    edited = helper_block()
+    edited["max_steps"] = 4
+    async with using(owner):
+        saved = await post(
+            owner, f"{VERSION}/edit", await csrf_token(owner), definition=definition_text(edited)
+        )
+    assert saved.status_code == 303
+    assert (await h.agents.get_version(TENANT, "it-helper", 1)).definition["max_steps"] == 4
+    assert [(e.kind, e.identity) for e in h.audit.events][-1] == ("agent_edit", f"user:{OWNER}")
 
-        admin_token = await csrf_token(admin)
+
+async def test_submitting_the_form_makes_the_version_pending(h):
+    """Fails if the submit form leaves the version a draft, or audits another identity."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    owner = await h.signed_in(OWNER)
+    async with using(owner):
+        submitted = await post(owner, f"{VERSION}/submit", await csrf_token(owner))
+    assert submitted.status_code == 303
+    assert await status_of_version(h) == "pending"
+    assert [(e.kind, e.identity) for e in h.audit.events][-1] == ("agent_submit", f"user:{OWNER}")
+
+
+async def test_an_admin_publishing_through_the_form_records_the_admin_and_says_so(h):
+    """Fails if the publish form does not publish as the admin, shows no notice, or skips the audit events."""
+    await make_pending(h)
+    admin = await h.signed_in(ADMIN2)
+    async with using(admin):
         published = await post(
-            admin, f"{VERSION}/publish", admin_token, **await shown(h, "publish")
+            admin, f"{VERSION}/publish", await csrf_token(admin), **await shown(h, "publish")
         )
         assert published.status_code == 303
-        assert "Published." in (await admin.get(published.headers["location"])).text
-
+        page = await admin.get(published.headers["location"])
+    assert "Published." in page.text
     record = await h.agents.get_version(TENANT, "it-helper", 1)
     assert record.status == "published" and record.approved_by == ADMIN2
-    assert kinds(h) == [
-        "agent_create",
-        "agent_edit",
-        "agent_submit",
-        "agent_publish",
-        "widening_confirm",
-    ]
-    assert [e.identity for e in h.audit.events] == [
-        f"user:{OWNER}",
-        f"user:{OWNER}",
-        f"user:{OWNER}",
-        f"user:{ADMIN2}",
-        f"user:{ADMIN2}",
+    assert [(e.kind, e.identity) for e in h.audit.events][-2:] == [
+        ("agent_publish", f"user:{ADMIN2}"),
+        ("widening_confirm", f"user:{ADMIN2}"),
     ]
 
 

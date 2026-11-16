@@ -200,7 +200,7 @@ def two_tenant_gateway(temporal, links=None, slack_secret="x"):
     return TestClient(app)
 
 
-def test_events_route_to_their_tenant():
+async def test_events_route_to_their_tenant():
     secret = token_source.token_hex(16)
     temporal = FakeTemporalClient()
     client = two_tenant_gateway(temporal, slack_secret=secret)
@@ -210,7 +210,7 @@ def test_events_route_to_their_tenant():
     globex_event["team_id"] = GLOBEX_TEAM
     assert post_event(client, secret, globex_event).status_code == 200
 
-    assert deliver_inbound(client.app) == 2
+    assert await deliver_inbound(client.app) == 2
     acme_call, globex_call = temporal.signal_with_starts
     assert acme_call["arg"] == ConversationRef(TENANT, "it-helper", "D123", "1700000000.000200")
     assert acme_call["id"].startswith(f"{TENANT}:")
@@ -218,7 +218,7 @@ def test_events_route_to_their_tenant():
     assert globex_call["id"] == ids.conversation_id(GLOBEX, "D123", "1700000000.000200")
 
 
-def test_unknown_workspace_event_dropped(caplog):
+async def test_unknown_workspace_event_dropped(caplog):
     secret = token_source.token_hex(16)
     temporal = FakeTemporalClient()
     client = two_tenant_gateway(temporal, slack_secret=secret)
@@ -228,7 +228,7 @@ def test_unknown_workspace_event_dropped(caplog):
     resp = post_event(client, secret, event)
 
     assert resp.status_code == 200
-    assert deliver_inbound(client.app) == 0
+    assert await deliver_inbound(client.app) == 0
     assert temporal.signal_with_starts == []
     assert "ignored event from an unknown Slack workspace" in caplog.text
     assert "T_STRANGER" in caplog.text

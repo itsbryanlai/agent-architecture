@@ -1,5 +1,6 @@
 """Retried history appends and Slack posts: no duplicate history, visible duplicate posts."""
 
+import asyncio
 import itertools
 import logging
 
@@ -7,8 +8,11 @@ import pytest
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
+from agentos.connectors.notion import FakeNotionAPI
 from agentos.llm import ScriptedLLMClient
-from agentos.models import LLMResponse, ToolCall
+from agentos.models import LLMResponse, ToolCall, TurnContext
+from agentos.slack_client import FakeSlack
+from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from tests.conftest import TENANT, eventually
 from tests.helpers.conversation import (
@@ -127,27 +131,97 @@ async def test_failed_finalize_stores_only_the_failure_notice_never_a_reply_nobo
     assert not any("The answer" in text_of(m) for m in stored)
 
 
-async def test_post_once_logs_possible_duplicate(agents, caplog):
+class LostResponseSlack(FakeSlack):
+    """Slack accepts the first post and the answer never arrives, as when a connection drops."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_next_response = True
+
+    async def post_message(self, channel, text, thread_ts=None, blocks=None) -> str:
+        ts = await super().post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
+        if self.lose_next_response:
+            self.lose_next_response = False
+            raise ConnectionError("response lost")
+        return ts
+
+
+class SlowFirstPostSlack(FakeSlack):
+    """The first post waits for the second attempt to start before it answers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_started = asyncio.Event()
+        self._attempts = 0
+
+    async def post_message(self, channel, text, thread_ts=None, blocks=None) -> str:
+        self._attempts += 1
+        attempt = self._attempts
+        if attempt == 1:
+            await self.second_started.wait()
+        else:
+            self.second_started.set()
+        return await super().post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
+
+
+def activities_with(agents, slack):
     acts = make_activities(agents, ScriptedLLMClient())
-    await acts.idem.put_if_absent(TENANT, "k1:pending", {"channel": "C1"})
+    acts.registry = TenantRegistry({agents.tenant_id: runtime_for(agents, slack, FakeNotionAPI())})
+    return acts
+
+
+def turn_context() -> TurnContext:
+    return TurnContext(TENANT, "it-helper", 1, "U1", CHANNEL, THREAD, "im")
+
+
+async def post(acts, key: str = "k1") -> str:
+    return await ActivityEnvironment().run(
+        acts.post_in_thread, turn_context(), "secret message text", key
+    )
+
+
+async def test_a_post_whose_result_was_lost_after_it_was_recorded_is_not_posted_again(agents):
+    """Fails if a retried post activity posts a second message once the first one's ts was stored."""
+    slack = FakeSlack()
+    acts = activities_with(agents, slack)
+
+    first = await post(acts)
+    retried = await post(acts)
+
+    assert retried == first
+    assert len(slack.posts()) == 1
+
+
+async def test_a_lost_slack_response_is_retried_as_a_logged_possible_duplicate(agents, caplog):
+    """Fails if a post whose answer never arrived is retried silently, or the log carries the message text.
+
+    Slack has no idempotency key, so the retry cannot know the first post happened: it posts
+    again, and the only guard is the warning that names the key.
+    """
+    slack = LostResponseSlack()
+    acts = activities_with(agents, slack)
+    with pytest.raises(ConnectionError):
+        await post(acts)
 
     with caplog.at_level(logging.WARNING, logger="agentos.activities"):
-        ts = await acts._post_once(TENANT, "k1", "C1", "secret message text", "1.1")
+        ts = await post(acts)
 
-    assert len(acts.registry.get(TENANT).slack.posts()) == 1
     assert (await acts.idem.get(TENANT, "k1"))["ts"] == ts
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "possible duplicate Slack post" in warnings[0]
-    assert "k1" in warnings[0]
-    assert "secret message text" not in caplog.text
+    assert len(warnings) == 1 and "possible duplicate Slack post" in warnings[0]
+    assert "k1" in warnings[0] and "secret message text" not in caplog.text
 
 
-async def test_post_once_returns_recorded_ts_without_posting(agents):
-    acts = make_activities(agents, ScriptedLLMClient())
-    await acts.idem.put_if_absent(TENANT, "k1", {"channel": "C1", "ts": "9.9"})
+async def test_overlapping_attempts_of_one_post_agree_on_one_ts(agents):
+    """Fails if two attempts of the same post return different ts values, so the workflow and
+    the idempotency store would name different messages.
 
-    ts = await acts._post_once(TENANT, "k1", "C1", "text", None)
+    The two posts both reach Slack (nothing makes a Slack post exactly-once); what is kept is
+    the first recorded ts.
+    """
+    slack = SlowFirstPostSlack()
+    acts = activities_with(agents, slack)
 
-    assert ts == "9.9"
-    assert acts.registry.get(TENANT).slack.posts() == []
+    first, second = await asyncio.gather(post(acts), post(acts))
+
+    assert first == second == (await acts.idem.get(TENANT, "k1"))["ts"]

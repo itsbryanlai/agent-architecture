@@ -72,7 +72,7 @@ async def test_search_returns_only_granted_scopes(kharness):
     )
 
     assert "sixteen weeks" not in it_text and "Dental" not in it_text
-    assert "VPN" in it_text or "Laptops" in it_text
+    assert "VPN" in it_text
     assert {c.scope for c in it_result.citations} == {SCOPE_A}
     assert "VPN" not in hr_text and "Swollen" not in hr_text
     assert {c.scope for c in hr_result.citations} == {SCOPE_B}

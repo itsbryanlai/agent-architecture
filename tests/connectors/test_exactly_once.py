@@ -265,3 +265,22 @@ async def test_a_comment_whose_response_was_lost_is_found_by_the_retry(harness):
     await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id)
 
     assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_second_comment_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a comment attempt starting while another is mid-write posts a second comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "comment-overlap")
+    hang = h.notion.hang_after_write("comment")
+    first = asyncio.create_task(run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id) == comment_id
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1

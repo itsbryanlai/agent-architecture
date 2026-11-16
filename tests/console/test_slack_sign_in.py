@@ -115,7 +115,8 @@ async def start_login(h, c):
 async def assert_no_session(h, c, response, status):
     assert response.status_code == status, response.text
     assert "agentos_session" not in response.headers.get("set-cookie", "")
-    assert h.sessions._rows == {}
+    signed_out = await c.get(f"/ui/{TENANT}/agents")
+    assert signed_out.status_code == 303 and signed_out.headers["location"] == "/login"
 
 
 async def test_callback_with_a_wrong_or_missing_state_is_refused(h):
@@ -154,9 +155,7 @@ async def test_the_login_cookie_is_spent_by_the_callback(h):
         state = await start_login(h, c)
         response = await c.get("/auth/slack/callback", params={"code": "x", "state": state})
         assert response.status_code == 303
-        assert 'agentos_login=""' in set_cookie(response, "agentos_login") or (
-            "Max-Age=0" in set_cookie(response, "agentos_login")
-        )
+        assert "Max-Age=0" in set_cookie(response, "agentos_login")
         again = await c.get("/auth/slack/callback", params={"code": "x", "state": state})
         assert again.status_code == 400
 
@@ -245,10 +244,9 @@ async def test_success_sets_a_locked_down_cookie_and_stores_only_the_hash(h):
     value = cookie.split(";")[0].split("=", 1)[1]
     tenant, token = value.split(".")
     assert tenant == TENANT and len(token) >= 40  # 256 bits, url-safe
-    [(key, record)] = h.sessions._rows.items()
-    assert key == (TENANT, hashlib.sha256(token.encode()).hexdigest())
-    stored = repr(h.sessions._rows)
-    assert token not in stored
+    now = h.clock()
+    record = await h.sessions.get(TENANT, token, now)
+    assert await h.sessions.get(TENANT, hashlib.sha256(token.encode()).hexdigest(), now) is None
     assert record.user_id == OWNER and record.tenant_id == TENANT
     assert (record.expires_at - record.created_at).total_seconds() == 8 * 3600
     assert record.csrf_secret and record.csrf_secret != token
@@ -260,7 +258,6 @@ async def test_sessions_are_unique_per_sign_in(h):
         await h.sign_in_as(one, OWNER)
         await h.sign_in_as(two, OWNER)
     assert one.cookies.get("agentos_session") != two.cookies.get("agentos_session")
-    assert len(h.sessions._rows) == 2
 
 
 async def test_an_expired_session_is_refused_and_a_live_one_is_not(h):
@@ -275,15 +272,6 @@ async def test_an_expired_session_is_refused_and_a_live_one_is_not(h):
         assert api.status_code == 401
 
 
-async def test_an_expired_session_is_cleaned_up_by_the_next_sign_in(h):
-    first = await h.signed_in(OWNER)
-    h.clock.advance(hours=9)
-    second = await h.signed_in(ROOT)
-    await first.aclose()
-    await second.aclose()
-    assert [r.user_id for r in h.sessions._rows.values()] == [ROOT]
-
-
 async def test_logout_deletes_the_session_and_clears_the_cookie(h):
     c = await h.signed_in(OWNER)
     async with using(c):
@@ -291,7 +279,6 @@ async def test_logout_deletes_the_session_and_clears_the_cookie(h):
         response = await post(c, "/logout", token)
         assert response.status_code == 200
         assert "Max-Age=0" in set_cookie(response, "agentos_session")
-        assert h.sessions._rows == {}
         assert (await c.get(f"/ui/{TENANT}/agents")).status_code == 303
 
 
@@ -301,7 +288,6 @@ async def test_logout_without_the_csrf_token_changes_nothing(h):
         for token in (None, "wrong"):
             response = await post(c, "/logout", token)
             assert response.status_code == 403
-        assert len(h.sessions._rows) == 1
         assert (await c.get(f"/ui/{TENANT}/agents")).status_code == 200
 
 

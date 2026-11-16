@@ -10,7 +10,6 @@ import logging
 import re
 from dataclasses import replace
 from datetime import UTC, date, datetime
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -63,8 +62,6 @@ from tests.helpers.agents import helper_block
 from tests.helpers.budgets import NOV
 from tests.helpers.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, using
 from tests.helpers.usage import SCOPE, D, _page_agents, block, price
-
-REPO = Path(__file__).resolve().parents[2]
 
 
 class Clock:

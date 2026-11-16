@@ -9,7 +9,6 @@ import logging
 import re
 from datetime import timedelta
 from decimal import Decimal
-from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -102,7 +101,6 @@ from tests.helpers.gateway import FakeTemporalClient
 from tests.helpers.tasks import approve, start_task, thread_posts, wait_state
 from tests.helpers.usage import price
 
-REPO = Path(__file__).resolve().parents[2]
 UI = f"/ui/{TENANT}"
 GLOBEX = "globex"
 ADMIN = "U_ADMIN"

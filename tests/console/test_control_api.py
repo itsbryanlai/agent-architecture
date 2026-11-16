@@ -4,7 +4,6 @@ Everything is in memory: the three stores, a fake Notion and a stand-in identity
 """
 
 import json
-from pathlib import Path
 
 import httpx
 import pytest
@@ -41,9 +40,6 @@ OWNER = "U_OWNER"  # a creator
 OTHER = "U_OTHER"  # a creator who owns nothing
 OUTSIDER = "U_OUTSIDER"  # no role
 OTHER_TENANT = GLOBEX
-
-
-SRC = Path(__file__).resolve().parents[2] / "src" / "agentos"
 
 
 def quiet_client(app) -> httpx.AsyncClient:

@@ -41,8 +41,16 @@ from agentos.stores import (
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, Prices, UsageEvent, UsageRecorder
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
-from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
-from tests.test_usage import SCOPE, _page_agents, block, price
+from tests.helpers.console_harness import (
+    OTHER,
+    OWNER,
+    ROOT,
+    ConsoleHarness,
+    csrf_token,
+    post,
+    using,
+)
+from tests.helpers.usage import SCOPE, _page_agents, block, price
 
 D = Decimal
 NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)

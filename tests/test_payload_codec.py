@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import stat
 
@@ -11,7 +10,6 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from temporalio.api.common.v1 import Payload
-from temporalio.api.enums.v1 import EventType
 from temporalio.converter import (
     ActivitySerializationContext,
     DataConverter,
@@ -48,6 +46,7 @@ from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, TENANT, eventually, make_fake_notion
+from tests.helpers.codec import all_payloads, is_sdk_patch_record
 
 CHANNEL = "C1"
 THREAD = "1700000000.000100"
@@ -273,47 +272,6 @@ def test_create_key_refuses_overwrite(tmp_path, capsys):
     assert (key_dir / "acme.key").read_bytes() == first
 
 
-def all_payloads(message) -> list[Payload]:
-    """Every Payload message anywhere inside a protobuf message."""
-    found: list[Payload] = []
-
-    def walk(m) -> None:
-        if isinstance(m, Payload):
-            found.append(m)
-            return
-        for field, value in m.ListFields():
-            if field.type != field.TYPE_MESSAGE:
-                continue
-            if field.is_repeated:
-                items = value.values() if field.message_type.GetOptions().map_entry else value
-                for item in items:
-                    if hasattr(item, "ListFields"):
-                        walk(item)
-            else:
-                walk(value)
-
-    walk(message)
-    return found
-
-
-def is_sdk_patch_record(event, payload: Payload) -> bool:
-    """True for the markers and search attribute the SDK writes for workflow.patched.
-
-    Temporal core writes these itself, outside the data converter, so no codec can
-    reach them. They hold only the patch IDs from the workflow code.
-    """
-    if event.event_type == EventType.EVENT_TYPE_MARKER_RECORDED:
-        if event.marker_recorded_event_attributes.marker_name != "core_patch":
-            return False
-        return set(json.loads(payload.data)) == {"id", "deprecated"}
-    if event.event_type == EventType.EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES:
-        fields = event.upsert_workflow_search_attributes_event_attributes.search_attributes
-        return payload.metadata.get("type") == b"KeywordList" and list(fields.indexed_fields) == [
-            "TemporalChangeVersion"
-        ]
-    return False
-
-
 async def test_workflow_history_is_encrypted(tmp_path, agents):
     key_dir = tmp_path / "keys"
     create_key(key_dir, TENANT)
@@ -333,6 +291,7 @@ async def test_workflow_history_is_encrypted(tmp_path, agents):
         audit=InMemoryAuditStore(),
         agents=seeded_agent_store(agents),
     )
+    # Own Temporal server, not the session's: it needs the encrypting data converter.
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
     try:
         async with Worker(
@@ -427,6 +386,7 @@ async def test_failure_messages_are_encrypted(tmp_path, agents):
         audit=InMemoryAuditStore(),
         agents=seeded_agent_store(agents),
     )
+    # Own Temporal server, not the session's: it needs the encrypting data converter.
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
     try:
         async with Worker(

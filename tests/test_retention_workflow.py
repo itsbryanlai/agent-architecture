@@ -1,6 +1,5 @@
 """RetentionWorkflow: one tenant, a batch per activity call, until nothing more is due."""
 
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from agentos import ids
@@ -9,7 +8,7 @@ from agentos.retention import InMemoryRetentionStore, PurgeCounts, RetentionActi
 from agentos.workflows.retention import RetentionWorkflow
 
 
-async def test_batches_repeat_until_one_comes_back_not_full():
+async def test_batches_repeat_until_one_comes_back_not_full(temporal_scope):
     """Fails if a night's purge stops after the first full batch, or never stops."""
     store = InMemoryRetentionStore(
         [
@@ -19,16 +18,13 @@ async def test_batches_repeat_until_one_comes_back_not_full():
             PurgeCounts(idempotency=999),  # never reached
         ]
     )
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue=TASK_QUEUE,
-            workflows=[RetentionWorkflow],
-            activities=RetentionActivities(store).all(),
-        ),
+    async with Worker(
+        temporal_scope.client,
+        task_queue=temporal_scope.task_queue,
+        workflows=[RetentionWorkflow],
+        activities=RetentionActivities(store).all(),
     ):
-        total = await env.client.execute_workflow(
+        total = await temporal_scope.client.execute_workflow(
             RetentionWorkflow.run,
             "acme",
             id=ids.retention_workflow_id("acme"),

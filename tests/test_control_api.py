@@ -32,7 +32,7 @@ from tests.conftest import (
     make_fake_notion,
     two_tenant_dicts,
 )
-from tests.test_agent_store import helper_block
+from tests.helpers.agents import helper_block
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"

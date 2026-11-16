@@ -28,7 +28,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.conftest import text_block as tb
-from tests.test_knowledge_search import search
+from tests.helpers.knowledge import search
 
 SCOPE_A = ids.knowledge_scope(ROOT_A)
 ROOT = normalize_id(ROOT_A)

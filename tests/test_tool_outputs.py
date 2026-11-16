@@ -8,8 +8,8 @@ from agentos import ids
 from agentos.llm import ScriptedLLMClient
 from agentos.models import LLMResponse, ToolCall, ToolResult
 from tests.conftest import DB_ID, TENANT, eventually, title_prop
-from tests.test_conversation_workflow import CHANNEL, THREAD, inbound, start_conversation
-from tests.test_llm_errors import make_activities
+from tests.helpers.conversation import CHANNEL, THREAD, inbound, start_conversation
+from tests.helpers.llm_errors import make_activities
 
 DISTINCTIVE = "Zebra-crossing laptop recall"
 

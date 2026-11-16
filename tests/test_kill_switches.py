@@ -87,10 +87,18 @@ from tests.conftest import (
     make_fake_notion,
     title_prop,
 )
-from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
-from tests.test_gateway import FakeTemporalClient
-from tests.test_task_workflow import approve, start_task, thread_posts, wait_state
-from tests.test_usage import price
+from tests.helpers.console_harness import (
+    OTHER,
+    OWNER,
+    ROOT,
+    ConsoleHarness,
+    csrf_token,
+    post,
+    using,
+)
+from tests.helpers.gateway import FakeTemporalClient
+from tests.helpers.tasks import approve, start_task, thread_posts, wait_state
+from tests.helpers.usage import price
 
 REPO = Path(__file__).resolve().parent.parent
 NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
@@ -251,7 +259,7 @@ async def test_the_agent_switch_is_checked_before_the_budget():
 async def test_a_reached_budget_still_stops_an_agent_that_is_on():
     budgets, usage = InMemoryBudgetStore(), InMemoryUsageStore()
     await budgets.set_budget(TENANT, "it-helper", Decimal(1), ROOT)
-    from tests.test_budgets import usage_row
+    from tests.helpers.budgets import usage_row
 
     await usage.record(usage_row("spent", cost="2"))
     world = World(BudgetGuard(budgets, usage, lambda: NOV))

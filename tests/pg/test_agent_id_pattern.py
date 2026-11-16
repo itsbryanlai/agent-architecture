@@ -6,8 +6,8 @@ import pytest
 from psycopg import errors
 
 from agentos.schema_version import EXPECTED_VERSIONS
+from tests.helpers.pg_seed import seed_version
 from tests.pg.conftest import BASE_SCHEMA, Databases, TestDatabase, load_migrate
-from tests.pg.test_policies import seed_version
 
 # One row per column, with the agent ID as the only thing that varies (the test fills %s).
 COLUMNS = {

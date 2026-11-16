@@ -25,7 +25,7 @@ from agentos.stores import (
 )
 from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, TENANT, make_fake_notion
-from tests.test_audience import THREAD, tenant_dict
+from tests.helpers.audience import THREAD, tenant_dict
 
 
 class FakeSlackServer:

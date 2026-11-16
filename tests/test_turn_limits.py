@@ -22,29 +22,29 @@ from agentos.workflows.conversation import (
     ConversationWorkflow,
 )
 from agentos.workflows.task import TaskWorkflow
-from tests.child_starts import ChildStarts
 from tests.conftest import ALICE, DB_ID, TENANT, agents_dict, eventually
-from tests.test_agent_store import republish
-from tests.test_audience import CHAN, OWNER, converse, say, tenant_dict
-from tests.test_audience import running as running_audience
-from tests.test_conversation_workflow import (
+from tests.helpers.agents import republish
+from tests.helpers.audience import CHAN, OWNER, converse, say, tenant_dict
+from tests.helpers.audience import running as running_audience
+from tests.helpers.child_starts import ChildStarts
+from tests.helpers.conversation import (
     CHANNEL,
     THREAD,
     inbound,
     start_conversation,
 )
-from tests.test_front_door import (
+from tests.helpers.fake_openai import FakeOpenAI, _response, _tool_call
+from tests.helpers.front_door import (
     answer,
     front_door_dict,
     hand_off_to,
     tool_turn,
     with_item_rules,
 )
-from tests.test_front_door import converse as converse_front_door
-from tests.test_front_door import message as front_door_message
-from tests.test_front_door import running as running_front_door
-from tests.test_llm import FakeOpenAI, _response, _tool_call
-from tests.test_turn_failure import tool_result_ids, tool_use_ids
+from tests.helpers.front_door import converse as converse_front_door
+from tests.helpers.front_door import message as front_door_message
+from tests.helpers.front_door import running as running_front_door
+from tests.helpers.turns import tool_result_ids, tool_use_ids
 
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
 
@@ -276,6 +276,12 @@ async def test_a_text_reply_cut_off_at_the_token_limit_says_so(harness):
     await eventually(lambda: h.slack.updates())
 
     assert h.slack.updates()[0]["text"] == "Step one, then\n\n(reply cut short)"
+
+    async def reply_stored() -> bool:
+        # The reply is stored after it was shown, so the update comes first.
+        return len(await h.history.load(TENANT, CONV_ID)) >= 2
+
+    await eventually(reply_stored)
     stored = await h.history.load(TENANT, CONV_ID)
     assert stored[-1] == {
         "role": "assistant",

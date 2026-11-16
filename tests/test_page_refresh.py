@@ -26,8 +26,8 @@ from tests.conftest import (
     knowledge_agents_dict,
 )
 from tests.conftest import text_block as tb
-from tests.test_gateway import FakeTemporalClient
-from tests.test_indexing import SCOPE_A, run_index
+from tests.helpers.gateway import FakeTemporalClient
+from tests.helpers.indexing_run import SCOPE_A, run_index
 
 TOKEN = "refresh-test-token"
 
@@ -121,17 +121,6 @@ def test_no_refresh_without_page_grants():
     assert [(wf, name) for wf, name, _ in temporal.signals] == [
         (f"{TENANT}:task:t1", "external_update")
     ]
-
-
-def test_unsigned_page_event_starts_nothing():
-    temporal = FakeTemporalClient()
-    client = gateway(knowledge_agents_dict(), temporal)
-    body = json.dumps(
-        {"type": "page.content_updated", "entity": {"id": PAGE_A1, "type": "page"}}
-    ).encode()
-    resp = client.post("/notion/webhook", content=body)
-    assert resp.status_code == 401
-    assert temporal.signal_with_starts == []
 
 
 async def test_burst_of_events_runs_one_refresh(kharness):

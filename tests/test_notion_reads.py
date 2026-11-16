@@ -14,7 +14,7 @@ from agentos.connectors.notion import RealNotionAPI
 from agentos.connectors.notion_limiter import NotionLimiter, bulk_priority
 from agentos.models import LLMResponse, ToolCall
 from tests.conftest import DB_ID, TENANT, eventually, title_prop
-from tests.test_conversation_workflow import CHANNEL, THREAD, inbound, start_conversation
+from tests.helpers.conversation import CHANNEL, THREAD, inbound, start_conversation
 
 
 def api_error(code: str, status: int, retry_after: str | None = None) -> APIResponseError:

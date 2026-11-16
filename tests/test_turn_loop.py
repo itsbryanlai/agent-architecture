@@ -30,14 +30,14 @@ from agentos.workflows.conversation import (
 )
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, TENANT, agents_dict, eventually, make_fake_notion
-from tests.test_conversation_workflow import (
+from tests.helpers.conversation import (
     CHANNEL,
     THREAD,
     inbound,
     placeholders,
     start_conversation,
 )
-from tests.test_turn_failure import tool_result_ids, tool_use_ids
+from tests.helpers.turns import tool_result_ids, tool_use_ids
 
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
 
@@ -148,8 +148,10 @@ async def test_failing_placeholder_post_still_gets_a_reply(harness):
 
 
 async def test_early_failure_notice_is_posted_once(harness):
+    """Fails if a repeated event gets a second failure notice, so a Slack retry shows two errors."""
     # The error post is idempotent: a second message with the same event ID is
-    # dropped as a duplicate and never produces a second notice.
+    # dropped as a duplicate and never produces a second notice. A later message
+    # (the sentinel) gets its own notice, so once it shows, the duplicate was handled.
     h = harness
     msg = inbound("Ev1")
     handle = await h.client.start_workflow(
@@ -161,8 +163,9 @@ async def test_early_failure_notice_is_posted_once(harness):
         start_signal_args=[msg],
     )
     await handle.signal(ConversationWorkflow.message, msg)
-    await eventually(lambda: h.slack.posts())
-    assert len(h.slack.posts()) == 1
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2-sentinel"))
+    await eventually(lambda: len(h.slack.posts()) >= 2)
+    assert len(h.slack.posts()) == 2
 
 
 async def test_message_signalled_with_the_idle_timeout_is_not_dropped():
@@ -171,6 +174,7 @@ async def test_message_signalled_with_the_idle_timeout_is_not_dropped():
     No worker runs while the clock is moved past the idle timeout and the
     message is signalled, so the next task holds both events.
     """
+    # Own Temporal server, not the session's: the clock is moved with no worker running, which the shared server's other tests must not see.
     env = await WorkflowEnvironment.start_time_skipping()
     try:
         agents = parse_agents_config(agents_dict())

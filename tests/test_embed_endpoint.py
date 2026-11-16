@@ -33,6 +33,10 @@ def test_embedder_uses_own_endpoint_when_set():
 
 
 def test_embedder_falls_back_to_qwen_settings():
+    """Fails if an embedder is built with no page grants, or without the Qwen key when no endpoint is set."""
+    no_pages = TenantsConfig.of(parse_agents_config(agents_dict()))
+    assert build_embedder(Settings(), no_pages) is None
+
     cfg = TenantsConfig.of(with_pages())
     with pytest.raises(RuntimeError, match="QWEN_API_KEY"):
         build_embedder(Settings(), cfg)

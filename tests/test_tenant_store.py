@@ -46,9 +46,9 @@ from tests.conftest import (
     TENANT,
     two_tenant_dicts,
 )
-from tests.console_harness import ROOT, ConsoleHarness, using
-from tests.test_control_api import BASE, JSON, StandIn
-from tests.test_gateway import FakeTemporalClient, im_event, post_event
+from tests.helpers.console_harness import ROOT, ConsoleHarness, using
+from tests.helpers.control_api import BASE, JSON, StandIn
+from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
 
 
 @pytest.fixture

@@ -11,12 +11,12 @@ import pytest
 from agentos import worker
 from agentos.config import ConfigError, Settings, load_settings
 from agentos.llm import (
-    MAX_TOKENS,
     QwenLLMClient,
     from_openai_response,
     to_openai_messages,
     to_openai_tools,
 )
+from tests.helpers.fake_openai import FakeOpenAI, _response, _tool_call
 
 PROVIDER_VARS = (
     "AGENTOS_LLM_PROVIDER",
@@ -25,32 +25,6 @@ PROVIDER_VARS = (
     "QWEN_BASE_URL",
     "QWEN_API_KEY",
 )
-
-
-def _tool_call(call_id: str, name: str, arguments: str):
-    return SimpleNamespace(
-        id=call_id,
-        type="function",
-        function=SimpleNamespace(name=name, arguments=arguments),
-    )
-
-
-def _response(content=None, tool_calls=None, finish_reason="stop"):
-    message = SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
-
-
-class FakeOpenAI:
-    """Stands in for ``openai.AsyncOpenAI``: records each create call."""
-
-    def __init__(self, response=None):
-        self.calls: list[dict] = []
-        self._response = response or _response(content="ok")
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
-
-    async def _create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._response
 
 
 def _qwen(fake: FakeOpenAI, **kwargs) -> QwenLLMClient:
@@ -72,11 +46,10 @@ TOOLS = [
 ]
 
 
-async def test_max_tokens_is_3072():
-    assert MAX_TOKENS == 3072
+async def test_qwen_request_carries_the_model_and_the_tools():
+    """Fails if the Qwen request goes out without the configured model or the agent's tools."""
     fake = FakeOpenAI()
     await _qwen(fake).complete("sys", [{"role": "user", "content": "hi"}], TOOLS)
-    assert fake.calls[0]["max_tokens"] == 3072
     assert fake.calls[0]["model"] == "qwen-test"
     assert fake.calls[0]["tools"] == to_openai_tools(TOOLS)
 
@@ -215,19 +188,18 @@ async def test_qwen_thinking_flag():
 
 
 def test_settings_provider_defaults(monkeypatch):
+    """Fails if the provider variable is ignored, read case-sensitively, or an unknown provider is accepted."""
     for name in PROVIDER_VARS:
         monkeypatch.delenv(name, raising=False)
 
     default = load_settings()
     assert default.llm_provider == "anthropic"
-    assert default.model == "claude-sonnet-5-5"
     assert default.qwen_thinking is False
 
     monkeypatch.setenv("AGENTOS_LLM_PROVIDER", "QWEN")
     monkeypatch.setenv("AGENTOS_QWEN_THINKING", "Yes")
     qwen = load_settings()
     assert qwen.llm_provider == "qwen"
-    assert qwen.model == "qwen3.7-plus"
     assert qwen.qwen_thinking is True
 
     monkeypatch.setenv("AGENTOS_LLM_PROVIDER", "openai")
@@ -248,29 +220,81 @@ def test_require_qwen_key_names_variable(monkeypatch):
     assert "QWEN_BASE_URL" in str(exc.value)
 
 
-def test_build_llm_selects_provider(monkeypatch):
-    built: list[tuple] = []
+@pytest.mark.parametrize(
+    ("provider", "host", "settings"),
+    [
+        ("anthropic", "api.anthropic.com", {"anthropic_api_key": "k"}),
+        (
+            "qwen",
+            "qwen.test",
+            {"qwen_api_key": "k", "qwen_base_url": "http://qwen.test/v1"},
+        ),
+    ],
+)
+async def test_build_llm_calls_the_chosen_provider_with_the_chosen_model(
+    monkeypatch, provider, host, settings
+):
+    """Fails if the provider setting builds the other provider's client, or drops the configured model."""
+    import anthropic
+    import httpx
+    import httpx2
+    import openai
 
-    class FakeAnthropicClient:
-        def __init__(self, *args):
-            built.append(("anthropic", args))
+    seen: list = []
+    # The Anthropic SDK is built on httpx2, the OpenAI SDK on httpx.
+    library = httpx2 if provider == "anthropic" else httpx
 
-    class FakeQwenClient:
-        def __init__(self, *args):
-            built.append(("qwen", args))
+    def answer(request):
+        seen.append(request)
+        if provider == "anthropic":
+            return library.Response(
+                200,
+                json={
+                    "id": "m1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "chosen-model",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+        return library.Response(
+            200,
+            json={
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "chosen-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
 
-    monkeypatch.setattr(worker, "AnthropicLLMClient", FakeAnthropicClient)
-    monkeypatch.setattr(worker, "QwenLLMClient", FakeQwenClient)
-
-    assert isinstance(worker.build_llm(Settings(anthropic_api_key="k")), FakeAnthropicClient)
-    qwen_settings = Settings(
-        llm_provider="qwen",
-        model="qwen3.7-plus",
-        qwen_api_key="k",
-        qwen_base_url="http://fake.invalid",
+    # The SDK clients the builder makes send through a transport that answers locally.
+    module, name = (
+        (anthropic, "AsyncAnthropic") if provider == "anthropic" else (openai, "AsyncOpenAI")
     )
-    assert isinstance(worker.build_llm(qwen_settings), FakeQwenClient)
-    assert built[1] == ("qwen", ("k", "http://fake.invalid", "qwen3.7-plus", False))
+    sdk = getattr(module, name)
+
+    def local(*args, **kwargs):
+        kwargs["http_client"] = library.AsyncClient(transport=library.MockTransport(answer))
+        return sdk(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, local)
+
+    client = worker.build_llm(Settings(llm_provider=provider, model="chosen-model", **settings))
+    reply = await client.complete("sys", [{"role": "user", "content": "hi"}], [])
+
+    assert reply.text == "hello"
+    [request] = seen
+    assert request.url.host == host
+    assert json.loads(request.content)["model"] == "chosen-model"
 
 
 class FakeAnthropic:

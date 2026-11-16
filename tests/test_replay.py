@@ -8,7 +8,7 @@ deploy time failing on its next step.
 
 import pytest
 
-from tests.replay_support import FIXTURES, load_fixture, replay
+from tests.helpers.replay_support import FIXTURES, load_fixture, replay
 
 NAMES = sorted(p.stem for p in FIXTURES.glob("*.json"))
 

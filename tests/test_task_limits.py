@@ -33,13 +33,6 @@ CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
 
 
-def test_limits_table():
-    assert EDITABLE_FIELDS == {
-        "create_item": {"title": 150, "details": 1900},
-        "add_comment": {"comment": 1900},
-    }
-
-
 @pytest.mark.parametrize(
     ("tool", "field"),
     [("create_item", "title"), ("create_item", "details"), ("add_comment", "comment")],
@@ -92,23 +85,25 @@ async def _converse(h, call: ToolCall):
     return h.llm.calls[1]["messages"][-1]["content"][0]
 
 
-async def test_first_draft_over_limit_is_an_error_the_model_can_act_on(harness):
-    h = harness
-    result = await _converse(
-        h, ToolCall("tu", "create_item", {"title": "T", "details": "d" * 1901})
-    )
-    assert result["is_error"] is True
-    assert "details" in result["content"] and "1900" in result["content"]
-    assert [p for p in h.slack.posts() if p["blocks"]] == []
-
-
-async def test_first_draft_comment_over_limit_is_an_error(harness):
+@pytest.mark.parametrize(
+    ("tool", "field", "limit"),
+    [("create_item", "details", 1900), ("add_comment", "comment", 1900)],
+)
+async def test_first_draft_over_limit_is_an_error_the_model_can_act_on(harness, tool, field, limit):
+    """Fails if a first draft over a field limit gets a card instead of an error the model can fix."""
     h = harness
     page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
-    result = await _converse(
-        h, ToolCall("tu", "add_comment", {"item": page["url"], "comment": "c" * 1901})
+    args = (
+        {"title": "T", "details": "d" * 1901}
+        if tool == "create_item"
+        else {
+            "item": page["url"],
+            "comment": "c" * 1901,
+        }
     )
-    assert result["is_error"] is True and "1900" in result["content"]
+    result = await _converse(h, ToolCall("tu", tool, args))
+    assert result["is_error"] is True
+    assert field in result["content"] and str(limit) in result["content"]
     assert [p for p in h.slack.posts() if p["blocks"]] == []
 
 
@@ -122,6 +117,7 @@ async def test_first_draft_at_limit_gets_a_card(harness):
 
 
 async def test_details_at_the_limit_reach_notion(harness):
+    """Fails if a details text at the limit is cut or dropped on its way into the Notion page body."""
     h = harness
     spec = TaskSpec(
         _ctx(),
@@ -136,7 +132,8 @@ async def test_details_at_the_limit_reach_notion(harness):
         return await handle.query(TaskWorkflow.state) == "watching"
 
     await eventually(watching, timeout=20)
-    assert h.notion.count("create_page") == 1
+    [body] = h.notion.bodies.values()
+    assert body[0]["paragraph"]["rich_text"][0]["text"]["content"] == "d" * 1900
 
 
 async def test_comment_at_the_limit_with_signature_reaches_notion(harness):

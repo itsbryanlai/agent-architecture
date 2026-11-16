@@ -13,7 +13,7 @@ from agentos.control import ControlPlane, Forbidden
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore, MemberError
 from tests.conftest import TENANT, agents_dict, make_fake_notion
-from tests.test_agent_store import helper_block
+from tests.helpers.agents import helper_block
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"  # an admin added through the app

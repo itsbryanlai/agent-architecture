@@ -8,6 +8,7 @@ import copy
 from dataclasses import dataclass, field
 
 import pytest
+import pytest_asyncio
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -16,7 +17,6 @@ from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import (
-    TASK_QUEUE,
     AgentsConfig,
     Settings,
     TenantsConfig,
@@ -42,6 +42,12 @@ from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
+from tests.helpers.temporal import (
+    TemporalScope,
+    current_server,
+    replace_server_if_stuck,
+    set_server,
+)
 
 TENANT = "acme"
 TEAM = "T0TEST"
@@ -144,7 +150,7 @@ def title_prop(title: str) -> dict:
 
 @dataclass
 class Harness:
-    wf_env: WorkflowEnvironment
+    wf_env: TemporalScope
     agents: AgentsConfig
     llm: ScriptedLLMClient
     slack: FakeSlack
@@ -164,9 +170,28 @@ class Harness:
         return self.wf_env.client
 
 
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def temporal_server():
+    """The one Temporal time-skipping server of the session."""
+    set_server(await WorkflowEnvironment.start_time_skipping())
+    yield
+    server = current_server()
+    set_server(None)
+    await server.shutdown()
+
+
 @pytest.fixture
-async def harness(agents):
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+async def temporal_scope(temporal_server):
+    """The shared server with this test's own task queue; its workflows end with the test."""
+    scope = TemporalScope(current_server())
+    yield scope
+    await scope.finish()
+    await replace_server_if_stuck()
+
+
+@pytest.fixture
+async def harness(agents, temporal_scope):
+    wf_env = temporal_scope
     h = Harness(
         wf_env=wf_env,
         agents=agents,
@@ -197,13 +222,13 @@ async def harness(agents):
     acts.visibility_interval = 0
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow],
         activities=acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
 
 
 async def eventually(check, timeout: float = 10.0, interval: float = 0.05):
@@ -296,9 +321,9 @@ class KnowledgeHarness(Harness):
 
 
 @pytest.fixture
-async def kharness():
+async def kharness(temporal_scope):
     cfg = parse_agents_config(knowledge_agents_dict())
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+    wf_env = temporal_scope
     notion = make_fake_notion()
     notion.add_page_tree(ROOT_A, a_tree())
     notion.add_page_tree(ROOT_B, b_tree())
@@ -343,13 +368,13 @@ async def kharness():
     )
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
         activities=h.acts.all() + index_acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
 
 
 # --- Two tenants in one deployment, each with its own Slack and Notion fakes.
@@ -383,7 +408,7 @@ def two_tenant_dicts() -> tuple[dict, dict]:
 
 @dataclass
 class TwoTenantHarness:
-    wf_env: WorkflowEnvironment
+    wf_env: TemporalScope
     tenants: TenantsConfig
     registry: TenantRegistry
     llm: ScriptedLLMClient
@@ -397,10 +422,10 @@ class TwoTenantHarness:
 
 
 @pytest.fixture
-async def two_tenants():
+async def two_tenants(temporal_scope):
     acme_raw, globex_raw = two_tenant_dicts()
     tenants = TenantsConfig.of(parse_agents_config(acme_raw), parse_agents_config(globex_raw))
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+    wf_env = temporal_scope
     # Each tenant's Slack client answers for its own workspace, as the real one does.
     slacks = {
         t: FakeSlack(emails={ALICE: "alice@example.com"}, team_id=cfg.slack_team_id)
@@ -432,13 +457,13 @@ async def two_tenants():
     )
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow],
         activities=acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
 
 
 @pytest.fixture(autouse=True)

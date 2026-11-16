@@ -5,7 +5,7 @@ import pytest
 from agentos import ids
 from agentos.slack_format import to_slack_mrkdwn
 from tests.conftest import TENANT, eventually
-from tests.test_knowledge_search import (
+from tests.helpers.knowledge import (
     CHANNEL,
     ROOT_A,
     SCOPE_A,

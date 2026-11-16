@@ -44,7 +44,7 @@ from agentos.stores import InMemoryTaskLinkStore
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, title_prop
-from tests.test_gateway import FakeTemporalClient, im_event, post_event, signed_headers
+from tests.helpers.gateway import FakeTemporalClient, im_event, post_event, signed_headers
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -584,7 +584,7 @@ async def test_identical_writes_in_one_reply_start_one_task_and_a_bad_input_is_a
 
 async def test_a_hand_off_in_a_stored_message_turn_switches_the_thread_without_the_workflow_reading_the_input():
     """Fails if a hand-off needs the tool input in the workflow, or leaves a stale specialist."""
-    from tests.test_front_door import ANNOUNCEMENT, front_door_dict, running
+    from tests.helpers.front_door import ANNOUNCEMENT, front_door_dict, running
 
     async with running(front_door_dict()) as h:
         h.llm.queue(

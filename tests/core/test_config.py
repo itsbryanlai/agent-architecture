@@ -170,7 +170,7 @@ def test_a_definition_with_a_stray_key_a_wrong_type_or_a_number_out_of_range_is_
 def test_the_shipped_agent_files_still_parse():
     """Fails if a tracked agent file would be refused by the strict definition rules."""
     for name in ("agents.yaml", "agents.example.yaml"):
-        path = Path(__file__).resolve().parent.parent / "config" / name
+        path = Path(__file__).resolve().parents[2] / "config" / name
         if path.exists():
             assert load_agents_config(path).agents
 

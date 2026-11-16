@@ -17,6 +17,7 @@ from tests.helpers.conversation import (
     inbound,
     placeholders,
     start_conversation,
+    stored_history,
 )
 from tests.helpers.llm_errors import make_activities
 from tests.helpers.turns import assert_tool_pairs_valid
@@ -118,7 +119,7 @@ async def test_failed_finalize_stores_only_the_failure_notice_never_a_reply_nobo
     assert h.slack.updates()[0]["ts"] == placeholders(h)[0]["ts"]
 
     conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
-    stored = await h.history.load(TENANT, conv_id)
+    stored = await stored_history(h, conv_id)
     roles = [m["role"] for m in stored]
     assert roles == ["user", "assistant"]
     assert all(a != b for a, b in itertools.pairwise(roles))

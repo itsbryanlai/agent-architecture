@@ -5,6 +5,7 @@ import pytest
 from agentos import ids
 from agentos.slack_format import to_slack_mrkdwn
 from tests.conftest import TENANT, eventually
+from tests.helpers.conversation import stored_history
 from tests.helpers.knowledge import (
     CHANNEL,
     ROOT_A,
@@ -72,5 +73,5 @@ async def test_finalize_reply_posts_converted_text_and_footer(kharness):
     title, url = (await h.knowledge.page_meta(TENANT, [SCOPE_A], [plain(ROOT_A)]))[plain(ROOT_A)]
     update = h.slack.updates()[0]["text"]
     assert update == f"*Report it* [1]\n\nSources: [1] <{url}|{title}>"
-    stored = await h.history.load(TENANT, ids.conversation_id(TENANT, CHANNEL, "1700000000.000300"))
+    stored = await stored_history(h, ids.conversation_id(TENANT, CHANNEL, "1700000000.000300"))
     assert stored[-1]["content"][0]["text"] == "**Report it** [1]"

@@ -13,16 +13,9 @@ from agentos.agent_store import AgentStoreError, InMemoryAgentStore, PostgresAge
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore, canonical_sha256
 from agentos.config import ConfigError, agent_definition, parse_agent, parse_agents_config
 from tests.conftest import agents_dict
+from tests.helpers.agents import ADMIN, EDITOR, helper_block
 
-EDITOR = "U_EDITOR"
-ADMIN = "U_ADMIN"
 IMPORT = "import:yaml"
-
-
-def helper_block() -> dict:
-    block = copy.deepcopy(agents_dict()["agents"]["it-helper"])
-    del block["version"]
-    return block
 
 
 def front_door_agents() -> dict:

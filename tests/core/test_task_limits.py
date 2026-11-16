@@ -5,7 +5,6 @@ and a section's text 3000. The card shows the escaped value, and a comment is
 posted with a signature, so each limit leaves room for both.
 """
 
-import asyncio
 import uuid
 
 import pytest
@@ -158,8 +157,6 @@ async def test_edit_over_the_limit_is_ignored_and_at_the_limit_accepted(harness)
     await handle.signal(
         TaskWorkflow.edit, EditRequest(NONCE, ALICE, {"title": "T", "details": "d" * 1901})
     )
-    await asyncio.sleep(0.5)
-    assert (await handle.query(TaskWorkflow.draft)).nonce == NONCE
 
     await handle.signal(
         TaskWorkflow.edit, EditRequest(NONCE, ALICE, {"title": "T", "details": "d" * 1900})
@@ -169,3 +166,6 @@ async def test_edit_over_the_limit_is_ignored_and_at_the_limit_accepted(harness)
         return (await handle.query(TaskWorkflow.draft)).nonce != NONCE
 
     await eventually(changed, timeout=20)
+    # Signals are handled in order: the over-limit edit was refused, or it would
+    # have replaced the nonce and the at-limit edit would have been ignored.
+    assert (await handle.query(TaskWorkflow.draft)).fields["details"] == "d" * 1900

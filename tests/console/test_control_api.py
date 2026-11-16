@@ -33,6 +33,7 @@ from tests.conftest import (
     two_tenant_dicts,
 )
 from tests.helpers.agents import helper_block
+from tests.helpers.control_api import BASE, JSON, StandIn
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"
@@ -41,20 +42,8 @@ OTHER = "U_OTHER"  # a creator who owns nothing
 OUTSIDER = "U_OUTSIDER"  # no role
 OTHER_TENANT = GLOBEX
 
-BASE = "http://127.0.0.1:8100"
-JSON = {"Content-Type": "application/json"}
 
-SRC = Path(__file__).resolve().parent.parent / "src" / "agentos"
-
-
-class StandIn:
-    """A test identity: whoever the test says is acting. Wave 5 replaces the real one."""
-
-    def __init__(self, user: str):
-        self.user = user
-
-    async def actor(self, request) -> str:
-        return self.user
+SRC = Path(__file__).resolve().parents[2] / "src" / "agentos"
 
 
 def quiet_client(app) -> httpx.AsyncClient:

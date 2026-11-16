@@ -4,10 +4,15 @@ from datetime import timedelta
 import pytest
 from temporalio.client import WorkflowExecutionStatus
 
-from agentos.models import ApprovalDecision, ExternalUpdate, TaskSpec
+from agentos.models import ApprovalDecision, EditRequest, ExternalUpdate, TaskSpec
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, BOB, DB_ID, title_prop
+from tests.conftest import ALICE, BOB, DB_ID, eventually, title_prop
 from tests.helpers.tasks import NONCE, approve, spec, start_task, thread_posts, wait_state
+
+
+async def _nonce_changed(handle):
+    d = await handle.query(TaskWorkflow.draft)
+    return d if d.nonce != NONCE else None
 
 
 async def test_approval_from_wrong_user_or_nonce_ignored(harness):
@@ -16,7 +21,11 @@ async def test_approval_from_wrong_user_or_nonce_ignored(harness):
 
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, BOB, True))
     await handle.signal(TaskWorkflow.decision, ApprovalDecision("wrong-nonce", ALICE, True))
-    await asyncio.sleep(0.5)
+    # Settle point: an edit is accepted only while the task still awaits approval.
+    await handle.signal(
+        TaskWorkflow.edit, EditRequest(NONCE, ALICE, {"title": "Settled", "details": "d"})
+    )
+    await eventually(lambda: _nonce_changed(handle))
 
     assert await handle.query(TaskWorkflow.state) == "awaiting_approval"
     assert h.notion.count("create_page") == 0

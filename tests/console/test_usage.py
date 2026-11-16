@@ -10,7 +10,6 @@ import logging
 import re
 from dataclasses import replace
 from datetime import UTC, date, datetime
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,15 +60,11 @@ from agentos.usage import (
 )
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, agents_dict, make_fake_notion
 from tests.helpers.agents import helper_block
+from tests.helpers.budgets import NOV
 from tests.helpers.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, using
+from tests.helpers.usage import SCOPE, D, _page_agents, block, price
 
-REPO = Path(__file__).resolve().parent.parent
-NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
-D = Decimal
-
-
-def price(model="m", effective_from=date(2026, 1, 1), i="3", o="15", cr="0.3", cw="3.75"):
-    return PriceEntry(model, effective_from, D(i), D(o), D(cr), D(cw))
+REPO = Path(__file__).resolve().parents[2]
 
 
 class Clock:
@@ -554,15 +549,6 @@ def index_activities(recorder, embedder):
     )
 
 
-def _page_agents():
-    raw = agents_dict()
-    raw["agents"]["it-helper"]["grants"]["notion"]["pages"] = [{"id": ROOT_A, "name": "IT wiki"}]
-    return raw
-
-
-SCOPE = ids.knowledge_scope(ROOT_A)
-
-
 async def test_indexing_records_embedding_tokens_against_the_tenant_with_no_agent():
     store, recorder = recorder_with(entries=[price("fake-embed", i="0.1", o="0", cr="0", cw="0")])
     embedder = FakeEmbedder()
@@ -787,13 +773,6 @@ async def make_plane() -> Plane:
         clock=Clock(),
     )
     return Plane(plane, usage, agents)
-
-
-def block(team=None):
-    definition = helper_block()
-    if team:
-        definition["team"] = team
-    return definition
 
 
 async def seeded_plane() -> Plane:

@@ -1,13 +1,13 @@
 # Replay fixtures
 
-Each `.json` file is the recorded history of one workflow run. `tests/test_replay.py` replays
+Each `.json` file is the recorded history of one workflow run. `tests/core/test_replay.py` replays
 every file on the current workflow code. A replay fails with a non-determinism error when a
 change to a workflow alters the commands an existing history would issue, which is what would
 happen to a workflow that is running when the change is deployed.
 
 ## Where they come from
 
-`scripts/record_replay_fixtures.py` runs each scenario in `tests/replay_support.py` against
+`scripts/record_replay_fixtures.py` runs each scenario in `tests/helpers/replay_support.py` against
 Temporal's time-skipping test server, with fakes and the production encrypting data converter
 under a fixed test key, and writes the histories here. Each file starts with a header: the
 code commit it was recorded at, the date, the converter, and the scenario.
@@ -34,4 +34,4 @@ default converter and no header. They are kept as they are.
 3. Keep the old fixtures. They are the proof that workflows already running still replay.
    Record an old scenario again only when the scenario itself changed, never to make a replay
    pass.
-4. Run `--check` and `uv run pytest tests/test_replay.py`.
+4. Run `--check` and `uv run pytest tests/core/test_replay.py`.

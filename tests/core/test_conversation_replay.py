@@ -15,7 +15,7 @@ from temporalio.worker import Replayer
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 
-FIXTURES = Path(__file__).parent / "fixtures" / "replay"
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "replay"
 
 
 @pytest.mark.parametrize("name", ["plain_turn", "step_limit", "partial_failure"])

@@ -44,6 +44,7 @@ from agentos.stores import InMemoryTaskLinkStore
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, title_prop
+from tests.helpers.conversation import stored_history
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event, signed_headers
 
 CHANNEL = "C_GENERAL"
@@ -211,7 +212,7 @@ async def test_a_dm_turn_leaves_no_message_or_reply_text_in_history(harness):
     conv = ids.conversation_id(TENANT, "D1", THREAD)
     assert leaked(await history_bytes(h.client, [conv]), S_USER, S_MODEL) == []
     assert S_USER not in json.dumps(list(h.acts.content.inbound.values()))
-    stored = await h.history.load(TENANT, conv)
+    stored = await stored_history(h, conv)
     assert [m["role"] for m in stored] == ["user", "assistant"]
 
 
@@ -354,7 +355,7 @@ async def test_a_slack_retry_of_an_event_gives_one_turn(harness):
 
 class SlowSignal(DownTemporal):
     async def signal(self, *_):
-        await asyncio.sleep(5)
+        await asyncio.Event().wait()  # never answers; the gateway's own timeout cancels it
 
 
 class BrokenHandle:
@@ -542,7 +543,7 @@ async def test_a_reply_slack_refused_is_never_stored_in_history(harness):
     await eventually(lambda: h.slack.updates())
 
     assert replies(h) == [TURN_FAILED]
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID)
     assert [m["role"] for m in stored] == ["user", "assistant"]
     assert S_MODEL not in json.dumps(stored)
 
@@ -603,7 +604,8 @@ async def test_a_hand_off_in_a_stored_message_turn_switches_the_thread_without_t
         await eventually(lambda: len(h.slack.updates()) >= 2)
 
         assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "The specialist's answer."]
-        assert "Handed to it-helper" in json.dumps(await h.history.load(TENANT, CONV_ID))
+        stored = await stored_history(h, CONV_ID)
+        assert "Handed to it-helper" in json.dumps(stored)
 
 
 # --- both kinds of message in one thread -----------------------------------------------------

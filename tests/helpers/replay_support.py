@@ -2,7 +2,7 @@
 
 ``scripts/record_replay_fixtures.py`` runs every scenario here against Temporal's time-skipping
 server with fakes and the production encrypting data converter, and writes each history to
-``tests/fixtures/replay``. ``tests/test_replay.py`` replays every file there under the current
+``tests/fixtures/replay``. ``tests/core/test_replay.py`` replays every file there under the current
 workflow code, which fails with a non-determinism error when a change alters the commands an
 existing history would issue.
 """

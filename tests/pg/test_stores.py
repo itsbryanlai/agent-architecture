@@ -6,7 +6,6 @@ its ON CONFLICT and paging clauses, and asserts what a caller would see.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 from datetime import UTC, datetime, timedelta
 
@@ -22,7 +21,6 @@ from agentos.stores import (
     tenant_transaction,
 )
 from agentos.switches import PostgresSwitchStore
-from tests.conftest import agents_dict
 from tests.pg.conftest import TestDatabase
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
@@ -94,12 +92,6 @@ async def test_sessions_expire_and_creating_one_clears_the_expired(
     assert await store.get(tenant, "wrong", NOW) is None
     await store.delete(tenant, fresh.token)
     assert await store.get(tenant, fresh.token, NOW + timedelta(hours=2)) is None
-
-
-def helper_block() -> dict:
-    block = copy.deepcopy(agents_dict()["agents"]["it-helper"])
-    del block["version"]
-    return block
 
 
 async def test_external_writes_are_per_tenant_and_a_done_result_never_changes(

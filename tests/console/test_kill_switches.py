@@ -7,7 +7,7 @@ and Temporal's time-skipping test server.
 import json
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -87,6 +87,7 @@ from tests.conftest import (
     make_fake_notion,
     title_prop,
 )
+from tests.helpers.budgets import NOV
 from tests.helpers.console_harness import (
     OTHER,
     OWNER,
@@ -96,14 +97,13 @@ from tests.helpers.console_harness import (
     post,
     using,
 )
+from tests.helpers.control_api import JSON
 from tests.helpers.gateway import FakeTemporalClient
 from tests.helpers.tasks import approve, start_task, thread_posts, wait_state
 from tests.helpers.usage import price
 
-REPO = Path(__file__).resolve().parent.parent
-NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
+REPO = Path(__file__).resolve().parents[2]
 UI = f"/ui/{TENANT}"
-JSON = {"Content-Type": "application/json"}
 GLOBEX = "globex"
 ADMIN = "U_ADMIN"
 CONV = "acme:conv:C1:1.1"

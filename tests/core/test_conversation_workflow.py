@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 from agentos.models import LLMResponse, ToolCall
@@ -14,15 +13,17 @@ async def test_text_reply_and_duplicate_event_dropped(harness):
     handle = await start_conversation(h, inbound("Ev1"))
     await handle.signal(ConversationWorkflow.message, inbound("Ev1"))
 
-    await eventually(lambda: h.slack.updates())
-    await asyncio.sleep(0.5)  # give a duplicate turn time to show up if it existed
+    # Settle point: a later message and its reply; then the duplicate would show.
+    h.llm.queue(LLMResponse(text="Second", tool_calls=[], stop_reason="end_turn"))
+    await handle.signal(ConversationWorkflow.message, inbound("Ev1b", "again"))
+    await eventually(lambda: len(h.slack.updates()) >= 2)
 
-    assert len(placeholders(h)) == 1
-    assert len(h.slack.updates()) == 1
+    assert len(placeholders(h)) == 2
+    assert len(h.slack.updates()) == 2
     update = h.slack.updates()[0]
     assert update["text"] == "Hi there"
     assert update["ts"] == placeholders(h)[0]["ts"]
-    assert len(h.llm.calls) == 1
+    assert len(h.llm.calls) == 2
 
 
 async def test_read_tool_round_trip(harness):

@@ -15,7 +15,7 @@ from slack_sdk.signature import SignatureVerifier
 from temporalio.client import WorkflowHistory
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
-from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Replayer, Worker
 
 from agentos import ids
@@ -38,7 +38,6 @@ from agentos.llm import ScriptedLLMClient
 from agentos.members import InMemoryMemberStore
 from agentos.models import (
     AudienceEvent,
-    ConversationRef,
     InboundMessage,
     LLMResponse,
 )
@@ -54,19 +53,18 @@ from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, TEAM, TENANT, agents_dict, eventually, make_fake_notion
+from tests.helpers.audience import CHAN, OWNER, THREAD, converse
 from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
 from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
 from tests.helpers.gateway import FakeTemporalClient, signed_headers
+from tests.helpers.temporal import new_scope, replace_server_if_stuck
 
-CHAN = "C0AAAA111"
 OTHER_CHAN = "C0BBBB222"
 THIRD_CHAN = "C0CCCC333"
 ADMIN = "U_ROOT"
-OWNER = "U_OWNER"
 HR_OWNER = "U_HR_OWNER"
 MEMBER_ADMIN = "U_ADMIN2"
 BYSTANDER = "U_OTHER_CREATOR"
-THREAD = "1700000000.000100"
 
 GUEST = SlackUser("U_GUEST", TEAM, is_restricted=True)
 SINGLE_GUEST = SlackUser("U_SINGLE", TEAM, is_ultra_restricted=True)
@@ -272,7 +270,7 @@ async def test_pausing_is_audited_with_ids_and_the_reason_only():
 
 @asynccontextmanager
 async def running(w: World, llm: ScriptedLLMClient | None = None):
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+    wf_env = new_scope()
     w.llm = llm or ScriptedLLMClient()
     w.history = InMemoryHistoryStore()
     acts = AgentActivities(
@@ -289,16 +287,18 @@ async def running(w: World, llm: ScriptedLLMClient | None = None):
     )
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow, AudienceWatchWorkflow],
         activities=[*acts.all(), *w.watch.all()],
+        interceptors=[wf_env.children],
     )
     w.client = wf_env.client
     async with worker:
         try:
             yield w
         finally:
-            await wf_env.shutdown()
+            await wf_env.finish()
+            await replace_server_if_stuck()
 
 
 async def start_watch(w: World, ev: AudienceEvent):
@@ -330,17 +330,6 @@ async def test_the_workflow_id_names_the_tenant_and_the_event():
 
 def say(event_id: str, user: str, channel: str, kind: str, thread: str = THREAD):
     return InboundMessage(event_id, user, "secret question", channel, thread, kind)
-
-
-async def converse(w: World, agent_id: str, msg: InboundMessage):
-    return await w.client.start_workflow(
-        ConversationWorkflow.run,
-        ConversationRef(TENANT, agent_id, msg.channel, msg.thread_ts),
-        id=ids.conversation_id(TENANT, msg.channel, msg.thread_ts),
-        task_queue=TASK_QUEUE,
-        start_signal="message",
-        start_signal_args=[msg],
-    )
 
 
 def answer(text: str) -> LLMResponse:

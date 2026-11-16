@@ -586,8 +586,9 @@ in-memory stores) plus Temporal's time-skipping test server, which downloads a
 test-server binary on first use. They never call Claude, Slack or Notion.
 
 ```bash
-uv run pytest tests/test_ids.py tests/test_config.py tests/test_notion_connector.py \
-  tests/test_conversation_workflow.py tests/test_task_workflow.py tests/test_gateway.py -v
+uv run pytest tests/core/test_ids.py tests/core/test_config.py \
+  tests/connectors/test_notion_connector.py tests/core/test_conversation_workflow.py \
+  tests/core/test_task_workflow.py tests/core/test_gateway.py -v
 uv run ruff check . && uv run ruff format --check .
 ```
 

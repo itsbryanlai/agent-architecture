@@ -16,6 +16,8 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Exactly-once Notion create and comment | built | `activities.py` (`_write_once`), `external_writes` table | A target whose search lags longer than the look-before-write window can get a second item from a retry (accepted) |
 | Pending cards stop for agent off, pause or lost audience | built | `activities.py` (`check_before_write`), `workflows/task.py` | |
 | Follow-up on status to "marked Done" | built | `workflows/task.py` | |
+| Long task watch: continue-as-new | built | `workflows/task.py`, `models.py` (`WatchState`) | `WatchState` carries references and small values only; a hop at 1000 events or when Temporal suggests it; a burst of pokes answered once per 60 s |
+| Replay fixtures for workflow changes | built | `scripts/record_replay_fixtures.py`, `tests/fixtures/replay/` | Recorded in a legacy shape and a reference shape under the encrypting converter; old fixtures are kept; `--check` replays them |
 | "No movement" follow-up | partial | `workflows/task.py`, `task_notices.py` | One notice; no nudge offer and no action |
 | Notion connector (read, create item, comment) | built | `connectors/notion.py` | |
 | Connector manifest: risk, idempotency, requester scoping | built | `connectors/manifest.py`, `connectors/manifests/notion.yaml` | Risk class is read; no admin adjustment |

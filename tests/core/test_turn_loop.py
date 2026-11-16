@@ -36,6 +36,7 @@ from tests.helpers.conversation import (
     inbound,
     placeholders,
     start_conversation,
+    stored_history,
 )
 from tests.helpers.turns import tool_result_ids, tool_use_ids
 
@@ -77,7 +78,7 @@ async def test_failed_tool_does_not_hide_a_task_that_was_started(harness):
 
     assert h.slack.updates()[0]["text"] == TURN_FAILED
     assert [p for p in h.slack.posts() if p["blocks"]], "the approval card went out"
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID, lambda s: tool_result_ids(s) == ["tu_c", "tu_s"])
     assert tool_use_ids(stored) == tool_result_ids(stored) == ["tu_c", "tu_s"]
     results = tool_results(stored)
     assert "approval card" in results["tu_c"]["content"]
@@ -102,7 +103,7 @@ async def test_last_step_does_not_dispatch_tools(harness):
 
     assert h.slack.updates()[0]["text"] == OUT_OF_STEPS
     assert not [p for p in h.slack.posts() if p["blocks"]], "no write task was started"
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID)
     assert tool_results(stored)["tu_last"]["content"] == "step limit reached"
     assert tool_results(stored)["tu_last"]["is_error"] is True
     assert stored[-1] == {"role": "assistant", "content": [{"type": "text", "text": OUT_OF_STEPS}]}
@@ -217,8 +218,19 @@ async def test_message_signalled_with_the_idle_timeout_is_not_dropped():
             )
             await eventually(lambda: slack.updates())
 
+            async def idle_timer_started():
+                history = await handle.fetch_history()
+                return any(e.HasField("timer_started_event_attributes") for e in history.events)
+
+            await eventually(idle_timer_started)
+
         skip = asyncio.create_task(env.sleep(IDLE_TIMEOUT + timedelta(hours=1)))
-        await asyncio.sleep(2)
+
+        async def idle_timer_fired():
+            history = await handle.fetch_history()
+            return any(e.HasField("timer_fired_event_attributes") for e in history.events)
+
+        await eventually(idle_timer_fired)
         await handle.signal(ConversationWorkflow.message, inbound("Ev2", "still there?"))
 
         skip.cancel()

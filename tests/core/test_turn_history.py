@@ -7,7 +7,7 @@ from agentos.history_view import HISTORY_BUDGET_CHARS, prepare_for_model
 from agentos.models import LLMResponse
 from agentos.workflows.conversation import EMPTY_MESSAGE_REPLY, ConversationWorkflow
 from tests.conftest import TENANT, eventually
-from tests.helpers.conversation import CHANNEL, THREAD, inbound, start_conversation
+from tests.helpers.conversation import CHANNEL, THREAD, inbound, start_conversation, stored_history
 from tests.helpers.turns import assert_tool_pairs_valid
 
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
@@ -51,7 +51,7 @@ async def test_unanswered_tool_use_is_closed_when_history_is_loaded(harness):
     assert closing["is_error"] is True
     assert h.slack.updates()[0]["text"] == "Fine now"
     # Stored history is not rewritten by the repair.
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID)
     assert not any(
         isinstance(b, dict) and b.get("type") == "tool_result" for m in stored for b in m["content"]
     )
@@ -162,7 +162,7 @@ async def test_message_without_text_gets_a_fixed_reply_and_poisons_nothing(harne
     assert h.slack.updates()[0]["text"] == "Real answer"
     assert len(h.llm.calls) == 1
     assert [m["content"][0]["text"] for m in h.llm.calls[0]["messages"]] == ["a real question"]
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID)
     assert all(b["text"].strip() for m in stored for b in m["content"])
 
 

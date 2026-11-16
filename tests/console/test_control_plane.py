@@ -8,12 +8,12 @@ from agentos.agent_store import (
     InMemoryAgentStore,
 )
 from agentos.audit import InMemoryAuditStore, canonical_sha256
-from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane, Forbidden
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore, MemberError
-from tests.conftest import TENANT, agents_dict, make_fake_notion
+from tests.conftest import TENANT, make_fake_notion
 from tests.helpers.agents import helper_block
+from tests.helpers.control_plane_tenants import tenants
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"  # an admin added through the app
@@ -21,12 +21,6 @@ OWNER = "U_OWNER"  # a creator who creates the agent under test
 OTHER = "U_OTHER"  # a creator who did not
 OUTSIDER = "U_OUTSIDER"  # no role
 PROMPT = "You help employees with IT requests."
-
-
-def tenants(*admins: str) -> TenantsConfig:
-    raw = agents_dict()
-    raw["admins"] = list(admins)
-    return TenantsConfig.of(parse_agents_config(raw))
 
 
 async def make_plane(admins: tuple[str, ...] = (ROOT,), seed: bool = True):

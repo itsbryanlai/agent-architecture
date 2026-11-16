@@ -18,7 +18,7 @@ reported as a deviation; the docs are changed only with the maintainer's go.
 - Temporal workflow code stays deterministic: `workflow.now()`,
   `workflow.uuid4()`, `workflow.sleep()`; no I/O. A change that alters the commands
   an existing history produces goes behind `workflow.patched("<name>")`, and
-  `tests/test_conversation_replay.py` keeps passing.
+  `tests/core/test_conversation_replay.py` keeps passing.
 - Committed files never name local planning paths, ticket IDs or tool
   attribution.
 
@@ -63,7 +63,7 @@ Shape:
 10. Same arrange and act with different input is one parametrized test. A refusal and its matching acceptance are rows of one table with an expected outcome.
 11. One behaviour per test. No lifecycle tours with 25 assertions.
 12. No real time. Inject the clock; use the time-skipping server. No `asyncio.sleep` to order timestamps, no `asyncio.run` inside a sync test.
-13. Helpers live in `conftest.py` or `tests/helpers/`. A test file never imports from another test file.
+13. Helpers live in `conftest.py` or `tests/helpers/`. A test file never imports from another test file. Tests sit in `tests/core/`, `tests/console/`, `tests/knowledge/` and `tests/connectors/`; the real-Postgres tier is `tests/pg/`.
 14. One Temporal test server per session, one task queue per test. A test that needs its own (the encrypting converter, a worker restart) says so in a comment.
 
 Fakes:
@@ -74,4 +74,4 @@ Fakes:
 
 Workflows:
 
-18. A change to workflow code adds a replay fixture recorded by the new code, from the fixture recording script, and keeps the old ones. A fixture no script can regenerate is deleted.
+18. A change to workflow code adds a replay fixture recorded by the new code, from the fixture recording script (`scripts/record_replay_fixtures.py`, which records each scenario in a legacy shape and a reference shape under the encrypting converter), and keeps the old ones. A fixture no script can regenerate is deleted.

@@ -29,10 +29,10 @@ from tests.helpers.console_harness import (
     post,
     using,
 )
+from tests.helpers.control_api import JSON
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
-JSON = {"Content-Type": "application/json"}
 PAGE = "cccccccc-0000-0000-0000-000000000001"
 USER_TOKEN = "ntn_user_token_for_the_picker_test"
 

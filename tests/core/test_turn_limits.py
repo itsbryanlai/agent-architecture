@@ -32,6 +32,7 @@ from tests.helpers.conversation import (
     THREAD,
     inbound,
     start_conversation,
+    stored_history,
 )
 from tests.helpers.fake_openai import FakeOpenAI, _response, _tool_call
 from tests.helpers.front_door import (
@@ -112,7 +113,7 @@ async def test_a_task_that_cannot_start_ends_the_turn_not_the_conversation():
         await eventually(lambda: h.slack.updates())
         assert h.slack.updates()[0]["text"] == TURN_FAILED
         assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
-        stored = await h.history.load(TENANT, CONV_ID)
+        stored = await stored_history(h, CONV_ID, lambda s: tool_result_ids(s) == ["tu_1"])
         assert tool_use_ids(stored) == tool_result_ids(stored) == ["tu_1"]
 
         await handle.signal(ConversationWorkflow.message, front_door_message("Ev2", "there?"))

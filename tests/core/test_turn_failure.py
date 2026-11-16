@@ -12,6 +12,7 @@ from tests.helpers.conversation import (
     inbound,
     placeholders,
     start_conversation,
+    stored_history,
 )
 from tests.helpers.llm_errors import StatusError
 from tests.helpers.turns import tool_result_ids, tool_use_ids
@@ -88,7 +89,7 @@ async def test_failed_tool_call_closes_pending_tool_use(harness):
     assert len(h.llm.calls) == 1
 
     conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
-    stored = await h.history.load(TENANT, conv_id)
+    stored = await stored_history(h, conv_id, lambda s: tool_result_ids(s) == ["tu_1"])
     closing = [
         b
         for m in stored

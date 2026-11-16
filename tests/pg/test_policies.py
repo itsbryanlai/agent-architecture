@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import psycopg
 import pytest
 from psycopg import errors
 
 from agentos.stores import tenant_transaction
+from tests.helpers.pg_seed import seed_version
 from tests.pg.conftest import TestDatabase
 
 VECTOR = "(SELECT array_fill(0.5::real, ARRAY[1024])::vector)"
@@ -223,21 +223,6 @@ def test_audit_log_refuses_changes_from_every_role(db: TestDatabase, tenant: str
         conn.execute(SEEDS["audit_events"], {"t": tenant})
         with pytest.raises(errors.RaiseException, match="append-only"):
             conn.execute(change)
-
-
-def seed_version(conn: psycopg.Connection, tenant: str, agent: str, status: str, version: int = 1):
-    """An agent version in a given status, with the fields every status needs filled in."""
-    conn.execute(
-        "INSERT INTO agents (tenant_id, agent_id, created_by) VALUES (%s, %s, 'u') "
-        "ON CONFLICT DO NOTHING",
-        (tenant, agent),
-    )
-    conn.execute(
-        "INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition, "
-        "created_by, submitted_by, approved_by, published_at, definition_sha256) "
-        "VALUES (%s, %s, %s, %s, '{}', 'u', 'u', 'u', '2026-01-01', %s)",
-        (tenant, agent, version, status, None if status == "draft" else "h"),
-    )
 
 
 ALLOWED_MOVES = {

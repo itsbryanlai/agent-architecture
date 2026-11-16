@@ -26,6 +26,7 @@ from tests.conftest import (
     TENANT,
     eventually,
 )
+from tests.helpers.conversation import stored_history
 from tests.helpers.front_door import (
     ANNOUNCEMENT,
     CONV_ID,
@@ -416,7 +417,7 @@ async def test_specialist_load_failure_keeps_the_thread_with_the_front_door(fd, 
 
     assert [u["text"] for u in h.slack.updates()] == [TURN_FAILED]
     assert len([p for p in h.slack.posts() if p["text"] == "Thinking…"]) == 1
-    stored = await h.history.load(TENANT, CONV_ID)
+    stored = await stored_history(h, CONV_ID, lambda s: len(s) >= 4)
     assert [m["role"] for m in stored] == ["user", "assistant", "user", "assistant"]
     closed = stored[2]["content"][0]
     assert closed["tool_use_id"] == "tu_h"

@@ -1,6 +1,5 @@
 """Comments on items and the Edit button on the approval card."""
 
-import asyncio
 import dataclasses
 import json
 import secrets
@@ -387,15 +386,21 @@ async def test_edit_replaces_draft_and_requires_new_approval(harness):
     assert "Better monitor" in text and "Edited — review and approve again" in text
     assert after.nonce in text and NONCE not in text
 
+    # A decision on the superseded nonce is refused: the task still waits, so
+    # the edit that follows (the settle point) is still accepted.
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
-    await asyncio.sleep(0.5)
+    await handle.signal(
+        TaskWorkflow.edit, EditRequest(after.nonce, ALICE, {"title": "Final", "details": "x"})
+    )
+    final = await eventually(lambda: _nonce_not(handle, after.nonce))
     assert await handle.query(TaskWorkflow.state) == "awaiting_approval"
     assert h.notion.count("create_page") == 0
+    after = final
 
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(after.nonce, ALICE, True))
     await wait_state(handle, "watching")
     [page] = h.notion.all_pages(DB_ID)
-    assert page["properties"]["Name"]["title"][0]["plain_text"] == "Better monitor"
+    assert page["properties"]["Name"]["title"][0]["plain_text"] == "Final"
 
 
 async def _changed(handle):
@@ -419,10 +424,13 @@ async def test_bad_edits_are_ignored(harness):
     await handle.signal(
         TaskWorkflow.edit, EditRequest(NONCE, ALICE, {"title": "t" * 151, "details": "y"})
     )
-    await asyncio.sleep(0.5)
-
-    d = await draft(handle)
-    assert d.nonce == NONCE and d.fields["title"] == "New monitor"
+    # Settle point: an edit on the original nonce is accepted only if none of
+    # the bad ones above was.
+    await handle.signal(
+        TaskWorkflow.edit, EditRequest(NONCE, ALICE, {"title": "Settled", "details": "y"})
+    )
+    d = await eventually(lambda: _nonce_not(handle, NONCE))
+    assert d.fields == {"title": "Settled", "details": "y"}
 
 
 async def test_edit_limit(harness):
@@ -444,10 +452,11 @@ async def test_edit_limit(harness):
     await handle.signal(
         TaskWorkflow.edit, EditRequest(nonce, ALICE, {"title": "too many", "details": "d"})
     )
-    await asyncio.sleep(0.5)
-    after = await draft(handle)
-    assert after.nonce == nonce and after.fields["title"] == f"T{MAX_EDITS - 1}"
-    assert after.editable is False
+    # Settle point: approve, then the filed page carries the last accepted edit.
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+    await wait_state(handle, "watching")
+    [page] = h.notion.all_pages(DB_ID)
+    assert page["properties"]["Name"]["title"][0]["plain_text"] == f"T{MAX_EDITS - 1}"
 
 
 async def _nonce_not(handle, nonce):

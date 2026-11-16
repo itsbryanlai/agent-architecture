@@ -7,7 +7,6 @@ import asyncio
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 import pytest
 from temporalio.testing import ActivityEnvironment
@@ -39,8 +38,9 @@ from agentos.stores import (
     InMemoryToolOutputStore,
 )
 from agentos.tenants import TenantRegistry, runtime_for
-from agentos.usage import InMemoryUsageStore, Prices, UsageEvent, UsageRecorder
+from agentos.usage import InMemoryUsageStore, Prices, UsageRecorder
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
+from tests.helpers.budgets import NOV, D, usage_row
 from tests.helpers.console_harness import (
     OTHER,
     OWNER,
@@ -50,12 +50,10 @@ from tests.helpers.console_harness import (
     post,
     using,
 )
+from tests.helpers.control_api import JSON
 from tests.helpers.usage import SCOPE, _page_agents, block, price
 
-D = Decimal
-NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
 UI = f"/ui/{TENANT}"
-JSON = {"Content-Type": "application/json"}
 
 
 class Clock:
@@ -64,19 +62,6 @@ class Clock:
 
     def __call__(self):
         return self.now
-
-
-def usage_row(key, agent="it-helper", cost="1", kind="llm", at=NOV, tenant=TENANT):
-    return UsageEvent(
-        tenant_id=tenant,
-        usage_key=key,
-        kind=kind,
-        agent_id=None if kind == "embedding" else agent,
-        agent_version=None if kind == "embedding" else 1,
-        model="m",
-        cost=None if cost is None else D(cost),
-        at=at,
-    )
 
 
 def make_guard(ttl=60, clock=None):

@@ -72,11 +72,13 @@ In the Notion integration's settings, enable the **Read comments** and
 **Insert comments** capabilities (both are off by default). The agent needs
 them to comment on items.
 
-After the wizard, with `NOTION_TOKEN` exported, check the Notion grant and get
-the stable property IDs:
+After the wizard and the import, with `NOTION_TOKEN` exported, check the Notion grant
+of the agent's draft and get the stable property IDs (paste the `property_ids` block into
+the definition before publishing; the worker will not start on a published agent without it):
 
 ```bash
-uv run python -m agentos.check_grants
+uv run python -m agentos.check_grants --tenant <tenant> --agent <agent>   # newest draft
+uv run python -m agentos.check_grants                                     # every published agent
 ```
 
 The property names in `config/agents.yaml` are labels; the worker addresses
@@ -105,7 +107,7 @@ Optional settings: `AGENTOS_MODEL` (default depends on the provider; see
 below),
 `AGENTOS_TEMPORAL_ADDRESS` (default `localhost:7233`) and `AGENTOS_CONFIG`
 (default `config/agents.yaml`; a file for one tenant, or a directory with one
-`*.yaml` per tenant). Only the two import commands and `check_grants` read it.
+`*.yaml` per tenant). Only the two import commands read it.
 `AGENTOS_DATABASE_URL` is required and has no default; see
 [Database and migrations](#database-and-migrations) (Compose publishes Postgres on host
 port 55432, bound to 127.0.0.1 along with Temporal's 7233 and 8233; Temporal keeps
@@ -766,8 +768,9 @@ The import copies each YAML agent that has no row yet in as a published version
 1 (`import:yaml` is the creator and approver). Running it again skips each
 agent that exists and names it. **After the import, editing the `agents`
 section of the YAML file changes nothing**: the database is the source.
-`check_grants` still reads the YAML file, so run it before the import to get a
-grant's property IDs.
+`check_grants` reads the database, not the YAML file: run it with `--tenant` and
+`--agent` on a draft to get a grant's property IDs before publishing (`--version`
+picks another version).
 
 Known gap: a version published after the worker started that adds a Notion page
 grant gets no index schedule and no startup grant check until the worker
@@ -983,6 +986,12 @@ The same process serves web pages for agents, versions, members, usage and the a
 behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
 JSON API, so a user's role in the tenant decides what they can do in both. The
 console is off unless sign-in is configured.
+
+A creator sees and opens only the agents they created: the agent list, an agent's
+versions and definitions, and its usage, budget and switch state. An agent that belongs to
+someone else is not listed, and opening it answers "not found", the same as for an agent that
+does not exist. An admin sees every agent. The JSON API follows the same rule. Before sign-in,
+an unknown tenant and a real one get the same answer.
 
 **In the Slack app** (api.slack.com/apps, the app the gateway uses):
 

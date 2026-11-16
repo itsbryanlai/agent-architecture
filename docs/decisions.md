@@ -73,6 +73,11 @@ Last reviewed 2026-11-14.
 - **Why:** an admin who turns an agent off during an incident expects nothing more to happen, and a card shown before a pause or a membership change should not outlive it.
 - **Consequence:** one gate in front of every activity that acts for an agent applies the agent, writes and connector switches by effect (model, read, write, poll). A switched-off specialist is not offered to a front door.
 
+### A creator reads only the agents they created
+- **Decision:** a creator lists and reads only the agents they created: definitions, versions, usage, budgets and switches follow one rule, enforced in `ControlPlane`, which the console and the API both call. An agent that belongs to someone else answers "not found", as an agent that does not exist does. Admins read every agent.
+- **Why:** a definition holds the system prompt and the access an agent was granted. Before this, usage, budgets and switches were limited to a creator's own agents but definitions were not, so the rule depended on which page asked.
+- **Consequence:** the caller's role and owned agents are resolved once per request into a `Principal` that plane calls accept, so a page makes one role lookup instead of one per call.
+
 ## Open questions
 
 | # | Question | Suggested default |

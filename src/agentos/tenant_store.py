@@ -41,6 +41,7 @@ from agentos.config import (
     ConfigError,
     TenantsConfig,
     TenantSecrets,
+    load_settings,
 )
 from agentos.stores import tenant_transaction
 
@@ -424,7 +425,7 @@ async def startup_tenants(directory: TenantDirectory) -> TenantsConfig:
 
 async def load_stored_tenants(database_url: str) -> TenantsConfig:
     """The enabled tenants in the database, for a command-line tool that runs once."""
-    pool = AsyncConnectionPool(database_url, open=False)
+    pool = AsyncConnectionPool(database_url, open=False, **load_settings().pool_args())
     await pool.open()
     try:
         return await startup_tenants(TenantDirectory(PostgresTenantStore(pool)))
@@ -454,7 +455,7 @@ async def import_tenant(store: TenantStore, config: AgentsConfig) -> bool:
 
 
 async def run_import() -> int:
-    from agentos.config import load_settings, load_tenants_config
+    from agentos.config import load_tenants_config
 
     settings = load_settings()
     try:
@@ -462,7 +463,7 @@ async def run_import() -> int:
     except (ConfigError, OSError) as err:
         print(f"cannot read the tenant YAML: {err}")
         return 1
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     failed = False
     try:

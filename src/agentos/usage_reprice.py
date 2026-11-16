@@ -31,7 +31,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from agentos import ids
 from agentos.audit import AuditStore
-from agentos.config import DEFAULT_PRICES_PATH, TENANT_ID_PATTERN, ConfigError
+from agentos.config import DEFAULT_PRICES_PATH, TENANT_ID_PATTERN, ConfigError, load_settings
 from agentos.models import AuditEvent
 from agentos.switches import operator_identity
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
@@ -173,7 +173,7 @@ async def run(args: argparse.Namespace) -> int:
     except ConfigError as err:
         print(f"refused: {err}")
         return 2
-    pool = AsyncConnectionPool(url, open=False)
+    pool = AsyncConnectionPool(url, open=False, **load_settings().pool_args())
     await pool.open()
     try:
         result = await reprice(

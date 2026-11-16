@@ -31,6 +31,8 @@ from typing import Literal, Protocol
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from agentos.history_view import HISTORY_BUDGET_CHARS, char_len, window
+
 
 class HistoryStore(Protocol):
     async def append(
@@ -45,6 +47,16 @@ class HistoryStore(Protocol):
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
         """Return the conversation as Anthropic-format messages, oldest first."""
+        ...
+
+    async def load_window(
+        self, tenant_id: str, conversation_id: str, budget: int = HISTORY_BUDGET_CHARS
+    ) -> list[dict]:
+        """The messages ``history_view.window`` would keep of the whole conversation.
+
+        Only the rows of the window are read; the cut is made in front of a user message with
+        text, from the sizes stored on the rows.
+        """
         ...
 
 
@@ -114,8 +126,9 @@ class PostgresHistoryStore:
         async with tenant_transaction(self._pool, tenant_id) as conn:
             cur = await conn.execute(
                 """
-                INSERT INTO conversation_messages (tenant_id, conversation_id, seq, step_key, role, content)
-                SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s
+                INSERT INTO conversation_messages
+                  (tenant_id, conversation_id, seq, step_key, role, content, char_len)
+                SELECT %s, %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s, %s
                 FROM conversation_messages
                 WHERE tenant_id = %s AND conversation_id = %s
                 ON CONFLICT (tenant_id, conversation_id, step_key) DO NOTHING
@@ -127,6 +140,7 @@ class PostgresHistoryStore:
                     step_key,
                     role,
                     Jsonb(content),
+                    char_len({"role": role, "content": content}),
                     tenant_id,
                     conversation_id,
                 ),
@@ -156,6 +170,54 @@ class PostgresHistoryStore:
             )
             rows = await cur.fetchall()
             return [{"role": role, "content": content} for role, content in rows]
+
+    async def load_window(
+        self, tenant_id: str, conversation_id: str, budget: int = HISTORY_BUDGET_CHARS
+    ) -> list[dict]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                _WINDOW_START, {"t": tenant_id, "c": conversation_id, "budget": budget}
+            )
+            (start,) = await cur.fetchone()
+            cur = await conn.execute(
+                """
+                SELECT role, content FROM conversation_messages
+                WHERE tenant_id = %s AND conversation_id = %s AND seq >= %s
+                ORDER BY seq
+                """,
+                (tenant_id, conversation_id, start),
+            )
+            rows = await cur.fetchall()
+            return [{"role": role, "content": content} for role, content in rows]
+
+
+# A user message with text and no tool result: the only place the window may be cut. The same
+# test as ``history_view._starts_a_turn``, which also ignores text blocks with no visible text.
+_STARTS_A_TURN = """
+  m.role = 'user' AND jsonb_typeof(m.content) = 'array'
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements(m.content) b
+              WHERE b ->> 'type' = 'text' AND b ->> 'text' ~ '\\S')
+  AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(m.content) b
+                  WHERE b ->> 'type' = 'tool_result')
+"""
+
+# The window start, from the sizes alone: the whole thread when it fits the budget; otherwise
+# the earliest turn start whose rows from there on fit; otherwise the newest turn start; and
+# the whole thread when it has none. Only seq and char_len are read for rows outside the window.
+_WINDOW_START = f"""
+WITH sizes AS (
+  SELECT seq, SUM(char_len) OVER (ORDER BY seq DESC) AS kept
+  FROM conversation_messages
+  WHERE tenant_id = %(t)s AND conversation_id = %(c)s
+)
+SELECT CASE WHEN (SELECT COALESCE(MAX(kept), 0) FROM sizes) <= %(budget)s THEN 0 ELSE COALESCE(
+  (SELECT MIN(m.seq) FROM conversation_messages m JOIN sizes s ON s.seq = m.seq
+   WHERE m.tenant_id = %(t)s AND m.conversation_id = %(c)s AND s.kept <= %(budget)s
+     AND {_STARTS_A_TURN}),
+  (SELECT MAX(m.seq) FROM conversation_messages m
+   WHERE m.tenant_id = %(t)s AND m.conversation_id = %(c)s AND {_STARTS_A_TURN}),
+  0) END
+"""
 
 
 class PostgresIdempotencyStore:
@@ -428,6 +490,11 @@ class InMemoryHistoryStore:
 
     async def load(self, tenant_id: str, conversation_id: str) -> list[dict]:
         return copy.deepcopy(self.messages.get((tenant_id, conversation_id), []))
+
+    async def load_window(
+        self, tenant_id: str, conversation_id: str, budget: int = HISTORY_BUDGET_CHARS
+    ) -> list[dict]:
+        return window(await self.load(tenant_id, conversation_id), budget)
 
 
 class InMemoryIdempotencyStore:

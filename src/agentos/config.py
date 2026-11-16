@@ -43,6 +43,9 @@ DEFAULT_SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 DEFAULT_NOTION_TOKEN_ENV = "NOTION_TOKEN"
 DEFAULT_NOTION_WEBHOOK_TOKEN_ENV = "NOTION_WEBHOOK_VERIFICATION_TOKEN"
 DEFAULT_EMBED_MODEL = "text-embedding-v4"
+DEFAULT_DB_POOL_MIN = 2
+DEFAULT_DB_POOL_MAX = 32
+DEFAULT_MAX_CONCURRENT_ACTIVITIES = 32
 # Must match the vector(1024) column in the knowledge_chunks table.
 EMBED_DIMENSIONS = 1024
 # The farthest a chunk may be from the question (cosine distance: 0 identical, 1 unrelated,
@@ -141,6 +144,20 @@ class Settings:
     notion_oauth_client_id: str | None = None
     notion_oauth_client_secret: str | None = field(default=None, repr=False)
     require_grant_picker: bool = False
+    # Database connections per process (min and max of the pool) and how many activities the
+    # worker runs at once. An activity holds a connection only while it runs a query, and a
+    # model call makes about six, so a pool smaller than the activity count makes activities
+    # queue for a connection. The worker therefore refuses to start with a pool max below
+    # ``max_concurrent_activities`` (see ``validate_worker_capacity``). The defaults suit one
+    # worker next to the gateway and the console on Postgres's default 100 connections:
+    # 32 + 32 + 32 stays under it. Raise both together, and the server's limit with them.
+    db_pool_min: int = DEFAULT_DB_POOL_MIN
+    db_pool_max: int = DEFAULT_DB_POOL_MAX
+    max_concurrent_activities: int = DEFAULT_MAX_CONCURRENT_ACTIVITIES
+
+    def pool_args(self) -> dict[str, int]:
+        """Keyword arguments for ``AsyncConnectionPool``: its minimum and maximum size."""
+        return {"min_size": self.db_pool_min, "max_size": self.db_pool_max}
 
     def require(self, name: str) -> str:
         """Return a required setting, or fail with a message naming the variable.
@@ -183,6 +200,34 @@ def _parse_distance(raw: str | None) -> float | None:
     return value
 
 
+def _parse_positive_int(env: Any, name: str, default: int) -> int:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ConfigError(f"{name} must be a whole number of at least 1; got {raw!r}")
+    return value
+
+
+def validate_worker_capacity(settings: Settings) -> None:
+    """Refuse a connection pool that cannot serve the activities the worker runs at once."""
+    if settings.db_pool_max < settings.db_pool_min:
+        raise ConfigError(
+            f"AGENTOS_DB_POOL_MAX ({settings.db_pool_max}) is below "
+            f"AGENTOS_DB_POOL_MIN ({settings.db_pool_min})"
+        )
+    if settings.db_pool_max < settings.max_concurrent_activities:
+        raise ConfigError(
+            f"AGENTOS_DB_POOL_MAX ({settings.db_pool_max}) is below "
+            f"AGENTOS_MAX_CONCURRENT_ACTIVITIES ({settings.max_concurrent_activities}): "
+            "activities would wait for a connection. Raise the pool or lower the activities."
+        )
+
+
 def load_settings() -> Settings:
     env = os.environ
     provider = _parse_provider(env.get("AGENTOS_LLM_PROVIDER"))
@@ -211,6 +256,11 @@ def load_settings() -> Settings:
         notion_oauth_client_id=env.get("NOTION_OAUTH_CLIENT_ID") or None,
         notion_oauth_client_secret=env.get("NOTION_OAUTH_CLIENT_SECRET") or None,
         require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
+        db_pool_min=_parse_positive_int(env, "AGENTOS_DB_POOL_MIN", DEFAULT_DB_POOL_MIN),
+        db_pool_max=_parse_positive_int(env, "AGENTOS_DB_POOL_MAX", DEFAULT_DB_POOL_MAX),
+        max_concurrent_activities=_parse_positive_int(
+            env, "AGENTOS_MAX_CONCURRENT_ACTIVITIES", DEFAULT_MAX_CONCURRENT_ACTIVITIES
+        ),
     )
 
 
@@ -281,6 +331,12 @@ class NotionPageGrant:
 class Grants:
     notion_databases: list[NotionDatabaseGrant] = field(default_factory=list)
     notion_pages: list[NotionPageGrant] = field(default_factory=list)
+
+
+# The most an agent definition may ask for. A task lives at most one approval window plus one
+# watch, so these bound how long a row a live task reads must be kept (see ``agentos.retention``).
+MAX_APPROVAL_EXPIRES_HOURS = 168
+MAX_WATCH_DAYS = 60
 
 
 @dataclass
@@ -453,6 +509,18 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
     )
 
 
+def _check_bound(where: str, name: str, block: dict[str, Any], maximum: int) -> None:
+    key = name.split(".")[1]
+    if key not in block:
+        return
+    try:
+        value = int(block[key])
+    except (TypeError, ValueError):
+        value = 0
+    if not 1 <= value <= maximum:
+        raise ConfigError(f"{where}: {name} must be a whole number from 1 to {maximum}")
+
+
 def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
     """Parse and validate one agent block, from the YAML file or from the database.
 
@@ -468,6 +536,8 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
     pages = [_parse_page_grant(agent_id, pg) for pg in notion.get("pages") or []]
     follow = raw.get("follow_up") or {}
     approval = raw.get("approval") or {}
+    _check_bound(where, "approval.expires_after_hours", approval, MAX_APPROVAL_EXPIRES_HOURS)
+    _check_bound(where, "follow_up.max_watch_days", follow, MAX_WATCH_DAYS)
     return AgentVersion(
         agent_id=agent_id,
         version=int(version if version is not None else _require(raw, "version", where)),

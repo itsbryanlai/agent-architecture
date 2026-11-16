@@ -500,7 +500,7 @@ async def run(args: argparse.Namespace) -> int:
     from agentos.config import load_settings
 
     settings = load_settings()
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         return await execute(

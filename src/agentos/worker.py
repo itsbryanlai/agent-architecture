@@ -32,9 +32,11 @@ from agentos.config import (
     PROVIDER_QWEN,
     TASK_QUEUE,
     AgentsConfig,
+    ConfigError,
     Settings,
     TenantsConfig,
     load_settings,
+    validate_worker_capacity,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
 from agentos.crypto_keys import LocalKeyStore, check_keys, startup_key_failure
@@ -43,6 +45,7 @@ from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
+from agentos.retention import PostgresRetentionStore, RetentionActivities
 from agentos.schema_version import require_current_schema
 from agentos.slack_client import RealSlackPoster
 from agentos.stores import (
@@ -61,6 +64,7 @@ from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
+from agentos.workflows.retention import RetentionWorkflow
 from agentos.workflows.task import TaskWorkflow
 
 
@@ -248,9 +252,13 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("agentos.worker")
     settings = load_settings()
+    try:
+        validate_worker_capacity(settings)
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
     llm = build_llm(settings)
     prices = load_prices(settings.prices_path)
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         await require_current_schema(pool)
@@ -332,8 +340,15 @@ async def main() -> None:
             audit_store,
             idempotency,
         )
-        workflows: list = [ConversationWorkflow, TaskWorkflow, AudienceWatchWorkflow]
-        all_activities = activities.all() + watch.all()
+        workflows: list = [
+            ConversationWorkflow,
+            TaskWorkflow,
+            AudienceWatchWorkflow,
+            RetentionWorkflow,
+        ]
+        all_activities = (
+            activities.all() + watch.all() + RetentionActivities(PostgresRetentionStore(pool)).all()
+        )
         if embedder is not None:
             # Indexing runs only where some published agent has a page grant.
             workflows += [IndexingWorkflow, PageRefreshWorkflow]
@@ -360,6 +375,7 @@ async def main() -> None:
             task_queue=TASK_QUEUE,
             workflows=workflows,
             activities=all_activities,
+            max_concurrent_activities=settings.max_concurrent_activities,
         )
         log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
         # A tenant added to, changed in or disabled in the database is picked up here,

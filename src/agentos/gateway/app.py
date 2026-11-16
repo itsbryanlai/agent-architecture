@@ -677,7 +677,7 @@ async def _real_lifespan(app: FastAPI):
     settings = load_settings()
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
     client = await build_temporal_client(settings)
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     agent_store = PostgresAgentStore(pool)
     try:

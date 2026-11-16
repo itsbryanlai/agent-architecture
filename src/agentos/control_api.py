@@ -688,7 +688,7 @@ async def _real_lifespan(app: FastAPI):
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         await require_current_schema(pool)

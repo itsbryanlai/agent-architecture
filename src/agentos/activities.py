@@ -697,7 +697,7 @@ class AgentActivities:
             stopped = await self.budgets.stop_response(ctx.tenant_id, ctx.agent_id, agent.name)
             if stopped is not None:
                 return stopped
-        messages = prepare_for_model(await self.history.load(ctx.tenant_id, conversation_id))
+        messages = prepare_for_model(await self.history.load_window(ctx.tenant_id, conversation_id))
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"

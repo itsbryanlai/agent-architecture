@@ -166,7 +166,7 @@ async def apply_schedules(
 @asynccontextmanager
 async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
     """The knowledge store, over the same database the worker uses."""
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         yield PostgresKnowledgeStore(pool)
@@ -177,7 +177,7 @@ async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
 @asynccontextmanager
 async def open_agent_store(settings: Settings) -> AsyncIterator[AgentStore]:
     """The agent store, over the same database the worker uses."""
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         yield PostgresAgentStore(pool)

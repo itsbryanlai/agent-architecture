@@ -1014,7 +1014,7 @@ async def run_import() -> int:
 
     settings = load_settings()
     tenants = load_tenants_config(settings.config_path)
-    pool = AsyncConnectionPool(settings.require("database_url"), open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     failed = False
     try:

@@ -23,6 +23,14 @@ import json
 from typing import Protocol
 
 from agentos.models import LLMResponse, ToolCall, Usage
+from agentos.workflows import LLM_TIMEOUT
+
+# A model call gives up well inside its activity's start_to_close_timeout, so the attempt fails
+# with a retryable timeout while the activity is still alive, and the call is not left running
+# (and billed) after Temporal has given up on it. The SDKs never retry (``max_retries=0``):
+# Temporal owns retries, so one failed call is one attempt of the activity.
+LLM_REQUEST_TIMEOUT_SECONDS = LLM_TIMEOUT.total_seconds() - 15
+SDK_MAX_RETRIES = 0
 
 # Upper bound on tokens the model may generate per call, for every provider.
 MAX_TOKENS = 3072
@@ -37,12 +45,17 @@ class LLMClient(Protocol):
 class AnthropicLLMClient:
     """Calls Claude with the agent's system prompt, history and tools."""
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, http_client=None):
         # Imported here so tests that never build the real client do not need
-        # the SDK to initialise anything.
+        # the SDK to initialise anything. ``http_client`` lets a test supply a transport.
         from anthropic import AsyncAnthropic
 
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = AsyncAnthropic(
+            api_key=api_key,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=SDK_MAX_RETRIES,
+            http_client=http_client,
+        )
         self._model = model
 
     async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
@@ -113,13 +126,20 @@ class QwenLLMClient:
         model: str,
         thinking: bool = False,
         client=None,
+        http_client=None,
     ):
         if client is None:
             # Imported here so nothing fails at import time and tests that
             # never build the real client do not need the SDK.
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+                max_retries=SDK_MAX_RETRIES,
+                http_client=http_client,
+            )
         self._client = client
         self._model = model
         self._thinking = thinking

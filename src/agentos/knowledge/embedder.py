@@ -14,6 +14,13 @@ import math
 import re
 from typing import Protocol
 
+from agentos.workflows import INDEX_TIMEOUT
+
+# One embeddings request gives up long before the indexing activity's timeout (which covers
+# a page's batches one after another), and the SDK never retries: Temporal owns retries.
+EMBED_REQUEST_TIMEOUT_SECONDS = INDEX_TIMEOUT.total_seconds() / 5
+SDK_MAX_RETRIES = 0
+
 # The endpoint accepts at most this many inputs per request.
 BATCH_SIZE = 10
 
@@ -44,11 +51,25 @@ class OpenAICompatibleEmbedder:
     ``openai.AsyncOpenAI`` client is built for ``base_url``.
     """
 
-    def __init__(self, api_key: str, base_url: str, model: str, dimensions: int, client=None):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        dimensions: int,
+        client=None,
+        http_client=None,
+    ):
         if client is None:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=EMBED_REQUEST_TIMEOUT_SECONDS,
+                max_retries=SDK_MAX_RETRIES,
+                http_client=http_client,
+            )
         self._client = client
         self.model = model
         self.dimensions = dimensions

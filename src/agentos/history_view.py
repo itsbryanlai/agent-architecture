@@ -17,6 +17,15 @@ HISTORY_BUDGET_CHARS = 120_000
 TOOL_RESULT_MISSING = "The tool call did not complete."
 
 
+def char_len(message: dict) -> int:
+    """The size of one message, in characters of JSON, as ``window`` counts it.
+
+    The store keeps this number on each row, so the same count is used whether the window
+    is cut in SQL or in memory.
+    """
+    return len(json.dumps(message, ensure_ascii=False))
+
+
 def prepare_for_model(messages: list[dict]) -> list[dict]:
     return window(close_open_tool_uses(drop_empty_text(messages)))
 
@@ -131,7 +140,7 @@ def window(messages: list[dict], budget: int = HISTORY_BUDGET_CHARS) -> list[dic
     is never separated from its tool_result. The newest such message is always
     kept, even when it alone is over budget.
     """
-    sizes = [len(json.dumps(m)) for m in messages]
+    sizes = [char_len(m) for m in messages]
     if sum(sizes) <= budget:
         return messages
     starts = [i for i, m in enumerate(messages) if _starts_a_turn(m)]

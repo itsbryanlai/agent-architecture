@@ -50,6 +50,7 @@ with workflow.unsafe.imports_passed_through():
         check_field,
     )
     from agentos.slack_format import escape_slack
+    from agentos.switches import agent_off_card_text, agent_off_text
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         RECONCILE_INTERVAL,
@@ -64,6 +65,9 @@ MAX_EDITS = 5
 # Histories recorded before the reconcile step ran the write with no heartbeat and
 # reported every exhausted retry as a failure. They replay on that path.
 RECONCILE_PATCH = "reconcile-on-exhaustion"
+# Histories recorded before the pre-write check never ask it, so they replay without it.
+PRE_WRITE_PATCH = "pre-write-audience"
+UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
 
@@ -188,7 +192,16 @@ class TaskWorkflow:
             # Resolve the item and check its database is granted before any card.
             try:
                 payload: dict = await self._act(AgentActivities.prepare_comment, spec)
-            except ActivityError:
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(escape_slack(agent.name)),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    return self._state
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
@@ -255,8 +268,21 @@ class TaskWorkflow:
             self._state = "cancelled"
             return self._state
 
+        if workflow.patched(PRE_WRITE_PATCH):
+            # Pending cards do not outlive what let them run: an agent turned off, a channel
+            # paused or an audience changed since the card was shown stops the write here.
+            try:
+                stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
+            except ActivityError:
+                # The check could not be completed: fail closed, take the buttons off.
+                stopped = UNCHECKED_CARD_TEXT
+            if stopped is not None:
+                await self._try(AgentActivities.update_card_line, spec, task_id, card_ts, stopped)
+                self._state = "cancelled"
+                return self._state
+
         if spec.tool_name == "add_comment":
-            return await self._run_comment(spec, task_id, card_ts)
+            return await self._run_comment(spec, task_id, card_ts, agent.name)
 
         title = spec.payload["title"]
 
@@ -267,6 +293,8 @@ class TaskWorkflow:
                 AgentActivities.create_notion_item, spec, task_id
             )
         except ActivityError as err:
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent.name)
             found = None
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(AgentActivities.reconcile_notion_item, spec, task_id)
@@ -342,6 +370,10 @@ class TaskWorkflow:
                     AgentActivities.get_notion_item, ctx.tenant_id, ctx.agent_id, item.page_id
                 )
             except ActivityError as err:
+                if _is_agent_off(err):
+                    # An admin turned the agent off: the watch ends here, with no post.
+                    self._state = "cancelled"
+                    return self._state
                 if _is_permanent(err):
                     await self._try(
                         AgentActivities.post_in_thread,
@@ -382,7 +414,23 @@ class TaskWorkflow:
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
 
-    async def _run_comment(self, spec: TaskSpec, task_id: str, card_ts: str) -> str:
+    async def _stop_for_agent_off(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """The agent was turned off after the approval and before the write: nothing was written."""
+        await self._try(
+            AgentActivities.update_card_line,
+            spec,
+            task_id,
+            card_ts,
+            agent_off_card_text(agent_name),
+        )
+        self._state = "cancelled"
+        return self._state
+
+    async def _run_comment(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
         """Post the approved comment once. There is nothing to watch afterwards."""
         ctx = spec.ctx
         self._state = "executing"
@@ -390,6 +438,8 @@ class TaskWorkflow:
         try:
             await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(
                     AgentActivities.reconcile_notion_comment, spec, task_id
@@ -490,6 +540,12 @@ def _is_permanent(err: ActivityError) -> bool:
     """True when a retry cannot help: the activity said so, rather than running out of tries."""
     cause = err.cause
     return isinstance(cause, ApplicationError) and cause.non_retryable
+
+
+def _is_agent_off(err: ActivityError) -> bool:
+    """True when the activity refused because an admin turned the agent off."""
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == "AgentOff"
 
 
 def _reason(err: ActivityError) -> str:

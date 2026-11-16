@@ -44,6 +44,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
@@ -75,6 +76,11 @@ def agent_off_text(agent_name: str) -> str:
     return f"{agent_name} is turned off by an admin."
 
 
+def agent_off_card_text(agent_name: str) -> str:
+    """What a card says when the agent was turned off before an approved write ran."""
+    return f"{agent_off_text(agent_name)} Nothing was changed."
+
+
 WRITES_OFF_TEXT = "Writes are turned off by your admin; nothing was changed."
 # What a task tells its requester when the write was approved but writes went off before it ran.
 WRITE_REFUSED_TEXT = f"{WRITES_OFF_TEXT} Ask again once they are turned back on."
@@ -96,8 +102,30 @@ class WritesOff(Exception):
     """Writes are turned off for the tenant."""
 
 
+class AgentOff(Exception):
+    """The agent, or every agent of the tenant, is turned off. ``switch`` says which."""
+
+    def __init__(self, switch: str):
+        super().__init__("this agent is turned off by an admin")
+        self.switch = switch
+
+
 class ConnectorOff(Exception):
     """A connector is turned off for the tenant."""
+
+
+class Effect(StrEnum):
+    """What an agent is about to do; each activity that acts for an agent names one.
+
+    ``model`` is the agent-level stop alone (a model call, a card, a redraw); the others
+    add the scopes that matter to them: ``read`` and ``poll`` the connector, ``write``
+    the connector and the writes switch.
+    """
+
+    MODEL = "model"
+    READ = "read"
+    WRITE = "write"
+    POLL = "poll"
 
 
 # --- rows -----------------------------------------------------------------------------
@@ -160,6 +188,20 @@ class SwitchState:
 
     def connector_off(self, connector: str) -> bool:
         return self._has(CONNECTOR, connector)
+
+    def refusal(self, agent_id: str, effect: Effect) -> Exception | None:
+        """Why ``agent_id`` may not do ``effect`` now, or None. One read of the switches.
+
+        The agent switches stop every effect; ``writes`` stops a write; the connector
+        switch stops a read, a write and a poll.
+        """
+        if (stopped := self.agent_stopped_by(agent_id)) is not None:
+            return AgentOff(stopped)
+        if effect == Effect.WRITE and self.writes_off:
+            return WritesOff(WRITE_REFUSED_TEXT)
+        if effect != Effect.MODEL and self.connector_off(NOTION):
+            return ConnectorOff(connector_off_text(NOTION))
+        return None
 
     def of(self, scope: str, target: str = "") -> Switch | None:
         return next((r for r in self.rows if r.scope == scope and r.target == target), None)

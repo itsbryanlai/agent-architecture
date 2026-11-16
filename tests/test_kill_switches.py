@@ -306,10 +306,10 @@ async def test_an_agent_that_is_off_answers_a_whole_conversation_turn_without_th
         start_signal="message",
         start_signal_args=[msg],
     )
-    await eventually(lambda: any("turned off" in u["text"] for u in h.slack.updates()))
+    await eventually(lambda: any("turned off" in p["text"] for p in h.slack.posts()))
 
     assert h.llm.calls == []
-    assert [u["text"] for u in h.slack.updates()] == ["IT helper is turned off by an admin."]
+    assert [p["text"] for p in h.slack.posts()] == ["IT helper is turned off by an admin."]
 
 
 # --- a connector --------------------------------------------------------------------------

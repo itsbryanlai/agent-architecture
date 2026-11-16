@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -101,6 +102,7 @@ async def running(raw: dict):
         tool_outputs=h.tool_outputs,
         audit=h.audit,
         agents=h.agent_store,
+        switches=h.switches,
     )
     worker = Worker(
         wf_env.client,
@@ -250,6 +252,18 @@ async def test_hand_off_tool_offered_only_to_front_door(fd):
     assert "- it-helper: IT helper. Laptops, accounts, VPN" in definition["description"]
     # No hand-off happened, so the second message still goes to the front door.
     assert tool_names(second_call) == tool_names(front_call)
+
+
+async def test_a_specialist_that_is_off_is_not_offered_by_the_front_door(fd):
+    """Fails if the front door can hand a thread to a specialist an admin turned off."""
+    h = fd
+    await h.switches.switch_off(TENANT, "agent", "it-helper", "U_ADMIN", datetime.now(UTC))
+    h.llm.queue(answer("front"))
+
+    await converse(h, "concierge", message("Ev1"))
+    await eventually(lambda: h.slack.updates())
+
+    assert "hand_off" not in tool_names(h.llm.calls[0])
 
 
 async def test_specialist_is_offered_no_hand_off(fd):

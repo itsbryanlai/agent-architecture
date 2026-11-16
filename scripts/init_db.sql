@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 021 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 024 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -10,6 +10,7 @@ CREATE TABLE conversation_messages (
   step_key        text,                   -- names the append; repeats are ignored
   role            text        NOT NULL,   -- 'user' | 'assistant'
   content         jsonb       NOT NULL,   -- Anthropic content blocks
+  char_len        integer     NOT NULL DEFAULT 0,   -- size of the message as JSON, set on append
   created_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, conversation_id, seq)
 );
@@ -150,7 +151,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('member_add'), ('member_remove'), ('member_role'),
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
-  ('switch_off'), ('switch_on'), ('usage_repriced'),
+  ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
   ('grant_pick'), ('widening_confirm')
 ON CONFLICT DO NOTHING;
 
@@ -179,7 +180,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
-             'switch_off', 'switch_on', 'usage_repriced')
+             'switch_off', 'switch_on', 'usage_repriced', 'retention_set')
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
@@ -412,6 +413,11 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
 CREATE INDEX IF NOT EXISTS usage_events_by_month ON usage_events (tenant_id, at);
 
+-- The retention job finds expired rows by age, per tenant. Same as migration 024.
+CREATE INDEX IF NOT EXISTS idempotency_records_created ON idempotency_records (tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS tool_outputs_created ON tool_outputs (tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS sessions_expires ON sessions (tenant_id, expires_at);
+
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
@@ -636,6 +642,11 @@ CREATE TABLE IF NOT EXISTS tenants (
   CONSTRAINT tenants_secret_env_object CHECK (jsonb_typeof(secret_env) = 'object')
 );
 
+-- Retention settings: whole days per kind of data; empty means the defaults. Same as migration 024.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS retention jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_retention_object;
+ALTER TABLE tenants ADD CONSTRAINT tenants_retention_object CHECK (jsonb_typeof(retention) = 'object');
+
 -- Every process notices a change by updated_at, so an UPDATE always moves it, including
 -- one an operator types by hand.
 CREATE OR REPLACE FUNCTION tenants_touch() RETURNS trigger
@@ -756,5 +767,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('024')
 ON CONFLICT DO NOTHING;

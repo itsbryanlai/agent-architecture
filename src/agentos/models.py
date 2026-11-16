@@ -251,6 +251,8 @@ BUDGET_AUDIT_KINDS = ("budget_set",)
 SWITCH_AUDIT_KINDS = ("switch_off", "switch_on")
 # A reprice of a month's unpriced usage belongs to the tenant, run by an owner from the command line.
 USAGE_AUDIT_KINDS = ("usage_repriced",)
+# A tenant's retention limits, set by an owner from the command line, belong to the tenant.
+RETENTION_AUDIT_KINDS = ("retention_set",)
 # Choosing grants from Notion, and an approver accepting that a version widens access.
 ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 AUDIT_KINDS = (
@@ -261,6 +263,7 @@ AUDIT_KINDS = (
     + BUDGET_AUDIT_KINDS
     + SWITCH_AUDIT_KINDS
     + USAGE_AUDIT_KINDS
+    + RETENTION_AUDIT_KINDS
     + ACCESS_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
@@ -304,7 +307,11 @@ class AuditEvent:
         if self.kind not in AUDIT_KINDS:
             raise ValueError(f"invalid audit kind {self.kind!r}")
         tenant_wide = (
-            MEMBER_AUDIT_KINDS + BUDGET_AUDIT_KINDS + SWITCH_AUDIT_KINDS + USAGE_AUDIT_KINDS
+            MEMBER_AUDIT_KINDS
+            + BUDGET_AUDIT_KINDS
+            + SWITCH_AUDIT_KINDS
+            + USAGE_AUDIT_KINDS
+            + RETENTION_AUDIT_KINDS
         )
         if self.kind not in tenant_wide and (not self.agent_id or self.agent_version is None):
             raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")

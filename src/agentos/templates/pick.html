@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Choose from Notion{% endblock %}
+{% block body %}
+<p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
+<h1>Choose from Notion</h1>
+{% if objects is none %}
+<p>Your list from Notion is not here or has expired.</p>
+<form method="post" action="{{ version_url }}/pick/start"><input type="hidden" name="csrf" value="{{ ctx.csrf }}"><button type="submit">Choose from Notion</button></form>
+{% elif not objects %}
+<p>Your Notion account has shared no databases or pages with the integration. Share some with it in Notion, then choose again.</p>
+{% else %}
+<p>These are the databases and pages your own Notion account lets you share. Tick the ones this agent may use; you then name them in the definition.</p>
+<form method="post" action="{{ version_url }}/pick/choose">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <table>
+    <tr><th></th><th>Title</th><th>Kind</th><th>Notion ID</th></tr>
+    {% for o in objects %}
+    <tr><td><input type="checkbox" name="pick_{{ loop.index0 }}" value="yes"></td><td>{{ o.title or "(untitled)" }}</td><td>{{ o.kind }}</td><td><code>{{ o.id }}</code></td></tr>
+    {% endfor %}
+  </table>
+  <p><button type="submit">Record my choice</button></p>
+</form>
+{% endif %}
+{% endblock %}

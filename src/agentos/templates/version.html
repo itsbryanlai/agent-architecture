@@ -21,6 +21,13 @@
     <form method="post" action="{{ version_url }}/publish">
       <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
       <input type="hidden" name="definition_sha256" value="{{ record.definition_sha256 }}">
+      <input type="hidden" name="reviewed_published" value="{{ review.diff.published if review and review.diff else 'unknown' }}">
+      {% if widens %}
+      <div class="error"><strong>This version widens access.</strong>
+        <ul>{% for c in review.diff.changes if c.widens %}<li>{{ c.what }} ({{ c.kind }})</li>{% endfor %}</ul>
+        <label><input type="checkbox" name="widening" value="yes"> I have seen what this version adds and approve it</label>
+      </div>
+      {% endif %}
       {% if audience.summary %}
       <input type="hidden" name="total" value="{{ audience.summary.total }}">
       <input type="hidden" name="guests" value="{{ audience.summary.guests }}">
@@ -31,10 +38,36 @@
     </form>
   {% endif %}
   {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
+  {% if editor and is_draft and picker_enabled %}{{ post_button(version_url ~ "/pick/start", ctx.csrf, "Choose from Notion") }}{% endif %}
   {% if editor and not is_draft %}
     {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version, "request_id": new_token()}) }}
   {% endif %}
 </div>
+
+
+{% if grant_rows %}
+<h2>Grants</h2>
+<table>
+  <tr><th>Creator's label</th><th>Kind</th><th>Notion ID</th>{% if review and review.reports %}<th>Live title in Notion</th><th>Parent</th>{% endif %}{% if picker_enabled %}<th>Chosen from Notion</th>{% endif %}</tr>
+  {% for g in grant_rows %}
+  <tr>
+    <td>{{ g.label }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
+    {% if review and review.reports %}
+    <td>{% if g.live and g.live.live_title is not none %}{{ g.live.live_title }}{% if g.live.label_differs %} <span class="error">The label does not match the live title: check this is the object you mean to give the agent.</span>{% endif %}{% else %}<span class="muted">not readable</span>{% endif %}</td>
+    <td>{% if g.live and g.live.parent %}{{ g.live.parent }}{% endif %}</td>
+    {% endif %}
+    {% if picker_enabled %}<td>{% if g.pick %}{{ g.pick.picked_by }}, {{ g.pick.picked_at | stamp }}{% else %}<span class="muted">no</span>{% endif %}</td>{% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% if review and review.live_problem %}<p class="error">{{ review.live_problem }}; the live titles are missing.</p>{% endif %}
+{% endif %}
+
+{% if review and review.diff and review.diff.changes %}
+<h2>Changes against the published version</h2>
+{% if not review.diff.baseline %}<p class="muted">Nothing is published yet, so all of it is new.</p>{% endif %}
+<ul>{% for c in review.diff.changes %}<li>{{ c.kind }}: {{ c.what }}{% if c.widens %} <strong>(widens access)</strong>{% endif %}</li>{% endfor %}</ul>
+{% endif %}
 
 {% if reports is not none %}
 <h2>Grant check: {% if grants_ok %}no problems{% else %}problems found{% endif %}</h2>
@@ -44,7 +77,7 @@
   {% for r in reports %}
   <tr>
     <td>{{ r.grant }}</td><td>{{ r.kind }}</td><td><code>{{ r.database_id }}</code></td>
-    <td>{% for p in r.problems %}<div class="error">{{ p }}</div>{% else %}none{% endfor %}</td>
+    <td>{% if r.detail %}{% for p in r.problems %}<div class="error">{{ p }}</div>{% else %}none{% endfor %}{% elif r.reason %}<div class="error">{{ r.reason }}</div>{% else %}ok{% endif %}</td>
     <td>{% for n in r.notes %}<div class="muted">{{ n }}</div>{% else %}{% endfor %}</td>
   </tr>
   {% endfor %}

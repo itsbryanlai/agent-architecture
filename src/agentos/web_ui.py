@@ -35,15 +35,26 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from agentos.access_diff import WideningNotAcknowledged
 from agentos.agent_store import PENDING, AgentNotFound
 from agentos.audience import AudienceError
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
+from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
+from agentos.grant_picks import GrantNotPicked
 from agentos.members import ADMIN, CREATOR, ROLES
-from agentos.sessions import SESSION_LIFETIME
+from agentos.notion_picker import (
+    NOTION_CALLBACK_PATH,
+    Flow,
+    NotionPickerError,
+)
+from agentos.notion_picker import (
+    authorize_url as notion_authorize_url,
+)
+from agentos.sessions import SESSION_LIFETIME, session_hash
 from agentos.slack_signin import (
     CALLBACK_PATH,
     LOGIN_COOKIE,
@@ -91,6 +102,7 @@ NOTICES = {
     "withdrawn": "Withdrawn; the version is a draft again.",
     "rejected": "Rejected; the version is a draft again.",
     "published": "Published.",
+    "picked": "Recorded. The objects you chose can now be granted in the definition.",
     "resumed": "Resumed; the agent answers in that channel again.",
     "member-added": "Member added.",
     "member-role": "Role changed.",
@@ -171,6 +183,31 @@ def parse_definition(text: str) -> dict[str, Any]:
     return parsed
 
 
+def grant_rows(agent, review) -> list[dict[str, Any]]:
+    """The version's grants as table rows: the creator's label and ID, who picked each from
+    Notion, and (for an admin, on a draft or pending version) the live title and parent."""
+    live = {}
+    if review is not None and review.reports:
+        live = {normalize_id(r.database_id): r for r in review.reports}
+    picks = {} if review is None else review.picks
+    rows = []
+    for kind, grant in (
+        *(("database", g) for g in agent.grants.notion_databases),
+        *(("page", g) for g in agent.grants.notion_pages),
+    ):
+        key = normalize_id(grant.id)
+        rows.append(
+            {
+                "label": grant.name,
+                "kind": kind,
+                "id": grant.id,
+                "pick": picks.get(key),
+                "live": live.get(key),
+            }
+        )
+    return rows
+
+
 # --- one request -----------------------------------------------------------------------
 
 
@@ -232,6 +269,10 @@ class WebUI:
         self.route("GET", version, self.version)
         self.route("POST", version + "/edit", self.edit_draft)
         self.route("POST", version + "/check-grants", self.check_grants)
+        self.route("POST", version + "/pick/start", self.pick_start)
+        self.route("GET", version + "/pick", self.pick_page)
+        self.route("POST", version + "/pick/choose", self.pick_choose)
+        app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
         self.route("POST", base + "/members", self.add_member)
@@ -596,12 +637,22 @@ class WebUI:
             version,
             count=(editor or ctx.is_admin) and record.status in ("draft", PENDING),
         )
+        review = (
+            await ctx.plane.version_review(ctx.tenant_id, ctx.user_id, agent_id, version)
+            if editor or ctx.is_admin
+            else None
+        )
+        picker = self.deps.picker
         return _page(
             "version.html",
             status,
             ctx=ctx,
             record=record,
             audience=audience,
+            review=review,
+            grant_rows=grant_rows(record.agent(), review),
+            widens=bool(review and review.diff and review.diff.widens),
+            picker_enabled=picker is not None,
             paused=await self.paused_of(ctx, agent_id) if editor or ctx.is_admin else [],
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
@@ -610,7 +661,7 @@ class WebUI:
             error=error,
             notice=notice,
             reports=reports,
-            grants_ok=None if reports is None else not any(r.problems for r in reports),
+            grants_ok=None if reports is None else all(r.ok for r in reports),
             base=self.base(ctx),
             agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
             version_url=self.version_url(ctx, agent_id, version),
@@ -648,6 +699,97 @@ class WebUI:
             return await self.notion_down(request, ctx, agent_id, version)
         return await self.version_page(request, ctx, agent_id, version, reports=reports)
 
+    # --- Choose from Notion ---------------------------------------------------------
+
+    def picker_flow(self, request: Request, ctx: Ctx, agent_id: str, version: int) -> Flow:
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        token = parsed[1] if parsed else ""
+        return Flow(ctx.tenant_id, ctx.user_id, session_hash(token), agent_id, version)
+
+    async def pick_start(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        picker = self.deps.picker
+        if picker is None:
+            return _message("Not available", "Choosing from Notion is not set up.", 404, ctx)
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.user_id, agent_id)
+        state = picker.sessions.begin(self.picker_flow(request, ctx, agent_id, version), ctx.now)
+        return _redirect(notion_authorize_url(picker.config, self.deps.console.sign_in, state))
+
+    async def notion_callback(self, request: Request) -> Response:
+        """Notion sends the browser back here. The state must be one this session began."""
+        picker = self.deps.picker
+        session = await self.session_of(request)
+        if picker is None or session is None:
+            return _redirect("/login")
+        now = self.deps.console.clock()
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        flow = picker.sessions.finish(request.query_params.get("state", ""), now)
+        mine = (
+            flow is not None
+            and parsed is not None
+            and flow.session_hash == session_hash(parsed[1])
+            and flow.tenant_id == session.tenant_id
+            and flow.user_id == session.user_id
+        )
+        if not mine or flow is None:
+            return _message("Could not sign in", "That Notion sign-in is not valid.", 400)
+        back = self.version_url_for(flow)
+        code = request.query_params.get("code", "")
+        if request.query_params.get("error") or not code:
+            return _redirect(back)
+        try:
+            objects = await picker.oauth.list_visible(
+                code, picker.config.redirect_uri(self.deps.console.sign_in)
+            )
+        except NotionPickerError as err:
+            log.warning("notion picker failed: %s", err)
+            return _message(
+                "Notion unavailable",
+                "Couldn't list your Notion pages just now. Try again.",
+                page_status(502),
+            )
+        picker.sessions.store(flow, objects, now)
+        return _redirect(back + "/pick")
+
+    def version_url_for(self, flow: Flow) -> str:
+        return (
+            f"/ui/{flow.tenant_id}/agents/{quote(flow.agent_id, safe='')}/versions/{flow.version}"
+        )
+
+    async def pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.user_id, agent_id)
+        picker = self.deps.picker
+        flow = self.picker_flow(request, ctx, agent_id, version)
+        objects = None if picker is None else picker.sessions.listing(flow, ctx.now)
+        return _page(
+            "pick.html",
+            ctx=ctx,
+            objects=objects,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=self.version_url(ctx, agent_id, version),
+        )
+
+    async def pick_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        picker = self.deps.picker
+        flow = self.picker_flow(request, ctx, agent_id, version)
+        objects = None if picker is None else picker.sessions.listing(flow, ctx.now)
+        if objects is None:
+            return _message(
+                "Choose again",
+                "Your list from Notion has expired. Choose from Notion again.",
+                409,
+                ctx,
+                back=self.version_url(ctx, agent_id, version),
+            )
+        # Only a position in the listing the creator's own token produced can be chosen.
+        chosen = [obj for i, obj in enumerate(objects) if ctx.get(f"pick_{i}") == "yes"]
+        await ctx.plane.record_grant_picks(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        picker.sessions.drop(flow)
+        return _redirect(self.version_url(ctx, agent_id, version, "picked"))
+
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
         plane = ctx.plane
         moves = {
@@ -665,9 +807,11 @@ class WebUI:
             # The hash of the version the approver's page showed; the plane refuses a
             # different one. A form without it is refused as a changed version.
             extra["reviewed_sha256"] = ctx.get("definition_sha256").strip() or "none"
+            extra["acknowledge_widening"] = ctx.get("widening") == "yes"
+            extra["reviewed_published"] = ctx.get("reviewed_published").strip() or "unknown"
         try:
             await call(ctx.tenant_id, ctx.user_id, agent_id, version, **extra)
-        except AudienceError as err:
+        except (AudienceError, WideningNotAcknowledged, GrantNotPicked) as err:
             status = page_status(status_of(err) or 409)
             return await self.version_page(request, ctx, agent_id, version, status, str(err))
         except GrantProblems as err:

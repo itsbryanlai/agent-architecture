@@ -19,6 +19,7 @@ from agentos.audience_pauses import PostgresPauseStore
 from agentos.audit import PostgresAuditStore
 from agentos.budgets import BudgetNotFound, PostgresBudgetStore
 from agentos.config import ConfigError, parse_agents_config
+from agentos.content_store import PostgresContentStore, StoredStep
 from agentos.knowledge.store import PageSync, PostgresKnowledgeStore
 from agentos.members import MemberError, MemberNotFound, PostgresMemberStore
 from agentos.models import AuditEvent
@@ -74,6 +75,49 @@ async def test_tool_outputs_keep_the_first_text_and_read_back_by_id(pool, tenant
     got = await store.get_many(tenant, "c", ["u1", "u2", "missing"])
     assert got == {"u1": ("first", False), "u2": ("boom", True)}
     assert await store.get_many(tenant, "c", []) == {}
+
+
+async def test_content_store_keeps_the_first_of_everything_it_is_given_twice(pool, tenant: str):
+    """Fails if a retry replaces a stored event, model step, tool input or draft revision."""
+    store = PostgresContentStore(pool)
+    assert await store.put_inbound(tenant, "Ev1", {"text": "first"}) is True
+    assert await store.put_inbound(tenant, "Ev1", {"text": "second"}) is False
+    assert await store.get_inbound(tenant, "Ev1") == {"text": "first"}
+    assert await store.get_inbound(tenant, "Ev2") is None
+
+    one = StoredStep("end_turn", [{"type": "text", "text": "a"}], "a")
+    two = StoredStep("tool_use", [{"type": "tool_use", "id": "u", "name": "n", "input": {}}])
+    assert await store.put_step(tenant, "c", "k", one) == one
+    assert await store.put_step(tenant, "c", "k", two) == one
+    assert await store.get_step(tenant, "c", "other") is None
+
+    await store.put_tool_input(tenant, "c", "u1", {"query": "first"})
+    await store.put_tool_input(tenant, "c", "u1", {"query": "second"})
+    assert await store.get_tool_input(tenant, "c", "u1") == (True, {"query": "first"})
+    assert await store.get_tool_input(tenant, "c", "missing") == (False, None)
+
+    await store.put_draft(tenant, "t", 1, {"title": "first"})
+    await store.put_draft(tenant, "t", 1, {"title": "second"})
+    await store.put_draft(tenant, "t", 2, {"title": "edited"})
+    assert await store.get_draft(tenant, "t", 1) == {"title": "first"}
+    assert await store.get_draft(tenant, "t", 2) == {"title": "edited"}
+    assert await store.get_draft(tenant, "t", 3) is None
+
+
+async def test_undelivered_events_come_oldest_first_and_leave_once_delivered(pool, tenant: str):
+    """Fails if the relay's queue is out of order, keeps a delivered event, or loses a delay."""
+    store = PostgresContentStore(pool)
+    for event in ("Ev1", "Ev2", "Ev3"):
+        await store.put_inbound(tenant, event, {"n": event})
+    await store.put_inbound(tenant, "edit:1", {"kind": "edit"}, delivered=True)
+
+    await store.mark_delivered(tenant, "Ev1", NOW)
+    await store.delay_inbound(tenant, "Ev2", 3, NOW + timedelta(minutes=1))
+
+    rows = await store.undelivered(tenant, 10)
+    assert [r.event_id for r in rows] == ["Ev2", "Ev3"]
+    assert (rows[0].attempts, rows[0].next_attempt_at) == (3, NOW + timedelta(minutes=1))
+    assert rows[1].attempts == 0
 
 
 async def test_task_link_keeps_the_first_task_for_a_page(pool, tenant: str):
@@ -577,3 +621,18 @@ async def test_the_owner_is_mentioned_once_a_day_per_agent_place_and_asker(
     assert await store.claim(tenant, "bb", "C1", "U1", day) is True
     assert await store.claim(other_tenant, "aa", "C1", "U1", day) is True
     assert await store.claim(tenant, "aa", "C1", "U1", day + timedelta(days=1)) is True
+
+
+async def test_consuming_an_inbound_event_leaves_no_content_and_keeps_the_row(pool, tenant: str):
+    """Fails if an inbound row still holds text or form values once consumed, or loses its IDs."""
+    store = PostgresContentStore(pool)
+    await store.put_inbound(tenant, "Ev1", {"channel": "C", "text": "secret words"})
+    await store.put_inbound(
+        tenant, "edit:1", {"task_id": "t", "fields": {"title": "secret title"}}, delivered=True
+    )
+    for event, stub in (("Ev1", {"channel": "C"}), ("edit:1", {"task_id": "t"})):
+        await store.consume_inbound(tenant, event, {**stub, "consumed": True}, NOW)
+
+    assert await store.get_inbound(tenant, "Ev1") == {"channel": "C", "consumed": True}
+    assert await store.get_inbound(tenant, "edit:1") == {"task_id": "t", "consumed": True}
+    assert await store.put_inbound(tenant, "Ev1", {"text": "again"}) is False

@@ -60,6 +60,15 @@ SEEDS = {
     "owner_pings": "INSERT INTO owner_pings "
     "(tenant_id, agent_id, channel, asker_user_id, notified_on) "
     "VALUES (%(t)s, 'aa', 'C1', 'u', '2026-11-16')",
+    "inbound_events": "INSERT INTO inbound_events (tenant_id, event_id, payload) "
+    "VALUES (%(t)s, 'e', '{}')",
+    "model_steps": "INSERT INTO model_steps "
+    "(tenant_id, conversation_id, step_key, stop_reason, content) "
+    "VALUES (%(t)s, 'c', 'k', 'end_turn', '[]')",
+    "tool_inputs": "INSERT INTO tool_inputs (tenant_id, conversation_id, tool_use_id, input) "
+    "VALUES (%(t)s, 'c', 'u', '{}')",
+    "task_drafts": "INSERT INTO task_drafts (tenant_id, task_id, revision, payload) "
+    "VALUES (%(t)s, 'k', 1, '{}')",
     "external_writes": "INSERT INTO external_writes "
     "(tenant_id, idem_key, state, lease_until, lease_token) "
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
@@ -90,8 +99,12 @@ PRIVILEGES = {
     "tenants": "SELECT INSERT UPDATE",
     "external_writes": "SELECT INSERT UPDATE",
     "grant_picks": "SELECT INSERT UPDATE",
-    "threads": "SELECT INSERT UPDATE",
-    "owner_pings": "SELECT INSERT UPDATE",
+    "threads": "SELECT INSERT UPDATE DELETE",
+    "owner_pings": "SELECT INSERT UPDATE DELETE",
+    "inbound_events": "SELECT INSERT UPDATE DELETE",
+    "model_steps": "SELECT INSERT DELETE",
+    "tool_inputs": "SELECT INSERT DELETE",
+    "task_drafts": "SELECT INSERT DELETE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }

@@ -60,6 +60,12 @@ async def test_turn_step_keys_do_not_collide(harness):
     await eventually(lambda: h.slack.updates())
 
     conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
+
+    async def reply_stored() -> bool:
+        # The reply is stored after it was shown, so the update comes first.
+        return len(await h.history.load(TENANT, conv_id)) == 4
+
+    await eventually(reply_stored)
     stored = await h.history.load(TENANT, conv_id)
     assert [m["role"] for m in stored] == ["user", "assistant", "user", "assistant"]
     assert stored[1]["content"][0]["type"] == "tool_use"

@@ -50,6 +50,57 @@ def seed(db: TestDatabase, tenant: str, retention: str = "{}") -> None:
                 "VALUES (%s, %s, %s, 'x', false, %s)",
                 (tenant, conv, use, ago(at)),
             )
+        for conv, use, at in [("old", "u1", 400), ("live", "u2", 400), ("live", "u3", 1)]:
+            c.execute(
+                "INSERT INTO tool_inputs (tenant_id, conversation_id, tool_use_id, input, created_at) "
+                "VALUES (%s, %s, %s, '{}', %s)",
+                (tenant, conv, use, ago(at)),
+            )
+            c.execute(
+                "INSERT INTO model_steps (tenant_id, conversation_id, step_key, stop_reason, content, "
+                "created_at) VALUES (%s, %s, %s, 'end_turn', '[]', %s)",
+                (tenant, conv, use, ago(at)),
+            )
+        # A task whose every revision is old, and a task edited a day ago.
+        for task, revision, at in [
+            ("done", 1, 400),
+            ("done", 2, 399),
+            ("open", 1, 400),
+            ("open", 2, 1),
+        ]:
+            c.execute(
+                "INSERT INTO task_drafts (tenant_id, task_id, revision, payload, created_at) "
+                "VALUES (%s, %s, %s, '{}', %s)",
+                (tenant, task, revision, ago(at)),
+            )
+        # Delivered long ago, delivered recently, never delivered, and a saved edit long delivered.
+        for event, delivered in [
+            ("old", 400),
+            ("recent", 10),
+            ("pending", None),
+            ("edit:old", 400),
+        ]:
+            c.execute(
+                "INSERT INTO inbound_events (tenant_id, event_id, payload, received_at, delivered_at) "
+                "VALUES (%s, %s, '{}', %s, %s)",
+                (tenant, event, ago(400), None if delivered is None else ago(delivered)),
+            )
+        for thread, at in [("idle", 400), ("active", 10)]:
+            c.execute(
+                "INSERT INTO threads (tenant_id, thread_key, agent_id, updated_at) "
+                "VALUES (%s, %s, 'aa', %s)",
+                (tenant, thread, ago(at)),
+            )
+        for asker, day in [
+            ("long-ago", "2026-11-01"),
+            ("yesterday", "2026-11-15"),
+            ("today", "2026-11-16"),
+        ]:
+            c.execute(
+                "INSERT INTO owner_pings (tenant_id, agent_id, channel, asker_user_id, notified_on) "
+                "VALUES (%s, 'aa', 'C1', %s, %s)",
+                (tenant, asker, day),
+            )
         for key, at in [("old", 400), ("middle", 40), ("young", 10)]:
             c.execute(
                 "INSERT INTO idempotency_records (tenant_id, idem_key, value, created_at) "
@@ -87,6 +138,12 @@ def remaining(db: TestDatabase, tenant: str) -> dict[str, set]:
     queries = {
         "messages": "SELECT conversation_id || ':' || seq FROM conversation_messages",
         "tool_outputs": "SELECT tool_use_id FROM tool_outputs",
+        "tool_inputs": "SELECT conversation_id || ':' || tool_use_id FROM tool_inputs",
+        "model_steps": "SELECT conversation_id || ':' || step_key FROM model_steps",
+        "task_drafts": "SELECT task_id || ':' || revision FROM task_drafts",
+        "inbound_events": "SELECT event_id FROM inbound_events",
+        "threads": "SELECT thread_key FROM threads",
+        "owner_pings": "SELECT asker_user_id FROM owner_pings",
         "idempotency": "SELECT idem_key FROM idempotency_records",
         "sessions": "SELECT session_hash FROM sessions",
         "external_writes": "SELECT idem_key FROM external_writes",
@@ -114,11 +171,22 @@ async def test_only_this_tenants_expired_rows_go_and_what_a_live_task_reads_stay
     after = remaining(db, tenant)
     assert after["messages"] == {"live:1", "live:2"}  # the thread with a new message is whole
     assert after["tool_outputs"] == {"u2", "u3"}  # in a live thread
+    assert after["tool_inputs"] == after["model_steps"] == {"live:u2", "live:u3"}
+    assert after["task_drafts"] == {"open:1", "open:2"}  # a task edited a day ago is whole
+    assert after["inbound_events"] == {"recent", "pending"}  # delivered long ago, edits too, go
+    assert after["threads"] == {"active"} and after["owner_pings"] == {"yesterday", "today"}
     assert after["idempotency"] == {"middle", "young"}  # younger than the longest task life
     assert after["sessions"] == {"just-expired", "valid"}
     assert after["external_writes"] == {"w"} and after["task_links"] == {"p"}
     assert after["audit"] == {"e"} and after["usage"] == {"k"}
     assert (total.messages, total.tool_outputs, total.idempotency, total.sessions) == (2, 1, 1, 1)
+    assert (total.tool_inputs, total.model_steps, total.task_drafts, total.inbound_events) == (
+        1,
+        1,
+        2,
+        2,
+    )
+    assert (total.threads, total.owner_pings) == (1, 1)
     assert remaining(db, other_tenant) == before_other
 
 
@@ -133,6 +201,36 @@ async def test_a_stored_limit_below_the_task_life_is_raised_to_it_at_run_time(
     assert policy.idempotency_days == policy.messages_days == MIN_TASK_DAYS
     await purge_all(PostgresRetentionStore(pool), tenant, clock=lambda: NOW)
     assert remaining(db, tenant)["idempotency"] == {"middle", "young"}
+
+
+async def test_nothing_a_live_task_reads_is_purged_under_a_short_stored_limit(
+    db: TestDatabase, pool, tenant: str
+):
+    """Fails if a hand-edited short limit deletes a draft, an event or a thread younger than a task lives."""
+    short = '{"idempotency_days": 1, "messages_days": 1, "tool_outputs_days": 1}'
+    seed(db, tenant, retention=short)
+    with db.owner() as c:
+        c.execute(
+            "INSERT INTO task_drafts (tenant_id, task_id, revision, payload, created_at) "
+            "VALUES (%s, 'mid', 1, '{}', %s)",
+            (tenant, ago(40)),
+        )
+        c.execute(
+            "INSERT INTO inbound_events (tenant_id, event_id, payload, delivered_at) "
+            "VALUES (%s, 'mid', '{}', %s)",
+            (tenant, ago(40)),
+        )
+        c.execute(
+            "INSERT INTO threads (tenant_id, thread_key, agent_id, updated_at) "
+            "VALUES (%s, 'mid', 'aa', %s)",
+            (tenant, ago(40)),
+        )
+
+    await purge_all(PostgresRetentionStore(pool), tenant, clock=lambda: NOW)
+
+    after = remaining(db, tenant)
+    assert "mid:1" in after["task_drafts"] and "mid" in after["inbound_events"]
+    assert "mid" in after["threads"]
 
 
 async def test_set_stores_the_limit_and_audits_it_but_refuses_one_below_the_task_life(
@@ -203,7 +301,8 @@ async def test_the_purge_command_deletes_the_tenants_expired_rows_and_prints_cou
     assert remaining(db, other_tenant) == before_other
     assert remaining(db, tenant)["idempotency"] == {"middle", "young"}
     assert capsys.readouterr().out.strip() == (
-        f"tenant_id={tenant} messages=2 tool_outputs=1 idempotency=1 sessions=1"
+        f"tenant_id={tenant} messages=2 tool_outputs=1 idempotency=1 sessions=1 tool_inputs=1 "
+        "model_steps=1 inbound_events=2 task_drafts=2 threads=1 owner_pings=1"
     )
 
 

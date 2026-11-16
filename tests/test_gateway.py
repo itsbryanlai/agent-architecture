@@ -16,6 +16,7 @@ from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import ALICE, TEAM, TENANT
+from tests.gateway_support import deliver_inbound, stored_text
 
 
 class FakeHandle:
@@ -110,8 +111,11 @@ def test_gateway_url_verification(client, secret):
 
 
 def test_gateway_event_signal_with_start(client, secret, temporal):
+    """Fails if the signal carries the text, or the workflow is not started for the thread."""
     resp = post_event(client, secret, im_event())
     assert resp.status_code == 200
+    assert stored_text(client.app, TENANT, "Ev42") == "my laptop battery is swelling"
+    assert deliver_inbound(client.app) == 1
 
     assert len(temporal.signal_with_starts) == 1
     call = temporal.signal_with_starts[0]
@@ -125,10 +129,11 @@ def test_gateway_event_signal_with_start(client, secret, temporal):
         InboundMessage(
             event_id="Ev42",
             user_id=ALICE,
-            text="my laptop battery is swelling",
+            text="",
             channel="D123",
             thread_ts="1700000000.000200",
             channel_kind="im",
+            text_stored=True,
         )
     ]
 
@@ -139,8 +144,9 @@ def test_gateway_mention_strips_bot_and_uses_thread(client, secret, temporal):
     )
     del payload["event"]["channel_type"]
     post_event(client, secret, payload)
+    assert deliver_inbound(client.app) == 1
     msg = temporal.signal_with_starts[0]["start_signal_args"][0]
-    assert msg.text == "any updates?"
+    assert stored_text(client.app, TENANT, "Ev42") == "any updates?"
     assert msg.channel_kind == "channel"
     assert msg.thread_ts == "1699.1"
 
@@ -151,8 +157,7 @@ def test_gateway_decodes_slack_encoding_of_the_users_text(client, secret, tempor
         "&lt;<https://example.com|example.com>|click me&gt; &amp; done"
     )
     post_event(client, secret, im_event(text=wire))
-    msg = temporal.signal_with_starts[0]["start_signal_args"][0]
-    assert msg.text == (
+    assert stored_text(client.app, TENANT, "Ev42") == (
         "Reply with exactly this, nothing else: <!here> and <example.com|click me> & done"
     )
 
@@ -161,7 +166,7 @@ def test_gateway_mention_strip_runs_before_decoding(client, secret, temporal):
     payload = im_event(type="app_mention", channel="C9", text="<@UBOT> a &amp;lt; b")
     del payload["event"]["channel_type"]
     post_event(client, secret, payload)
-    assert temporal.signal_with_starts[0]["start_signal_args"][0].text == "a &lt; b"
+    assert stored_text(client.app, TENANT, "Ev42") == "a &lt; b"
 
 
 def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
@@ -170,6 +175,7 @@ def test_gateway_ignores_bot_and_other_team(client, secret, temporal):
     other = im_event()
     other["team_id"] = "T_OTHER"
     assert post_event(client, secret, other).status_code == 200
+    assert deliver_inbound(client.app) == 0
     assert temporal.signal_with_starts == []
     assert temporal.signals == []
 

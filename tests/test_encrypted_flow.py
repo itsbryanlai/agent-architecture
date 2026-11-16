@@ -35,6 +35,7 @@ from agentos.models import (
     ApprovalDecision,
     ConversationRef,
     DraftView,
+    EditRequest,
     InboundMessage,
     LLMResponse,
     ToolCall,
@@ -93,7 +94,7 @@ async def flow(tmp_path, agents):
         workflows=[ConversationWorkflow, TaskWorkflow, HopWorkflow],
         activities=acts.all(),
     ):
-        yield env, llm, slack, notion
+        yield env, llm, slack, notion, acts
     await env.shutdown()
 
 
@@ -108,7 +109,7 @@ async def history_payloads(client: Client, workflow_ids: list[str]) -> list[Payl
 
 async def test_draft_approval_write_and_follow_up_all_decode_and_stay_encrypted(flow):
     """Fails if a child start, signal, query, activity or follow-up decodes under another workflow ID."""
-    env, llm, slack, notion = flow
+    env, llm, slack, notion, _ = flow
     llm.queue(
         LLMResponse(
             text=None,
@@ -157,6 +158,72 @@ async def test_draft_approval_write_and_follow_up_all_decode_and_stay_encrypted(
 
     payloads = await history_payloads(env.client, [conversation_id, value["task_id"]])
     assert payloads
+    assert {p.metadata["encoding"] for p in payloads} == {b"binary/encrypted"}
+
+
+async def test_a_flow_with_its_content_in_postgres_decodes_under_the_production_converter(flow):
+    """Fails if a stored-content signal, step, draft reference, edit or notice cannot be read back."""
+    env, llm, slack, notion, acts = flow
+    llm.queue(
+        LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall("tu_s", "search_items", {"query": "monitor"}),
+                ToolCall("tu_c", "create_item", {"title": "New monitor", "details": "Flickers."}),
+            ],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(text="Sent you an approval card.", tool_calls=[], stop_reason="end_turn"),
+    )
+    conversation_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
+    await acts.content.put_inbound(
+        TENANT,
+        "Ev1",
+        {"kind": "message", "agent_id": "it-helper", "user_id": ALICE, "text": "order a monitor"},
+    )
+    await env.client.start_workflow(
+        ConversationWorkflow.run,
+        ConversationRef(TENANT, "it-helper", CHANNEL, THREAD),
+        id=conversation_id,
+        task_queue=TASK_QUEUE,
+        start_signal="message",
+        start_signal_args=[InboundMessage("Ev1", ALICE, "", CHANNEL, THREAD, "channel", True)],
+    )
+    cards = await eventually(lambda: [p for p in slack.posts() if p["blocks"]])
+    value = json.loads(
+        next(b for b in cards[0]["blocks"] if b["type"] == "actions")["elements"][0]["value"]
+    )
+    task = env.client.get_workflow_handle(value["task_id"])
+    await eventually(lambda: slack.updates())
+
+    await acts.content.put_inbound(
+        TENANT,
+        "edit:1",
+        {
+            "kind": "edit",
+            "task_id": value["task_id"],
+            "fields": {"title": "Edited", "details": "d"},
+        },
+        delivered=True,
+    )
+    await task.signal("edit", EditRequest(value["nonce"], ALICE, {}, "edit:1"))
+
+    async def redrawn() -> bool:
+        return (await task.query("draft", result_type=DraftView)).revision == 2
+
+    await eventually(redrawn, timeout=20)
+    draft = await task.query("draft", result_type=DraftView)
+    await task.signal(TaskWorkflow.decision, ApprovalDecision(draft.nonce, ALICE, True))
+
+    async def watching() -> bool:
+        return await task.query("state") == "watching"
+
+    await eventually(watching, timeout=20)
+    assert [
+        p["properties"]["Name"]["title"][0]["text"]["content"] for p in notion.all_pages(DB_ID)
+    ] == ["Edited"]
+    assert any("Filed: Edited" in p["text"] for p in slack.posts())
+    payloads = await history_payloads(env.client, [conversation_id, value["task_id"]])
     assert {p.metadata["encoding"] for p in payloads} == {b"binary/encrypted"}
 
 

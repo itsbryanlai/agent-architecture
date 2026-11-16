@@ -83,4 +83,5 @@ def test_migrating_over_a_row_that_breaks_the_pattern_stops_and_names_it(databas
         assert "agents acme/a/b" in str(raised.value)
         conn.execute("DELETE FROM agents WHERE agent_id = 'a/b'")
         applied = migrate.migrate(conn, files, log=lambda _line: None)
-        assert applied == [v for v in EXPECTED_VERSIONS if v >= "022"]
+        # 022 ran before 023 stopped, so it is not applied again.
+        assert applied == [v for v in EXPECTED_VERSIONS if v >= "023"]

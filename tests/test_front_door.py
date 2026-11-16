@@ -43,6 +43,7 @@ from tests.conftest import (
     eventually,
     make_fake_notion,
 )
+from tests.gateway_support import deliver_inbound
 from tests.test_gateway import FakeTemporalClient, im_event, post_event
 from tests.test_llm_errors import StatusError
 
@@ -104,6 +105,7 @@ async def running(raw: dict, interceptors=()):
         agents=h.agent_store,
         switches=h.switches,
     )
+    h.acts = acts
     worker = Worker(
         wf_env.client,
         task_queue=TASK_QUEUE,
@@ -650,6 +652,7 @@ def test_mention_in_mapped_channel_starts_mapped_agent():
     post_mention(client, secret, "C_MAPPED")
     post_mention(client, secret, "C_OTHER")
     post_event(client, secret, im_event())
+    deliver_inbound(client.app)
 
     started = [call["arg"].agent_id for call in temporal.signal_with_starts]
     assert started == ["it-helper", "concierge", "concierge"]

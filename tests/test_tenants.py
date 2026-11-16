@@ -48,6 +48,7 @@ from tests.conftest import (
     title_prop,
     two_tenant_dicts,
 )
+from tests.gateway_support import deliver_inbound
 from tests.test_gateway import FakeTemporalClient, im_event, post_event
 
 PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -210,6 +211,7 @@ def test_events_route_to_their_tenant():
     globex_event["team_id"] = GLOBEX_TEAM
     assert post_event(client, secret, globex_event).status_code == 200
 
+    assert deliver_inbound(client.app) == 2
     acme_call, globex_call = temporal.signal_with_starts
     assert acme_call["arg"] == ConversationRef(TENANT, "it-helper", "D123", "1700000000.000200")
     assert acme_call["id"].startswith(f"{TENANT}:")
@@ -227,6 +229,7 @@ def test_unknown_workspace_event_dropped(caplog):
     resp = post_event(client, secret, event)
 
     assert resp.status_code == 200
+    assert deliver_inbound(client.app) == 0
     assert temporal.signal_with_starts == []
     assert "ignored event from an unknown Slack workspace" in caplog.text
     assert "T_STRANGER" in caplog.text

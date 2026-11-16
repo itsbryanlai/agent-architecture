@@ -604,6 +604,51 @@ done
 `REINDEX DATABASE` and `ALTER DATABASE ... REFRESH COLLATION VERSION` act on the
 database you are connected to, so run them once per database.
 
+## Connections and concurrency
+
+The worker runs up to `AGENTOS_MAX_CONCURRENT_ACTIVITIES` activities at once (default 32), and a
+model call makes about six queries, so each process keeps a pool of database connections between
+`AGENTOS_DB_POOL_MIN` (default 2) and `AGENTOS_DB_POOL_MAX` (default 32). The worker refuses to
+start with a pool maximum below its activity limit, because activities would wait for a
+connection. The worker, the gateway and the console each hold their own pool, so the three
+defaults together stay under Postgres's default of 100 connections. Raise both numbers together,
+and the server's `max_connections` with them.
+
+Model and embedding calls give up on their own (75 seconds for a model call, 60 for one
+embeddings request) before their activity's timeout, and the provider SDKs never retry: Temporal
+retries the activity.
+
+## Retention
+
+A nightly Temporal schedule (04:00 UTC) purges each tenant's expired rows in batches and logs
+counts only. Create or update the schedules once, after the worker is running:
+
+```bash
+uv run python -m agentos.retention --schedule            # every tenant
+uv run python -m agentos.retention --tenant acme          # purge one tenant now, without Temporal
+```
+
+A tenant's limits, in whole days, live in `tenants.retention` (an empty object means the
+defaults). Set them as the owner role; the change is recorded in the audit log as `retention_set`:
+
+```bash
+export AGENTOS_OWNER_DATABASE_URL=postgresql://<owner>:<password>@localhost:55432/agentos
+uv run python -m agentos.retention set --tenant acme --messages-days 180 --tool-outputs-days 60
+```
+
+| Setting | Default | What goes |
+|---|---|---|
+| `messages_days` | 365 | A conversation's messages, once its newest message is older than this (a thread is never cut in the middle) |
+| `tool_outputs_days` | 90 | Tool output text older than this, in a conversation with no newer message |
+| `idempotency_days` | 90 | Idempotency records older than this |
+| `sessions_days` | 1 | Console sessions, this many days after they expired (they are also purged at sign-in) |
+
+The first three are never shorter than the longest a task can live: an agent definition may
+ask for at most 168 hours of approval and a 60-day watch, so the floor is 68 days. `set` refuses
+a lower value, and the nightly job raises a lower stored one to it, so nothing a live approval or
+follow-up still needs is deleted. Audit and usage rows are kept (append-only by design), as are `external_writes`,
+`task_links` and agent definitions.
+
 ## Run
 
 ```bash
@@ -1103,6 +1148,7 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/control_api.py` | The control-plane API, a local-only process |
 | `src/agentos/grant_checker.py` | Checks a version's Notion database grants |
 | `src/agentos/index_knowledge.py` | Command that starts indexing, or schedules it nightly |
+| `src/agentos/retention.py` | Nightly purge of expired rows per tenant, and the command that schedules it |
 | `src/agentos/ids.py` | The only place workflow IDs are built |
 | `src/agentos/agent_store.py` | Agents in the database: versions, publish lifecycle, one-time YAML import |
 | `src/agentos/tenant_store.py` | Tenants in the database: one-time YAML import, the narrow cross-tenant reads, and the cached live view every process serves from |

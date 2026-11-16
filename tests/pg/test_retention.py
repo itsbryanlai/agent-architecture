@@ -32,7 +32,7 @@ def seed(db: TestDatabase, tenant: str, retention: str = "{}") -> None:
     with db.owner() as c:
         c.execute(
             "INSERT INTO tenants (tenant_id, slack_team_id, default_agent, retention) "
-            "VALUES (%s, %s, 'a', %s::jsonb)",
+            "VALUES (%s, %s, 'aa', %s::jsonb)",
             (tenant, f"T-{tenant}", retention),
         )
         # An old thread, a thread with an old and a new message, and a new thread.
@@ -73,7 +73,7 @@ def seed(db: TestDatabase, tenant: str, retention: str = "{}") -> None:
         c.execute(
             "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, agent_version, "
             "requester_user_id, identity, outcome, at) "
-            "VALUES (%s, 'e', 'answer', 'a', 1, 'u', 'agent:a', 'ok', %s)",
+            "VALUES (%s, 'e', 'answer', 'aa', 1, 'u', 'agent:aa', 'ok', %s)",
             (tenant, ago(400)),
         )
         c.execute(
@@ -213,7 +213,7 @@ async def test_a_full_batch_is_followed_by_another_until_nothing_is_due(
     """Fails if a purge stops after one batch while more expired rows remain."""
     with db.owner() as c:
         c.execute(
-            "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) VALUES (%s, %s, 'a')",
+            "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) VALUES (%s, %s, 'aa')",
             (tenant, f"T-{tenant}"),
         )
         for i in range(25):

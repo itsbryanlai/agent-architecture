@@ -5,11 +5,14 @@ import httpx
 import pytest
 from notion_client.errors import RequestTimeoutError
 
-from agentos.config import ConfigError, NotionDatabaseGrant, parse_agents_config
+from agentos.agent_store import InMemoryAgentStore
+from agentos.check_grants import check_published
+from agentos.config import ConfigError, NotionDatabaseGrant, TenantsConfig, parse_agents_config
 from agentos.connectors.notion import NotionConnector, check_grant
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker, is_transient
 from agentos.worker import check_grants_at_startup
-from tests.conftest import DB_ID, agents_dict, default_schema, make_fake_notion
+from tests.conftest import DB_ID, TENANT, agents_dict, default_schema, make_fake_notion
+from tests.test_agent_store import helper_block, make_published
 
 NAMES_ONLY_IDS = {
     "title_prop_id": None,
@@ -259,3 +262,50 @@ async def test_a_database_notion_will_not_show_is_a_grant_problem(agents, code):
 
     assert len(report.problems) == 1 and "IT requests" in report.problems[0]
     assert "Status" in report.problems[0]
+
+
+async def test_the_check_command_reads_published_definitions_from_the_database_not_the_yaml(
+    agents, capsys
+):
+    """Fails if the command checks the YAML file's agents instead of the ones the worker serves
+    from the database, or skips a published agent whose grant has a problem."""
+    store = InMemoryAgentStore()
+    definition = helper_block()
+    await make_published(store, "db-helper", definition)
+    assert "db-helper" not in agents.agents  # the YAML file's tenant has only it-helper
+    api = make_fake_notion()
+    broken = default_schema()
+    broken["Agent request ID"] = {"id": "reqid1", "type": "people"}
+    api.set_schema(DB_ID, broken)
+
+    code = await check_published(TenantsConfig.of(agents), store, lambda config: api)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "agent 'db-helper'" in out and "PROBLEM" in out
+    assert "it-helper" not in out
+
+
+async def test_the_check_command_prints_property_ids_for_a_draft_before_it_is_published(
+    agents, capsys
+):
+    """Fails if the property IDs cannot be had before publishing (the worker refuses a published
+    agent without them), or the command picks the published version over a newer draft."""
+    store = InMemoryAgentStore()
+    published = helper_block()
+    published["grants"]["notion"]["databases"][0]["name"] = "Old name"
+    await make_published(store, "db-helper", published)
+    draft = helper_block()
+    del draft["grants"]["notion"]["databases"][0]["property_ids"]
+    await store.create_draft(TENANT, "db-helper", "U1")
+    await store.replace_draft(TENANT, "db-helper", 2, draft)
+    tenants = TenantsConfig.of(agents)
+
+    code = await check_published(
+        tenants, store, lambda config: make_fake_notion(), tenant_id=TENANT, agent_id="db-helper"
+    )
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "version 2" in out and "grant 'IT requests'" in out
+    assert 'status: "stat1"' in out

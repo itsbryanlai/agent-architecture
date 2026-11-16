@@ -31,11 +31,11 @@ SEEDS = {
     "(tenant_id, scope, consecutive_gone, last_run) VALUES (%(t)s, 's', 1, 'r')",
     "audit_events": "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, "
     "agent_version, requester_user_id, identity, outcome) "
-    "VALUES (%(t)s, 'e', 'answer', 'a', 1, 'u', 'agent:a', 'ok')",
-    "agents": "INSERT INTO agents (tenant_id, agent_id, created_by) VALUES (%(t)s, 'a', 'u')",
+    "VALUES (%(t)s, 'e', 'answer', 'aa', 1, 'u', 'agent:aa', 'ok')",
+    "agents": "INSERT INTO agents (tenant_id, agent_id, created_by) VALUES (%(t)s, 'aa', 'u')",
     "agent_versions": "INSERT INTO agent_versions "
     "(tenant_id, agent_id, version, status, definition, created_by) "
-    "VALUES (%(t)s, 'a', 1, 'draft', '{}', 'u')",
+    "VALUES (%(t)s, 'aa', 1, 'draft', '{}', 'u')",
     "members": "INSERT INTO members (tenant_id, user_id, role, added_by) "
     "VALUES (%(t)s, 'u', 'admin', 'u')",
     "sessions": "INSERT INTO sessions (tenant_id, session_hash, user_id, csrf_secret, expires_at) "
@@ -48,14 +48,14 @@ SEEDS = {
     "budgets": "INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by) "
     "VALUES (%(t)s, NULL, 10, 'u')",
     "audience_pauses": "INSERT INTO audience_pauses (tenant_id, agent_id, channel, reason) "
-    "VALUES (%(t)s, 'a', 'C1', 'channel_shared')",
+    "VALUES (%(t)s, 'aa', 'C1', 'channel_shared')",
     "kill_switches": "INSERT INTO kill_switches (tenant_id, scope, target, turned_off_by) "
     "VALUES (%(t)s, 'writes', '', 'u')",
     "tenants": "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) "
-    "VALUES (%(t)s, 'T-' || %(t)s, 'a')",
+    "VALUES (%(t)s, 'T-' || %(t)s, 'aa')",
     "grant_picks": "INSERT INTO grant_picks "
     "(tenant_id, agent_id, notion_id, kind, picked_by, picked_at) "
-    "VALUES (%(t)s, 'a', 'n', 'page', 'u', now())",
+    "VALUES (%(t)s, 'aa', 'n', 'page', 'u', now())",
     "external_writes": "INSERT INTO external_writes "
     "(tenant_id, idem_key, state, lease_until, lease_token) "
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
@@ -246,7 +246,7 @@ async def test_agent_version_moves_only_along_the_lifecycle(
 ):
     """Fails if a version can change status outside draft, pending, published, superseded."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", start)
+        seed_version(conn, tenant, "aa", start)
     move = tenant_transaction(pool, tenant)
     if (start, end) in ALLOWED_MOVES:
         async with move as conn:
@@ -265,7 +265,7 @@ async def test_definition_changes_only_while_a_version_is_a_draft(
 ):
     """Fails if a submitted or published definition can be edited in place."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", status)
+        seed_version(conn, tenant, "aa", status)
     edit = tenant_transaction(pool, tenant)
     if allowed:
         async with edit as conn:
@@ -282,7 +282,7 @@ def test_only_a_draft_version_can_be_deleted(
 ):
     """Fails if a submitted version can be deleted."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", status)
+        seed_version(conn, tenant, "aa", status)
         if allowed:
             conn.execute("DELETE FROM agent_versions WHERE tenant_id = %s", (tenant,))
         else:
@@ -293,10 +293,10 @@ def test_only_a_draft_version_can_be_deleted(
 def test_an_agent_has_at_most_one_published_version(db: TestDatabase, tenant: str):
     """Fails if two versions of one agent can be published at once."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", "published", version=1)
+        seed_version(conn, tenant, "aa", "published", version=1)
         with pytest.raises(errors.UniqueViolation):
-            seed_version(conn, tenant, "a", "published", version=2)
-        seed_version(conn, tenant, "b", "published", version=1)
+            seed_version(conn, tenant, "aa", "published", version=2)
+        seed_version(conn, tenant, "bb", "published", version=1)
 
 
 async def test_directory_functions_return_ids_only_and_need_no_tenant(
@@ -342,7 +342,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
     async with tenant_transaction(pool, tenant) as conn:
         await conn.execute(
             "INSERT INTO tenants (tenant_id, slack_team_id, default_agent, updated_at) "
-            "VALUES (%(t)s, 'T-' || %(t)s, 'a', '2020-01-01')",
+            "VALUES (%(t)s, 'T-' || %(t)s, 'aa', '2020-01-01')",
             {"t": tenant},
         )
     async with tenant_transaction(pool, tenant) as conn:
@@ -353,7 +353,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
 @pytest.mark.parametrize(
     ("kind", "agent_id", "accepted"),
     [
-        ("answer", "a", True),
+        ("answer", "aa", True),
         ("answer", None, False),
         ("agent_publish", None, False),
         *[

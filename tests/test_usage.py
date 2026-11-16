@@ -1120,7 +1120,7 @@ def test_a_team_in_a_definition_survives_the_agent_store():
     import asyncio
 
     store = InMemoryAgentStore()
-    record = asyncio.run(store.create_agent(TENANT, "x", definition, "U1"))
+    record = asyncio.run(store.create_agent(TENANT, "team-x", definition, "U1"))
 
     assert record.agent().team == "IT"
 

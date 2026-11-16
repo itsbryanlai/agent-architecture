@@ -452,26 +452,123 @@ _PROPERTY_ID_FIELDS = {
 }
 
 
+AGENT_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{1,39}")
+
+
+def check_agent_id(agent_id: object) -> str:
+    """The agent ID, or ``ConfigError``.
+
+    Lower-case ASCII letters, digits and ``-``, starting with a letter, 2 to 40 characters.
+    A look-alike letter, a ``/`` that the console cannot route, or a ``:`` that makes an
+    audit key ambiguous cannot get in.
+    """
+    if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+        raise ConfigError(
+            f"agent ID {agent_id!r} is invalid: use 2 to 40 lowercase ASCII letters, digits "
+            "and hyphens, starting with a letter"
+        )
+    return agent_id
+
+
+# What an agent definition may contain, at each level. A key that is not listed is an
+# error, so a misspelt ``audiance`` is refused instead of reading as "no audience".
+_AGENT_KEYS = frozenset(
+    {
+        "version",
+        "name",
+        "description",
+        "system_prompt",
+        "max_steps",
+        "grants",
+        "follow_up",
+        "approval",
+        "specialists",
+        "audience",
+        "team",
+    }
+)
+_GRANT_KEYS = frozenset({"notion"})
+_NOTION_KEYS = frozenset({"databases", "pages"})
+_DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
+_PAGE_KEYS = frozenset({"id", "name"})
+
+# Inclusive bounds on the numbers a definition sets.
+MAX_STEPS_RANGE = (1, 50)
+_FOLLOW_UP_RANGES = {
+    "poll_interval_minutes": (1, 1440),
+    "stale_after_days": (1, 365),
+    "max_watch_days": (1, MAX_WATCH_DAYS),
+}
+_APPROVAL_RANGES = {
+    "expires_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
+    "reminder_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
+}
+
+
+def _mapping(where: str, raw: Any, allowed: frozenset[str]) -> dict[str, Any]:
+    """``raw`` as a mapping with only the allowed keys; None is an empty mapping."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: expected a mapping")
+    for key in raw:
+        if key not in allowed:
+            raise ConfigError(f"{where}: unknown field '{key}'")
+    return raw
+
+
+def _text(where: str, key: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: '{key}' must be non-empty text")
+    return value
+
+
+def _whole(where: str, key: str, value: Any, low: int, high: int) -> int:
+    """An int (a bool is not one) within the bounds."""
+    if type(value) is not int or not low <= value <= high:
+        raise ConfigError(f"{where}: '{key}' must be a whole number from {low} to {high}")
+    return value
+
+
 def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     if not isinstance(mapping, dict) or key not in mapping or mapping[key] in (None, ""):
         raise ConfigError(f"{where}: missing required field '{key}'")
     return mapping[key]
 
 
-def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseGrant:
-    where = f"agent '{agent_id}' notion database grant"
-    db_id = str(_require(raw, "id", where))
-    name = str(_require(raw, "name", where))
+def _list_of(where: str, raw: Any) -> list[Any]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: expected a list")
+    return raw
+
+
+def _parse_database_grant(
+    agent_id: str, raw: dict[str, Any], index: int = 0
+) -> NotionDatabaseGrant:
+    where = f"agent '{agent_id}' grants.notion.databases[{index}]"
+    _mapping(where, raw, _DATABASE_KEYS)
+    db_id = _text(where, "id", _require(raw, "id", where))
+    name = _text(where, "name", _require(raw, "name", where))
     props = raw.get("properties")
     if not isinstance(props, dict):
         raise ConfigError(f"agent '{agent_id}' grant '{name}': missing required field 'properties'")
+    pwhere = f"agent '{agent_id}' grant '{name}' properties"
+    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS))
     values: dict[str, Any] = {}
     for key, attr in _PROPERTY_FIELDS.items():
         if key not in props or props[key] in (None, "", []):
             raise ConfigError(
                 f"agent '{agent_id}' grant '{name}': missing property mapping 'properties.{key}'"
             )
-        values[attr] = props[key]
+        if key == "done_values":
+            done = props[key]
+            if not isinstance(done, list) or not all(isinstance(v, str) and v for v in done):
+                raise ConfigError(f"{pwhere}: 'done_values' must be a list of status names")
+            values[attr] = done
+        else:
+            values[attr] = _text(pwhere, key, props[key])
     ids_raw = raw.get("property_ids")
     if ids_raw is None:
         ids_raw = {}
@@ -486,39 +583,33 @@ def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseG
                 f"agent '{agent_id}' grant '{name}': unknown key 'property_ids.{key}'"
             )
         if value not in (None, ""):
-            id_values[_PROPERTY_ID_FIELDS[key]] = str(value)
-    done_values = values["done_values"]
-    if not isinstance(done_values, list):
-        done_values = [done_values]
+            id_values[_PROPERTY_ID_FIELDS[key]] = _text(
+                f"agent '{agent_id}' grant '{name}' property_ids", key, value
+            )
     return NotionDatabaseGrant(
         id=db_id,
         name=name,
-        title_prop=str(values["title_prop"]),
-        status_prop=str(values["status_prop"]),
-        done_values=[str(v) for v in done_values],
-        requested_by_prop=str(values["requested_by_prop"]),
-        request_id_prop=str(values["request_id_prop"]),
+        title_prop=values["title_prop"],
+        status_prop=values["status_prop"],
+        done_values=list(values["done_values"]),
+        requested_by_prop=values["requested_by_prop"],
+        request_id_prop=values["request_id_prop"],
         **id_values,
     )
 
 
-def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
-    where = f"agent '{agent_id}' notion page grant"
+def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> NotionPageGrant:
+    where = f"agent '{agent_id}' grants.notion.pages[{index}]"
+    _mapping(where, raw, _PAGE_KEYS)
     return NotionPageGrant(
-        id=str(_require(raw, "id", where)), name=str(_require(raw, "name", where))
+        id=_text(where, "id", _require(raw, "id", where)),
+        name=_text(where, "name", _require(raw, "name", where)),
     )
 
 
-def _check_bound(where: str, name: str, block: dict[str, Any], maximum: int) -> None:
-    key = name.split(".")[1]
-    if key not in block:
-        return
-    try:
-        value = int(block[key])
-    except (TypeError, ValueError):
-        value = 0
-    if not 1 <= value <= maximum:
-        raise ConfigError(f"{where}: {name} must be a whole number from 1 to {maximum}")
+def _parse_policy(where: str, raw: Any, ranges: dict[str, tuple[int, int]], cls: type) -> Any:
+    block = _mapping(where, raw, frozenset(ranges))
+    return cls(**{k: _whole(where, k, v, *ranges[k]) for k, v in block.items()})
 
 
 def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
@@ -527,27 +618,42 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
     Both sources go through this function, so an agent loaded from the
     database is checked exactly like one read from YAML. ``version`` overrides
     the block's own ``version`` field: the database assigns version numbers, so
-    a stored definition has none.
+    a stored definition has none. A key the definition may not have, a value of the
+    wrong type and a number out of range are each an error that names where.
     """
+    check_agent_id(agent_id)
     where = f"agent '{agent_id}'"
-    grants_raw = raw.get("grants") or {}
-    notion = grants_raw.get("notion") or {}
-    databases = [_parse_database_grant(agent_id, db) for db in notion.get("databases") or []]
-    pages = [_parse_page_grant(agent_id, pg) for pg in notion.get("pages") or []]
-    follow = raw.get("follow_up") or {}
-    approval = raw.get("approval") or {}
-    _check_bound(where, "approval.expires_after_hours", approval, MAX_APPROVAL_EXPIRES_HOURS)
-    _check_bound(where, "follow_up.max_watch_days", follow, MAX_WATCH_DAYS)
+    raw = _mapping(where, raw, _AGENT_KEYS)
+    grants_raw = _mapping(f"{where} grants", raw.get("grants"), _GRANT_KEYS)
+    notion = _mapping(f"{where} grants.notion", grants_raw.get("notion"), _NOTION_KEYS)
+    databases = [
+        _parse_database_grant(agent_id, db, i)
+        for i, db in enumerate(
+            _list_of(f"{where} grants.notion.databases", notion.get("databases"))
+        )
+    ]
+    pages = [
+        _parse_page_grant(agent_id, pg, i)
+        for i, pg in enumerate(_list_of(f"{where} grants.notion.pages", notion.get("pages")))
+    ]
+    description = raw.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ConfigError(f"{where}: 'description' must be text")
+    given_version = version if version is not None else _require(raw, "version", where)
     return AgentVersion(
         agent_id=agent_id,
-        version=int(version if version is not None else _require(raw, "version", where)),
-        name=str(_require(raw, "name", where)),
-        system_prompt=str(_require(raw, "system_prompt", where)),
-        max_steps=int(_require(raw, "max_steps", where)),
+        version=_whole(where, "version", given_version, 1, 2**31 - 1),
+        name=_text(where, "name", _require(raw, "name", where)),
+        system_prompt=_text(where, "system_prompt", _require(raw, "system_prompt", where)),
+        max_steps=_whole(where, "max_steps", _require(raw, "max_steps", where), *MAX_STEPS_RANGE),
         grants=Grants(notion_databases=databases, notion_pages=pages),
-        follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
-        approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
-        description=str(raw.get("description") or "").strip(),
+        follow_up=_parse_policy(
+            f"{where} follow_up", raw.get("follow_up"), _FOLLOW_UP_RANGES, FollowUpPolicy
+        ),
+        approval=_parse_policy(
+            f"{where} approval", raw.get("approval"), _APPROVAL_RANGES, ApprovalPolicy
+        ),
+        description=(description or "").strip(),
         specialists=_parse_specialists(where, raw.get("specialists")),
         audience=_parse_audience(where, raw.get("audience")),
         team=_parse_team(where, raw.get("team")),
@@ -773,6 +879,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
     if not isinstance(raw, dict):
         raise ConfigError("agents config: expected a mapping at the top level")
     agents_raw = _require(raw, "agents", "agents config")
+    if not isinstance(agents_raw, dict):
+        raise ConfigError("agents config: 'agents' must map each agent ID to its definition")
     agents = {aid: parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
     default_agent = str(_require(raw, "default_agent", "agents config"))
     if default_agent not in agents:

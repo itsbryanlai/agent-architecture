@@ -217,10 +217,10 @@ def audit_event(tenant: str, key: str, **fields) -> AuditEvent:
         "tenant_id": tenant,
         "event_key": key,
         "kind": "answer",
-        "agent_id": "a",
+        "agent_id": "aa",
         "agent_version": 1,
         "requester_user_id": "u",
-        "identity": "agent:a",
+        "identity": "agent:aa",
     }
     return AuditEvent(**(base | fields))
 
@@ -251,7 +251,7 @@ async def test_audit_log_refuses_a_kind_the_table_does_not_list(pool, tenant: st
             await conn.execute(
                 "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, agent_version, "
                 "requester_user_id, identity, outcome) "
-                "VALUES (%s, 'x', 'not_a_kind', 'a', 1, 'u', 'agent:a', 'ok')",
+                "VALUES (%s, 'x', 'not_a_kind', 'aa', 1, 'u', 'agent:aa', 'ok')",
                 (tenant,),
             )
 
@@ -265,7 +265,7 @@ async def test_usage_totals_group_a_month_and_count_unpriced_calls(pool, tenant:
             "tenant_id": tenant,
             "usage_key": key,
             "kind": "llm",
-            "agent_id": "a",
+            "agent_id": "aa",
             "agent_version": 1,
             "model": "m",
             "input_tokens": 10,
@@ -297,14 +297,14 @@ async def test_budgets_upsert_one_row_per_scope_and_remove_by_scope(pool, tenant
     store = PostgresBudgetStore(pool)
     first = await store.set_budget(tenant, None, Decimal("10.00"), "u1")
     again = await store.set_budget(tenant, None, Decimal("20.00"), "u2")
-    await store.set_budget(tenant, "a", Decimal("5.00"), "u1")
+    await store.set_budget(tenant, "aa", Decimal("5.00"), "u1")
     rows = {b.agent_id: b for b in await store.list(tenant)}
-    assert set(rows) == {None, "a"}
+    assert set(rows) == {None, "aa"}
     assert (rows[None].amount, rows[None].updated_by) == (Decimal("20.00"), "u2")
     assert first.updated_at <= again.updated_at
-    await store.remove_budget(tenant, "a")
+    await store.remove_budget(tenant, "aa")
     with pytest.raises(BudgetNotFound):
-        await store.remove_budget(tenant, "a")
+        await store.remove_budget(tenant, "aa")
     await store.remove_budget(tenant, None)
     assert await store.list(tenant) == []
 
@@ -314,9 +314,9 @@ async def test_switch_off_and_on_report_whether_anything_changed(pool, tenant: s
     store = PostgresSwitchStore(pool)
     assert await store.switch_off(tenant, "writes", "", "u", NOW) is True
     assert await store.switch_off(tenant, "writes", "", "u2", NOW) is False
-    assert await store.switch_off(tenant, "agent", "a", "u", NOW) is True
+    assert await store.switch_off(tenant, "agent", "aa", "u", NOW) is True
     assert [(s.scope, s.target, s.turned_off_by) for s in await store.list(tenant)] == [
-        ("agent", "a", "u"),
+        ("agent", "aa", "u"),
         ("writes", "", "u"),
     ]
     assert await store.switch_on(tenant, "writes", "") is True
@@ -329,19 +329,19 @@ async def test_pause_opens_once_and_a_resumed_channel_can_pause_again(pool, tena
     """Fails if a second open creates a second active pause, or a resumed one blocks the next."""
     store = PostgresPauseStore(pool)
     with pytest.raises(errors.CheckViolation):
-        await store.open_pause(tenant, "a", "C1", "someone_asked", NOW)
-    first = await store.open_pause(tenant, "a", "C1", "channel_shared", NOW)
-    again = await store.open_pause(tenant, "a", "C1", "channel_shared", NOW + timedelta(hours=1))
+        await store.open_pause(tenant, "aa", "C1", "someone_asked", NOW)
+    first = await store.open_pause(tenant, "aa", "C1", "channel_shared", NOW)
+    again = await store.open_pause(tenant, "aa", "C1", "channel_shared", NOW + timedelta(hours=1))
     assert again.paused_at == first.paused_at
-    await store.open_pause(tenant, "b", "C1", "channel_shared", NOW)
-    assert (await store.get_active(tenant, "a", "C1")).paused_at == first.paused_at
-    assert [p.agent_id for p in await store.list_active(tenant)] == ["a", "b"]
-    assert [p.agent_id for p in await store.list_active(tenant, "b")] == ["b"]
-    closed = await store.close_pause(tenant, "a", "C1", "admin", NOW + timedelta(hours=2))
+    await store.open_pause(tenant, "bb", "C1", "channel_shared", NOW)
+    assert (await store.get_active(tenant, "aa", "C1")).paused_at == first.paused_at
+    assert [p.agent_id for p in await store.list_active(tenant)] == ["aa", "bb"]
+    assert [p.agent_id for p in await store.list_active(tenant, "bb")] == ["bb"]
+    closed = await store.close_pause(tenant, "aa", "C1", "admin", NOW + timedelta(hours=2))
     assert (closed.resumed_by, closed.resumed_at) == ("admin", NOW + timedelta(hours=2))
-    assert await store.close_pause(tenant, "a", "C1", "admin", NOW) is None
-    assert await store.get_active(tenant, "a", "C1") is None
-    renewed = await store.open_pause(tenant, "a", "C1", "channel_shared", NOW + timedelta(days=1))
+    assert await store.close_pause(tenant, "aa", "C1", "admin", NOW) is None
+    assert await store.get_active(tenant, "aa", "C1") is None
+    renewed = await store.open_pause(tenant, "aa", "C1", "channel_shared", NOW + timedelta(days=1))
     assert renewed.paused_at == NOW + timedelta(days=1)
 
 

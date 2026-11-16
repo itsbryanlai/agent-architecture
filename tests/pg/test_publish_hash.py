@@ -44,17 +44,17 @@ def plane_for(pool, tenant: str, admins=("U_ROOT",), **parts) -> ControlPlane:
 def test_a_draft_cannot_carry_a_hash(db: TestDatabase, tenant: str):
     """Fails if a draft row can be inserted with a hash, or a submitted one without."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", "draft")
+        seed_version(conn, tenant, "aa", "draft")
         with pytest.raises(errors.CheckViolation):
             conn.execute(
                 "INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition, "
-                "created_by, definition_sha256) VALUES (%s, 'a', 2, 'draft', '{}', 'u', 'h')",
+                "created_by, definition_sha256) VALUES (%s, 'aa', 2, 'draft', '{}', 'u', 'h')",
                 (tenant,),
             )
         with pytest.raises(errors.CheckViolation):
             conn.execute(
                 "INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition, "
-                "created_by, submitted_by) VALUES (%s, 'a', 3, 'pending', '{}', 'u', 'u')",
+                "created_by, submitted_by) VALUES (%s, 'aa', 3, 'pending', '{}', 'u', 'u')",
                 (tenant,),
             )
 
@@ -81,7 +81,7 @@ def test_the_hash_changes_only_at_submit_and_withdraw(
 ):
     """Fails if the definition hash can move outside submit and withdraw, or on publish."""
     with db.owner() as conn:
-        seed_version(conn, tenant, "a", start)
+        seed_version(conn, tenant, "aa", start)
         update = f"UPDATE agent_versions SET {change} WHERE tenant_id = %s"
         if error is None:
             conn.execute(update, (tenant,))
@@ -113,12 +113,12 @@ def test_migrate_applies_017_over_rows_and_backfills_them(databases: Databases):
     migrate = load_migrate()
     database, files = database_at_016(databases)
     with database.owner() as conn:
-        conn.execute("INSERT INTO agents VALUES ('t', 'a', 'u', now())")
+        conn.execute("INSERT INTO agents VALUES ('t', 'aa', 'u', now())")
         for version, status in enumerate(("draft", "pending", "published", "superseded"), 1):
             conn.execute(
                 "INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition, "
                 "created_by, submitted_by, approved_by, published_at) "
-                "VALUES ('t', 'a', %s, %s, %s::jsonb, 'u', 'u', 'u', now())",
+                "VALUES ('t', 'aa', %s, %s, %s::jsonb, 'u', 'u', 'u', now())",
                 (version, status, f'{{"n": {version}}}'),
             )
         applied = migrate.migrate(conn, files, log=lambda _line: None)
@@ -150,30 +150,30 @@ async def test_publish_names_the_submitted_hash_through_the_app_role(pool, tenan
     """Fails if a stale hash publishes, a refused publish supersedes the live version, a
     concurrent withdraw surfaces as anything but a typed error, or submit stores another hash."""
     store = PostgresAgentStore(pool)
-    await store.create_agent(tenant, "a", helper_block(), "U1")
-    first = await store.submit(tenant, "a", 1, "U1")
+    await store.create_agent(tenant, "aa", helper_block(), "U1")
+    first = await store.submit(tenant, "aa", 1, "U1")
     assert first.definition_sha256 == canonical_sha256(helper_block())
-    await store.publish(tenant, "a", 1, "U2", reviewed_sha256=first.definition_sha256)
+    await store.publish(tenant, "aa", 1, "U2", reviewed_sha256=first.definition_sha256)
 
-    await store.create_draft(tenant, "a", "U1")
-    seen = (await store.submit(tenant, "a", 2, "U1")).definition_sha256
-    await store.withdraw(tenant, "a", 2)
-    assert (await store.get_version(tenant, "a", 2)).definition_sha256 is None
-    await store.replace_draft(tenant, "a", 2, helper_block() | {"max_steps": 3})
-    now = (await store.submit(tenant, "a", 2, "U1")).definition_sha256
+    await store.create_draft(tenant, "aa", "U1")
+    seen = (await store.submit(tenant, "aa", 2, "U1")).definition_sha256
+    await store.withdraw(tenant, "aa", 2)
+    assert (await store.get_version(tenant, "aa", 2)).definition_sha256 is None
+    await store.replace_draft(tenant, "aa", 2, helper_block() | {"max_steps": 3})
+    now = (await store.submit(tenant, "aa", 2, "U1")).definition_sha256
     assert now != seen
 
     with pytest.raises(VersionChanged):
-        await store.publish(tenant, "a", 2, "U2", reviewed_sha256=seen)
-    assert (await store.published(tenant, "a")).version == 1
+        await store.publish(tenant, "aa", 2, "U2", reviewed_sha256=seen)
+    assert (await store.published(tenant, "aa")).version == 1
 
-    await store.withdraw(tenant, "a", 2)
+    await store.withdraw(tenant, "aa", 2)
     with pytest.raises(AgentStoreError) as refused:
-        await store.publish(tenant, "a", 2, "U2", reviewed_sha256=now)
+        await store.publish(tenant, "aa", 2, "U2", reviewed_sha256=now)
     assert not isinstance(refused.value, TypeError)
 
-    await store.submit(tenant, "a", 2, "U1")
-    done = await store.publish(tenant, "a", 2, "U2", reviewed_sha256=now)
+    await store.submit(tenant, "aa", 2, "U1")
+    done = await store.publish(tenant, "aa", 2, "U2", reviewed_sha256=now)
     assert done.definition_sha256 == now and done.status == "published"
 
 
@@ -197,7 +197,7 @@ async def test_audit_get_reads_an_event_by_key_inside_a_transaction(pool, tenant
         tenant_id=tenant,
         event_key=f"{tenant}:k",
         kind="agent_draft",
-        agent_id="a",
+        agent_id="aa",
         agent_version=2,
         requester_user_id="U1",
         identity="user:U1",

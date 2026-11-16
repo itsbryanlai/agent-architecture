@@ -54,6 +54,12 @@ DEFAULT_TTL_SECONDS = 15.0
 # a burst of unknown requests costs one read, not one each.
 FORCED_REFRESH_GAP_SECONDS = 1.0
 
+# A tenant ID found to be unknown or disabled is answered from memory for this long, so a
+# caller who keeps asking for one costs no database read. The set is capped so that
+# many different made-up IDs cannot grow it without bound.
+UNKNOWN_TENANT_TTL_SECONDS = 10.0
+MAX_UNKNOWN_TENANTS = 1024
+
 IMPORT_COMMAND = "uv run python -m agentos.tenant_store import"
 
 
@@ -326,6 +332,7 @@ class TenantDirectory:
         self._refreshed_at: float | None = None
         self._attempted_at: float | None = None
         self._lock = asyncio.Lock()
+        self._unknown: dict[str, float] = {}
         self.stored_count = 0
 
     def latest(self) -> TenantsConfig:
@@ -393,12 +400,22 @@ class TenantDirectory:
         config = (await self.snapshot()).get(tenant_id)
         if config is not None or not TENANT_ID_PATTERN.fullmatch(tenant_id):
             return config
+        if self._unknown.get(tenant_id, 0.0) > self._clock():
+            return None
         ref = next((r for r in await self._store.list_refs() if r.tenant_id == tenant_id), None)
         if ref is None or not ref.enabled:
+            self._remember_unknown(tenant_id)
             return None
         if self._may_force():
             await self._refresh_or_keep()
         return self.latest().get(tenant_id)
+
+    def _remember_unknown(self, tenant_id: str) -> None:
+        now = self._clock()
+        if len(self._unknown) >= MAX_UNKNOWN_TENANTS:
+            self._unknown = {t: until for t, until in self._unknown.items() if until > now}
+        if len(self._unknown) < MAX_UNKNOWN_TENANTS:
+            self._unknown[tenant_id] = now + UNKNOWN_TENANT_TTL_SECONDS
 
     async def only_tenant(self) -> str | None:
         return (await self.snapshot()).only_tenant()

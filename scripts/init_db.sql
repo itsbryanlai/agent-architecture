@@ -756,6 +756,40 @@ CREATE POLICY tenant_isolation ON grant_picks
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Agent IDs follow one pattern (migration 023): lower-case ASCII letters, digits and hyphens,
+-- 2 to 40 characters, starting with a letter.
+ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_agent_id_pattern;
+ALTER TABLE agents ADD CONSTRAINT agents_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE agent_versions DROP CONSTRAINT IF EXISTS agent_versions_agent_id_pattern;
+ALTER TABLE agent_versions ADD CONSTRAINT agent_versions_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_agent_id_pattern;
+ALTER TABLE audit_events ADD CONSTRAINT audit_events_agent_id_pattern
+  CHECK (agent_id IS NULL OR agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE usage_events DROP CONSTRAINT IF EXISTS usage_events_agent_id_pattern;
+ALTER TABLE usage_events ADD CONSTRAINT usage_events_agent_id_pattern
+  CHECK (agent_id IS NULL OR agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE budgets DROP CONSTRAINT IF EXISTS budgets_agent_id_pattern;
+ALTER TABLE budgets ADD CONSTRAINT budgets_agent_id_pattern
+  CHECK (agent_id IS NULL OR agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE audience_pauses DROP CONSTRAINT IF EXISTS audience_pauses_agent_id_pattern;
+ALTER TABLE audience_pauses ADD CONSTRAINT audience_pauses_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE grant_picks DROP CONSTRAINT IF EXISTS grant_picks_agent_id_pattern;
+ALTER TABLE grant_picks ADD CONSTRAINT grant_picks_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE kill_switches DROP CONSTRAINT IF EXISTS kill_switches_agent_target_pattern;
+ALTER TABLE kill_switches ADD CONSTRAINT kill_switches_agent_target_pattern
+  CHECK (scope <> 'agent' OR target ~ '^[a-z][a-z0-9-]{1,39}$');
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -767,5 +801,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('024')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('023'), ('024')
 ON CONFLICT DO NOTHING;

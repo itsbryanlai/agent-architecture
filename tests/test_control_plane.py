@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from agentos.agent_store import AgentStoreError, InMemoryAgentStore, PostgresAgentStore
+from agentos.agent_store import (
+    AgentNotFound,
+    AgentStoreError,
+    InMemoryAgentStore,
+    PostgresAgentStore,
+)
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane, Forbidden
@@ -83,16 +88,66 @@ async def test_a_tenant_with_no_admins_can_publish_nothing():
 # --- reads --------------------------------------------------------------------------
 
 
-async def test_admins_and_creators_read_agents_and_versions_and_others_cannot():
+async def test_a_creator_reads_only_their_own_agents_and_an_admin_reads_all():
+    """Fails if a creator can list, read or open the versions of an agent another creator
+    made, or learn from the answer that it exists, or if an admin cannot read it."""
     plane, *_ = await make_plane()
     await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
-    for actor in (ROOT, ADMIN2, OWNER, OTHER):
+    for actor in (ROOT, ADMIN2, OWNER):
         assert [a.agent_id for a in await plane.list_agents(TENANT, actor)] == ["it-helper"]
         assert [v.version for v in await plane.versions(TENANT, actor, "it-helper")] == [1]
         assert (await plane.get_version(TENANT, actor, "it-helper", 1)).status == "draft"
+    assert await plane.list_agents(TENANT, OTHER) == []
+    assert await plane.versions(TENANT, OTHER, "it-helper") == []
+    assert await plane.get_version(TENANT, OTHER, "it-helper", 1) is None
+    with pytest.raises(AgentNotFound):
+        await plane.audience_view(TENANT, OTHER, "it-helper", 1)
     await refused(plane.list_agents(TENANT, OUTSIDER))
     await refused(plane.versions(TENANT, OUTSIDER, "it-helper"))
     await refused(plane.get_version(TENANT, OUTSIDER, "it-helper", 1))
+
+
+async def test_budgets_and_switches_follow_the_same_rule_as_the_definitions():
+    """Fails if a creator's budgets or switches list an agent whose definition they cannot read."""
+    plane, *_ = await make_plane()
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await plane.add_agent(TENANT, OTHER, "other-agent", helper_block())
+    for actor, expected in ((OWNER, ["it-helper"]), (OTHER, ["other-agent"]), (ROOT, None)):
+        readable = [a.agent_id for a in await plane.list_agents(TENANT, actor)]
+        budget_lines = [line.agent_id for line in (await plane.budgets(TENANT, actor)).agents]
+        assert readable == budget_lines == (expected or ["it-helper", "other-agent"])
+        assert [line.target for line in (await plane.switches(TENANT, actor)).agents] == readable
+
+
+async def test_a_principal_looks_the_role_up_once_for_any_number_of_reads():
+    """Fails if each plane call made with a resolved principal looks the member up again."""
+    plane, _, members, _ = await make_plane()
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    lookups = []
+    original = members.get_member
+
+    async def counting(*args, **kwargs):
+        lookups.append(args)
+        return await original(*args, **kwargs)
+
+    members.get_member = counting
+    who = await plane.principal(TENANT, OWNER)
+    assert (who.role, who.owned_agent_ids) == ("creator", frozenset({"it-helper"}))
+    await plane.list_agents(TENANT, who)
+    await plane.versions(TENANT, who, "it-helper")
+    await plane.get_version(TENANT, who, "it-helper", 1)
+    await plane.budgets(TENANT, who)
+    await plane.switches(TENANT, who)
+    await plane.usage_report(TENANT, who)
+    await plane.paused_channels(TENANT, who, "it-helper", count=False)
+    assert len(lookups) == 1
+
+
+async def test_a_principal_of_another_tenant_is_refused():
+    """Fails if a principal resolved in one tenant is honoured in another."""
+    plane, *_ = await make_plane()
+    who = await plane.principal(TENANT, ROOT)
+    await refused(plane.list_agents("globex", who))
 
 
 # --- agent lifecycle ----------------------------------------------------------------

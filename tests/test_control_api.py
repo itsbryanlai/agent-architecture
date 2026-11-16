@@ -359,6 +359,47 @@ async def test_a_stale_publish_is_409(h):
         assert stale.status_code == 409
 
 
+@pytest.mark.parametrize(
+    "bad_id", ["a/b", "a:b", "it-hеlper", "It-helper", "it_helper", "a", "a" * 41, "1ab"], ids=repr
+)
+async def test_creating_an_agent_with_an_id_outside_the_pattern_is_refused_and_stores_nothing(
+    h, bad_id
+):
+    """Fails if the API accepts an agent ID with a slash, a colon, a Cyrillic look-alike or any
+    other character the pattern excludes."""
+    async with h.client() as c:
+        h.as_user(OWNER)
+        response = await c.post(
+            t("/agents"), json={"agent_id": bad_id, "definition": helper_block()}
+        )
+    assert response.status_code == 422
+    assert "agent ID" in response.json()["error"]
+    assert await h.agents.list_agents(TENANT) == []
+    assert kinds(h) == []
+
+
+async def test_a_creator_cannot_read_an_agent_another_creator_made_but_an_admin_can(h):
+    """Fails if the API lists, shows or opens a version of an agent for a creator who did not
+    make it, or answers differently from an agent that does not exist."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    async with h.client() as c:
+        h.as_user(OTHER)
+        assert (await c.get(t("/agents"))).json() == []
+        hidden = [
+            await c.get(t("/agents/it-helper/versions")),
+            await c.get(t("/agents/it-helper/versions/1")),
+        ]
+        missing = [
+            await c.get(t("/agents/nobody/versions")),
+            await c.get(t("/agents/nobody/versions/1")),
+        ]
+        assert [r.status_code for r in hidden] == [r.status_code for r in missing] == [404, 404]
+        for user in (OWNER, ROOT):
+            h.as_user(user)
+            assert [a["agent_id"] for a in (await c.get(t("/agents"))).json()] == ["it-helper"]
+            assert (await c.get(t("/agents/it-helper/versions/1"))).status_code == 200
+
+
 async def test_an_invalid_definition_or_request_is_422_without_echoing_the_input(h):
     async with h.client() as c:
         h.as_user(OWNER)
@@ -366,10 +407,10 @@ async def test_an_invalid_definition_or_request_is_422_without_echoing_the_input
         bad["max_steps"] = "many"
         response = await c.post(t("/agents"), json={"agent_id": "it-helper", "definition": bad})
         assert response.status_code == 422
-        assert "invalid" in response.json()["error"]
+        assert "max_steps" in response.json()["error"]
         missing = await c.post(t("/agents"), json={"agent_id": "it-helper"})
         assert missing.status_code == 422
-        junk = await c.post(t("/agents"), json={"agent_id": "x", "definition": "SECRET-TEXT"})
+        junk = await c.post(t("/agents"), json={"agent_id": "junk-id", "definition": "SECRET-TEXT"})
         assert junk.status_code == 422
         assert "SECRET-TEXT" not in junk.text
         h.as_user(ROOT)

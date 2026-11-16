@@ -41,7 +41,7 @@ from agentos.audience import AudienceError
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
 from agentos.connectors.notion import normalize_id
-from agentos.control import ControlPlane, Forbidden
+from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
@@ -218,6 +218,7 @@ class Ctx:
     tenant_id: str
     user_id: str
     role: str
+    principal: Principal
     csrf: str
     plane: ControlPlane
     config_admins: tuple[str, ...]
@@ -333,13 +334,14 @@ class WebUI:
             return _message(
                 "Not available", "This organisation is not available.", 403, back="/login"
             )
-        role = await deps.plane.role_of(tenant_id, session.user_id)
-        if role is None:
+        principal = await deps.plane.principal(tenant_id, session.user_id)
+        if principal.role is None:
             return self.no_access()
         ctx = Ctx(
             tenant_id=tenant_id,
             user_id=session.user_id,
-            role=role,
+            role=principal.role,
+            principal=principal,
             csrf=session.csrf_secret,
             plane=deps.plane,
             config_admins=config.admins,
@@ -400,7 +402,11 @@ class WebUI:
             log.error("console error: %s", type(err).__name__)
             return _message("Something went wrong", "Internal error.", 500, ctx, back)
         if rerender is not None:
-            return await rerender(status, str(err))
+            try:
+                return await rerender(status, str(err))
+            except AgentNotFound:
+                # The page to show again is one this person may not read.
+                pass
         return _message(_TITLES.get(status, "Refused"), str(err), status, ctx, back)
 
     def base(self, ctx: Ctx) -> str:
@@ -504,7 +510,7 @@ class WebUI:
         error: str | None = None,
         notice: str | None = None,
     ) -> Response:
-        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.user_id)
+        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.principal)
         return _page(
             "agents.html",
             status,
@@ -547,12 +553,12 @@ class WebUI:
         error: str | None = None,
         notice: str | None = None,
     ) -> Response:
-        versions = await ctx.plane.versions(ctx.tenant_id, ctx.user_id, agent_id)
+        versions = await ctx.plane.versions(ctx.tenant_id, ctx.principal, agent_id)
         if not versions:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         owner = await self.owner_of(ctx, agent_id)
-        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
-        switches = await ctx.plane.switches(ctx.tenant_id, ctx.user_id)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.principal)
+        switches = await ctx.plane.switches(ctx.tenant_id, ctx.principal)
         can_edit = self.can_edit(ctx, owner)
         return _page(
             "agent.html",
@@ -573,7 +579,7 @@ class WebUI:
 
     @staticmethod
     async def paused_of(ctx: Ctx, agent_id: str):
-        return await ctx.plane.paused_channels(ctx.tenant_id, ctx.user_id, agent_id)
+        return await ctx.plane.paused_channels(ctx.tenant_id, ctx.principal, agent_id)
 
     async def resume_channel(self, request: Request, ctx: Ctx, agent_id: str, channel: str):
         try:
@@ -593,7 +599,10 @@ class WebUI:
         return _redirect(f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}?done=resumed")
 
     async def owner_of(self, ctx: Ctx, agent_id: str) -> str | None:
-        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.user_id)
+        if ctx.role == CREATOR:
+            # A creator reads only their own agents, so the principal already says.
+            return ctx.user_id if agent_id in ctx.principal.owned_agent_ids else None
+        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.principal)
         return next((a.created_by for a in agents if a.agent_id == agent_id), None)
 
     @staticmethod
@@ -626,19 +635,19 @@ class WebUI:
         text: str | None = None,
         reports: list | None = None,
     ) -> Response:
-        record = await ctx.plane.get_version(ctx.tenant_id, ctx.user_id, agent_id, version)
+        record = await ctx.plane.get_version(ctx.tenant_id, ctx.principal, agent_id, version)
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         editor = self.can_edit(ctx, await self.owner_of(ctx, agent_id))
         audience = await ctx.plane.audience_view(
             ctx.tenant_id,
-            ctx.user_id,
+            ctx.principal,
             agent_id,
             version,
             count=(editor or ctx.is_admin) and record.status in ("draft", PENDING),
         )
         review = (
-            await ctx.plane.version_review(ctx.tenant_id, ctx.user_id, agent_id, version)
+            await ctx.plane.version_review(ctx.tenant_id, ctx.principal, agent_id, version)
             if editor or ctx.is_admin
             else None
         )
@@ -693,7 +702,7 @@ class WebUI:
     async def check_grants(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         try:
             reports = await ctx.plane.check_version_grants(
-                ctx.tenant_id, ctx.user_id, agent_id, version
+                ctx.tenant_id, ctx.principal, agent_id, version
             )
         except GrantCheckUnavailable:
             return await self.notion_down(request, ctx, agent_id, version)
@@ -710,7 +719,7 @@ class WebUI:
         picker = self.deps.picker
         if picker is None:
             return _message("Not available", "Choosing from Notion is not set up.", 404, ctx)
-        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.user_id, agent_id)
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         state = picker.sessions.begin(self.picker_flow(request, ctx, agent_id, version), ctx.now)
         return _redirect(notion_authorize_url(picker.config, self.deps.console.sign_in, state))
 
@@ -756,7 +765,7 @@ class WebUI:
         )
 
     async def pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
-        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.user_id, agent_id)
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         picker = self.deps.picker
         flow = self.picker_flow(request, ctx, agent_id, version)
         objects = None if picker is None else picker.sessions.listing(flow, ctx.now)
@@ -858,8 +867,8 @@ class WebUI:
 
     async def usage(self, request: Request, ctx: Ctx) -> Response:
         month = request.query_params.get("month") or None
-        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.user_id, month)
-        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.user_id)
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.principal, month)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.principal)
         return _page(
             "usage.html",
             ctx=ctx,
@@ -892,7 +901,7 @@ class WebUI:
             "switches.html",
             status,
             ctx=ctx,
-            view=await ctx.plane.switches(ctx.tenant_id, ctx.user_id),
+            view=await ctx.plane.switches(ctx.tenant_id, ctx.principal),
             needs_confirm=CONFIRMED_SWITCHES,
             error=error,
             notice=self.notice(request),
@@ -922,7 +931,7 @@ class WebUI:
     async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
         """The page's aggregates as a download. It only reads, so it is a GET."""
         month = request.query_params.get("month") or None
-        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.user_id, month)
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.principal, month)
         return Response(
             report.csv_text(),
             media_type="text/csv; charset=utf-8",

@@ -65,6 +65,7 @@ from agentos.config import (
     TenantsConfig,
     agent_definition,
     channel_audience_problems,
+    check_agent_id,
     check_front_doors,
     parse_agent,
 )
@@ -603,6 +604,8 @@ class PostgresAgentStore:
         self, tenant_id: str, agents: dict[str, AgentVersion], imported_by: str = IMPORT_USER
     ) -> ImportResult:
         result = ImportResult()
+        for agent_id in agents:
+            check_agent_id(agent_id)
         async with tenant_transaction(self._pool, tenant_id) as conn:
             await self._lock(conn, tenant_id)
             cur = await conn.execute(
@@ -927,6 +930,8 @@ class InMemoryAgentStore:
         self, tenant_id: str, agents: dict[str, AgentVersion], imported_by: str = IMPORT_USER
     ) -> ImportResult:
         result = ImportResult()
+        for agent_id in agents:
+            check_agent_id(agent_id)
         new = {aid: a for aid, a in agents.items() if (tenant_id, aid) not in self._agents}
         result.skipped = [aid for aid in agents if aid not in new]
         check_front_doors({**await self.published_all(tenant_id), **new})

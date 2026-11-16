@@ -360,17 +360,19 @@ def create_app(
         log.error("control API error: %s", type(err).__name__)
         return _error(500, "internal error")
 
-    async def known_tenant(tenant_id: str) -> str:
+    async def acting(request: Request) -> str:
+        """Who is asking. Runs before anything about the path's tenant is looked up, so a
+        caller with no session cannot tell a real tenant from an unknown one."""
+        return await identity.actor(request)
+
+    Actor = Annotated[str, Depends(acting)]
+
+    async def known_tenant(tenant_id: str, actor: Actor) -> str:
         if deps.tenants is None or await deps.tenants.get(tenant_id) is None:
             raise HTTPException(404, f"unknown tenant '{tenant_id}'")
         return tenant_id
 
     Tenant = Annotated[str, Depends(known_tenant)]
-
-    async def acting(request: Request, tenant_id: Tenant) -> str:
-        return await identity.actor(request)
-
-    Actor = Annotated[str, Depends(acting)]
 
     async def request_id(
         request: Request,

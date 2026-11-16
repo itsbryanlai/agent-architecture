@@ -186,8 +186,9 @@ async def check_grants_at_startup(
     summary = f"{failed} Notion grant(s) have problems; the worker will not start."
     if missing_ids:
         summary += (
-            " Property IDs are missing: run `uv run python -m agentos.check_grants`"
-            " and paste its property_ids block into the config."
+            " Property IDs are missing: run `uv run python -m agentos.check_grants"
+            " --tenant <tenant> --agent <agent>` on a draft and paste its property_ids"
+            " block into the definition."
         )
     return summary
 

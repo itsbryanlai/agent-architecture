@@ -178,6 +178,28 @@ class Forbidden(Exception):
     """The actor's role does not allow the action."""
 
 
+@dataclass(frozen=True)
+class Principal:
+    """Who is acting, resolved once per request by ``ControlPlane.principal``.
+
+    ``role`` is None for a person with no role. ``owned_agent_ids`` holds the agents a creator
+    made; an admin reads every agent, so it is empty for them. A plane call that takes an
+    ``actor`` takes this in place of the user ID and then looks nothing up again.
+    """
+
+    tenant_id: str
+    user_id: str
+    role: str | None
+    owned_agent_ids: frozenset[str] = frozenset()
+
+    def sees(self, agent_id: str) -> bool:
+        """Whether this person may read the agent: an admin any, a creator their own."""
+        return self.role == ADMIN or agent_id in self.owned_agent_ids
+
+
+Actor = str | Principal
+
+
 @dataclass
 class AudienceView:
     """What the console shows of a version's audience: the rules in force and who they reach.
@@ -308,23 +330,48 @@ class ControlPlane:
         row = await self._members.get_member(tenant_id, user_id, conn=conn)
         return None if row is None else row.role
 
-    async def _require_role(self, tenant_id: str, actor: str, *allowed: str) -> str:
-        role = await self.role_of(tenant_id, actor)
-        if role not in allowed:
-            raise Forbidden(f"'{actor}' may not do this in tenant '{tenant_id}'")
-        return role
+    async def principal(self, tenant_id: str, user_id: str) -> Principal:
+        """The caller's role and, for a creator, their agents: the lookups a request needs, once."""
+        role = await self.role_of(tenant_id, user_id)
+        owned: frozenset[str] = frozenset()
+        if role == CREATOR:
+            owned = frozenset(
+                a.agent_id
+                for a in await self._agents.list_agents(tenant_id)
+                if a.created_by == user_id
+            )
+        return Principal(tenant_id, user_id, role, owned)
 
-    async def _require_editor(self, tenant_id: str, actor: str, agent_id: str) -> str:
+    async def _principal(self, tenant_id: str, actor: Actor) -> Principal:
+        if isinstance(actor, Principal):
+            if actor.tenant_id != tenant_id:
+                raise Forbidden(f"'{actor.user_id}' may not do this in tenant '{tenant_id}'")
+            return actor
+        return await self.principal(tenant_id, actor)
+
+    async def _require(self, tenant_id: str, actor: Actor, *allowed: str) -> Principal:
+        who = await self._principal(tenant_id, actor)
+        if who.role not in allowed:
+            raise Forbidden(f"'{who.user_id}' may not do this in tenant '{tenant_id}'")
+        return who
+
+    async def _require_role(self, tenant_id: str, actor: Actor, *allowed: str) -> str:
+        who = await self._require(tenant_id, actor, *allowed)
+        assert who.role is not None
+        return who.role
+
+    async def _require_editor(self, tenant_id: str, actor: Actor, agent_id: str) -> str:
         """An admin, or the creator of this agent. Returns the actor's role."""
-        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
         agent = await self._agents.get_agent(tenant_id, agent_id)
         if agent is None:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
-        if role != ADMIN and agent.created_by != actor:
-            raise Forbidden(f"'{actor}' did not create agent '{agent_id}'")
-        return role
+        if who.role != ADMIN and agent.created_by != who.user_id:
+            raise Forbidden(f"'{who.user_id}' did not create agent '{agent_id}'")
+        assert who.role is not None
+        return who.role
 
-    async def require_agent_editor(self, tenant_id: str, actor: str, agent_id: str) -> None:
+    async def require_agent_editor(self, tenant_id: str, actor: Actor, agent_id: str) -> None:
         """Raise ``Forbidden`` unless the actor is an admin or created this agent."""
         await self._require_editor(tenant_id, actor, agent_id)
 
@@ -384,18 +431,27 @@ class ControlPlane:
 
     # --- reads ---------------------------------------------------------------
 
-    async def list_agents(self, tenant_id: str, actor: str) -> list[AgentRecord]:
-        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        return await self._agents.list_agents(tenant_id)
+    async def list_agents(self, tenant_id: str, actor: Actor) -> list[AgentRecord]:
+        """Every agent for an admin; the agents they created for a creator."""
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        return [a for a in await self._agents.list_agents(tenant_id) if who.sees(a.agent_id)]
 
-    async def versions(self, tenant_id: str, actor: str, agent_id: str) -> list[AgentVersionRecord]:
-        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+    async def versions(
+        self, tenant_id: str, actor: Actor, agent_id: str
+    ) -> list[AgentVersionRecord]:
+        """An agent's versions. A creator gets none for an agent that is not theirs, the same
+        as for one that does not exist."""
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if not who.sees(agent_id):
+            return []
         return await self._agents.versions(tenant_id, agent_id)
 
     async def get_version(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
     ) -> AgentVersionRecord | None:
-        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if not who.sees(agent_id):
+            return None
         return await self._agents.get_version(tenant_id, agent_id, version)
 
     async def list_members(self, tenant_id: str, actor: str) -> list[MemberRecord]:
@@ -415,7 +471,7 @@ class ControlPlane:
         return await self._audit.list(tenant_id, limit, before, before_seq)
 
     async def usage_report(
-        self, tenant_id: str, actor: str, month: str | None = None
+        self, tenant_id: str, actor: Actor, month: str | None = None
     ) -> UsageReport:
         """Usage and cost for a UTC calendar month (``YYYY-MM``; default the current one).
 
@@ -423,53 +479,44 @@ class ControlPlane:
         only the agents they created, which is the agents they may edit. There is no
         per-person view: no row or total here is grouped by who asked.
         """
-        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
         start, end, label = month_bounds(month, self._clock())
         groups = await self._usage.totals(tenant_id, start, end)
-        if role != ADMIN:
-            mine = {
-                a.agent_id
-                for a in await self._agents.list_agents(tenant_id)
-                if a.created_by == actor
-            }
-            groups = [g for g in groups if g.agent_id in mine]
+        if who.role != ADMIN:
+            groups = [g for g in groups if g.agent_id in who.owned_agent_ids]
         teams: dict[tuple[str, int], str | None] = {}
         for agent_id, version in {(g.agent_id, g.agent_version) for g in groups if g.agent_id}:
             record = await self._agents.get_version(tenant_id, agent_id, version)
             teams[(agent_id, version)] = None if record is None else (record.agent().team or None)
         return build_report(label, groups, teams)
 
-    async def budgets(self, tenant_id: str, actor: str) -> BudgetsView:
+    async def budgets(self, tenant_id: str, actor: Actor) -> BudgetsView:
         """Each agent's budget against the spend of the current UTC month.
 
         An admin gets the tenant-wide line and every agent; a creator the agents they
         created and no tenant line. An agent with no budget is listed with no limit.
         """
-        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
         start, end, label = month_bounds(None, self._clock())
         spend = month_spend(await self._usage.totals(tenant_id, start, end))
         rows = {b.agent_id: b for b in await self._budgets.list(tenant_id)}
-        agents = await self._agents.list_agents(tenant_id)
-        if role != ADMIN:
-            agents = [a for a in agents if a.created_by == actor]
+        agents = [a for a in await self._agents.list_agents(tenant_id) if who.sees(a.agent_id)]
         lines = [
             BudgetLine.of(a.agent_id, rows.get(a.agent_id), spend.of(a.agent_id), AGENT_KINDS)
             for a in sorted(agents, key=lambda a: a.agent_id)
         ]
-        tenant = BudgetLine.of(None, rows.get(None), spend.tenant) if role == ADMIN else None
+        tenant = BudgetLine.of(None, rows.get(None), spend.tenant) if who.role == ADMIN else None
         return BudgetsView(label, tenant, lines)
 
-    async def switches(self, tenant_id: str, actor: str) -> SwitchesView:
+    async def switches(self, tenant_id: str, actor: Actor) -> SwitchesView:
         """Every switch and its state. An admin sees every agent; a creator their own."""
-        role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        agents = await self._agents.list_agents(tenant_id)
-        if role != ADMIN:
-            agents = [a for a in agents if a.created_by == actor]
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        agents = [a for a in await self._agents.list_agents(tenant_id) if who.sees(a.agent_id)]
         state = await read_state(self._switches, tenant_id)
         return SwitchesView.build(state, sorted(a.agent_id for a in agents))
 
     async def check_version_grants(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
     ) -> list[GrantReport]:
         """Check a version's Notion grants. Read-only; editors and admins.
 
@@ -484,7 +531,7 @@ class ControlPlane:
         return reports if role == ADMIN else [r.without_detail() for r in reports]
 
     async def version_review(
-        self, tenant_id: str, actor: str, agent_id: str, version: int
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
     ) -> VersionReview:
         """The access review of a version for an editor or admin (see ``VersionReview``)."""
         role = await self._require_editor(tenant_id, actor, agent_id)
@@ -510,15 +557,19 @@ class ControlPlane:
         return diff
 
     async def audience_view(
-        self, tenant_id: str, actor: str, agent_id: str, version: int, count: bool = True
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int, count: bool = True
     ) -> AudienceView:
         """The audience in force for a version and, when ``count``, the people it reaches.
 
         Any role that reads versions. Slack is read live; a failure is reported in ``problem`` and
         does not fail the page.
         """
-        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        record = await self._agents.get_version(tenant_id, agent_id, version)
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        record = (
+            await self._agents.get_version(tenant_id, agent_id, version)
+            if who.sees(agent_id)
+            else None
+        )
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         effective = await self._effective(tenant_id, record.agent())
@@ -532,7 +583,7 @@ class ControlPlane:
             return AudienceView(effective, problem=_slack_problem(err))
 
     async def paused_channels(
-        self, tenant_id: str, actor: str, agent_id: str | None = None, count: bool = True
+        self, tenant_id: str, actor: Actor, agent_id: str | None = None, count: bool = True
     ) -> list[PausedChannel]:
         """The channels where agents are paused, each with the people in it just now.
 
@@ -545,15 +596,8 @@ class ControlPlane:
             await self._require_editor(tenant_id, actor, agent_id)
             pauses = await self._pauses.list_active(tenant_id, agent_id)
         else:
-            role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-            pauses = await self._pauses.list_active(tenant_id)
-            if role != ADMIN:
-                mine = {
-                    a.agent_id
-                    for a in await self._agents.list_agents(tenant_id)
-                    if a.created_by == actor
-                }
-                pauses = [p for p in pauses if p.agent_id in mine]
+            who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+            pauses = [p for p in await self._pauses.list_active(tenant_id) if who.sees(p.agent_id)]
         views = []
         for pause in pauses:
             if not count or self._audience is None:

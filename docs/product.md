@@ -1,6 +1,6 @@
 # Product
 
-Status: draft · Last updated 2026-11-06
+Status: draft · Last updated 2026-11-06 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (Confluence and Google Drive, the nudge offer, admin-adjustable approval policy and risk classes, the console's connectors page) are marked `target` there; this document's scope and roadmap are unchanged.
 
 ## One-line pitch
 

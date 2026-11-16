@@ -1,90 +1,110 @@
 # Architecture
 
-Status: draft · Last updated 2026-11-14 · Product context: [product.md](product.md) · Decisions: [decisions.md](decisions.md)
+Status: draft · Last updated 2026-11-16 · Product context: [product.md](product.md) · Decisions: [decisions.md](decisions.md) · What is built: [status.md](status.md) · Module map: [modules.md](modules.md) · Running it: [operations.md](operations.md)
 
 Design target: **multi-tenant agents that do work.** They take actions, wait for approvals and external events, and follow up over days. Each agent acts within access its creator granted it.
 
+How to read this document. Every section opens with a status line. Text in the present tense describes code that exists. What is designed but not in the code is under a **Target:** label or in a "Not built yet" list, and [status.md](status.md) lists each capability as `built`, `partial` or `target`. A difference between the code and a present-tense sentence here is a defect to report, not a plan.
+
 ## 1. System overview
+
+Status: **built**, except the credential vault, per-tenant rate limits and model allowlists (target).
 
 ```mermaid
 flowchart LR
   Slack[Slack] -->|events, button clicks| GW[Ingress gateway]
-  GW -->|signal-with-start| T[(Temporal)]
+  GW -->|store event| DB
+  GW -->|relay: signal-with-start| T[(Temporal)]
   T --> W[Agent workers]
-  W --> LLM[LLM gateway]
+  W --> LLM[LLM client]
   W --> CX[Connector runtime]
-  CX --> V[Credential vault]
-  CX --> SaaS[Notion / Confluence / Drive]
+  CX --> SaaS[Notion]
   W --> KB[Knowledge service]
-  KB --> VDB[(Vector index, by tenant and scope)]
-  W --> DB[(Postgres: tenants, agents, history, audit)]
+  KB --> VDB[(pgvector tables)]
+  W --> DB[(Postgres: tenants, agents, history, content, audit)]
   W -->|post / update message| Slack
-  Admin[Admin and creator console] --> API[Control-plane API] --> DB
+  Admin[Admin and creator console] --> API[Control plane] --> DB
   Sync[Indexing workflows] --> VDB
 ```
 
+Target, not in the diagram because it does not exist: a credential vault between the connector runtime and the systems it calls (tenant connector secrets are environment variables named in the tenant's settings), and Confluence and Google Drive behind the connector runtime.
+
 | Component | Responsibility |
 |---|---|
-| Ingress gateway | Verifies Slack signatures, maps the Slack `team_id` to a tenant, drops duplicate events, replies `200` within 3 seconds, and routes each event to the right workflow with signal-with-start |
+| Ingress gateway | Verifies Slack signatures, maps the Slack `team_id` to a tenant and stores each message event in Postgres (`inbound_events`, one row per event ID, so duplicates store nothing) before answering Slack at once. A relay loop in the gateway process then signal-with-starts the thread's workflow with the event ID, retrying with a growing delay until Temporal takes it, so a Temporal outage never loses or repeats a message. Button clicks are handled before the reply, within 2.0 seconds (§9) |
 | Temporal + agent workers | Durable conversations, tasks, approvals, and timers. Workers are stateless and scale horizontally |
-| LLM gateway | Hides which model provider is used (Anthropic, or an OpenAI-compatible endpoint such as Qwen) and returns the provider's token counts with each reply. The activity that makes the call prices it with the price in effect that day and records one usage row (§10) per call, by agent, agent version and model; an agent's optional `team` label groups cost by team. Before the provider is called, the same activity checks the tenant's and the agent's monthly dollar budgets (§8): a reached budget returns a fixed answer, calls no model and records no usage row. A reached tenant budget also stops indexing's embedding calls. Per-tenant model allowlists and rate limits are not built yet |
-| Connector runtime | Runs tool calls inside Activities, enforces the agent's grants and the action policy, injects credentials, and attaches idempotency keys |
-| Credential vault | Tenant connector credentials (app installs, service accounts), plus per-user tokens only for systems that can't filter by person (D-17); encrypted with a per-tenant key |
+| LLM client | Hides which model provider is used (Anthropic, or an OpenAI-compatible endpoint such as Qwen) and returns the provider's token counts with each reply. The activity that makes the call prices it with the price in effect that day and records one usage row (§10) per call, by agent, agent version and model; an agent's optional `team` label groups cost by team. Before the provider is called, the same activity checks the kill switches and the tenant's and the agent's monthly dollar budgets (§8): a stopped agent returns a fixed answer, calls no model and records no usage row. A reached tenant budget also stops indexing's embedding calls. Target: per-tenant model allowlists, rate limits and bring-your-own keys |
+| Connector runtime | Runs tool calls inside activities, enforces the agent's grants, screens each call against the connector manifest (`read` runs at once; any write becomes an approved task) and attaches idempotency keys. Tenant credentials are read from the environment (see Credentials, §5) |
 | Knowledge service | Retrieval limited to the agent's granted scopes, re-checked against the source, with citations (§6) |
-| Indexing | Reads the documents under each granted scope, nightly and on demand (webhooks later), and keeps the index in step with the source (§6). Access is the agent's grant, so no per-user access lists or group membership are synced |
-| Control plane | Tenants, agents and their versions, creator roles, policies, audit log queries |
+| Indexing | Reads the documents under each granted scope, nightly and on demand, and refreshes a single page within about 30 seconds of a Notion webhook event (§6). Access is the agent's grant, so no per-user access lists or group membership are synced |
+| Control plane | Tenants, agents and their versions, creator roles, budgets, kill switches, usage and audit log queries (§5) |
 
 ## 2. Multi-tenancy
 
-Tenant = one company = one Slack workspace or Enterprise Grid org.
+Status: **partial**. Built: tenant ID in every workflow ID, row and log line, row-level security, per-tenant payload keys held as local files. Target: cells, KMS-held keys, crypto-shredding, `tenant_id` search attribute, per-tenant rate limits, model allowlist and bring-your-own key.
 
-**Cell architecture.** A *cell* is one complete stack: a Temporal namespace, a set of workers, a Postgres cluster, and a vector index. Each tenant is assigned to exactly one cell. Many small tenants share a cell, and large or regulated tenants can get a dedicated one. A customer-hosted deployment on the roadmap is just a single-tenant cell running in the customer's cloud account, so we don't need a second architecture for it.
+Tenant = one company = one Slack workspace. Many tenants share one deployment (one Temporal namespace, one set of workers, one Postgres); the tenant list lives in the `tenants` table (see D-20 in [decisions.md](decisions.md)).
 
-Inside a shared cell:
+Inside the deployment:
 
 | Layer | Isolation mechanism |
 |---|---|
-| Temporal | Every workflow ID starts with the tenant ID, plus a `tenant_id` search attribute. Payloads are encrypted by a payload codec using the **tenant's own KMS key**. Rate limits per tenant stop one tenant from starving the others |
-| Postgres | `tenant_id` on every row, enforced by row-level security. Queries run with the tenant set on the session, so a missing `WHERE` clause can't leak data |
-| Vector index | pgvector tables in the cell's Postgres, so the Postgres row applies: `tenant_id` on every row, and every search filters by tenant and the agent's granted scopes inside the query itself, never on results afterwards. A tenant that needs physical separation gets a dedicated cell |
-| Vault | Per-tenant encryption key. Deleting a tenant destroys its key (crypto-shredding) |
-| LLM | Per-tenant allowlist of providers and models, optional bring-your-own API key, and a monthly budget limit |
+| Temporal | Every workflow ID starts with the tenant ID (built only in `src/agentos/ids.py`). Payloads are encrypted by a payload codec with the tenant's own key: a local key file per tenant and version, with the workflow ID as associated data (§10 and D-12). Target: a `tenant_id` search attribute; rate limits per tenant |
+| Postgres | `tenant_id` on every row, enforced by row-level security. Queries run with the tenant set on the session, so a missing `WHERE` clause can't leak data. The app connects as a role that bypasses nothing |
+| Vector index | pgvector tables in the same Postgres, so the Postgres row applies: `tenant_id` on every row, and every search filters by tenant and the agent's granted scopes inside the query itself, never on results afterwards |
+| Slack and Notion clients | One client per tenant, built from the environment variables the tenant's settings name; one tenant's client never serves another's work |
 | Audit and logs | Tagged with the tenant. No document content is written to application logs |
 
+**Target: cell architecture** (D-03). A *cell* would be one complete stack: a Temporal namespace, a set of workers, a Postgres cluster, and a vector index. Each tenant is assigned to exactly one cell; many small tenants share a cell, and large or regulated tenants get a dedicated one. A customer-hosted deployment on the roadmap is a single-tenant cell running in the customer's cloud account. Today there is one cell.
+
+**Target: vault and per-tenant LLM policy.** A vault holding a per-tenant encryption key, with crypto-shredding when a tenant is deleted; a per-tenant allowlist of providers and models and an optional bring-your-own API key. The monthly budget limit (§8) is built.
+
 ## 3. Workflow model
+
+Status: **built**. Not built yet: progress updates on the placeholder (it stays "Thinking…" until the reply), a token budget per turn and a cap on writes per task (§8).
 
 Conversations and tasks are separate workflows, because **a conversation ends but the work it started does not.**
 
 | Workflow | ID | Lifetime | Responsibility |
 |---|---|---|---|
-| `ConversationWorkflow` | `{tenant}:conv:{slack_channel}:{thread_ts}` | Until the thread is idle for 7 days, then closes. Uses continue-as-new periodically | Turn loop: receive message → LLM → tools → reply. Starts tasks |
-| `TaskWorkflow` | `{tenant}:task:{uuid}` | Until the task completes, fails, or expires (days to weeks) | One unit of real work: draft → approval → execute (exactly once) → watch → follow up |
-| `IndexingWorkflow` | `{tenant}:index:{scope}` | One run per refresh: started nightly by a Temporal schedule, or on demand | Indexes one granted knowledge scope (§6): reads every page under it, re-embeds what changed, removes what left |
+| `ConversationWorkflow` | `{tenant}:conv:{slack_channel}:{thread_ts}` | Until the thread is idle for 7 days, then closes. Uses continue-as-new when Temporal suggests it | Turn loop: receive message, call the model, run tools, reply. Starts tasks |
+| `TaskWorkflow` | `{tenant}:task:{uuid}` | Until the task completes, fails, or expires (days to weeks) | One unit of real work: draft, approval, execute (exactly once), watch, follow up |
+| `IndexingWorkflow` | `{tenant}:index:{scope}` | One run per refresh: started nightly by a Temporal schedule, or on demand | Indexes one granted knowledge scope (§6) |
+| `PageRefreshWorkflow` | `{tenant}:page-refresh:{page}` | Until its page has been quiet for 30 seconds | Refreshes one page after Notion webhook events (§6) |
+| `AudienceWatchWorkflow` | `{tenant}:audience-event:{event}` | One activity, then done | Pauses agents in a channel shared with another organisation (§5) |
+| `RetentionWorkflow` | `{tenant}:retention` | One run per night, started by a schedule | Purges one tenant's expired rows, a batch per activity (§10) |
 
-The conversation starts a task as a **child workflow with `ABANDON` as its parent-close policy**, so the task keeps running after the conversation closes. The task posts back to the original thread through activities, and reopens the conversation with signal-with-start if the user replies.
+The conversation starts a task as a **child workflow with `ABANDON` as its parent-close policy**, so the task keeps running after the conversation closes. The task posts back to the original thread through activities.
+
+Where in code: `src/agentos/workflows/`, `src/agentos/activities.py`, `src/agentos/ids.py`.
 
 ### Turn loop (ConversationWorkflow)
 
-Rules that apply to every turn:
-- Messages arrive through a signal handler into an inbox, with duplicates dropped by Slack event ID.
+Intent: each Slack message becomes one turn, and a turn leaves history valid whether it succeeds, fails or is refused.
+
+- Messages arrive through a signal handler into an inbox of event IDs (no text), with duplicates dropped by Slack event ID. The workflow reads the text from Postgres.
 - Agent config is loaded at the start of each turn and pinned to an agent *version*. Edits apply from the next turn onward, and the audit log records which version answered.
-- Chat history lives in Postgres. The workflow only carries a reference to it and a turn counter, which keeps Temporal history small and keeps document content out of it. Tool output text is written to Postgres by the activity that ran the tool; the workflow passes only a reference, and an activity puts the text into history. Each history append carries a key built from the Slack event ID and the turn step, so a retried append never stores a message twice.
-- Each turn has a maximum number of steps and a token budget. On the last step the model's tool calls are not run: each gets an error result, and the reply says the step limit was reached, so nothing is started that the reply then calls unfinished.
-- History is repaired and windowed every time it is loaded for the LLM. A tool call left without a result gets an error result, so one broken turn can't make every later call fail. Past a size budget the oldest turns are dropped, cutting only at a user message that carries no tool results.
-- When a turn fails, only the tool calls that did not complete are marked as not completed; a call that already produced a result, such as a write task whose approval card went out, keeps it. A turn that fails before its placeholder is posted still tells the user it failed.
-- Multiple tool calls from one LLM response run in parallel and are matched back to the model by their tool-call IDs.
-- **Front door.** An agent whose config lists `specialists` is a front door. Its tool list gets `hand_off`, whose only allowed values are those specialists, each described to the model by its config `description`. The hand-off itself runs no tool: the workflow loads the specialist, turns the front door's placeholder into "<name> here, picking this up.", posts a new placeholder below it, and only then stores the step's results and switches the thread, so a failure before the switch leaves the thread with the front door and history that never claims a hand-off. Other tool calls in the same response are not run. The specialist answers the same message with its own grants, context and step budget. The thread's agent is workflow state and carries over continue-as-new, so later messages go to the specialist; a specialist cannot hand off. Its history appends carry an `h1:` key prefix so they never collide with the front door's. A hand-off is allowed on the front door's last step. Threads with no hand-off issue the same commands as before; a replay test over histories recorded before the front door checks this. The front door is offered only the specialists the asker may use in this place (see Deployment and audience), and no `hand_off` tool when there are none. The workflow checks the chosen specialist again before it switches; a refused hand-off keeps the thread with the front door, the model gets a tool error saying the specialist is not available, and an `audience_refused` event records it.
-- Every activity has explicit timeouts and a retry policy. Errors like 4xx, auth failures, and policy denials are non-retryable.
+- Chat history lives in Postgres. Temporal history carries only references and small values: the message text (`inbound_events`), each model reply (`model_steps`), each tool call's input (`tool_inputs`), tool output text (`tool_outputs`) and a task's draft (`task_drafts`, one row per revision) are stored by the activity that handles them, and the workflow passes IDs, a turn counter, whether a message had text, a tool call's name and an input hash. Each history append carries a key built from the Slack event ID and the turn step, so a retried append never stores a message twice.
+- A conversation or task that was running when content left history keeps its earlier shape until it ends, so histories recorded before the change still replay (D-26). Only messages signalled by the gateway before the change carry their text, and a turn is entirely one shape or the other.
+- Each turn has a maximum number of steps. On the last step the model's tool calls are not run: each gets an error result, and the reply says the step limit was reached, so nothing is started that the reply then calls unfinished.
+- A reply the model cut off at its token limit is posted with a note when it is text. When it has tool calls, none runs and each gets an error result asking for less.
+- History is repaired and windowed every time it is loaded for the LLM. A tool call left without a result gets an error result, so one broken turn can't make every later call fail. Past a size budget (120,000 characters of JSON, about 30k tokens) the oldest turns are dropped, cutting only at a user message that carries no tool results. The window is selected in SQL from a stored per-message `char_len`, so a long thread is not loaded whole.
+- When a turn fails, only the tool calls that did not complete are marked as not completed; a call that already produced a result, such as a write task whose approval card went out, keeps it. A turn that fails before its placeholder is posted still tells the user it failed. A failed turn never ends the conversation.
+- Multiple tool calls from one LLM response run in parallel and are matched back to the model by their tool-call IDs, which are namespaced at the client so no two replies share one. One reply may start at most the agent's `max_writes_per_turn` write tasks (1 to 10, default 2); the other write calls, and a write repeated in the same reply, get an error result that tells the model so. A tool input that does not fit its schema gets an error result too. There is no cap per task or per tenant.
+- A reply is stored in history only after it was shown, so a Slack failure never leaves history claiming the user saw an answer.
+- **Front door.** An agent whose config lists `specialists` is a front door. Its tool list gets `hand_off`, whose only allowed values are those specialists, each described to the model by its config `description`. The hand-off itself runs no tool: the workflow loads the specialist, turns the front door's placeholder into "<name> here, picking this up.", posts a new placeholder below it, and only then stores the step's results and switches the thread, so a failure before the switch leaves the thread with the front door and history that never claims a hand-off. Other tool calls in the same response are not run. The specialist answers the same message with its own grants, context and step budget. The thread's agent is workflow state, carries over continue-as-new, and is also stored per thread in the `threads` table and read when a workflow starts, so a thread keeps its specialist when the workflow closes after a week of silence and a later message starts it again. A new thread starts at the front door. A specialist cannot hand off. Its history appends carry an `h1:` key prefix so they never collide with the front door's. A hand-off is allowed on the front door's last step. The front door is offered only the specialists the asker may use in this place and that are not switched off (§5, §8), and no `hand_off` tool when there are none. The workflow checks the chosen specialist again before it switches; a refused hand-off keeps the thread with the front door, the model gets a tool error saying the specialist is not available, and an `audience_refused` event records it.
+- Every activity has explicit timeouts and a retry policy. Errors like 4xx, auth failures, and policy denials are non-retryable. Model and embedding calls give up on their own (75 seconds for a model call, 60 for one embeddings request) before their activity's timeout, and the provider SDKs never retry: Temporal retries the activity.
+- Workflow code changes that alter the commands of an existing history sit behind `workflow.patched` markers, and recorded histories are replayed in tests. A `patched` marker record is written by the Temporal SDK core outside the payload codec and carries only the patch ID.
 
 ```python
 @workflow.defn
 class ConversationWorkflow:
     def __init__(self):
-        self.inbox: deque[InboundMessage] = deque()
+        self.inbox: deque[InboundMessage] = deque()   # event IDs and small metadata
         self.seen = BoundedSet(500)
 
     @workflow.signal
-    def message(self, m: InboundMessage):        # event_id, user_id, text, channel_kind
+    def message(self, m: InboundMessage):        # event_id, user_id, channel_kind; the text is in Postgres
         if m.event_id not in self.seen:
             self.seen.add(m.event_id)
             self.inbox.append(m)
@@ -100,34 +120,37 @@ class ConversationWorkflow:
             ctx = TurnContext(tenant=conv.tenant, user=m.user_id, channel_kind=m.channel_kind)
 
             agent = await act(load_agent_version, conv.agent_id)
-            await act(append_history, conv.history_ref, user_turn(m))
-            placeholder = await act(post_thinking, conv, idem=f"{m.event_id}:ph")
+            if not await act(check_audience, ctx):           # asker and place, from the runtime
+                continue                                    # fixed refusal posted; nothing stored or run
+            await act(ingest_message, conv.history_ref, m.event_id)   # text from inbound_events into history
+            placeholder = await act(post_placeholder, ctx, idem=f"{m.event_id}:ph")
 
             for step in range(agent.max_steps):
-                resp = await act(call_llm, agent.version, conv.history_ref, ctx)
-                if not resp.tool_calls:
-                    await act(finalize_reply, placeholder, resp.text, idem=f"{m.event_id}:reply")
+                out = await act(call_model, ctx, conv.history_ref, step_key)   # reply stored as a model_step
+                if not out.tool_calls:
+                    await act(finalize_model_reply, placeholder, out, idem=f"{m.event_id}:reply")
                     break
-                results = await asyncio.gather(*[self.dispatch(ctx, agent, tc) for tc in resp.tool_calls])
-                await act(append_history, conv.history_ref, results)
+                results = await asyncio.gather(*[self.dispatch(ctx, agent, tc) for tc in out.tool_calls])
+                await act(append_tool_results, conv.history_ref, results)
 
             if workflow.info().is_continue_as_new_suggested():
                 workflow.continue_as_new(conv, self.inbox)
 
     async def dispatch(self, ctx, agent, tc):
-        policy = agent.policy_for(tc.name)                 # read | write
-        if policy.kind == "read":
-            return await act(run_connector, ctx, agent.grants, tc)  # agent's grants; ctx.user for audit
+        if tc.kind == "read":                              # from the connector manifest's risk
+            return await act(run_stored_read_tool, ctx, tc)    # agent's grants; ctx.user for audit
         task = await workflow.start_child_workflow(        # writes become durable tasks
-            TaskWorkflow.run, TaskSpec(ctx, agent.version, tc),
+            TaskWorkflow.run, TaskSpec(ctx, agent.version, draft_ref),
             id=f"{ctx.tenant}:task:{workflow.uuid4()}",
             parent_close_policy=ParentClosePolicy.ABANDON)
         return ToolResult(tc.id, f"Task {task.id} created; awaiting approval from the user.")
 ```
 
-`act(...)` is shorthand for `workflow.execute_activity` with the activity's standard timeout and retry options.
+`act(...)` is shorthand for `workflow.execute_activity` with the activity's standard timeout and retry options. The listing is simplified: the real loop also handles hand-offs, the step limit, cut-off replies and failures.
 
 ## 4. Actions, approvals, and follow-up (TaskWorkflow)
+
+Status: **partial**. Built: approval by the requester, edit, reminder and expiry, exactly-once create and comment, watch by webhook and polling, a single "no movement" notice. Not built yet: admin-adjustable risk classes and approval policy, a second approver, the nudge offer after "no movement", and follow-up actions that ask for approval again.
 
 This is where shape 3 lives.
 
@@ -135,242 +158,313 @@ This is where shape 3 lives.
 stateDiagram-v2
   [*] --> Drafted
   Drafted --> AwaitingApproval: post approval card
-  AwaitingApproval --> Executing: approved (by an authorized person)
-  AwaitingApproval --> Drafted: edited
-  AwaitingApproval --> Cancelled: rejected / expired
+  AwaitingApproval --> Executing: approved by the requester
+  AwaitingApproval --> AwaitingApproval: edited (new revision, new nonce)
+  AwaitingApproval --> Cancelled: rejected, expired, or stopped before the write
   Executing --> Watching: success (exactly once)
   Executing --> Failed: non-retryable error
-  Watching --> FollowUp: external event or timer
-  FollowUp --> Watching
-  Watching --> Done: resolved / user closes
+  Watching --> Watching: external event or poll
+  Watching --> Done: item reaches a done value
+  Watching --> Ended: watch limit, item gone, or agent turned off
 ```
 
-**Action policy.** Every tool has a risk class, set by the connector author and adjustable by the tenant admin:
+**Action policy.** Each tool in the connector manifest has a risk class: `read` runs at once within the agent's grants; `write_reversible` (a comment) and `write_irreversible` (a new item) both become a task that asks the requester to approve. The manifest's `risk` decides which path a call takes, and its `idempotency` method decides how a write avoids a duplicate; a write whose method no manifest declares is refused.
 
-| Class | Example | Default policy |
-|---|---|---|
-| `read` | Search Confluence, read a Notion page | Auto, within the agent's grants |
-| `write_reversible` | Comment on a Notion page | Ask the requesting user |
-| `write_irreversible` | Add a Notion database item, submit time off, send an email | Ask the requesting user. An admin may require a second approver |
+Target: the tenant admin adjusts a class's policy, creators make a policy stricter but never looser than the admin's ceiling, and an admin may require a second approver. None exists: the requester is the only approver (D-11, Q-5).
 
-Creators can make a policy stricter but never looser than the admin's ceiling.
+### Approvals
 
-**Approvals.**
+Intent: nothing is written until the requester has seen exactly what will be written and said yes.
+
 - An approval is a Slack interactive card whose payload carries `task_id` and an approval nonce. The click arrives at the gateway, which sends it to the task workflow as a signal.
-- The workflow checks that **the person who clicked** is an authorized approver. It doesn't trust which channel the click came from.
-- Approvals expire (default 72 hours) and send reminders using durable timers.
-- The approved payload is frozen. If the user edits the draft, they have to approve again, so what was approved is exactly what runs.
+- The workflow checks that **the person who clicked** is the requester. It doesn't trust which channel the click came from. A click with another nonce is ignored.
+- The payload is frozen before the card is posted, as revision 1 of the task's draft in Postgres. An approval binds to one (revision, nonce), and the write reads that revision. **Edit** stores the next revision with a new nonce and asks again, so what was approved is exactly what runs. A request can be edited up to 5 times.
+- A comment may only target a page in a database the agent was granted: checked before the card is posted and again before the comment is made.
+- Approvals expire and send one reminder using durable timers. An agent definition sets `expires_after_hours` (default 72, at most 168) and `reminder_after_hours` (default 24); each edit restarts the window.
+- **Pending cards do not outlive what let them run.** Just before an approved write, the task checks that the agent is not turned off, the channel is not paused and the requester is still in the audience of the agent's current published version (see §5 and §8). If any fails, nothing is written, the card shows a fixed line and the task ends; a check that cannot be completed stops the write too. A writes or connector switch is applied inside the write activity, before the Notion call, and ends the task the same way.
 
-**Exactly-once execution.**
-- Each write carries an idempotency key, `{task_id}:{step}`. Connectors pass it on where the target system supports one. Where it doesn't, the connector looks for a marker (a label or custom field holding the key) before creating anything.
-- An activity retry after a timeout therefore can't create a second item.
+Where in code: `src/agentos/workflows/task.py`, `AgentActivities.check_before_write` and the write activities in `src/agentos/activities.py`, `src/agentos/gateway/app.py`.
+
+### Exactly-once execution
+
+Intent: a crash, a retry or two overlapping attempts produce one item and one "Filed" line.
+
+- Each write has an idempotency key, `{task_id}:create` or `{task_id}:comment`. Notion has no idempotency key of its own, so Postgres decides which attempt writes: an attempt claims the key in `external_writes` with a lease, marks it issued just before it sends the write, and stores the result as soon as the write returns.
+- A second attempt that finds a live lease writes nothing and retries later; one that finds a stored result returns it without calling Notion. After a claim that took over from an attempt that had sent the write, the connector looks for a marker (a hidden "Agent request ID" property, or a reference at the end of a comment) a few times before it writes, because Notion's search can lag. That lookup is a check, not the guard.
+- Accepted residual risk: a target whose search lags a write by longer than the look-before-write window gets a second item from the retry.
+- When the activity's retries run out, the task looks for the item a few times with timers between. If it is found the task carries on as filed; if not it says it could not confirm and points to the tracker. It never says nothing was filed after retries ran out.
 - Editable fields are capped below the target system's limits (Notion takes 2,000 characters per text item; details and comments are capped at 1,900 so the signature fits), so an approved payload can't be rejected for its size.
-- If a step fails after the user was told the task is in hand, the task posts a line in the thread saying so instead of failing silently. While watching, a transient failure is retried on the next poll; a permanent one (the item is gone or no longer granted) ends the watch with a message.
+- If a step fails after the user was told the task is in hand, the task posts a line in the thread saying so instead of failing silently.
 
-**Watching and follow-up.**
-- Prefer webhooks from the target system. The ingress gateway maps the event to the task and signals it.
-- Fall back to polling with backoff, using durable timers.
-- Follow-up rules come from the agent config, for example "nudge after 3 days without movement, ask before nudging". Each follow-up that would *change* something goes through approval again.
+Where in code: `AgentActivities._write_once` in `src/agentos/activities.py`, `scripts/migrations/018_external_writes.sql`, `src/agentos/connectors/notion.py`.
+
+### Watching and follow-up
+
+Intent: the task keeps watching the item until its status reaches a done value, and survives restarts.
+
+- A signed Notion webhook event is mapped to the task and signals it. Polling with durable timers (every 15 minutes by default) is the fallback, so a missed webhook costs delay, not correctness.
+- A transient failure while watching is retried on the next poll; a permanent one (the item is gone or no longer granted) ends the watch with a message. Turning the agent off ends the watch with no post; turning the connector off makes the poll fail retryably, so the task keeps watching.
+- The agent definition sets `stale_after_days` (default 3) and `max_watch_days` (default 30, at most 60). The task posts "No movement on '<title>' in N days." once.
+- Target: the follow-up rules in the agent config ("nudge after 3 days, ask before nudging") and an approval for each follow-up that would change something. No follow-up action exists.
+
+Where in code: `src/agentos/workflows/task.py`, `src/agentos/task_notices.py`, `src/agentos/config.py` (`FollowUp`, `Approval`).
 
 ## 5. Identity and permissions (D-07)
+
+Status: **partial**. Built: agent-owned grants enforced before every connector call, versions and roles, the audience and its checks, the console and its sign-in. Target: the nightly re-check of a creator's own access with suspension and notification, tenant connector credentials in a vault, requester delegation, a specific approver per action.
 
 **Each agent is its own principal with its own access.** The agent doesn't borrow the access of whoever is asking. Its creator grants it access, and the creator is accountable for who can reach it.
 
 ### Access grants
-- A *grant* is a connector plus a scope plus a list of tools, for example "Confluence, space `IT`, read" or "Notion, database `IT requests`, create_item and add_comment".
-- The connector runtime enforces grants inside the activity. A call outside the agent's grants is denied before anything goes out, whatever the LLM asked for.
-- **No escalation:** a creator can only grant scopes they can access themselves. For Notion this is enforced by a picker, only when it is configured (`NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET`, `AGENTOS_REQUIRE_GRANT_PICKER=1`): the creator signs in to Notion with a public integration, the console lists what their token can search, and submit refuses a grant that is new since the published version and was not picked there. The creator's Notion token is used once to list and is never stored. Not built yet: the nightly re-check against the creator's own identity, suspending the grant when the creator loses access or leaves, and notifying the owner and admin. Without the picker, only the admin's approval stands in for the check; it shows each grant's live title and parent, a warning when the label differs, and a diff against the published version.
+
+Intent: an agent can reach only what its creator granted it, and a creator can grant only what they can see themselves.
+
+- A *grant* is a connector plus a scope plus a list of tools, for example "Notion, database `IT requests`, create_item and add_comment".
+- The connector runtime enforces grants inside the activity. A call outside the agent's grants is denied before anything goes out, whatever the LLM asked for. A call that names a page by link or ID cannot be checked first, because Notion tells a page's database only when the page is fetched; a page that is missing, unshared or in an ungranted database raises the same error, so the answer never reveals whether an ungranted page exists.
+- Grants are read from the published version when a tool runs, not when the worker starts. A grant removed by a new published version applies to the next call, including a write that was approved before. A turn's model calls and its audience check use the version the turn started with, so a publish in the middle of a turn does not change its prompt.
+- **No escalation, as built:** a Notion *picker*, only when configured (`NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET`, `AGENTOS_REQUIRE_GRANT_PICKER=1`). The creator signs in to Notion with a public integration, the console lists what their token can search, and submit refuses a grant that is new since the published version and was not picked there. The creator's Notion token is used once to list and is never stored. Picks are audited as `grant_pick`.
+- Without the picker only the admin's approval stands in for the check. The version page shows, per grant, the object's live title and parent, a warning when the creator's label differs, and a diff of grants and audience against the published version. A version that widens access (a new grant, other properties, a new channel, wider direct messages, guests) is published only with the approver's acknowledgement, which names the published version the diff was computed against, is refused if another was published since, and is audited as `widening_confirm`. A first publish, with nothing to compare with, always widens.
 - Publishing an agent, or widening its grants, needs admin approval.
+- The grant check (`check-grants`) shows a creator only ok or a problem category per grant and never a schema; an admin sees titles, parents and property detail.
+- Target: the nightly re-check of each grant against the creator's own identity, suspending the grant when the creator loses access or leaves, and notifying the owner and admin. Not built.
+
+Where in code: `src/agentos/connectors/notion.py` (`GrantDenied`), `src/agentos/grant_checker.py`, `src/agentos/grant_picks.py`, `src/agentos/notion_picker.py`, `src/agentos/access_diff.py`, `ControlPlane.publish_version` in `src/agentos/control.py`.
 
 ### Agent versions, roles and publishing
-- Agents live in Postgres as **versions**: `draft` → `pending` (submitted) → `published`, and the version it replaces becomes `superseded`. A pending version can be withdrawn or rejected back to `draft`. A database trigger keeps a published version immutable, and only one version per agent is published. Workers read the current published version on every call, so a publish takes effect on the next message without a restart.
-- A tenant starts from its YAML file once: the import copies each agent in as published version 1 and records an `agent_import` audit event. After that the database is the source of truth for agents. Tenant settings (Slack workspace, enabled flag, default agent, channel routing, admins, and the names of the secret variables, never a value) are imported once into the `tenants` table the same way, and every process reads them through a short cache, so a tenant added, changed or disabled there is served or refused within seconds without a restart. Row-level security hides other tenants' rows; the two reads that must cross tenants (Slack workspace to tenant, and the list of tenants) go through narrow `SECURITY DEFINER` functions that return the tenant ID, the enabled flag and a change time only.
-- **Roles.** A tenant's first admins are listed in its config file (`admins:`) and can't be removed or demoted through the app. Admins add other admins and creators, who are stored per tenant. Creators create agents and edit and submit their drafts; only an admin publishes or rejects. An admin may approve their own submission, and the audit event records both the requester and the approver. The last admin can't remove or demote themself.
-- **Grant check.** Before any publish, the control plane reads every database and page the version grants, with the tenant's Notion credential. A grant that is gone, trashed or not shared is a problem and the publish is refused with the list. A network error, rate limit or Notion server error only means "try again": nothing is judged or changed. Anything else, such as a missing tenant key, is a setup error and shows as one.
-- One service layer (`ControlPlane`) holds every role check and writes one audit event per change (`agent_create`, `agent_draft`, `agent_edit`, `agent_submit`, `agent_withdraw`, `agent_reject`, `agent_publish`, `member_add`, `member_remove`, `member_role`). The API and the console call it; nothing else writes agents or members.
-- Not built yet: the nightly no-escalation re-check, suspension and notification (above). The grant check proves the tenant credential can reach each grant; the picker, when configured, shows the creator's own account could see it when it was picked. A version that widens access (a new grant, other properties, a new channel, wider direct messages, guests) (a first publish, with nothing published to compare with, always does) is published only with the approver's acknowledgement, which names the published version the diff was computed against and is refused if another was published since, audited as `widening_confirm`; picks are audited as `grant_pick`.
+
+Intent: what runs is a version an admin approved, and every change to who may do what is recorded with the change.
+
+- Agents live in Postgres as **versions**: `draft`, then `pending` (submitted), then `published`; the version it replaces becomes `superseded`. A pending version can be withdrawn or rejected back to `draft`. A database trigger keeps a published version immutable, allows only those moves, and only one version per agent is published. Publishing a version lower than the published one is refused; a rollback is a new draft from the old version.
+- Workers read the current published version on every call, so a publish takes effect on the next message without a restart.
+- A tenant starts from its YAML file once: the import copies each agent in as published version 1 and records an `agent_import` audit event. After that the database is the source of truth for agents; editing the YAML afterwards changes nothing. Tenant settings are imported once into the `tenants` table the same way (D-20).
+- **Approving is approving a content.** Submit stores the SHA-256 of the definition (`definition_sha256`). A publish must carry the hash the approver was shown and is refused (409 in the API; a missing hash is 422) when the version carries another, which a withdraw, an edit and a resubmit under the same number produces. The `agent_publish` event records that reviewed hash (D-29).
+- **Roles.** A tenant's first admins are listed in its config file (`admins:`) and can't be removed or demoted through the app. Admins add other admins and creators, who are stored per tenant. Creators create agents and edit and submit their drafts; only an admin publishes or rejects. An admin may approve their own submission, and the audit event records both. The last admin can't remove or demote themself. A tenant with no admins can publish nothing.
+- **A creator reads only the agents they created** (D-30): definitions, versions, usage, budgets and switches follow one rule, enforced in `ControlPlane`; an agent that belongs to someone else answers "not found". Admins read every agent.
+- **Grant check.** Before any publish, the control plane reads every database and page the version grants, with the tenant's Notion credential. A grant that is gone, trashed or not shared is a problem and the publish is refused with the list. A network error, rate limit or Notion server error only means "try again" (502 from the API, 503 from a console page): nothing is judged or changed. Anything else, such as a missing tenant key, is a setup error and shows as one.
+- **Every change and its audit event commit in one transaction** (a unit of work holding the tenant's advisory lock), so a failed audit insert leaves no change behind and the retry is not refused as "already done". `ControlPlane` holds every role check and writes one audit event per change (`agent_create`, `agent_draft`, `agent_edit`, `agent_submit`, `agent_withdraw`, `agent_reject`, `agent_publish`, `member_add`, `member_remove`, `member_role`, `budget_set`, `switch_off`, `switch_on`, `audience_confirm`, `audience_resume`, `widening_confirm`, `grant_pick`). A refused action is not audited. A retried `new_draft` returns the draft its first attempt made. Two things change state without passing through `ControlPlane`, on purpose: the host operator's switches command (audited as `operator:<OS login>`) and the one-time YAML imports (`agent_import`, which run before any admin exists). Opening an audience pause is the Slack event handler's. Retention limits (`retention_set`) and repricing (`usage_repriced`) are audited by their owner-role commands.
+- Row-level security hides other tenants' rows; the two reads that must cross tenants (Slack workspace to tenant, and the list of tenants) go through narrow `SECURITY DEFINER` functions that return the tenant ID, the enabled flag and a change time only.
+
+Where in code: `src/agentos/agent_store.py`, `src/agentos/control.py`, `src/agentos/unit_of_work.py`, `src/agentos/members.py`, `src/agentos/audit.py`, `src/agentos/tenant_store.py`.
 
 ### Control plane and console
-- The control plane is **its own process**, never mounted on the Slack gateway, because the gateway is reachable from the internet. It serves a JSON API and server-rendered console pages from the same role layer.
+
+Intent: the control plane is a separate process from the internet-facing gateway, and every request acts as a verified person.
+
+- It serves a JSON API and server-rendered console pages from the same role layer, so a user's role decides what they can do in both.
 - **Without sign-in configured** it listens on loopback only and acts as one fixed operator named at start. No request can name or change the actor. It refuses a non-loopback bind.
-- **With Sign in with Slack configured** (Slack's OpenID Connect; client ID, client secret and the console's public URL) it may listen publicly. The signed-in user's Slack team must map to a tenant, and the session's tenant must equal the tenant in the path. Sessions live in Postgres: a 256-bit ID of which only the SHA-256 is stored, 8-hour expiry, a cookie that is `HttpOnly`, `Secure` and `SameSite=Lax`.
-- **Browser guard.** Requests must carry an allowed `Host` and, when present, an allowed `Origin`. A cross-site request is refused, with two exceptions: Slack's redirect to the sign-in callback, and a top-level page navigation (GET, `navigate`, `document`) to a console page, so the redirect after sign-in and links from Slack or email work. Every console GET only reads, pages can't be framed, and the Lax cookie is sent on such navigations anyway. API writes must be JSON; console form posts need the session's CSRF token and the console's own origin.
-- Pages never answer 502 or 504, because a proxy such as Cloudflare replaces those with its own page and the message is lost; "Notion couldn't be reached" is a 503 page that says nothing changed.
+- **With Sign in with Slack configured** (Slack's OpenID Connect; client ID, client secret and the console's public `https://` URL) it may listen publicly, but not while the database password is empty or a development default. The signed-in user's Slack team must map to a tenant, the user must have a role there (otherwise a "no access" page and no session), and the session's tenant must equal the tenant in the path.
+- Sessions live in Postgres under row-level security: a 256-bit ID of which only the SHA-256 is stored, 8-hour expiry, a cookie that is `HttpOnly`, `Secure` and `SameSite=Lax`. Sign out deletes the row. The JSON API accepts the same cookie for its own tenant's paths.
+- **Browser guard.** Requests must carry an allowed `Host` and, when present, an allowed `Origin`. A cross-site request is refused, with two exceptions: Slack's redirect to the sign-in callback, and a top-level page navigation (GET, `navigate`, `document`) to a console page. Every console GET only reads, pages can't be framed, and pages are served with a Content-Security-Policy that allows no script and no outside asset. API writes must be JSON; console form posts need the session's CSRF token and the console's own origin.
+- Pages never answer 502 or 504, because a proxy such as Cloudflare replaces those with its own page; "Notion couldn't be reached" is a 503 page that says nothing changed. An unknown tenant and a real one get the same answer before sign-in.
 - The process needs each tenant's Notion key (for the grant check) and refuses to start without it. It also reads each tenant's Slack bot token, on first use, to count an audience's people; a tenant without it shows "could not count" on the version page and can't publish until the variable is set.
+- Not built yet: the console's connectors page, a tenant-settings page, a test set for agent versions.
+
+Where in code: `src/agentos/control_api.py`, `src/agentos/web_ui.py`, `src/agentos/slack_signin.py`, `src/agentos/sessions.py`, `src/agentos/control_errors.py`, `src/agentos/templates/`.
 
 ### Credentials
-- Agents use **tenant-level connector credentials**: an app install or service account per connector, which the tenant admin sets up once. An agent's grants are a subset of what that credential can reach.
-- Credentials are never tied to the creator's personal token, so an agent keeps working when its creator goes on leave.
+
+Intent: connector credentials belong to the tenant, never to a creator or to the model.
+
+- Agents use **tenant-level connector credentials**: one Notion integration token per tenant and one Slack bot token, read from the environment variables the tenant's settings name (the tenants table stores the names, never a value). An agent's grants are a subset of what that credential can reach.
+- Credentials are never tied to the creator's personal token, so an agent keeps working when its creator goes on leave. The creator's Notion sign-in for the picker is used once and not stored.
 - The LLM never sees credentials. The worker attaches the agent's grants and the requester from `TurnContext`, never from tool arguments.
+- Target: a credential vault encrypted with a per-tenant key, and per-user tokens only for systems that can't filter by person (D-17). Not built.
+
+Where in code: `src/agentos/tenants.py`, `src/agentos/config.py` (`read_secret`, `Settings.require`).
 
 ### Deployment and audience
-- Where a message lands: a DM or a mention in an unmapped channel starts at the tenant's `default_agent` (the front door, when it has one); the agents config can map a channel ID to an agent, and mentions there start at that agent. A running thread keeps its current agent.
-- **The audience is part of the agent version.** A definition may carry `audience: {channels: [C...], dm: everyone | {user_groups: [S...]}, guests: false}`, edited in the console with the rest of the definition, so a change is a new version that an admin publishes. It is parsed with the rest of the definition and holds Slack IDs only. A definition with no `audience` keeps working under a legacy default, because published versions never change: every full member by direct message, the channels the tenant file maps to the agent (the default agent also answers in channels the file does not map, and a front door's specialists follow it into the front door's channels), and no guests. The console shows the audience in force and marks the default "default (no audience set)".
+
+Intent: an agent answers only the people and places its creator and an admin approved, and says so plainly when it refuses.
+
+- Where a message lands: a DM or a mention in an unmapped channel starts at the tenant's `default_agent` (the front door, when it has one); the tenant settings can map a channel ID to an agent, and mentions there start at that agent. A running thread keeps its current agent.
+- **The audience is part of the agent version.** A definition may carry `audience: {channels: [C...], dm: everyone | {user_groups: [S...]}, guests: false}`, edited in the console with the rest of the definition, so a change is a new version that an admin publishes. It holds Slack IDs only. A definition with no `audience` keeps working under a legacy default, because published versions never change: every full member by direct message, the channels the tenant settings map to the agent (the default agent also answers in channels not mapped, and a front door's specialists follow it into the front door's channels), and no guests. The console marks the default "default (no audience set)".
 - **Who counts.** "Everyone" is every full member of the tenant's own Slack workspace. Single and multi-channel guests are refused unless `guests: true`. A person from another workspace (Slack Connect: a different `team_id` on the user) and a deactivated user are always refused.
-- **Enforced at the start of every turn**, for the thread's current agent, by an activity that gets the asker, the channel and its kind from the Slack event, never from the model. A channel message needs the channel in the audience. A direct message needs `dm: everyone`, or the asker in one of the listed user groups. The check sits behind a workflow version marker, so threads recorded before it replay unchanged. A refused turn stores nothing, runs no model call or tool, posts one fixed reply in the thread ("<agent name> isn't available to you here. Ask <creator> for access.") and records an `audience_refused` event with the agent, version, requester and a reason code, never the message.
-- **Slack lookups** (`users.info`, `usergroups.users.list`, and for the console `conversations.members` and `users.list`, paged) go through the Slack client and are cached per tenant in the worker for five minutes: a busy channel costs a few calls per person, not one per message, and a person removed from a group, made a guest or deactivated is refused within five minutes. A transient failure is retried. When the answer can't be had, the turn is refused, never allowed, with its own reply ("I couldn't check whether ... is available to you just now. Try again in a few minutes.") and an `audience_refused` event with outcome `error`.
-- **Channel routing stays in the tenant file.** A publish, and the startup check, refuse an agent that the file maps to a channel its audience leaves out, since every mention there would be refused.
-- **Confirmation at publish.** The console's version page shows the audience in force and counts, live from Slack, the people who can reach the agent: in total, how many are guests and how many are from other workspaces, per channel and for direct messages. The count is of everyone present in the audience's places, so it can overstate: a guest in a listed channel is counted though refused without `guests: true`. Publishing needs the approver to confirm those counts ("I confirm these people may see what this agent can access"). The API's publish takes `{"confirm_audience": {"total": n, "guests": g, "external": e}}`, and `ControlPlane.publish_version` refuses with 409 when it is missing or no longer matches a fresh count, so both paths get it. An `audience_confirm` event records the approver and the three counts with the publish. Counting a whole workspace for "everyone" costs one `users.list` call per 200 users; the page may reuse a list read in the last five minutes, a publish always reads again.
-- **Audience changes are watched** (untested live: verified only by the automated tests, not yet against a real Slack Connect channel). A channel being shared with another organisation (Slack Connect, the `channel_shared` event) widens who reads an agent's answers in it. A person joining, guest or not, is not watched: who is added to a channel is the admins' responsibility. The gateway verifies the signature as for messages and starts one `AudienceWatchWorkflow` per Slack event, with an ID built from the tenant and the event ID that is never reused, so a Slack retry starts nothing. Its one activity needs no Slack lookup: it pauses every published agent whose effective audience names the channel, in that channel only (reason `channel_shared`). A `member_joined_channel` event is answered 200 and ignored. A pause is a row in `audience_pauses` (tenant, agent, channel, reason code, time, who resumed and when); a resumed row stays as history and at most one is active per agent and channel. `check_audience` refuses a turn in a paused channel with reason `paused` and a fixed reply, so the turn runs no model or tool, in a thread already running as well; direct messages and other channels are unaffected. The conversation workflow only picks the reply text from the decision. The agent's creator and the tenant's admins get one direct message per pause (channel and reason, no content); the notice and the `audience_pause` audit event have keys built from when the pause began, so a retried activity repeats neither. `ControlPlane.paused_channels` (admins and the agent's editors) lists the pauses with a fresh count of the people in each channel, and `resume_channel` (the creator or an admin) needs that count confirmed like a publish; it records `audience_resume`.
+- **Enforced at the start of every turn**, for the thread's current agent, by an activity that gets the asker, the channel and its kind from the Slack event, never from the model. A channel message needs the channel in the audience. A direct message needs `dm: everyone`, or the asker in a listed user group. A refused turn stores nothing, runs no model call or tool, posts one fixed reply ("<agent name> isn't available to you here. Ask <creator> for access.") and records an `audience_refused` event with agent, version, requester and a reason code, never the message. The creator is mentioned in that reply once a day per asker and place, and named without a mention after that (`owner_pings`).
+- **Slack lookups** (`users.info`, `usergroups.users.list`, and for the console `conversations.members` and `users.list`, paged) go through the Slack client and are cached per tenant in the worker for five minutes, so a person removed from a group, made a guest or deactivated is refused within five minutes. A transient failure is retried. When the answer can't be had, the turn is refused, never allowed, with its own reply ("I couldn't check whether ... is available to you just now. Try again in a few minutes.") and an `audience_refused` event with outcome `error`.
+- **Channel routing stays in the tenant settings.** A publish, and the startup check, refuse an agent that the settings map to a channel its audience leaves out, since every mention there would be refused.
+- **Confirmation at publish.** The version page shows the audience in force and counts, live from Slack, the people who can reach the agent: in total, how many are guests and how many are from other workspaces, per channel and for direct messages. The count is of everyone present in the audience's places, so it can overstate (a guest in a listed channel is counted though refused without `guests: true`). Publishing needs the approver to confirm those counts. The API's publish takes `{"confirm_audience": {"total": n, "guests": g, "external": e}}`, and `ControlPlane.publish_version` refuses with 409 when it is missing or no longer matches a fresh count. An `audience_confirm` event records the approver and the three counts. Counting a whole workspace costs one `users.list` call per 200 users; the page may reuse a list read in the last five minutes, a publish always reads again.
+
+Where in code: `src/agentos/audience.py`, `AgentActivities.check_audience` in `src/agentos/activities.py`, `src/agentos/threads.py`, `src/agentos/control.py`.
+
+### Audience changes are watched
+
+Intent: when an agent's channel starts reaching another organisation, the agent stops answering there until its owner has looked. Built, and untested against a real Slack Connect channel (tested only with fakes).
+
+- The one trigger is a channel being shared with another organisation (`channel_shared`). A person joining, guest or not, is not watched: who is added to a channel is the admins' responsibility.
+- The gateway verifies the signature as for messages and starts one `AudienceWatchWorkflow` per Slack event, with an ID built from the tenant and the event ID that is never reused, so a Slack retry starts nothing. A `member_joined_channel` event is answered 200 and ignored.
+- Its one activity needs no Slack lookup: it pauses every published agent whose effective audience names the channel, in that channel only (reason `channel_shared`). The same trigger while a channel is already paused changes nothing.
+- A pause is a row in `audience_pauses` (tenant, agent, channel, reason code, time, who resumed and when); a resumed row stays as history and at most one is active per agent and channel.
+- `check_audience` refuses a turn in a paused channel with reason `paused` and one fixed reply ("<agent name> is paused in this channel until its owner reviews who can see it."), so the turn runs no model or tool, in a thread already running as well; direct messages and other channels are unaffected.
+- The agent's creator and the tenant's admins get one direct message per pause (agent, channel and reason, no content); the notice and the `audience_pause` audit event have keys built from when the pause began, so a retried activity repeats neither.
+- **Pending approval cards stop too** (D-23): the pre-write check (§4) refuses a write when the channel is paused or the requester has left the audience, and the card reads "<agent name> can no longer act for you here; nothing was changed."
+- `ControlPlane.paused_channels` (admins and the agent's editors) lists the pauses with a fresh count of the people in each channel, and `resume_channel` (the creator or an admin) needs that count confirmed like a publish; it records `audience_resume`.
+
+Where in code: `src/agentos/audience_watch.py`, `src/agentos/audience_pauses.py`, `src/agentos/workflows/audience_watch.py`, `src/agentos/gateway/app.py`, `scripts/migrations/013_audience_watch.sql`.
 
 ### Writes and attribution
-- Writes run as the agent's identity. The requester is recorded in the target system where possible, for example in a "Requested by" person property in Notion or with "on behalf of Priya" in the description, and always in the audit log.
-- Approval is still required by default (D-11). The requester approves; a creator can also require a specific approver for each action.
+
+Intent: a write runs as the agent, is attributed to the requester, and needs the requester's approval.
+
+- Writes run as the agent's identity. The requester is recorded in the target system where possible: the "Requested by" person property in Notion when the requester's Slack email matches a Notion user, otherwise a "Requested by <name> via <agent>" line in the item's body, shown on the approval card before approval. The audit log always records the requester.
+- Approval is required for every write (D-11). The requester approves; there is no per-action approver (Target) and no admin relaxation (Target).
+
+Where in code: `AgentActivities._requester` in `src/agentos/activities.py`, `src/agentos/connectors/notion.py`.
 
 ### Requester-scoped data (D-17)
-Some questions are about the requester's own records ("my open requests", "my PTO balance"). With an agent-level credential the agent can technically read *everyone's* records, so the runtime must not rely on the LLM to filter by person.
 
-- **Pinned arguments (default).** Tools marked `requester_scoped` in the manifest have their person field (such as "Requested by" or employee ID) filled in by the runtime from the requester's Slack identity. The field is removed from the schema the LLM sees, so the LLM can't set it. Results are answered in the conversation where they were asked. The audience rule (D-07) already covers who can see them: everyone in a channel the agent serves may see what the agent can reach. Pinning is about correctness ("my" is always the asker), not confidentiality.
-- **Identity mapping.** The runtime maps the Slack user to the target system's user by verified email, and the result is cached per tenant. If there's no match, the tool returns `unknown_requester` instead of guessing.
-- **User delegation (exception).** Only for systems whose API can't filter by person: those tools use the requester's own OAuth token (a *Connect* button) and answer only in a DM.
+Intent: "my open requests" is answered from the asker's own records, and the model can't choose whose.
+
+- **Pinned arguments.** Tools marked `requester_scoped` in the manifest have their person field filled in by the runtime from the requester's Slack identity and removed from the schema the LLM sees. Results are answered in the conversation where they were asked; the audience rule (D-07) already covers who can see them. Pinning is about correctness ("my" is always the asker), not confidentiality.
+- **Identity mapping.** The runtime maps the Slack user to the Notion user by verified email, cached per tenant. With no match, `my_items` returns "I couldn't match your Slack email to a Notion user" (`UnknownRequester`) instead of guessing.
+- Target: **user delegation**, for systems whose API can't filter by person: the requester's own OAuth token (a *Connect* button), answers only in a DM. Not built.
+
+Where in code: `src/agentos/connectors/manifest.py`, `NotionConnector.my_items` in `src/agentos/connectors/notion.py`.
 
 ## 6. Knowledge retrieval
 
+Status: **built** for Notion pages. Target: Confluence spaces, Google Drive folders and a company-wide scope the admin makes available to every agent.
+
 Agents answer from documents their creator granted, and every answer cites its sources.
 
-**Scopes.** A grant names a root, and everything under it is one *scope*. In v1 the root is a Notion page: the page and every sub-page beneath it, at any depth, including sub-pages inside toggles or columns. Confluence spaces and Drive folders become scopes the same way. The company-wide knowledge base is a set of scopes the admin makes available to every agent, such as the all-staff handbook.
+**Scopes.** A grant names a root, and everything under it is one *scope*. The root is a Notion page: the page and every sub-page beneath it, at any depth, including sub-pages inside toggles or columns, and the rows of any database placed on those pages (a row is indexed as a page of the same grant: its title, its properties as text and its body). Text nested more than five levels inside one page is not indexed.
 
-**Ingestion.**
-1. One `IndexingWorkflow` per (tenant, scope) walks the tree from the root with the tenant's connector credential, a couple of pages at a time to stay under the source's rate limits. Workflow history carries only page IDs and counts; each page is fetched, split into chunks, embedded and stored inside one activity.
-2. Each page's content hash includes the embedding model, so unchanged pages are skipped, and changing the model re-embeds everything on the next run.
-3. Pages that left the tree, were trashed or can no longer be read are removed from the index.
-4. Every indexing run checks that its scope is still granted before any connector call. The nightly schedule deletes the stored pages and chunks of scopes no longer granted to any agent.
-5. A Temporal schedule refreshes every granted scope nightly, and an operator command starts a refresh on demand. Updates driven by source webhooks come later.
+### Ingestion
 
-**Embeddings** sit behind one interface that calls any OpenAI-compatible embeddings endpoint: a hosted provider in production, or a local model for development. The vector size is fixed by the index column (1024), so every model must produce that size.
+Intent: the index follows the source, never deletes on weak evidence, and never lets one bad page stop a run.
 
-**Query.**
-1. Each query is filtered *inside* the vector search to the tenant and the scopes in the agent's grants. Because grants are per agent rather than per user, the filter is small and cacheable, and we don't need to track every employee's group membership.
-2. Before the top results go to the LLM, each page is checked against the source again: it must still exist, not be trashed, and still sit under the granted root. The check walks up the page's parents (pages, and blocks such as toggles); any parent it can't follow drops the page. A page deleted or moved out of a granted scope since the last refresh never reaches the model.
-3. Retrieved text is wrapped as *untrusted data* in the prompt (see §8), and the system prompt tells the model never to follow instructions inside it.
+1. One `IndexingWorkflow` per (tenant, scope) walks the tree from the root with the tenant's connector credential, two pages at a time (this bounds the work in flight; it is not rate limiting) and at most 2,000 pages per scope. Notion's rate limit is a per-tenant token bucket in each worker process (about three requests a second; interactive requests go ahead of bulk work such as indexing and polling), and a 429 is retried by Temporal. Workflow history carries only page IDs and counts; each page is fetched, split into chunks, embedded and stored inside one activity.
+2. A page's content is unchanged when its last-edited time and the embedding model are the same as the stored row: then its blocks are not fetched, but the run still follows the sub-pages and database rows stored for it. Changing the model re-embeds everything on the next run.
+3. A page ends a run in one of three states. A page that is trashed or answers 404 is **gone** and it and what hung beneath it leave the index. A page that fails for any other lasting reason (403 included, or a request the embedder or Notion rejects) is **failed**: it keeps what is stored for it and for everything beneath it, and the run goes on. Only a rate limit, a timeout or a server error is retried.
+4. If the **granted root itself** is gone, nothing is deleted on that evidence alone. The scope is recorded as unhealthy, the agent's creator is told once in a direct message (the tenant's admins when the creator can't be messaged), and the index is deleted when three nightly runs in a row find the page gone, or when an admin runs `index_knowledge --confirm-gone`. A run that finds the page again clears the record. A page stored while a run is going (by a page event) is never deleted by that run.
+5. Every indexing run checks that its scope is still granted before any connector call, and the connector switch is checked too (§8). The nightly schedule deletes the stored pages and chunks of scopes no longer granted to any agent.
+6. A Temporal schedule refreshes every granted scope nightly, and an operator command starts a refresh on demand. A signed Notion page event (content or properties updated, created, moved, deleted or restored) refreshes that single page within about 30 seconds of the last edit through `PageRefreshWorkflow`, one per page, so a burst of edits is coalesced. A new page under a granted page is indexed; sub-pages added under it wait for the nightly run, which remains the backstop.
+7. A tenant budget that is reached stops embedding (§8): the page is kept but not re-embedded and counted as deferred, never pruned because of the stop.
+
+**Embeddings** sit behind one interface that calls any OpenAI-compatible embeddings endpoint: a hosted provider, or a local model such as `bge-m3` through Ollama (D-25). The vector size is fixed by the index column (1024), so every model must produce that size. Each page records the model that embedded it, and a search compares the question only with chunks of the model in use.
+
+### Query
+
+1. The agent's `search_knowledge` tool searches only its own granted scopes. Each query is filtered *inside* the vector search to the tenant and the scopes in the agent's grants, and chunks farther from the question than the model's cut-off (`AGENTOS_EMBED_MAX_DISTANCE`) are dropped. One page gives at most two passages and a search returns at most six pages.
+2. Before the top results go to the LLM, each page is checked against the source again, with three calls per page however deep it sits (the page itself, its parent, the granted root, from a stored chain of ancestors): it must still exist, not be trashed, and still sit under the parent it was indexed under and the granted root. A page deleted or moved out of a granted scope since the last refresh never reaches the model; a page that moved together with its whole parent is caught by the nightly run.
+3. Retrieved text is wrapped in `<source>` tags as *untrusted data*, and the system prompt tells the model never to follow instructions inside it. Notion item lists from the read tools (`search_items`, `my_items`) are wrapped the same way in `<items>` and the same rule applies to every agent.
 
 **Citations.** Each passage reaches the model with a number. The model cites by number only, like `[2]`; it never writes a link. When the reply is posted, the runtime looks up each cited page's title and link in the index and adds a Sources line. Numbers are unique for the life of a thread, including across continue-as-new, so a number cited in a later turn still means the page it meant when it was first shown. A number that matches nothing gets no link.
 
+Where in code: `src/agentos/knowledge/`, `src/agentos/workflows/indexing.py`, `src/agentos/workflows/page_refresh.py`, `src/agentos/index_knowledge.py`, `src/agentos/connectors/notion_limiter.py`.
+
 ## 7. Connectors
 
-- **MCP as the connector contract** (D-08). Each connector is an MCP server describing its tools with JSON Schema. Our connector runtime is the MCP client, running inside Temporal activities. It adds what MCP doesn't provide: credential injection, grant enforcement, risk class, idempotency, audit, and per-tenant rate limits.
+Status: **partial**. Built: the Notion connector (knowledge, one create action, one comment action) and a manifest that classifies each call. Target: MCP as the connector contract (deferred, D-28), an OpenAPI adapter, certified and custom tiers, Confluence and Google Drive.
 
-### Connectors are mostly configuration, not code (D-15)
-Calling a tool is generic: any MCP server, or any REST API with an OpenAPI spec through a generic adapter, works without connector-specific code. What makes a tool safe for agents that *do work* is metadata, so each connector ships a **manifest**:
+### What the manifest does today
 
-```yaml
-connector: notion
-source: mcp://vendor-official            # or openapi://…, or our own MCP server
-grant_scopes: [database, page]           # what a grant can be limited to
-tools:
-  search:          { risk: read }
-  query_my_items:  { risk: read, requester_scoped: { property: "Requested by" } }   # D-17
-  create_item:
-    risk: write_irreversible
-    idempotency: { method: marker_field, property: "Agent request ID" }   # query before create
-    attribution: { person_property: "Requested by", value: requester }
-    watch: { webhook: page_properties_updated, poll_fallback: 15m, done_when: { property: "Status", in: [Done] } }
-  add_comment:     { risk: write_reversible, idempotency: { method: marker_text } }
-index: { documents: pages_in_granted_scopes }   # how to ingest for knowledge
-```
+Intent: a manifest holds the safety metadata for each tool, and the runtime reads it.
 
-Property names such as "Status", "Done", and "Requested by" differ per database. The creator maps them when granting the agent a database. The mapping is stored by the system's stable property IDs, so a rename doesn't break the agent; names are kept only as labels. The runtime checks the mapping against the live schema (each property exists, has the expected type, and the done values are real options) before the agent starts, and refuses to run a grant that fails. Webhook event names are to be confirmed against Notion's API docs during implementation.
+- `src/agentos/connectors/manifests/notion.yaml` lists each tool with `risk` (`read`, `write_reversible`, `write_irreversible`), an `input_schema` checked before anything runs, an optional `requester_scoped` input field, an `idempotency` method (`marker_property` for a created item, `marker_text` for a comment) and `offer_to_llm`.
+- A read tool runs at once; a tool whose `risk` is a write is never run by the conversation and becomes a task that asks the requester to approve (§4). A write whose idempotency method no manifest declares is refused before anything is sent.
+- The creator maps the property names a database uses ("Status", "Done", "Requested by") when granting it. The mapping is stored by Notion's stable property IDs, so a rename doesn't break the agent; names are kept only as labels. The runtime checks the mapping against the live schema (each property exists, has the expected type, the done values are real options) at publish and at worker start-up, and refuses to run a grant that fails.
 
-Connectors come in two tiers:
+### Notion specifics (D-13)
 
-| Tier | Who writes the manifest | What's guaranteed |
-|---|---|---|
-| Certified | Us: manifest plus integration tests against a real instance | Exactly-once writes, follow-up tracking, attribution |
-| Custom (v2) | Tenant admin, for any MCP server or OpenAPI spec | All writes default to `write_irreversible` with approval. **Writes are never retried automatically** without a declared idempotency method; a failure goes back to the user instead of risking a duplicate. No follow-up tracking unless `watch` is declared |
-
-So adding a new system usually means writing and testing a manifest, not a whole integration. Certified write actions still get built and tested one by one, because "exactly once" and "tell me when it's done" depend on how each system behaves.
-
-- Certified connectors for v1: Confluence, Google Drive (knowledge), Notion (knowledge and the first write action).
-
-### Notion specifics for v1 (D-13)
-- **Access model fits grants well.** A Notion integration only sees pages and databases a workspace member has explicitly shared with it. The tenant admin installs our integration once, and agent grants are subsets of what's shared with it.
-- **No native idempotency key.** Every created item gets a hidden "Agent request ID" property. Before creating, the connector queries for that ID, so a retry finds the existing item instead of creating a second one.
-- **Low rate limits.** Notion's API allows only a few requests per second per integration. The connector runtime queues and rate-limits per tenant, and bulk indexing runs in the background at low priority so it never blocks interactive requests.
-- **Follow-up** watches the mapped "Status" property through webhooks, with polling as a fallback.
-- Admin-added custom connectors (v2) run in a sandbox with no network access beyond the host they declared.
+- **Access model fits grants well.** A Notion integration only sees pages and databases a workspace member has explicitly shared with it. The tenant admin installs the integration once, and agent grants are subsets of what's shared with it.
+- **No native idempotency key.** Every created item gets a hidden "Agent request ID" property, and Postgres decides which attempt writes (§4).
+- **Low rate limits.** About three requests a second per integration. Each worker process keeps a per-tenant token bucket; interactive requests go ahead of bulk work (indexing, status polling). The buckets are per process, so several workers share the integration's allowance and a 429 is retried by Temporal. Read tools turn a final Notion error into a tool result the model can pass on.
+- **Follow-up** watches the mapped "Status" property through webhooks, with polling as a fallback (§4).
 - The agent framework stays a thin custom loop. No LangChain, LangGraph, or CrewAI (D-04).
+
+### Target: connector contract and tiers
+
+Not built, kept as the design:
+
+- **MCP as the connector contract** (D-08, deferred): each connector an MCP server describing its tools with JSON Schema; our runtime the MCP client inside activities, adding credential injection, grant enforcement, risk class, idempotency, audit and per-tenant rate limits.
+- **Generic adapters** (D-15): any MCP server, or any REST API with an OpenAPI spec, without connector-specific code, described by a manifest that also carries `source`, `grant_scopes`, `attribution`, `watch` (webhook, poll fallback, done condition) and `index` blocks.
+- **Two tiers:** certified (by us, integration-tested against a real instance: exactly-once writes, follow-up tracking, attribution) and custom (v2, by tenant admins, for any MCP server or OpenAPI spec: all writes default to `write_irreversible` with approval, **writes are never retried automatically** without a declared idempotency method, no follow-up tracking unless `watch` is declared, and a sandbox with no network access beyond the declared host).
+- Certified connectors planned for v1: Confluence, Google Drive (knowledge), Notion (knowledge and the first write action). Only Notion exists.
 
 ## 8. Safety
 
-- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions *always* need approval by an authorized person, show the exact payload, and can only reach what the agent's grants allow. An injected instruction can at most propose an action the user then sees and rejects.
-- **Limits:** maximum steps per turn, token budget per turn, per tenant, and per agent, and a cap on actions per task.
-- **Monthly budgets.** An admin sets a budget in US dollars for the tenant and for each agent, for the UTC calendar month; none means no limit. `call_llm` sums the month's usage cost before the provider call (model calls and embeddings for the tenant budget, the agent's model calls for its own) and, at or over a budget, returns a fixed text naming the agent, with no tool calls and the stop reason `budget_reached`, without calling the model or writing a usage row. The workflow is unchanged. Spend is read at most once a minute per tenant in each worker process, so overspend is bounded by one minute of the tenant's spend per process plus the calls in flight; a read failure fails the activity so Temporal retries it. A usage row with no price is not a dollar amount: the pages count those rows and say the budget cannot see them. Warnings show from 80% on the Usage page and the agent's page. Only an admin sets, raises or removes a budget, each as a `budget_set` audit event naming the agent (none for the tenant) and the new amount. Spend is shown per cost type (model and embedding, from one list of usage kinds, so a new cost type is one entry). A reached tenant budget also stops indexing: no embedding call is made, the page is kept but not re-embedded (counted as deferred, never pruned because of the stop), and indexing resumes by itself when the budget is raised or removed or the month turns. An agent budget never stops indexing.
-- **Kill switches.** An admin turns an agent, every agent, a connector or all writes off for a tenant, and on again. A switch is one row in `kill_switches` (tenant, scope, target); a row present means off. Every check reads the table again, one indexed query, with no cache, so a switch applies to the next step without a restart, and a read failure fails the step so Temporal retries it. The checks are in activities and the gateway; no workflow code changed. `call_llm` checks the agent and all-agents switches before the budget, and answers with a fixed text naming the agent and the stop reason `switched_off`, without calling the model or writing a usage row. A connector that is off makes its tool calls return an error the model passes on, makes knowledge search refuse, drops page events, fails a full indexing run for good before it can prune anything, and makes follow-up polling fail retryably, which the task workflow already treats as "still watching". With writes off, drafting still works and the gateway refuses Submit before the workflow is signalled, leaving the card in place; a write that was approved but has not run is refused inside its activity, before the Notion call, as a non-retryable failure the task workflow already reports, so the task ends with the reason and the requester can ask again. Nothing is held for later. Only an admin changes a switch (a creator reads the state of their agents), each change is a `switch_off` or `switch_on` audit event, and the host operator can use the same switches from the command line with the console down, audited as `operator:<OS login>`.
+Status: **built**, except a token budget per turn, tenant and agent and a cap on writes per task (target).
+
+- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions *always* need approval by the requester, show the exact payload, and can only reach what the agent's grants allow. An injected instruction can at most propose an action the user then sees and rejects.
+- **Limits built:** maximum steps per turn, the model's reply token limit (3,072), a history window, `max_writes_per_turn`, at most 5 edits per approval. Not built: a token budget per turn, tenant or agent, and a cap on writes per task.
+
+### Monthly budgets
+
+Intent: an admin's dollar limit stops spend, and spend that can't be measured stops it too.
+
+- An admin sets a budget in US dollars for the tenant and for each agent, for the UTC calendar month; none means no limit. The tenant budget counts every model call and embedding; an agent's counts that agent's model calls across all versions. Only an admin sets, raises or removes a budget, each as a `budget_set` audit event naming the agent (none for the tenant) and the new amount (`0` for a removal). A creator reads the budgets of the agents they created.
+- `call_llm` sums the month's usage cost (including repricing adjustments) before the provider call and, at or over a budget, answers with a fixed text naming the agent ("... has reached its monthly budget. An admin can raise it in the console."), no tool calls, the stop reason `budget_reached`, without calling the model or writing a usage row. The workflow is unchanged. Each stopped turn logs one line with the tenant, the agent and which budget.
+- **Overspend bound.** Spend is read at most once a minute per tenant in each worker process, in one query however many turns ask, and each call a process records is added at once. The most a budget can be overspent is the other processes' spend in one window, plus the calls in flight, plus one call's cost (unknown until it returns). A raised budget lifts a stop within a minute. A read failure fails the activity so Temporal retries it; a call is never let through unchecked.
+- **Unknown spend is not zero.** A scope with a budget is stopped, with its own reply ("... spending can't be measured this month ..."), when any of its rows this month has no price, and the pages say why. Raising the budget doesn't lift it; adding the price, restarting the worker and repricing the month (`python -m agentos.usage reprice`) does. The same stop covers a call whose usage row couldn't be saved after three tries (also logged at error level with the token counts), for one cache window, in that worker process only. Prices match by exact name, alias, or a dated name starting with an entry's name, and the worker refuses to start with no price for its chat model (or embedding model). Known deviation: a dropped usage row marks the scope unmetered only in that process for one window.
+- Warnings show from 80% on the Usage page and the agent's page. Spend is shown per cost type, side by side (model and embedding, from one list of usage kinds, so a new cost type is one entry), and the API carries the same split.
+- A reached tenant budget also stops indexing: no embedding call is made, the page is kept but not re-embedded (counted as `deferred`, never pruned because of the stop), and indexing resumes by itself when the budget is raised or removed or the month turns. An agent budget never stops indexing. An unpriced row at tenant scope stops indexing the same way.
+
+Where in code: `src/agentos/budgets.py`, `src/agentos/usage.py`, `src/agentos/usage_reprice.py`, `AgentActivities._model_response` in `src/agentos/activities.py`.
+
+### Kill switches
+
+Intent: an admin can stop an agent, all agents, a connector or all writes at once, and an approved write that has not run stops too (D-22).
+
+- A switch is one row in `kill_switches` (tenant, scope, target); a row present means off. Every check reads the table again, one indexed query, with no cache, so a switch applies to the next step without a restart, and a read failure fails the step so Temporal retries it. The checks are in activities and the gateway; no workflow code reads a switch.
+- **One gate** runs first in every activity that acts for an agent, reading the switches once and applying the scopes that matter to the effect: model, read, write or poll. A test enumerates the activities and fails for one that never calls it.
+- **An agent, or all agents:** `call_llm` answers with a fixed text ("<agent name> is turned off by an admin."), calls no model and writes no usage row, before the budget check. A read tool already dispatched returns an error without calling Notion, follow-up polling ends the watch with no post, and a switched-off specialist is not offered to a front door. Pending approval cards stop too (D-22): Submit on one, or a write approved but not yet run, writes nothing, and the card says the agent was turned off by an admin and nothing was changed; the task ends without a follow-up watch.
+- **A connector (`notion`):** its tool calls return an error the model passes on, knowledge search refuses, the approval step of a comment is refused, page events are dropped, a full indexing run or its prune step fails for good before it reads or deletes anything, and follow-up polling fails retryably so the task keeps watching and carries on when the switch is back on. A write approved before the switch is refused.
+- **All writes:** read-only mode. Drafting still works and the card is posted. The gateway refuses Submit with "Writes are turned off by your admin; nothing was changed." before the workflow is signalled, leaving the card in place so Submit works again once writes are on. A write approved but not yet run is refused inside its activity, before the Notion call, as a non-retryable failure the task workflow reports: the task ends, tells the requester nothing was changed and that they can ask again, and is not held.
+- Nothing turned off is held for later, and work already finished is not undone.
+- Only an admin changes a switch, never a creator (a creator reads the state of their agents); turning off every agent or all writes asks for a tick in the console form. Each change is a `switch_off` or `switch_on` audit event naming the agent for an agent switch and the scope in `tool`; turning off what is already off records nothing. The host operator can use the same switches with the console down (`python -m agentos.switches`), audited as `operator:<OS login>` read from the account database for the process's real user ID, so it can't be typed or chosen by the model; the command needs only the database URL and a tenant ID.
+
+Where in code: `src/agentos/switches.py`, `AgentActivities._gate` and `_gate_write` in `src/agentos/activities.py`, `src/agentos/gateway/app.py`, `src/agentos/workflows/task.py`.
 
 ## 9. Slack integration
 
-- One distributed Slack app (Events API + interactivity + OAuth install), listed on the Slack Marketplace.
-- The 3-second rule: the gateway acknowledges first and then signals Temporal. Slack retries are dropped as duplicates by event ID.
-- Responsiveness: post a "thinking…" placeholder or assistant-thread status immediately, update it with progress ("Searching Confluence…"), and replace it with the final answer.
+Status: **partial**. Built: Events API, interactivity, signed requests, per-tenant workspace mapping, Sign in with Slack for the console. Target: a distributed app with OAuth install, Marketplace listing, progress updates on the placeholder.
+
+- One Slack app per deployment (Events API and interactivity), installed by hand from `slack/app-manifest.yaml`. Target: OAuth install for any workspace, and a Marketplace listing.
+- **Acknowledge first.** A message event is stored in Postgres and answered at once, whether or not Temporal is reachable; a Slack retry stores nothing, and if the event can't be stored the gateway answers with an error so Slack sends it again. Button clicks are not retried by Slack, so a click is handled before the reply, within 2.0 seconds; when Temporal or the database doesn't answer in time the person gets an ephemeral "That didn't go through. Please try again in a moment." (or an error on the form) and nothing is half done.
+- Responsiveness: a "Thinking…" placeholder is posted at once and replaced with the final answer. Target: progress updates ("Searching Notion…").
 - Slack posts are at least once. The posted message's `ts` is kept under an idempotency key, and a retry that finds it uses the existing message instead of posting again. Slack has no idempotency key of its own, so a crash between Slack accepting a post and the `ts` being recorded can repeat the post; a pending marker written before each post makes such a duplicate visible in the logs. Closing that window would need channel-history read scopes, which the app deliberately doesn't request.
 - The model writes Markdown, which Slack doesn't render. Replies are converted to Slack's mrkdwn when they are posted; code, links and citation numbers pass through unchanged, and stored history keeps the model's Markdown.
-- Text the runtime didn't write itself (the model's, the requester's, a Notion title) has `&`, `<` and `>` escaped before it is posted, in replies, approval cards and thread lines. Slack reads `<...>` as mentions and links, so without this a page the model read could make it ping a channel or show a link whose text hides where it goes.
-- Inbound message text is decoded once, in the gateway: Slack's `&amp;`, `&lt;` and `&gt;` become the characters the user typed, and links become their label, or `label (url)` when the user gave one. Mentions stay as Slack markup. The model and stored history see what the user wrote, not Slack's wire format.
+- Text the runtime didn't write itself (the model's, the requester's, a Notion title) has `&`, `<` and `>` escaped before it is posted, in replies, approval cards and thread lines, so a page the model read can't make it ping a channel or show a link whose text hides where it goes.
+- Inbound message text is decoded once, in the gateway: Slack's `&amp;`, `&lt;` and `&gt;` become the characters the user typed, and links become their label, or `label (url)` when the user gave one. Mentions stay as Slack markup.
+
+Where in code: `src/agentos/gateway/`, `src/agentos/slack_client.py`, `src/agentos/slack_format.py`, `src/agentos/slack_signin.py`, `slack/app-manifest.yaml`.
 
 ## 10. Data and storage
 
+Status: **partial**. Built: every table below except blob storage for large tool outputs and the audit export. Retention is built for the tables named in the retention row.
+
 | Data | Store | Notes |
 |---|---|---|
-| Tenants, agents, agent versions, policies | Postgres | Agent versions are immutable once published |
-| Conversation history | Postgres (blob storage for large tool outputs) | Retention configurable per tenant. Tool output text is stored next to it, keyed by tool-call ID, and never passes through Temporal |
-| Audit log | Append-only table (no update, delete or truncate), exportable to the tenant's security monitoring system | Who, agent version, identity used, tool, inputs, outputs (or a hash of them), approver. Conversation events hold only hashes, never message or document text. Paged by sequence number, which may have gaps |
-| Usage and cost | Postgres, append-only for the app role, row-level security like every other table | One row per model call or embedded page: tenant, agent and version (none for an embedding), the model the provider reported, input, output, cache-read and cache-write tokens, cost in US dollars (null when the model has no price in `config/prices.yaml`), the conversation ID for tracing, and the time. Keyed by the activity attempt that made the call, so each billed attempt is counted once: a retry that calls the provider again is billed again and records its own row. Priced when recorded, so a later price change never rewrites a stored cost. Never holds the requester or any chat or document text. The console's Usage page, its CSV export and the usage API show these by agent, team and model per UTC month: an admin sees every agent and the embedding line, a creator only the agents they created |
-| Kill switches | Postgres, row-level security like every other table | One row per switch that is off: tenant, scope (`agent`, `all_agents`, `connector`, `writes`), target (an agent ID or a connector name, empty otherwise), who turned it off and when. Turning it on deletes the row; the audit log keeps the history. The app role can read, insert and delete, never update. Holds IDs and names only |
-| Members and console sessions | Postgres, row-level security like every other table | Members: role per Slack user per tenant (config-file admins are not stored). Sessions: only the hash of the session ID |
-| Indexed knowledge | pgvector in the cell's Postgres: one row per page (title, link, content hash) and one per chunk (text, embedding), keyed by tenant, scope and page | Searches filter by tenant and granted scope inside the query |
-| OAuth tokens | Vault | Per-tenant key |
-| Temporal history | Temporal | Encrypted with the tenant key; holds only references and small values |
+| Tenants, agents, agent versions | Postgres (`tenants`, `agents`, `agent_versions`) | Agent versions are immutable once published (database trigger) |
+| Conversation history | Postgres | One row per message with its size in characters. Tool output text is stored next to it (`tool_outputs`), keyed by tool-call ID, and never passes through Temporal |
+| Content behind Temporal references | Postgres: `inbound_events`, `model_steps`, `tool_inputs`, `task_drafts` | What people wrote, what the model returned, each tool call's input, and a task's frozen payload, one row per draft revision. Temporal carries the IDs |
+| Threads and owner mentions | Postgres: `threads`, `owner_pings` | The agent a thread was handed to; the UTC day an agent's owner was last mentioned to an asker in a place |
+| Audit log | Append-only table `audit_events` (no update, delete or truncate for any role) | Who, agent version, identity used (`agent:<agent id>`), tool, a hash of inputs and outputs, approver. Holds IDs and SHA-256 hashes only, never message or document text. Each row has an event key so a retried activity records once; if the database can't be written the activity fails and retries, so nothing is done without a record. Paged by sequence number, which may have gaps. Target: export to the tenant's security monitoring system. Rows are kept; no retention applies |
+| Usage and cost | Postgres, append-only for the app role | One row per model call or embedded page: tenant, agent and version (none for an embedding), the model the provider reported, input, output, cache-read and cache-write tokens, cost in US dollars (null when the model has no price in `config/prices.yaml`), the conversation ID for tracing, and the time. Keyed by the activity attempt that made the call, so each billed attempt is counted once. Priced when recorded, so a later price change never rewrites a stored cost; `usage_adjustments` prices an earlier unpriced row later and the row itself never changes. Never holds the requester or any chat or document text. The console's Usage page, its CSV export and the usage API show these by agent, team and model per UTC month: an admin sees every agent and the embedding line, a creator only the agents they created; nothing is grouped by who asked |
+| Budgets | Postgres | One row per tenant or agent budget |
+| Kill switches | Postgres | One row per switch that is off: tenant, scope (`agent`, `all_agents`, `connector`, `writes`), target, who turned it off and when. Turning it on deletes the row; the audit log keeps the history. The app role can read, insert and delete, never update. IDs and names only |
+| Audience pauses | Postgres | One row per pause; a resumed row stays as history |
+| External writes | Postgres | One row per write key: state (claimed, issued, done), a lease, and a small reference to what the write made. The app role can't delete |
+| Members and console sessions | Postgres | Members: role per Slack user per tenant (config-file admins are not stored). Sessions: only the hash of the session ID |
+| Grant picks, knowledge scope health | Postgres | Which granted Notion objects were picked from the creator's account; which scopes' roots were not found and how many runs in a row |
+| Indexed knowledge | pgvector in the same Postgres: one row per page (title, link, content hash, embedding model, last-edited time, parent, ancestors, sub-pages) and one per chunk (text, embedding), keyed by tenant, scope and page | Searches filter by tenant and granted scope inside the query |
+| Temporal history | Temporal | Encrypted with the tenant's key; holds only references and small values |
+| Connector credentials, OAuth tokens | Target: vault | Today: environment variables named in the tenant's settings |
+
+**Payload encryption** (D-27). Every payload the platform writes to Temporal (workflow inputs and results, signals, queries, activity inputs and results, failure messages) is encrypted with AES-256-GCM under the key of the tenant it belongs to. The tenant comes from the workflow ID, which starts with the tenant ID; each payload carries its key ID (`<tenant>/v<N>`) and is bound to its workflow ID as associated data, so a payload from another tenant, or moved to another workflow, is refused, and a payload with no tenant is never sent. Keys are local files (`<tenant>.key`, `<tenant>.vN.key`, owner-only, outside the repo) made and rotated by `python -m agentos.tenant_keys`. A payload with no encrypted tag is refused unless `AGENTOS_ALLOW_PLAINTEXT_PAYLOADS` is set, for old histories only. Where in code: `src/agentos/payload_codec.py`, `src/agentos/crypto_keys.py`, `src/agentos/temporal_client.py`. Limitation: the `workflow.patched` marker records are written by the Temporal SDK core outside the codec and carry only patch IDs. Target: keys held in a cloud KMS, and crypto-shredding.
+
+**Retention.** A nightly schedule (04:00 UTC) purges each tenant's expired rows in batches and logs counts only. Limits are per tenant in whole days, stored in `tenants.retention` (defaults in parentheses): conversation messages once the newest message is older than the limit (`messages_days`, 365; a thread is never cut in the middle, and a stored specialist idle longer is dropped); tool output text, tool inputs, stored model replies and task drafts (`tool_outputs_days`, 90); idempotency records and delivered inbound events (`idempotency_days`, 90); console sessions after they expired (`sessions_days`, 1, also at sign-in). The first three are never shorter than the longest a task can live: an agent definition may ask for at most 168 hours of approval and a 60-day watch, so the floor is 68 days (D-31); a lower value is refused when set and raised by the nightly job. Owner mentions are purged after two days. Audit rows, usage rows, `external_writes`, task links and agent definitions are exempt, and an inbound event not yet delivered is never purged. Where in code: `src/agentos/retention.py`, `src/agentos/workflows/retention.py`.
+
+**Pools.** Each process keeps a pool of database connections between `AGENTOS_DB_POOL_MIN` and `AGENTOS_DB_POOL_MAX`; the worker runs up to `AGENTOS_MAX_CONCURRENT_ACTIVITIES` activities and refuses to start with a pool maximum below that.
 
 ## 11. Operations
 
-- **Workflow versioning:** Temporal Worker Versioning. Keep workflow code small, put logic in activities, and use continue-as-new so long-running workflows pick up new code.
-- **Observability:** OpenTelemetry traces through the gateway, workflow, activities, LLM, and connectors, tagged with tenant and agent. Dashboards for cost and latency per tenant.
-- **Evals:** each agent version can have a test set. Creators run it before publishing, and we run regression tests on prompt and model changes.
+Status: **target** for Worker Versioning, OpenTelemetry and evals. What exists: Temporal's `workflow.patched` markers with replay tests, structured log lines that carry IDs only, and the commands in [operations.md](operations.md).
 
-## 12. Connector health and self-repair (roadmap, D-16)
+- **Workflow versioning.** Today: `workflow.patched` for every change to the commands a workflow issues, with recorded histories replayed in tests. Target: Temporal Worker Versioning, small workflow code with logic in activities, and continue-as-new so long-running workflows pick up new code.
+- **Observability.** Target: OpenTelemetry traces through the gateway, workflow, activities, LLM and connectors, tagged with tenant and agent; dashboards for cost and latency per tenant.
+- **Evals.** Target: each agent version has a test set that creators run before publishing, plus regression tests on prompt and model changes.
 
-Custom connectors (D-15) are untested when they're added, so they will fail. This section describes how failures are caught and, later, fixed by a coding agent working inside strict limits.
+## 12. Connector health and self-repair
 
-### Which failures can be fixed with code
-
-| Cause | Route |
-|---|---|
-| Wrong manifest: field mapping, schema, missing idempotency declaration | Coding agent |
-| Bug in a connector server we own | Coding agent |
-| Bug in a vendor's or tenant's MCP server | Fix-up layer in our wrapper if possible, otherwise report to the owner. We never change code we don't own |
-| Expired login, missing permission, rate limit, target system down | Admin notification or normal retries. Never the coding agent |
-
-### RemediationWorkflow
-
-```
-Connector failures ──signal-with-start──▶ RemediationWorkflow
-                                            ID = {cell}:remediate:{connector}:{failure_signature}
-  1. Circuit breaker: pause writes on the connector (reads continue), notify the tenant admin
-  2. Classify the cause → not fixable with code? route as in the table above and stop
-  3. Build a redacted failure bundle (see below)
-  4. Coding agent activity: long timeout, heartbeats, runs in a sandbox, pushes to a branch
-  5. Verify: contract tests, replay of recorded redacted traffic, read-only checks against the live system
-  6. Human approval (signal; may wait days): tenant admin for a custom connector, our team for a certified one
-  7. Canary rollout → watch error rate on a durable timer → promote, or roll back automatically
-  8. Re-enable writes; ask users whose tasks were stuck to approve again
-```
-
-Using the failure signature (connector, tool, error class, and the shape of the request) in the workflow ID means many identical failures start **one** remediation. Later failures with the same signature are signals to the existing workflow and only add to its evidence.
-
-### Rules
-- **Failed writes are never replayed automatically.** A write that failed may have partly succeeded. After a fix, stuck tasks resume only after the requester approves again.
-- **Safety fields are locked.** The coding agent can't change risk class, approval policy, grants, or idempotency declarations. A change to any of them fails verification and needs a human to make it.
-- **Tenant isolation.** The failure bundle contains error messages, schemas, and the *shape* of requests and responses, with values redacted and no record contents. A fix for a custom connector deploys only to the tenant that owns it. Sharing it with others means promoting it to a certified connector, which we review.
-- **The agent never deploys.** Only the pipeline deploys, with credentials the agent never has, and only after verification and approval.
-
-### Boundaries for the coding agent
-- It runs in a **separate platform-operations cell and cloud account**, never in a tenant cell.
-- Each run gets a **throwaway sandbox** (a microVM or gVisor) that is destroyed afterwards.
-- **No production credentials.** Network access is limited to the git host, a package mirror, and sandbox or recorded test targets.
-- **Read** access: the redacted failure bundle and connector source. **Write** access: its own branch only.
-- Every run is recorded (prompt, actions, diff, test results) in the platform audit log.
-
-### Staged rollout
-1. **v2:** classification, circuit breaker, and failure reports to the admin. No coding agent yet.
-2. **v3:** the coding agent proposes fixes; a human approves every deploy.
-3. **Later:** automatic deploy only for manifest-only fixes to `read` tools, once the record of approved fixes supports it. Fixes to write tools always need a human.
+Status: **target** (roadmap, D-16). The design is in [design/self-repair.md](design/self-repair.md).

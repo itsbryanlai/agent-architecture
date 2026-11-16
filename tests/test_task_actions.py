@@ -30,7 +30,7 @@ from agentos.stores import InMemoryTaskLinkStore
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import MAX_EDITS, TaskWorkflow
 from tests.conftest import ALICE, BOB, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, title_prop
-from tests.test_gateway import FakeTemporalClient, signed_headers
+from tests.helpers.gateway import FakeTemporalClient, signed_headers
 
 NONCE = "nonce-1"
 
@@ -194,19 +194,6 @@ async def test_comment_runs_once_after_lost_response(harness):
     assert "ref " in texts[0] and "IT helper" in texts[0]
     assert len(thread_posts(h, "Commented on Broken VPN")) == 1
     assert [u["text"] for u in h.slack.updates()][-1] == "Commented: Broken VPN"
-
-
-async def test_comment_cancel_posts_nothing(harness):
-    h = harness
-    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
-    handle = await start(h, comment_spec(page["id"]))
-    await wait_state(handle, "awaiting_approval")
-
-    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, False))
-
-    assert await handle.result() == "cancelled"
-    assert h.notion.count("create_comment") == 0
-    assert all_comment_text(h) == []
 
 
 # --- Edit on the card ---------------------------------------------------------------

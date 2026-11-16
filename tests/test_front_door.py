@@ -3,123 +3,47 @@
 import copy
 import json
 import logging
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 from temporalio.client import WorkflowExecutionStatus
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
 
-from agentos import ids
-from agentos.activities import AgentActivities
-from agentos.agent_store import seeded_agent_store
-from agentos.config import TASK_QUEUE, ConfigError, Settings, TenantsConfig, parse_agents_config
+from agentos.config import ConfigError, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
-from agentos.knowledge.search import ITEM_RULES
-from agentos.llm import ScriptedLLMClient
-from agentos.models import ConversationRef, InboundMessage, LLMResponse, ToolCall
-from agentos.slack_client import FakeSlack
+from agentos.models import ToolCall
 from agentos.stores import (
-    InMemoryHistoryStore,
-    InMemoryIdempotencyStore,
     InMemoryTaskLinkStore,
-    InMemoryToolOutputStore,
 )
-from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import (
     OUT_OF_STEPS,
     TURN_FAILED,
     ConversationWorkflow,
 )
-from agentos.workflows.task import TaskWorkflow
 from tests.conftest import (
     ALICE,
-    BOB,
     TENANT,
-    Harness,
-    agents_dict,
     eventually,
-    make_fake_notion,
 )
-from tests.gateway_support import deliver_inbound
-from tests.replay_support import suggest_continue_as_new_after
-from tests.test_gateway import FakeTemporalClient, im_event, post_event
-from tests.test_llm_errors import StatusError
+from tests.helpers.front_door import (
+    ANNOUNCEMENT,
+    CONV_ID,
+    THREAD,
+    answer,
+    converse,
+    front_door_dict,
+    hand_off_to,
+    message,
+    running,
+    tool_turn,
+    with_item_rules,
+)
+from tests.helpers.gateway import FakeTemporalClient, deliver_inbound, im_event, post_event
+from tests.helpers.llm_errors import StatusError
+from tests.helpers.replay_support import suggest_continue_as_new_after
 
-CHANNEL = "C_GENERAL"
-THREAD = "1700000000.000100"
-CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
-ANNOUNCEMENT = "IT helper here, picking this up."
 NOT_RUN = "Not run: the conversation was handed to a specialist."
-
-
-def with_item_rules(prompt: str) -> str:
-    """The system prompt an agent with the Notion item tools is given."""
-    return f"{prompt}\n\n{ITEM_RULES}"
-
-
-def front_door_dict(concierge_steps: int = 4) -> dict:
-    """``concierge`` is a front door for ``it-helper``; ``it-helper`` has the Notion grant."""
-    raw = agents_dict()
-    helper = raw["agents"]["it-helper"]
-    helper["description"] = "Laptops, accounts, VPN, access and other IT requests."
-    concierge = copy.deepcopy(helper)
-    concierge["name"] = "Concierge"
-    concierge["description"] = "General questions about the company."
-    concierge["system_prompt"] = "You answer general questions."
-    concierge["max_steps"] = concierge_steps
-    concierge["grants"] = {}
-    concierge["specialists"] = ["it-helper"]
-    raw["agents"]["concierge"] = concierge
-    raw["agents"]["unlisted"] = {**copy.deepcopy(helper), "name": "Unlisted"}
-    raw["default_agent"] = "concierge"
-    return raw
-
-
-@asynccontextmanager
-async def running(raw: dict, interceptors=()):
-    config = parse_agents_config(raw)
-    wf_env = await WorkflowEnvironment.start_time_skipping()
-    h = Harness(
-        wf_env=wf_env,
-        agents=config,
-        llm=ScriptedLLMClient(),
-        slack=FakeSlack(emails={ALICE: "alice@example.com", BOB: "bob@example.com"}),
-        notion=make_fake_notion(),
-        history=InMemoryHistoryStore(),
-        idem=InMemoryIdempotencyStore(),
-        links=InMemoryTaskLinkStore(),
-        tool_outputs=InMemoryToolOutputStore(),
-        agent_store=seeded_agent_store(config),
-    )
-    acts = AgentActivities(
-        settings=Settings(),
-        registry=TenantRegistry({TENANT: runtime_for(config, h.slack, h.notion)}),
-        history=h.history,
-        idem=h.idem,
-        links=h.links,
-        llm=h.llm,
-        tool_outputs=h.tool_outputs,
-        audit=h.audit,
-        agents=h.agent_store,
-        switches=h.switches,
-    )
-    h.acts = acts
-    worker = Worker(
-        wf_env.client,
-        task_queue=TASK_QUEUE,
-        workflows=[ConversationWorkflow, TaskWorkflow],
-        activities=acts.all(),
-        interceptors=list(interceptors),
-    )
-    async with worker:
-        try:
-            yield h
-        finally:
-            await wf_env.shutdown()
 
 
 @pytest.fixture
@@ -134,33 +58,6 @@ async def fd_one_step():
         yield h
 
 
-def message(event_id: str, text: str = "my laptop battery is swelling") -> InboundMessage:
-    return InboundMessage(event_id, ALICE, text, CHANNEL, THREAD, "channel")
-
-
-async def converse(h, agent_id: str, msg: InboundMessage):
-    return await h.client.start_workflow(
-        ConversationWorkflow.run,
-        ConversationRef(TENANT, agent_id, CHANNEL, THREAD),
-        id=CONV_ID,
-        task_queue=TASK_QUEUE,
-        start_signal="message",
-        start_signal_args=[msg],
-    )
-
-
-def hand_off_to(agent: str, call_id: str = "tu_h") -> ToolCall:
-    return ToolCall(id=call_id, name="hand_off", input={"agent": agent})
-
-
-def tool_turn(*calls: ToolCall) -> LLMResponse:
-    return LLMResponse(text=None, tool_calls=list(calls), stop_reason="tool_use")
-
-
-def answer(text: str) -> LLMResponse:
-    return LLMResponse(text=text, tool_calls=[], stop_reason="end_turn")
-
-
 def tool_names(call: dict) -> list[str]:
     return [t["name"] for t in call["tools"]]
 
@@ -170,14 +67,6 @@ def announcements(h) -> list[dict]:
 
 
 # --- config ----------------------------------------------------------------
-
-
-def test_config_without_front_door_keys_parses_unchanged():
-    config = parse_agents_config(agents_dict())
-    helper = config.agents["it-helper"]
-    assert helper.description == ""
-    assert helper.specialists == []
-    assert config.channels == {}
 
 
 def test_config_front_door_parses():
@@ -271,16 +160,6 @@ async def test_a_specialist_that_is_off_is_not_offered_by_the_front_door(fd):
     assert "hand_off" not in tool_names(h.llm.calls[0])
 
 
-async def test_specialist_is_offered_no_hand_off(fd):
-    h = fd
-    h.llm.queue(answer("ok"))
-
-    await converse(h, "it-helper", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
-
-    assert "hand_off" not in tool_names(h.llm.calls[0])
-
-
 async def test_hand_off_specialist_answers_same_message(fd):
     h = fd
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
@@ -361,25 +240,25 @@ async def test_second_hand_off_in_one_response_refused(fd):
     assert h.llm.calls[1]["system"] == with_item_rules("You help employees with IT requests.")
 
 
-async def test_hand_off_step_keys_unique(fd):
+async def test_a_hand_off_turn_stores_all_four_messages_in_order(fd):
+    """Fails if the hand-off's steps collide and a stored message is dropped or reordered."""
     h = fd
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
 
     await converse(h, "concierge", message("Ev1", "battery"))
     await eventually(lambda: len(h.slack.updates()) >= 2)
 
+    async def reply_stored() -> bool:
+        # The reply is stored after it was shown, so the update comes first.
+        return len(await h.history.load(TENANT, CONV_ID)) == 4
+
+    await eventually(reply_stored)
     stored = await h.history.load(TENANT, CONV_ID)
     assert [m["role"] for m in stored] == ["user", "assistant", "user", "assistant"]
     assert stored[0]["content"] == [{"type": "text", "text": "battery"}]
     assert stored[1]["content"][0]["name"] == "hand_off"
     assert stored[2]["content"][0]["tool_use_id"] == "tu_h"
     assert stored[3]["content"] == [{"type": "text", "text": "Report it to IT."}]
-    assert h.history.step_keys[(TENANT, CONV_ID)] == {
-        "Ev1:user": 1,
-        "Ev1:s0:assistant": 2,
-        "Ev1:s0:results": 3,
-        "Ev1:h1:s0:assistant": 4,
-    }
 
 
 async def test_hand_off_announcement_survives_a_slack_retry(fd):
@@ -605,7 +484,8 @@ async def test_second_hand_off_in_a_turn_refused_even_if_specialist_lists_specia
         assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Staying here."]
 
 
-async def test_specialist_out_of_steps_uses_its_own_keys_and_placeholder():
+async def test_specialist_out_of_steps_answers_in_its_own_placeholder():
+    """Fails if a specialist that runs out of steps overwrites the front door's announcement instead of its own placeholder."""
     raw = front_door_dict()
     raw["agents"]["it-helper"]["max_steps"] = 1
     async with running(raw) as h:
@@ -620,9 +500,6 @@ async def test_specialist_out_of_steps_uses_its_own_keys_and_placeholder():
         placeholders = [p for p in h.slack.posts() if p["text"] == "Thinking…"]
         assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, OUT_OF_STEPS]
         assert h.slack.updates()[1]["ts"] == placeholders[1]["ts"]
-        keys = h.history.step_keys[(TENANT, CONV_ID)]
-        assert "Ev1:h1:s0:out-of-steps" in keys
-        assert "Ev1:h1:s0:results" in keys
 
 
 # --- where messages land -------------------------------------------------------

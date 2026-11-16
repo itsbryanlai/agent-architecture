@@ -13,7 +13,8 @@ import pytest
 from agentos.config import parse_agent
 from agentos.web_ui import SKELETON, definition_text, parse_definition
 from tests.conftest import DB_ID, GLOBEX, TENANT, default_schema
-from tests.console_harness import (
+from tests.helpers.agents import helper_block
+from tests.helpers.console_harness import (
     ADMIN2,
     CONSOLE_URL,
     OTHER,
@@ -25,7 +26,6 @@ from tests.console_harness import (
     post,
     using,
 )
-from tests.test_agent_store import helper_block
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "agentos" / "templates"
 UI = f"/ui/{TENANT}"

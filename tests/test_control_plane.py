@@ -17,7 +17,7 @@ from agentos.control import ControlPlane, Forbidden
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore, MemberError
 from tests.conftest import TENANT, agents_dict, make_fake_notion
-from tests.test_agent_store import helper_block
+from tests.helpers.agents import helper_block
 from tests.test_row_level_security import AGENT_ROW, FakeConnection, FakePool
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "agentos"

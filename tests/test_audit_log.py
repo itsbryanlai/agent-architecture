@@ -30,7 +30,7 @@ from agentos.models import (
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, TENANT, eventually, title_prop
-from tests.test_front_door import front_door_dict, running
+from tests.helpers.front_door import front_door_dict, running
 from tests.test_row_level_security import FakePool
 
 CHANNEL = "C_GENERAL"

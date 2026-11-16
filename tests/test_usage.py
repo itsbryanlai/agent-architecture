@@ -60,8 +60,8 @@ from agentos.usage import (
     month_bounds,
 )
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, agents_dict, make_fake_notion
-from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, using
-from tests.test_agent_store import helper_block
+from tests.helpers.agents import helper_block
+from tests.helpers.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, using
 
 REPO = Path(__file__).resolve().parent.parent
 NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)

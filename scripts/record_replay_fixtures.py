@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tests import replay_support as rs
+from tests.helpers import replay_support as rs
 
 
 def commit() -> str:

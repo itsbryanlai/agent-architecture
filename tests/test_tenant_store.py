@@ -51,9 +51,9 @@ from tests.conftest import (
     TENANT,
     two_tenant_dicts,
 )
-from tests.console_harness import ROOT, ConsoleHarness, using
-from tests.test_control_api import BASE, JSON, StandIn
-from tests.test_gateway import FakeTemporalClient, im_event, post_event
+from tests.helpers.console_harness import ROOT, ConsoleHarness, using
+from tests.helpers.control_api import BASE, JSON, StandIn
+from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
 from tests.test_row_level_security import FakePool
 
 ROOT_DIR = Path(__file__).resolve().parent.parent

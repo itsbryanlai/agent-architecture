@@ -4,52 +4,17 @@ import pytest
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
-from agentos.activities import AgentActivities, _is_client_error
-from agentos.agent_store import seeded_agent_store
-from agentos.audit import InMemoryAuditStore
-from agentos.config import Settings
-from agentos.connectors.notion import FakeNotionAPI
+from agentos.activities import _is_client_error
 from agentos.llm import ScriptedLLMClient
 from agentos.models import TurnContext
-from agentos.slack_client import FakeSlack
-from agentos.stores import (
-    InMemoryHistoryStore,
-    InMemoryIdempotencyStore,
-    InMemoryTaskLinkStore,
-    InMemoryToolOutputStore,
-)
-from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, TENANT
-
-
-class StatusError(Exception):
-    """Stands in for an SDK APIStatusError, which carries ``status_code``."""
-
-    def __init__(self, status_code: int):
-        super().__init__(f"Error code: {status_code}")
-        self.status_code = status_code
+from tests.helpers.llm_errors import StatusError, make_activities
 
 
 class NotionStatusError(Exception):
     def __init__(self, status: int):
         super().__init__(f"status {status}")
         self.status = status
-
-
-def make_activities(agents, llm):
-    return AgentActivities(
-        settings=Settings(),
-        registry=TenantRegistry(
-            {agents.tenant_id: runtime_for(agents, FakeSlack(), FakeNotionAPI())}
-        ),
-        history=InMemoryHistoryStore(),
-        idem=InMemoryIdempotencyStore(),
-        links=InMemoryTaskLinkStore(),
-        llm=llm,
-        tool_outputs=InMemoryToolOutputStore(),
-        audit=InMemoryAuditStore(),
-        agents=seeded_agent_store(agents),
-    )
 
 
 def turn_ctx() -> TurnContext:
@@ -78,15 +43,10 @@ async def test_call_llm_auth_error_is_non_retryable(agents):
     assert exc.value.type == "StatusError"
 
 
-async def test_call_llm_rate_limit_is_retried(agents):
-    error = StatusError(429)
-    with pytest.raises(StatusError) as exc:
-        await run_call_llm(agents, error)
-    assert exc.value is error
-
-
-async def test_call_llm_server_error_is_retried(agents):
-    error = StatusError(500)
+@pytest.mark.parametrize("status", [429, 500])
+async def test_call_llm_rate_limit_and_server_error_are_retried(agents, status):
+    """Fails if a rate limit or a server error is made final, so Temporal never retries the call."""
+    error = StatusError(status)
     with pytest.raises(StatusError) as exc:
         await run_call_llm(agents, error)
     assert exc.value is error

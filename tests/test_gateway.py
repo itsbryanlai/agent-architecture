@@ -1,14 +1,10 @@
-import hashlib
-import hmac
 import json
 import secrets
-import time
 from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
-from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
@@ -16,31 +12,14 @@ from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import ALICE, TEAM, TENANT
-from tests.gateway_support import deliver_inbound, stored_text
-
-
-class FakeHandle:
-    def __init__(self, client, workflow_id):
-        self._client = client
-        self.workflow_id = workflow_id
-
-    async def signal(self, name, arg):
-        if self.workflow_id in self._client.missing:
-            raise RPCError("workflow not found", RPCStatusCode.NOT_FOUND, b"")
-        self._client.signals.append((self.workflow_id, name, arg))
-
-
-class FakeTemporalClient:
-    def __init__(self):
-        self.signal_with_starts: list[dict] = []
-        self.signals: list[tuple] = []
-        self.missing: set[str] = set()
-
-    async def start_workflow(self, workflow, arg=None, **kwargs):
-        self.signal_with_starts.append({"workflow": workflow, "arg": arg, **kwargs})
-
-    def get_workflow_handle(self, workflow_id):
-        return FakeHandle(self, workflow_id)
+from tests.helpers.gateway import (
+    FakeTemporalClient,
+    deliver_inbound,
+    im_event,
+    post_event,
+    signed_headers,
+    stored_text,
+)
 
 
 @pytest.fixture
@@ -63,37 +42,6 @@ def client(agents, temporal, secret) -> TestClient:
         SignatureVerifier(secret),
     )
     return TestClient(app)
-
-
-def signed_headers(secret: str, body: bytes, content_type: str) -> dict:
-    ts = str(int(time.time()))
-    base = f"v0:{ts}:".encode() + body
-    sig = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
-    return {
-        "X-Slack-Request-Timestamp": ts,
-        "X-Slack-Signature": sig,
-        "Content-Type": content_type,
-    }
-
-
-def post_event(client, secret, payload: dict):
-    body = json.dumps(payload).encode()
-    return client.post(
-        "/slack/events", content=body, headers=signed_headers(secret, body, "application/json")
-    )
-
-
-def im_event(**overrides) -> dict:
-    event = {
-        "type": "message",
-        "channel_type": "im",
-        "channel": "D123",
-        "user": ALICE,
-        "text": "my laptop battery is swelling",
-        "ts": "1700000000.000200",
-    }
-    event.update(overrides)
-    return {"type": "event_callback", "team_id": TEAM, "event_id": "Ev42", "event": event}
 
 
 def test_gateway_rejects_bad_signature(client, temporal):

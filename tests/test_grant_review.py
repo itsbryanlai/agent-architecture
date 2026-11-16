@@ -19,15 +19,16 @@ from agentos.control_api import create_app
 from agentos.grant_picks import GrantNotPicked
 from agentos.notion_picker import HttpNotionOAuth, Picker, PickerConfig
 from tests.conftest import DB_ID, TENANT, agents_dict, parse_agents_config
-from tests.console_harness import (
+from tests.helpers.agents import helper_block
+from tests.helpers.console_harness import (
+    OTHER,
+    OWNER,
     ROOT,
     ConsoleHarness,
     csrf_token,
     post,
     using,
 )
-from tests.test_agent_store import helper_block
-from tests.test_control_plane import OTHER, OWNER
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"

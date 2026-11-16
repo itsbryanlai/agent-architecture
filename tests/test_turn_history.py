@@ -7,7 +7,8 @@ from agentos.history_view import HISTORY_BUDGET_CHARS, prepare_for_model
 from agentos.models import LLMResponse
 from agentos.workflows.conversation import EMPTY_MESSAGE_REPLY, ConversationWorkflow
 from tests.conftest import TENANT, eventually
-from tests.test_conversation_workflow import CHANNEL, THREAD, inbound, start_conversation
+from tests.helpers.conversation import CHANNEL, THREAD, inbound, start_conversation
+from tests.helpers.turns import assert_tool_pairs_valid
 
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
 
@@ -16,37 +17,6 @@ def is_text_user(message: dict) -> bool:
     return message["role"] == "user" and any(
         isinstance(b, dict) and b.get("type") == "text" for b in message["content"]
     )
-
-
-def assert_tool_pairs_valid(messages: list[dict]) -> None:
-    """Every tool_use is answered by the very next message, and no result is orphaned."""
-    for i, m in enumerate(messages):
-        uses = [
-            b["id"] for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use"
-        ]
-        if uses:
-            assert i + 1 < len(messages), "tool_use is the last message"
-            nxt = messages[i + 1]
-            assert nxt["role"] == "user"
-            answered = [
-                b["tool_use_id"]
-                for b in nxt["content"]
-                if isinstance(b, dict) and b.get("type") == "tool_result"
-            ]
-            assert sorted(answered) == sorted(uses)
-        results = [
-            b["tool_use_id"]
-            for b in m["content"]
-            if isinstance(b, dict) and b.get("type") == "tool_result"
-        ]
-        if results:
-            assert i > 0
-            prev_uses = [
-                b["id"]
-                for b in messages[i - 1]["content"]
-                if isinstance(b, dict) and b.get("type") == "tool_use"
-            ]
-            assert sorted(results) == sorted(prev_uses)
 
 
 async def test_unanswered_tool_use_is_closed_when_history_is_loaded(harness):
@@ -88,6 +58,7 @@ async def test_unanswered_tool_use_is_closed_when_history_is_loaded(harness):
 
 
 async def test_history_sent_to_the_model_is_bounded(harness):
+    """Fails if a long thread is sent to the model whole, or the stored thread loses messages."""
     h = harness
     chunk = "x" * (HISTORY_BUDGET_CHARS // 8)
     turns = 20
@@ -124,8 +95,12 @@ async def test_history_sent_to_the_model_is_bounded(harness):
     assert "q0 " not in str(sent)
     assert "q19 " in str(sent)
     assert len(str(sent)) <= HISTORY_BUDGET_CHARS * 1.1
-    stored = await h.history.load(TENANT, CONV_ID)
-    assert len(stored) == turns * 4 + 2  # the stored thread stays complete
+
+    async def reply_stored() -> bool:
+        # The reply is stored after it was shown, so the update comes first.
+        return len(await h.history.load(TENANT, CONV_ID)) == turns * 4 + 2
+
+    await eventually(reply_stored)  # the stored thread stays complete
 
 
 async def test_newest_message_is_kept_when_it_alone_exceeds_the_budget(harness):
@@ -134,19 +109,6 @@ async def test_newest_message_is_kept_when_it_alone_exceeds_the_budget(harness):
     await start_conversation(h, inbound("Ev1", "y" * (HISTORY_BUDGET_CHARS * 2)))
     await eventually(lambda: h.slack.updates())
     assert len(h.llm.calls[0]["messages"]) == 1
-
-
-async def test_later_message_still_answered(harness):
-    h = harness
-    h.llm.queue(
-        LLMResponse(text="one", tool_calls=[], stop_reason="end_turn"),
-        LLMResponse(text="two", tool_calls=[], stop_reason="end_turn"),
-    )
-    handle = await start_conversation(h, inbound("Ev1"))
-    await eventually(lambda: len(h.slack.updates()) >= 1)
-    await handle.signal(ConversationWorkflow.message, inbound("Ev2", "again"))
-    await eventually(lambda: len(h.slack.updates()) >= 2)
-    assert_tool_pairs_valid(h.llm.calls[1]["messages"])
 
 
 def test_result_that_answers_no_tool_use_is_dropped():

@@ -36,7 +36,7 @@ from agentos.stores import (
 )
 from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, DB_ID, TENANT, agents_dict, make_fake_notion
-from tests.test_front_door import front_door_dict
+from tests.helpers.front_door import front_door_dict
 
 ADMIN = "U_ADMIN"
 EDITOR = "U_EDITOR"

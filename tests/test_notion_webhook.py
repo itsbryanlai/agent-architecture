@@ -17,7 +17,7 @@ from agentos.gateway.app import create_app
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import TENANT
-from tests.test_gateway import FakeTemporalClient
+from tests.helpers.gateway import FakeTemporalClient
 
 TOKEN = "secret_verification_token_abc123"
 PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -193,19 +193,19 @@ def test_event_rejected_when_token_not_configured(agents, temporal, links, tmp_p
     assert temporal.signals == []
 
 
-def test_event_with_bad_signature_rejected(agents, temporal, links, tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("event_type", ["page.properties_updated", "page.content_updated"])
+@pytest.mark.parametrize("signature", [sign(b"other body"), None], ids=["wrong body", "missing"])
+def test_event_with_bad_signature_rejected(
+    agents, temporal, links, tmp_path, monkeypatch, caplog, event_type, signature
+):
+    """Fails if an event with a missing or wrong signature is accepted, signals anything, or logs the token."""
     client = make_client(agents, temporal, links, tmp_path, monkeypatch)
     with caplog.at_level(logging.DEBUG):
-        resp = post(client, page_event(), sign(b"other body"))
+        resp = post(client, page_event(event_type), signature)
     assert resp.status_code == 401
     assert temporal.signals == []
+    assert temporal.signal_with_starts == []
     assert TOKEN not in caplog.text
-
-
-def test_event_without_signature_rejected(agents, temporal, links, tmp_path, monkeypatch):
-    client = make_client(agents, temporal, links, tmp_path, monkeypatch)
-    assert post(client, page_event(), None).status_code == 401
-    assert temporal.signals == []
 
 
 def test_signed_event_signals_task(agents, temporal, links, tmp_path, monkeypatch):

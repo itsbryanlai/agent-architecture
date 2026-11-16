@@ -7,6 +7,8 @@ enters a message. Links the runtime builds itself stay live.
 
 import uuid
 
+import pytest
+
 from agentos import ids
 from agentos.activities import approval_card_blocks
 from agentos.config import TASK_QUEUE
@@ -78,17 +80,18 @@ def _card_text(blocks: list) -> str:
     return "\n".join(out)
 
 
-def test_create_card_escapes_fields():
-    spec = _spec("create_item", {"title": HOSTILE, "details": HOSTILE, "database_id": DB_ID})
-    text = _card_text(approval_card_blocks(spec, "t1", "IT helper", "Requests"))
+@pytest.mark.parametrize(
+    ("tool", "payload", "occurrences"),
+    [
+        ("create_item", {"title": HOSTILE, "details": HOSTILE, "database_id": DB_ID}, 2),
+        ("add_comment", {"item_title": HOSTILE, "comment": HOSTILE, "item_url": "u"}, 2),
+    ],
+)
+def test_approval_card_escapes_every_model_written_field(tool, payload, occurrences):
+    """Fails if model-written text reaches the approval card with a live mention or link."""
+    text = _card_text(approval_card_blocks(_spec(tool, payload), "t1", "IT helper", "Requests"))
     assert "<!channel>" not in text and "<@U1>" not in text and "<https" not in text
-    assert text.count(ESCAPED) == 2
-
-
-def test_comment_card_escapes_fields():
-    payload = {"item_title": HOSTILE, "comment": HOSTILE, "item_url": "u"}
-    text = _card_text(approval_card_blocks(_spec("add_comment", payload), "t1", "A", "D"))
-    assert "<!channel>" not in text and text.count(ESCAPED) == 2
+    assert text.count(ESCAPED) == occurrences
 
 
 async def test_thread_and_card_lines_are_escaped(harness):

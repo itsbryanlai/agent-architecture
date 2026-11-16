@@ -68,9 +68,9 @@ from tests.conftest import (
     eventually,
     make_fake_notion,
 )
-from tests.console_harness import ROOT as CONSOLE_ADMIN
-from tests.console_harness import ConsoleHarness, csrf_token, post, using
-from tests.test_control_api import JSON, StandIn
+from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
+from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
+from tests.helpers.control_api import JSON, StandIn
 
 ROOT = Path(__file__).resolve().parent.parent
 CHAN = "C0AAAA111"

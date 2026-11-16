@@ -52,7 +52,7 @@ from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, DB_ID, TENANT, eventually, make_fake_notion
-from tests.test_payload_codec import all_payloads, is_sdk_patch_record
+from tests.helpers.codec import all_payloads, is_sdk_patch_record
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -73,6 +73,7 @@ class HopWorkflow:
 async def flow(tmp_path, agents):
     create_key(tmp_path / "keys", TENANT)
     converter = tenant_data_converter(LocalKeyStore(tmp_path / "keys"))
+    # Own Temporal server, not the session's: it needs the encrypting data converter.
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
     llm = ScriptedLLMClient()
     slack = FakeSlack(emails={ALICE: "alice@example.com", BOB: "bob@example.com"})
@@ -245,6 +246,7 @@ async def test_scheduled_run_reads_the_input_the_schedule_encoded(tmp_path):
     converter = tenant_data_converter(LocalKeyStore(tmp_path / "keys"))
     # The time-skipping server has no schedules; this one is the local dev server.
     async with (
+        # Own Temporal server, not the session's: it needs a real dev server with the encrypting data converter.
         await WorkflowEnvironment.start_local(data_converter=converter) as env,
         Worker(env.client, task_queue=TASK_QUEUE, workflows=[HopWorkflow]),
     ):

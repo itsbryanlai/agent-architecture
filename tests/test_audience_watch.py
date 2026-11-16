@@ -54,9 +54,9 @@ from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, TEAM, TENANT, agents_dict, eventually, make_fake_notion
-from tests.console_harness import ROOT as CONSOLE_ADMIN
-from tests.console_harness import ConsoleHarness, csrf_token, post, using
-from tests.test_gateway import FakeTemporalClient, signed_headers
+from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
+from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
+from tests.helpers.gateway import FakeTemporalClient, signed_headers
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CHAN = "C0AAAA111"

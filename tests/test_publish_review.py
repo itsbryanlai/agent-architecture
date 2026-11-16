@@ -21,9 +21,17 @@ from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from agentos.switches import InMemorySwitchStore, set_switch
 from tests.conftest import TENANT, make_fake_notion
-from tests.console_harness import ConsoleHarness, csrf_token, post, using
-from tests.test_agent_store import helper_block
-from tests.test_control_plane import ADMIN2, OWNER, ROOT, tenants
+from tests.helpers.agents import helper_block
+from tests.helpers.console_harness import (
+    ADMIN2,
+    OWNER,
+    ROOT,
+    ConsoleHarness,
+    csrf_token,
+    post,
+    using,
+)
+from tests.helpers.control_plane_tenants import tenants
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"

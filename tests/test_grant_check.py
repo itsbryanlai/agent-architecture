@@ -12,7 +12,7 @@ from agentos.connectors.notion import NotionConnector, check_grant
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker, is_transient
 from agentos.worker import check_grants_at_startup
 from tests.conftest import DB_ID, TENANT, agents_dict, default_schema, make_fake_notion
-from tests.test_agent_store import helper_block, make_published
+from tests.helpers.agents import helper_block, make_published
 
 NAMES_ONLY_IDS = {
     "title_prop_id": None,
@@ -37,6 +37,7 @@ def schema_with(**changes) -> dict:
 
 
 async def test_check_resolves_ids_by_name(agents):
+    """Fails if a names-only grant reports a problem or does not resolve all four property ids."""
     api = make_fake_notion()
     check = await check_grant(api, names_only(agents), require_ids=False)
     assert check.problems == []
@@ -165,13 +166,6 @@ async def test_worker_refuses_to_start_without_ids(agents):
     )
     assert failure is not None
     assert "agentos.check_grants" in failure
-
-
-async def test_check_command_prints_ids_for_names_only_config(agents):
-    api = make_fake_notion()
-    check = await check_grant(api, names_only(agents), require_ids=False)
-    assert check.problems == []
-    assert set(check.resolved) == {"title", "status", "requested_by", "request_id"}
 
 
 def test_connector_rejects_grant_without_ids(agents):

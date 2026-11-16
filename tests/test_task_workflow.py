@@ -1,61 +1,13 @@
 import asyncio
-import uuid
 from datetime import timedelta
 
 import pytest
 from temporalio.client import WorkflowExecutionStatus
 
-from agentos import ids
-from agentos.config import TASK_QUEUE
-from agentos.models import ApprovalDecision, ExternalUpdate, TaskSpec, TurnContext
+from agentos.models import ApprovalDecision, ExternalUpdate, TaskSpec
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, BOB, DB_ID, TENANT, eventually
-
-NONCE = "nonce-123"
-
-
-def spec() -> TaskSpec:
-    ctx = TurnContext(
-        tenant_id=TENANT,
-        agent_id="it-helper",
-        agent_version=1,
-        requester_user_id=ALICE,
-        channel="C_GENERAL",
-        thread_ts="1700000000.000100",
-        channel_kind="channel",
-    )
-    return TaskSpec(
-        ctx=ctx,
-        tool_name="create_item",
-        payload={"title": "New monitor", "details": "Mine flickers.", "database_id": DB_ID},
-        approval_nonce=NONCE,
-    )
-
-
-async def start_task(h):
-    handle = await h.client.start_workflow(
-        TaskWorkflow.run,
-        spec(),
-        id=ids.task_id(TENANT, str(uuid.uuid4())),
-        task_queue=TASK_QUEUE,
-    )
-    await wait_state(handle, "awaiting_approval")
-    return handle
-
-
-async def wait_state(handle, expected: str):
-    async def check():
-        return await handle.query(TaskWorkflow.state) == expected
-
-    await eventually(check, timeout=20)
-
-
-def thread_posts(h, needle: str):
-    return [p for p in h.slack.posts() if p["thread_ts"] and needle in p["text"]]
-
-
-async def approve(h, handle):
-    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+from tests.conftest import ALICE, BOB, DB_ID, title_prop
+from tests.helpers.tasks import NONCE, approve, spec, start_task, thread_posts, wait_state
 
 
 async def test_approval_from_wrong_user_or_nonce_ignored(harness):
@@ -87,16 +39,25 @@ async def test_approve_creates_exactly_once_and_survives_retry(harness):
     assert len(card_updates) == 1
 
 
-async def test_cancel(harness):
+@pytest.mark.parametrize("tool", ["create_item", "add_comment"])
+async def test_cancel(harness, tool):
+    """Fails if cancelling the approval still writes the page or the comment."""
     h = harness
-    handle = await start_task(h)
+    if tool == "create_item":
+        handle = await start_task(h)
+    else:
+        page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+        base = spec()
+        payload = {"item": page["id"], "comment": "Any update on this?"}
+        handle = await start_task(h, TaskSpec(base.ctx, "add_comment", payload, NONCE))
 
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, False))
 
     assert await handle.result() == "cancelled"
     assert await handle.query(TaskWorkflow.state) == "cancelled"
-    assert h.notion.all_pages(DB_ID) == []
     assert h.notion.count("create_page") == 0
+    assert h.notion.count("create_comment") == 0
+    assert len(h.notion.all_pages(DB_ID)) == (0 if tool == "create_item" else 1)
 
 
 async def test_expiry_with_reminder(harness):

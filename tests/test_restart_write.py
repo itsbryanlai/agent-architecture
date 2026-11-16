@@ -76,6 +76,7 @@ async def test_a_worker_killed_after_notion_created_the_item_leaves_one_item_and
         {"title": "New monitor", "details": "Mine flickers.", "database_id": DB_ID},
         NONCE,
     )
+    # Own Temporal server, not the session's: the test kills and restarts the worker and must own the server's history.
     env = await WorkflowEnvironment.start_time_skipping()
     try:
         first = new_worker(env, agents, stores, slack, notion)

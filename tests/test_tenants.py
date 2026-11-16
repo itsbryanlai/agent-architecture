@@ -48,8 +48,7 @@ from tests.conftest import (
     title_prop,
     two_tenant_dicts,
 )
-from tests.gateway_support import deliver_inbound
-from tests.test_gateway import FakeTemporalClient, im_event, post_event
+from tests.helpers.gateway import FakeTemporalClient, deliver_inbound, im_event, post_event
 
 PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 

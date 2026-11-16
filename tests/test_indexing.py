@@ -20,18 +20,9 @@ from tests.conftest import (
 from tests.conftest import (
     text_block as tb,
 )
+from tests.helpers.indexing_run import SCOPE_A, run_index
 
-SCOPE_A = ids.knowledge_scope(ROOT_A)
 ROOT_A_PLAIN = ROOT_A.replace("-", "")
-
-
-async def run_index(h, scope=SCOPE_A, root=ROOT_A):
-    return await h.client.execute_workflow(
-        IndexingWorkflow.run,
-        args=[TENANT, scope, root.replace("-", "")],
-        id=ids.index_workflow_id(TENANT, scope),
-        task_queue=TASK_QUEUE,
-    )
 
 
 async def test_page_text_extracts_blocks_and_children():

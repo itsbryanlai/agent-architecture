@@ -77,7 +77,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 
-FIXTURES = Path(__file__).parent / "fixtures" / "replay"
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "replay"
 CONVERTER = "tenant payload codec (encrypting), fixed test key"
 ADMIN = "U_ADMIN"
 HOP_EVENTS = 8
@@ -147,6 +147,7 @@ class Rig:
 async def rig(key_dir: Path, *, workflows=None):
     """A time-skipping server and a worker, both using the encrypting converter."""
     cfg = parse_agents_config(replay_agents_dict())
+    # Own Temporal server, not the session's: the recorded histories use the encrypting data converter.
     env = await WorkflowEnvironment.start_time_skipping(data_converter=converter(key_dir))
     notion = make_fake_notion()
     notion.add_page_tree(ROOT_A, a_tree())

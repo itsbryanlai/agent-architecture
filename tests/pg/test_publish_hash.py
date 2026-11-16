@@ -19,9 +19,9 @@ from agentos.stores import tenant_transaction
 from agentos.switches import PostgresSwitchStore
 from agentos.unit_of_work import PostgresUnitOfWork
 from tests.conftest import agents_dict, make_fake_notion
+from tests.helpers.agents import helper_block
+from tests.helpers.pg_seed import seed_version
 from tests.pg.conftest import MIGRATIONS, Databases, TestDatabase, load_migrate
-from tests.pg.test_policies import seed_version
-from tests.pg.test_stores import helper_block
 
 
 def plane_for(pool, tenant: str, admins=("U_ROOT",), **parts) -> ControlPlane:

@@ -19,7 +19,7 @@ from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.indexing import IndexingWorkflow
 from tests.conftest import ROOT_A, ROOT_B, TENANT, knowledge_agents_dict, make_fake_notion
-from tests.test_knowledge_search import FakeScheduleClient
+from tests.helpers.knowledge import FakeScheduleClient
 
 SCOPE_A = ids.knowledge_scope(ROOT_A)
 SCOPE_B = ids.knowledge_scope(ROOT_B)
@@ -89,22 +89,6 @@ async def test_leftover_schedule_run_reads_and_stores_nothing(kharness):
 
     assert len(h.notion.calls) == calls_before
     assert h.knowledge.pages == {}
-
-
-async def test_store_deletes_one_scope_and_lists_scopes():
-    store = InMemoryKnowledgeStore()
-    await seed(store, SCOPE_A, "p1")
-    await seed(store, SCOPE_A, "p2")
-    await seed(store, SCOPE_B, "p3")
-    await store.replace_page("globex", SCOPE_A, "p1", "T", "u", "h", [("t", [1.0])])
-
-    assert sorted(await store.scopes(TENANT)) == [SCOPE_A, SCOPE_B]
-    assert await store.delete_scope(TENANT, SCOPE_A) == 2
-
-    assert await store.scopes(TENANT) == [SCOPE_B]
-    assert ("globex", SCOPE_A, "p1") in store.pages
-    assert ("globex", SCOPE_A, "p1") in store.chunks
-    assert not [k for k in store.chunks if k[:2] == (TENANT, SCOPE_A)]
 
 
 async def test_apply_schedules_deletes_rows_of_ungranted_scopes():

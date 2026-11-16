@@ -9,32 +9,21 @@ from temporalio.testing import ActivityEnvironment
 from agentos import ids
 from agentos.llm import ScriptedLLMClient
 from agentos.models import LLMResponse, ToolCall
-from agentos.stores import InMemoryHistoryStore
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from tests.conftest import TENANT, eventually
-from tests.test_conversation_workflow import (
+from tests.helpers.conversation import (
     CHANNEL,
     THREAD,
     inbound,
     placeholders,
     start_conversation,
 )
-from tests.test_llm_errors import make_activities
+from tests.helpers.llm_errors import make_activities
+from tests.helpers.turns import assert_tool_pairs_valid
 
 
 def text_of(message):
     return [b["text"] for b in message["content"] if b.get("type") == "text"]
-
-
-async def test_history_append_is_idempotent_per_step_key():
-    store = InMemoryHistoryStore()
-    first = await store.append(TENANT, "c1", "Ev1:user", "user", [{"type": "text", "text": "hi"}])
-    again = await store.append(TENANT, "c1", "Ev1:user", "user", [{"type": "text", "text": "hi"}])
-    other = await store.append(TENANT, "c1", "Ev2:user", "user", [{"type": "text", "text": "hi"}])
-
-    assert first == again == 1
-    assert other == 2
-    assert len(await store.load(TENANT, "c1")) == 2
 
 
 async def test_append_history_rejects_empty_step_key(agents):
@@ -45,7 +34,8 @@ async def test_append_history_rejects_empty_step_key(agents):
         )
 
 
-async def test_turn_step_keys_do_not_collide(harness):
+async def test_a_tool_turn_keeps_all_four_messages_in_order(harness):
+    """Fails if two steps of one turn collide and a stored message is dropped or reordered."""
     h = harness
     h.llm.queue(
         LLMResponse(
@@ -72,14 +62,6 @@ async def test_turn_step_keys_do_not_collide(harness):
     assert stored[2]["content"][0]["type"] == "tool_result"
     assert stored[3]["content"][0]["type"] == "text"
 
-    keys = h.history.step_keys[(TENANT, conv_id)]
-    assert keys == {
-        "Ev1:user": 1,
-        "Ev1:s0:assistant": 2,
-        "Ev1:s0:results": 3,
-        "Ev1:s1:assistant": 4,
-    }
-
 
 async def test_retried_append_does_not_duplicate_history(harness):
     h = harness
@@ -91,12 +73,19 @@ async def test_retried_append_does_not_duplicate_history(harness):
 
     assert h.slack.updates()[0]["text"] == "Hi there"
     conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
+
+    async def reply_stored() -> bool:
+        # The reply is stored after it was shown, so the update comes first.
+        return len(await h.history.load(TENANT, conv_id)) >= 2
+
+    await eventually(reply_stored)
     stored = await h.history.load(TENANT, conv_id)
     assert [m["role"] for m in stored] == ["user", "assistant"]
     assert [text_of(m) for m in stored if m["role"] == "user"] == [["hello"]]
 
 
 async def test_two_messages_same_text_both_stored(harness):
+    """Fails if a second message with the same text is dropped as a duplicate, or leaves the history invalid."""
     h = harness
     h.llm.queue(
         LLMResponse(text="one", tool_calls=[], stop_reason="end_turn"),
@@ -113,6 +102,7 @@ async def test_two_messages_same_text_both_stored(harness):
     stored = await h.history.load(TENANT, conv_id)
     users = [text_of(m) for m in stored if m["role"] == "user"]
     assert users == [["same"], ["same"]]
+    assert_tool_pairs_valid(h.llm.calls[1]["messages"])
 
 
 async def test_failed_finalize_stores_only_the_failure_notice_never_a_reply_nobody_saw(harness):

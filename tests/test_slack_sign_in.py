@@ -33,7 +33,7 @@ from agentos.slack_signin import (
 )
 from agentos.tenant_store import StaticTenants
 from tests.conftest import GLOBEX, GLOBEX_TEAM, TEAM, TENANT
-from tests.console_harness import (
+from tests.helpers.console_harness import (
     CLIENT_ID,
     CONSOLE_URL,
     OUTSIDER,

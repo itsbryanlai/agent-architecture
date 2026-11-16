@@ -2,24 +2,19 @@
 
 import re
 
+import pytest
 from temporalio.client import ScheduleOverlapPolicy, WorkflowExecutionStatus
-from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
-from agentos.config import TASK_QUEUE, parse_agents_config
+from agentos.config import parse_agents_config
 from agentos.connectors.notion import text_block
-from agentos.index_knowledge import apply_schedules, plan_schedules
+from agentos.index_knowledge import apply_schedules
 from agentos.knowledge.search import KNOWLEDGE_RULES, SEARCH_RESULTS, sources_footer
 from agentos.models import (
     Citation,
-    ConversationRef,
     InboundMessage,
-    LLMResponse,
-    ToolCall,
-    TurnContext,
 )
 from agentos.workflows.conversation import ConversationWorkflow
-from agentos.workflows.indexing import IndexingWorkflow
 from tests.conftest import (
     ALICE,
     PAGE_A1,
@@ -30,77 +25,21 @@ from tests.conftest import (
     eventually,
     knowledge_agents_dict,
 )
-from tests.replay_support import suggest_continue_as_new_after
-
-SCOPE_A = ids.knowledge_scope(ROOT_A)
-SCOPE_B = ids.knowledge_scope(ROOT_B)
-CHANNEL = "C_GENERAL"
-
-
-def plain(page_id: str) -> str:
-    return page_id.replace("-", "")
-
-
-async def index(h, scope, root):
-    return await h.client.execute_workflow(
-        IndexingWorkflow.run,
-        args=[TENANT, scope, plain(root)],
-        id=ids.index_workflow_id(TENANT, scope),
-        task_queue=TASK_QUEUE,
-    )
-
-
-async def index_both(h):
-    await index(h, SCOPE_A, ROOT_A)
-    await index(h, SCOPE_B, ROOT_B)
-
-
-def turn_ctx(agent_id: str) -> TurnContext:
-    return TurnContext(
-        tenant_id=TENANT,
-        agent_id=agent_id,
-        agent_version=1,
-        requester_user_id=ALICE,
-        channel=CHANNEL,
-        thread_ts="1.1",
-        channel_kind="channel",
-    )
-
-
-async def search(h, agent_id: str, query: str, first_marker: int = 1):
-    """Run search_knowledge as an activity; return (output text, result)."""
-    # Stored tool output is first-write-wins per tool_use_id, so each search gets its own.
-    tool_id = f"tu_s{len(h.tool_outputs.outputs)}"
-    call = ToolCall(id=tool_id, name="search_knowledge", input={"query": query})
-    result = await ActivityEnvironment().run(
-        h.acts.run_read_tool, turn_ctx(agent_id), f"conv-{agent_id}", call, first_marker
-    )
-    stored = await h.tool_outputs.get_many(TENANT, f"conv-{agent_id}", [tool_id])
-    return stored[tool_id][0], result
-
-
-async def converse(h, agent_id: str, thread: str, text: str = "hello"):
-    msg = InboundMessage(f"Ev-{thread}", ALICE, text, CHANNEL, thread, "channel")
-    return await h.client.start_workflow(
-        ConversationWorkflow.run,
-        ConversationRef(TENANT, agent_id, CHANNEL, thread),
-        id=ids.conversation_id(TENANT, CHANNEL, thread),
-        task_queue=TASK_QUEUE,
-        start_signal="message",
-        start_signal_args=[msg],
-    )
-
-
-def call(tool_id: str, query: str) -> ToolCall:
-    return ToolCall(id=tool_id, name="search_knowledge", input={"query": query})
-
-
-def tool_turn(*calls: ToolCall) -> LLMResponse:
-    return LLMResponse(text=None, tool_calls=list(calls), stop_reason="tool_use")
-
-
-def answer(text: str) -> LLMResponse:
-    return LLMResponse(text=text, tool_calls=[], stop_reason="end_turn")
+from tests.helpers.knowledge import (
+    CHANNEL,
+    SCOPE_A,
+    SCOPE_B,
+    FakeScheduleClient,
+    answer,
+    call,
+    converse,
+    index,
+    index_both,
+    plain,
+    search,
+    tool_turn,
+)
+from tests.helpers.replay_support import suggest_continue_as_new_after
 
 
 async def test_search_tool_offered_only_with_page_grants(kharness):
@@ -230,6 +169,7 @@ async def test_search_with_no_match_says_so(kharness):
 
 
 async def test_cited_answer_gets_sources_footer(kharness):
+    """Fails if a cited answer shows no footer of its sources, or the footer is stored in history."""
     h = kharness
     await index_both(h)
     h.llm.queue(
@@ -245,8 +185,15 @@ async def test_cited_answer_gets_sources_footer(kharness):
     title, url = (await h.knowledge.page_meta(TENANT, [SCOPE_A], [plain(ROOT_A)]))[plain(ROOT_A)]
     update = h.slack.updates()[0]["text"]
     assert update == f"Reset it at the portal [1].\n\nSources: [1] <{url}|{title}>"
-    # History keeps the model's text without the footer.
-    stored = await h.history.load(TENANT, ids.conversation_id(TENANT, CHANNEL, "1700000000.000200"))
+    # History keeps the model's text without the footer. The reply is stored after it was shown,
+    # so wait for the stored row.
+    conv_id = ids.conversation_id(TENANT, CHANNEL, "1700000000.000200")
+
+    async def reply_stored() -> bool:
+        return (await h.history.load(TENANT, conv_id))[-1]["role"] == "assistant"
+
+    await eventually(reply_stored)
+    stored = await h.history.load(TENANT, conv_id)
     assert stored[-1]["content"][0]["text"] == "Reset it at the portal [1]."
 
 
@@ -382,70 +329,20 @@ async def test_markers_survive_continue_as_new(kharness):
     assert "Sources: [1] <" in h.slack.updates()[1]["text"]
 
 
-def test_schedule_plan_creates_and_deletes():
-    cfg = parse_agents_config(knowledge_agents_dict())  # scopes A (it) and B (hr)
-    existing = [
-        ids.index_schedule_id(TENANT, SCOPE_A),
-        ids.index_schedule_id(TENANT, "notion:page:" + "9" * 32),  # no longer granted
-        ids.index_schedule_id("other-tenant", SCOPE_B),  # another tenant's: untouched
-        "unrelated-schedule",
-    ]
-
-    plan = plan_schedules(cfg, existing)
-
-    assert plan.create == [ids.index_schedule_id(TENANT, SCOPE_B)]
-    assert plan.update == [ids.index_schedule_id(TENANT, SCOPE_A)]
-    assert plan.delete == [ids.index_schedule_id(TENANT, "notion:page:" + "9" * 32)]
-
-
-class FakeScheduleHandle:
-    def __init__(self, client, schedule_id):
-        self.client, self.id = client, schedule_id
-
-    async def update(self, updater):
-        self.client.schedules[self.id] = updater(None).schedule
-        self.client.log.append(("update", self.id))
-
-    async def delete(self):
-        del self.client.schedules[self.id]
-        self.client.log.append(("delete", self.id))
-
-
-class FakeScheduleClient:
-    """Stands in for the Temporal client: the time-skipping test server does not
-    implement the schedule listing call, so apply_schedules runs against this."""
-
-    def __init__(self, existing=()):
-        self.schedules = {i: None for i in existing}
-        self.log: list[tuple[str, str]] = []
-
-    async def list_schedules(self):
-        async def gen():
-            for schedule_id in list(self.schedules):
-                yield type("S", (), {"id": schedule_id})()
-
-        return gen()
-
-    async def create_schedule(self, schedule_id, schedule):
-        self.schedules[schedule_id] = schedule
-        self.log.append(("create", schedule_id))
-
-    def get_schedule_handle(self, schedule_id):
-        return FakeScheduleHandle(self, schedule_id)
-
-
 async def test_apply_schedules_creates_updates_and_deletes():
-    cfg = parse_agents_config(knowledge_agents_dict())
-    stale = ids.index_schedule_id(TENANT, "notion:page:" + "9" * 32)
+    """Fails if the nightly schedules are not created, updated or removed to match the grants, or another tenant's is touched."""
+    cfg = parse_agents_config(knowledge_agents_dict())  # scopes A (it) and B (hr)
+    stale = ids.index_schedule_id(TENANT, "notion:page:" + "9" * 32)  # no longer granted
     keep = ids.index_schedule_id(TENANT, SCOPE_A)
-    client = FakeScheduleClient([keep, stale, "unrelated-schedule"])
+    others = ids.index_schedule_id("other-tenant", SCOPE_B)
+    client = FakeScheduleClient([keep, stale, "unrelated-schedule", others])
 
     plan = await apply_schedules(client, cfg)
 
     new = ids.index_schedule_id(TENANT, SCOPE_B)
     assert sorted(client.log) == sorted([("update", keep), ("create", new), ("delete", stale)])
     assert (plan.create, plan.update, plan.delete) == ([new], [keep], [stale])
-    assert set(client.schedules) == {keep, new, "unrelated-schedule"}
+    assert set(client.schedules) == {keep, new, "unrelated-schedule", others}
     schedule = client.schedules[new]
     assert schedule.policy.overlap == ScheduleOverlapPolicy.SKIP
     calendar = schedule.spec.calendars[0]
@@ -460,16 +357,24 @@ def _cite(marker: int, page_id: str) -> Citation:
 FOOTER_META = {"P": ("P", "uP"), "Q": ("Q", "uQ")}
 
 
-def test_footer_lists_every_number_of_a_page():
-    cited = [_cite(1, "P"), _cite(3, "Q"), _cite(6, "Q")]
-    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [1] <uP|P> · [3, 6] <uQ|Q>"
-
-
-def test_footer_orders_pages_by_lowest_number():
-    cited = [_cite(6, "Q"), _cite(2, "P"), _cite(4, "Q")]
-    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [2] <uP|P> · [4, 6] <uQ|Q>"
-
-
-def test_footer_skips_numbers_without_metadata():
-    cited = [_cite(1, "P"), _cite(2, "GONE"), _cite(3, "Q")]
-    assert sources_footer(cited, FOOTER_META) == "\n\nSources: [1] <uP|P> · [3] <uQ|Q>"
+@pytest.mark.parametrize(
+    ("cited", "expected"),
+    [
+        (
+            [_cite(1, "P"), _cite(3, "Q"), _cite(6, "Q")],
+            "\n\nSources: [1] <uP|P> · [3, 6] <uQ|Q>",
+        ),
+        (
+            [_cite(6, "Q"), _cite(2, "P"), _cite(4, "Q")],
+            "\n\nSources: [2] <uP|P> · [4, 6] <uQ|Q>",
+        ),
+        (
+            [_cite(1, "P"), _cite(2, "GONE"), _cite(3, "Q")],
+            "\n\nSources: [1] <uP|P> · [3] <uQ|Q>",
+        ),
+    ],
+    ids=["every number of a page", "ordered by lowest number", "skips a page without metadata"],
+)
+def test_sources_footer_lists_pages_by_lowest_number_with_every_number(cited, expected):
+    """Fails if the footer drops a number, orders pages wrongly, or lists a page the store no longer has."""
+    assert sources_footer(cited, FOOTER_META) == expected

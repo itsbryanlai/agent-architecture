@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 025 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 026 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -457,6 +457,31 @@ ALTER TABLE usage_adjustments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_adjustments FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON usage_adjustments;
 CREATE POLICY tenant_isolation ON usage_adjustments
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Monthly usage rollup, written with each usage row and each adjustment. Same as migration 026.
+CREATE TABLE IF NOT EXISTS usage_month_totals (
+  tenant_id       text           NOT NULL,
+  month           date           NOT NULL CHECK (month = date_trunc('month', month)::date),
+  agent_id        text           NOT NULL DEFAULT '',
+  kind            text           NOT NULL CHECK (kind IN ('llm', 'embedding')),
+  calls           bigint         NOT NULL DEFAULT 0 CHECK (calls >= 0),
+  cost_usd        numeric(20, 8) NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
+  unpriced_calls  bigint         NOT NULL DEFAULT 0 CHECK (unpriced_calls >= 0),
+  PRIMARY KEY (tenant_id, month, agent_id, kind),
+  CONSTRAINT usage_month_totals_agent_id_pattern
+    CHECK (agent_id = '' OR agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON usage_month_totals FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON usage_month_totals TO agentos_app;
+
+ALTER TABLE usage_month_totals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_month_totals FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON usage_month_totals;
+CREATE POLICY tenant_isolation ON usage_month_totals
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
@@ -938,5 +963,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026')
 ON CONFLICT DO NOTHING;

@@ -7,9 +7,11 @@ No budget means no limit.
 
 ``BudgetGuard`` is asked by ``call_llm`` before the provider is called. When the month's
 spend has reached a budget the activity answers with a fixed text and calls no model, so
-nothing is billed and no usage row is written. The spend comes from the usage rows (and
-their adjustments), read by one aggregate query per tenant at a time per process, at most
-once per ``ttl_seconds``: concurrent checks after the cache expires wait for that one read.
+nothing is billed and no usage row is written. The spend comes from the monthly rollup the
+usage store keeps (``usage_month_totals``, updated with every usage row and every
+adjustment), so a read is a few rows however many calls the month has. It is read once per
+tenant at a time per process, at most once per ``ttl_seconds``: concurrent checks after the
+cache expires wait for that one read.
 Each cost the recorder stores is added to the cached figure at once (``note_recorded``), so
 one process never lets the window's own calls go uncounted. What the cache can still miss
 is spend from other worker processes and a call's cost before it returns. A call's cost is
@@ -548,21 +550,21 @@ class BudgetGuard:
 
     async def _read(self, tenant_id: str) -> _Cached:
         now = self.clock()
-        start, end, _ = month_bounds(None, now)
+        start, _, _ = month_bounds(None, now)
         cached = self._fresh(tenant_id, now, start)
         if cached is not None:
             return cached
-        # One aggregate read per tenant at a time: a check that finds the cache expired while
+        # One rollup read per tenant at a time: a check that finds the cache expired while
         # another is reading waits, then uses what that read stored.
         async with self._locks.setdefault(tenant_id, asyncio.Lock()):
             now = self.clock()
-            start, end, _ = month_bounds(None, now)
+            start, _, _ = month_bounds(None, now)
             cached = self._fresh(tenant_id, now, start)
             if cached is not None:
                 return cached
             limits = {b.agent_id: b.amount for b in await self.budgets.list(tenant_id)}
             spend = MonthSpend()
             if limits:
-                spend = month_spend(await self.usage.totals(tenant_id, start, end))
+                spend = month_spend(await self.usage.month_totals(tenant_id, start))
             cached = self._cache[tenant_id] = _Cached(now, start, limits, spend)
             return cached

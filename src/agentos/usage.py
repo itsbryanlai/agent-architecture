@@ -310,6 +310,15 @@ class UsageStore(Protocol):
         """The tenant's rows from ``start`` up to but not including ``end``, grouped."""
         ...
 
+    async def month_totals(self, tenant_id: str, start: datetime) -> list[UsageGroup]:
+        """The tenant's month that starts at ``start`` (UTC), one group per agent and cost type.
+
+        What the budget check reads. The Postgres store keeps these as a rollup it updates with
+        each row and each adjustment, so this reads a few rows however many calls the month has.
+        The groups have no version, model or token counts.
+        """
+        ...
+
 
 class InMemoryUsageStore:
     def __init__(self) -> None:
@@ -374,6 +383,22 @@ class InMemoryUsageStore:
                 )
         return list(groups.values())
 
+    async def month_totals(self, tenant_id: str, start: datetime) -> list[UsageGroup]:
+        end = month_bounds(start.astimezone(UTC).strftime("%Y-%m"), start)[1]
+        groups: dict[tuple, UsageGroup] = {}
+        for g in await self.totals(tenant_id, start, end):
+            rolled = groups.setdefault(
+                (g.kind, g.agent_id), UsageGroup(g.kind, g.agent_id, None, "")
+            )
+            rolled.calls += g.calls
+            rolled.cost += g.cost
+            rolled.unpriced_calls += g.unpriced_calls
+        return list(groups.values())
+
+
+# The rollup row of a usage row: its UTC month, and the agent ('' when it has none).
+_MONTH_OF = "date_trunc('month', {at} AT TIME ZONE 'UTC')::date"
+
 
 class PostgresUsageStore:
     def __init__(self, pool: AsyncConnectionPool):
@@ -381,15 +406,29 @@ class PostgresUsageStore:
 
     async def record(self, event: UsageEvent) -> None:
         async with tenant_transaction(self._pool, event.tenant_id) as conn:
+            # One statement: the rollup is changed only for a row that was stored, so a
+            # repeat of the same usage key counts once.
             await conn.execute(
-                """
-                INSERT INTO usage_events (
-                  tenant_id, usage_key, kind, agent_id, agent_version, model,
-                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                  cost_usd, conversation_id, at
+                f"""
+                WITH stored AS (
+                  INSERT INTO usage_events (
+                    tenant_id, usage_key, kind, agent_id, agent_version, model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    cost_usd, conversation_id, at
+                  )
+                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()))
+                  ON CONFLICT (tenant_id, usage_key) DO NOTHING
+                  RETURNING tenant_id, kind, agent_id, cost_usd, at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()))
-                ON CONFLICT (tenant_id, usage_key) DO NOTHING
+                INSERT INTO usage_month_totals
+                  (tenant_id, month, agent_id, kind, calls, cost_usd, unpriced_calls)
+                SELECT tenant_id, {_MONTH_OF.format(at="at")}, COALESCE(agent_id, ''), kind, 1,
+                       COALESCE(cost_usd, 0), (cost_usd IS NULL)::int
+                FROM stored
+                ON CONFLICT (tenant_id, month, agent_id, kind) DO UPDATE
+                SET calls = usage_month_totals.calls + 1,
+                    cost_usd = usage_month_totals.cost_usd + EXCLUDED.cost_usd,
+                    unpriced_calls = usage_month_totals.unpriced_calls + EXCLUDED.unpriced_calls
                 """,
                 (
                     event.tenant_id,
@@ -445,7 +484,23 @@ class PostgresUsageStore:
                     """,
                     (row.cost, row.price_model, row.price_effective_from, tenant_id, row.usage_key),
                 )
-                stored += cur.rowcount
+                if cur.rowcount != 1:
+                    continue
+                stored += 1
+                # The row was unpriced and is priced now: its cost moves from the unpriced
+                # count into the month's cost, in the same transaction as the adjustment.
+                await db.execute(
+                    f"""
+                    UPDATE usage_month_totals t
+                    SET cost_usd = t.cost_usd + %s, unpriced_calls = t.unpriced_calls - 1
+                    FROM usage_events e
+                    WHERE e.tenant_id = %s AND e.usage_key = %s
+                      AND t.tenant_id = e.tenant_id AND t.kind = e.kind
+                      AND t.agent_id = COALESCE(e.agent_id, '')
+                      AND t.month = {_MONTH_OF.format(at="e.at")}
+                    """,
+                    (row.cost, tenant_id, row.usage_key),
+                )
         return stored
 
     async def totals(self, tenant_id: str, start: datetime, end: datetime) -> list[UsageGroup]:
@@ -494,6 +549,30 @@ class PostgresUsageStore:
                 cost,
                 unpriced,
             ) in rows
+        ]
+
+    async def month_totals(self, tenant_id: str, start: datetime) -> list[UsageGroup]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                """
+                SELECT kind, agent_id, calls, cost_usd, unpriced_calls
+                FROM usage_month_totals
+                WHERE tenant_id = %s AND month = (%s AT TIME ZONE 'UTC')::date
+                """,
+                (tenant_id, start),
+            )
+            rows = await cur.fetchall()
+        return [
+            UsageGroup(
+                kind,
+                agent_id or None,
+                None,
+                "",
+                int(calls),
+                cost=Decimal(cost),
+                unpriced_calls=int(unpriced),
+            )
+            for (kind, agent_id, calls, cost, unpriced) in rows
         ]
 
 

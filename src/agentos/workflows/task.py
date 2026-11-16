@@ -25,6 +25,8 @@ Rules this workflow keeps:
   item a few times, with timers between, before it speaks. If it is found, the task
   carries on as filed. If it is not, the task says it could not confirm and points to
   the tracker. It never says nothing was filed after retries ran out.
+* A long watch continues as new, carrying a ``WatchState`` of IDs, times and flags, and a burst
+  of pokes is answered at most once per ``POKE_GAP``.
 * Logs carry IDs only, never the comment, the title or the details.
 * History stays small and free of content: after creation the workflow keeps only the item's
   page ID and last status. The lines posted in the thread that name the title, the comment
@@ -54,15 +56,18 @@ with workflow.unsafe.imports_passed_through():
         ExternalUpdate,
         NotionItem,
         TaskSpec,
+        WatchState,
         check_field,
     )
     from agentos.slack_format import escape_slack
     from agentos.switches import agent_off_card_text, agent_off_text
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
+        POKE_GAP,
         RECONCILE_INTERVAL,
         RECONCILE_TRIES,
         RETRY,
+        WATCH_HISTORY_BOUND,
         WRITE_HEARTBEAT_TIMEOUT,
         WRITE_TIMEOUT,
     )
@@ -76,6 +81,8 @@ RECONCILE_PATCH = "reconcile-on-exhaustion"
 PRE_WRITE_PATCH = "pre-write-audience"
 # Histories recorded before a task's payload was stored in Postgres carry it in the spec.
 DRAFT_REFS_PATCH = "draft-refs"
+# Histories recorded before it never continue as new and answer every poke at once.
+CONTINUE_AS_NEW_PATCH = "task-continue-as-new"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -98,6 +105,8 @@ class TaskWorkflow:
         self._poked = False
         self._edits = 0
         self._refresh_due = False
+        if spec.resume is not None:
+            self._state = "watching"
 
     @workflow.query(name="draft")
     def draft(self) -> DraftView:
@@ -211,6 +220,12 @@ class TaskWorkflow:
         agent: AgentVersion = await self._act(
             AgentActivities.load_agent, ctx.tenant_id, ctx.agent_id
         )
+        if spec.resume is not None:
+            # A continue-as-new of a watching task: approval and the write are long done.
+            resume = spec.resume
+            database_id = spec.database_id if self._refs else spec.payload["database_id"]
+            item = NotionItem(page_id=resume.page_id, url="", title="", status=resume.last_status)
+            return await self._watch(task_id, agent, item, database_id, resume)
         if spec.tool_name == "add_comment":
             # Resolve the item and check its database is granted before any card.
             try:
@@ -368,32 +383,76 @@ class TaskWorkflow:
         )
 
         # --- watch until done ----------------------------------------------------
+        now = workflow.now()
+        state = WatchState(
+            page_id=item.page_id,
+            last_status=item.status,
+            last_change=now,
+            stale_sent=False,
+            deadline=now + timedelta(days=agent.follow_up.max_watch_days),
+        )
+        return await self._watch(task_id, agent, item, database_id, state)
+
+    async def _watch(
+        self,
+        task_id: str,
+        agent: AgentVersion,
+        item: NotionItem,
+        database_id: str,
+        state: WatchState,
+    ) -> str:
+        """Poll the item until it is done, the watch runs out or the agent is turned off.
+
+        A long watch continues as new, carrying ``state``, so no run's history grows without
+        bound. Pokes are answered at most once per ``POKE_GAP``.
+        """
+        ctx = self._spec.ctx
         self._state = "watching"
         self._page_key = normalize_id(item.page_id)
+        self._poked = state.poked
         done_values = _done_values(agent, database_id)
         poll = timedelta(minutes=agent.follow_up.poll_interval_minutes)
         stale_after = timedelta(days=agent.follow_up.stale_after_days)
-        max_watch = timedelta(days=agent.follow_up.max_watch_days)
-        watch_start = workflow.now()
-        last_status = item.status
-        last_change = watch_start
-        stale_sent = False
+        deadline = state.deadline
+        last_status = state.last_status
+        last_change = state.last_change
+        stale_sent = state.stale_sent
+        # Histories recorded before this patch neither hop nor space out pokes.
+        hop = workflow.patched(CONTINUE_AS_NEW_PATCH)
+        last_poll = None
 
         while True:
-            elapsed = workflow.now() - watch_start
-            if elapsed >= max_watch:
+            remaining = deadline - workflow.now()
+            if remaining <= timedelta(0):
                 await self._notice(
                     task_notices.STOPPED_WATCH, f"{task_id}:stopped", task_id, subject=item.title
                 )
                 self._state = "done"
                 return self._state
-            try:
-                await workflow.wait_condition(
-                    lambda: self._poked, timeout=min(poll, max_watch - elapsed)
+            if hop and _hop_due():
+                # Signals that arrive after this point make Temporal refuse the hop and run
+                # their handlers first, so a poke is never lost; one already received is carried.
+                await workflow.wait_condition(workflow.all_handlers_finished)
+                resume = WatchState(
+                    page_id=item.page_id,
+                    last_status=last_status,
+                    last_change=last_change,
+                    stale_sent=stale_sent,
+                    deadline=deadline,
+                    poked=self._poked,
                 )
+                workflow.continue_as_new(dataclasses.replace(self._spec, resume=resume))
+            woken_by_poke = True
+            try:
+                await workflow.wait_condition(lambda: self._poked, timeout=min(poll, remaining))
             except TimeoutError:
-                pass
+                woken_by_poke = False
+            if hop and woken_by_poke and last_poll is not None:
+                wait = POKE_GAP - (workflow.now() - last_poll)
+                if wait > timedelta(0):
+                    await workflow.sleep(wait)
             self._poked = False
+            last_poll = workflow.now()
 
             try:
                 current: NotionItem = await self._act(
@@ -626,6 +685,14 @@ class TaskWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+
+
+def _hop_due() -> bool:
+    """True when this run's history is long enough that the watch should start a new run."""
+    info = workflow.info()
+    return info.is_continue_as_new_suggested() or info.get_current_history_length() >= (
+        WATCH_HISTORY_BOUND
+    )
 
 
 def _subject(spec: TaskSpec) -> str:

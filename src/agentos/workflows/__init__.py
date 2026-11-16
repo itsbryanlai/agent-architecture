@@ -18,6 +18,13 @@ WRITE_LEASE_SECONDS = WRITE_TIMEOUT.total_seconds() + 30
 RECONCILE_TRIES = 4
 RECONCILE_INTERVAL = timedelta(seconds=3)
 
+# A watching task answers a poke from a webhook at most once per this long, so a burst of
+# pokes adds a poll, not a history's worth of events.
+POKE_GAP = timedelta(seconds=60)
+# A watch starts a new run when its history reaches this many events, if Temporal has not
+# suggested it sooner. Far below the server's limit, and about 150 polls.
+WATCH_HISTORY_BOUND = 1000
+
 # Reading, chunking, embedding and storing one page.
 INDEX_TIMEOUT = timedelta(minutes=5)
 

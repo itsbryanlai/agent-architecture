@@ -217,6 +217,23 @@ class LLMResponse:
 
 
 @dataclass
+class WatchState:
+    """What a watching task carries into its next run: IDs, a status value, times and flags.
+
+    Never a title, a comment or a link: those are read from Postgres when a line is posted.
+    """
+
+    page_id: str
+    last_status: str | None
+    last_change: datetime
+    stale_sent: bool
+    # When the watch ends, whatever the number of runs it takes.
+    deadline: datetime
+    # A poke arrived and has not been answered by a poll yet.
+    poked: bool = False
+
+
+@dataclass
 class TaskSpec:
     ctx: TurnContext
     tool_name: str
@@ -231,6 +248,8 @@ class TaskSpec:
     revision: int = 0
     # The Notion database the task writes to (a reference). Empty until a comment's page is resolved.
     database_id: str = ""
+    # Set on a continue-as-new: the task is already past approval and only watches.
+    resume: WatchState | None = None
 
 
 @dataclass

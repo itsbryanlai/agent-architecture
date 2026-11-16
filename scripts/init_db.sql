@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 021 (020 is reserved) applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 021 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -150,7 +150,8 @@ INSERT INTO audit_kinds (kind) VALUES
   ('member_add'), ('member_remove'), ('member_role'),
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
-  ('switch_off'), ('switch_on'), ('usage_repriced')
+  ('switch_off'), ('switch_on'), ('usage_repriced'),
+  ('grant_pick'), ('widening_confirm')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -722,6 +723,28 @@ CREATE POLICY tenant_isolation ON external_writes
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Grants picked from Notion by the draft's owner. Same as migration 020.
+CREATE TABLE IF NOT EXISTS grant_picks (
+  tenant_id  text        NOT NULL,
+  agent_id   text        NOT NULL,
+  notion_id  text        NOT NULL,   -- normalised: lower case, no hyphens
+  kind       text        NOT NULL CHECK (kind IN ('database', 'page')),
+  picked_by  text        NOT NULL,
+  picked_at  timestamptz NOT NULL,
+  PRIMARY KEY (tenant_id, agent_id, notion_id)
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON grant_picks FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON grant_picks TO agentos_app;
+
+ALTER TABLE grant_picks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE grant_picks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON grant_picks;
+CREATE POLICY tenant_isolation ON grant_picks
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -733,5 +756,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('021')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021')
 ON CONFLICT DO NOTHING;

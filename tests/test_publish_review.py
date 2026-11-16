@@ -75,12 +75,24 @@ async def replace_pending(plane, **changes) -> None:
 async def publish_through(surface: str, h: ConsoleHarness, sha: str | None):
     """An admin's publish request from the API or from the version page's form."""
     if surface == "api":
-        body = {} if sha is None else {"definition_sha256": sha}
+        body = (
+            {}
+            if sha is None
+            else {
+                "definition_sha256": sha,
+                "acknowledge_widening": True,
+                "reviewed_published": "none",
+            }
+        )
         async with api_client(h) as c:
             return await c.post(f"{API}/agents/it-helper/versions/1/publish", json=body)
     c = await h.signed_in(ROOT)
     async with using(c):
-        fields = {} if sha is None else {"definition_sha256": sha}
+        fields = (
+            {}
+            if sha is None
+            else {"definition_sha256": sha, "widening": "yes", "reviewed_published": "none"}
+        )
         return await post(c, f"{VERSION}/publish", await csrf_token(c), **fields)
 
 
@@ -348,7 +360,7 @@ async def test_a_failed_audit_insert_rolls_the_change_back_and_the_retry_records
 
     await act(w)
 
-    assert [e.kind for e in w.audit.events[events:]] == [kind]
+    assert [e.kind for e in w.audit.events[events:] if e.kind != "widening_confirm"] == [kind]
 
 
 async def test_the_operators_switch_command_is_one_commit_with_its_audit_event():

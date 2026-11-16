@@ -122,6 +122,10 @@ class NotionAPI(Protocol):
         """One block, for its ``parent`` (a page can sit under a block)."""
         ...
 
+    async def retrieve_database(self, database_id: str) -> dict:
+        """The database object: its ``title`` and ``parent`` (read only)."""
+        ...
+
     async def list_child_blocks(self, block_id: str) -> list[dict]:
         """Every child block of a page or block, following all pages of results."""
         ...
@@ -228,6 +232,9 @@ class RealNotionAPI:
     async def retrieve_block(self, block_id: str) -> dict:
         return await self._client.blocks.retrieve(block_id=block_id)
 
+    async def retrieve_database(self, database_id: str) -> dict:
+        return await self._client.databases.retrieve(database_id=database_id)
+
     async def list_child_blocks(self, block_id: str) -> list[dict]:
         blocks: list[dict] = []
         cursor = None
@@ -319,6 +326,8 @@ class FakeNotionAPI:
         # block by normalized ID, for parent walks.
         self.children: dict[str, list[dict]] = {}
         self.blocks: dict[str, dict] = {}
+        # Title and parent of a database, by normalized ID (see ``set_database_info``).
+        self.database_info: dict[str, dict] = {}
         self.comments: dict[str, list[dict]] = {}
         self._fail_next_query: Exception | None = None
         # The body blocks of pages created through ``create_page``, by page ID.
@@ -369,6 +378,13 @@ class FakeNotionAPI:
 
     def add_database(self, database_id: str) -> None:
         self.databases.setdefault(normalize_id(database_id), {})
+
+    def set_database_info(self, database_id: str, title: str, parent: dict | None = None) -> None:
+        """Set what ``retrieve_database`` returns for a database: its title and parent."""
+        self.database_info[normalize_id(database_id)] = {
+            "title": title,
+            "parent": parent or {"type": "workspace", "workspace": True},
+        }
 
     def set_schema(self, database_id: str, schema: dict[str, dict]) -> None:
         """Set the property schema: ``{name: {"id", "type", "options"?}}``."""
@@ -546,6 +562,19 @@ class FakeNotionAPI:
         if block is None:
             raise FakeNotFound(block_id)
         return copy.deepcopy(block)
+
+    async def retrieve_database(self, database_id: str) -> dict:
+        self.calls.append(("retrieve_database", {"database_id": database_id}))
+        key = normalize_id(database_id)
+        if key not in self.databases and key not in self.database_info:
+            raise FakeNotFound(database_id)
+        info = self.database_info.get(key, {"title": "", "parent": {"type": "workspace"}})
+        return {
+            "object": "database",
+            "id": database_id,
+            "title": [_rich({"text": {"content": info["title"]}})],
+            "parent": copy.deepcopy(info["parent"]),
+        }
 
     async def list_child_blocks(self, block_id: str) -> list[dict]:
         self.calls.append(("list_child_blocks", {"block_id": block_id}))
@@ -851,6 +880,71 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
                         f"status: done value '{done}' is not an option of property '{name}'"
                     )
     return result
+
+
+@dataclass
+class LiveObject:
+    """What Notion says a granted database or page is called and where it sits.
+
+    ``title`` is the object's own live title; ``parent`` reads like ``page 'Handbook'``,
+    ``database 'Tasks'`` or ``workspace``. Either is None when Notion would not show it
+    to the integration. Titles only, never page text.
+    """
+
+    title: str | None = None
+    parent: str | None = None
+
+
+_MAX_PARENT_HOPS = 6
+
+
+def _page_title(page: dict) -> str:
+    for prop in (page.get("properties") or {}).values():
+        if prop.get("type") == "title":
+            return _plain(prop.get("title", []))
+    return ""
+
+
+async def _parent_label(api: NotionAPI, parent: dict) -> str:
+    """The first ancestor's kind and title; a block parent is followed up to a page."""
+    for _ in range(_MAX_PARENT_HOPS):
+        kind = parent.get("type")
+        if kind == "workspace":
+            return "workspace"
+        try:
+            if parent.get("database_id"):
+                db = await api.retrieve_database(parent["database_id"])
+                return f"database '{_plain(db.get('title', []))}'"
+            if kind == "page_id":
+                page = await api.retrieve_page(parent["page_id"])
+                return f"page '{_page_title(page)}'"
+            if kind == "block_id":
+                parent = (await api.retrieve_block(parent["block_id"])).get("parent") or {}
+                continue
+        except Exception as err:
+            if is_unreachable(err):
+                return "not shared with the integration"
+            raise
+        break
+    return "unknown"
+
+
+async def describe_object(api: NotionAPI, kind: str, object_id: str) -> LiveObject:
+    """Fetch the live title and first parent of a granted database (``kind`` ``database``)
+    or page. An object or parent Notion refuses to show (403, 404) leaves that field None
+    or says so; any other failure propagates for the caller to judge."""
+    try:
+        if kind == "database":
+            obj = await api.retrieve_database(object_id)
+            title = _plain(obj.get("title", []))
+        else:
+            obj = await api.retrieve_page(object_id)
+            title = _page_title(obj)
+    except Exception as err:
+        if is_unreachable(err):
+            return LiveObject()
+        raise
+    return LiveObject(title, await _parent_label(api, obj.get("parent") or {}))
 
 
 async def check_page_grant(api: NotionAPI, grant: NotionPageGrant) -> list[str]:

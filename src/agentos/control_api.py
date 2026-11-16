@@ -49,6 +49,12 @@ from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
 from agentos.control import ControlPlane
 from agentos.control_errors import STATUS_BY_ERROR
 from agentos.grant_checker import GrantProblems
+from agentos.notion_picker import (
+    NOTION_CALLBACK_PATH,
+    HttpNotionOAuth,
+    Picker,
+    picker_from_settings,
+)
 from agentos.sessions import SessionStore
 from agentos.slack_signin import (
     CALLBACK_PATH,
@@ -187,6 +193,11 @@ class Publish(BaseModel):
     model_config = ConfigDict(extra="ignore")
     definition_sha256: str
     confirm_audience: AudienceCounts | None = None
+    # The approver has seen that the version widens access (see ``access_diff``).
+    acknowledge_widening: bool = False
+    # The published version number the approver's diff was computed against, or "none"
+    # (``published`` in the review). A publish without it is refused.
+    reviewed_published: str
 
 
 class BudgetAmount(_Body):
@@ -215,6 +226,7 @@ class ControlDeps:
     tenants: TenantSource | None
     sessions: SessionStore | None = None
     console: Console | None = None
+    picker: Picker | None = None
 
 
 def create_app(
@@ -225,13 +237,14 @@ def create_app(
     port: int = DEFAULT_PORT,
     sessions: SessionStore | None = None,
     console: Console | None = None,
+    picker: Picker | None = None,
 ) -> FastAPI:
     """Build the API. Tests pass fakes; the real process fills ``deps`` on startup.
 
     With a ``console`` the app also serves the web pages, and ``identity`` should be
     ``SlackSession()``. The Host and Origin allowlists then include the console URL.
     """
-    deps = ControlDeps(plane, as_source(tenants), sessions, console)
+    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
@@ -290,7 +303,10 @@ def create_app(
             return _error(403, "origin not allowed")
         # Slack sends the browser back to the callback from another site; the callback
         # is protected by its state cookie instead.
-        arrives_from_slack = console is not None and request.url.path == CALLBACK_PATH
+        arrives_from_slack = console is not None and request.url.path in (
+            CALLBACK_PATH,
+            NOTION_CALLBACK_PATH,
+        )
         if (
             headers.get("sec-fetch-site") in ("cross-site", "same-site")
             and not arrives_from_slack
@@ -471,6 +487,8 @@ def create_app(
                 rid,
                 None if confirm is None else confirm.model_dump(),
                 reviewed_sha256=body.definition_sha256,
+                acknowledge_widening=body.acknowledge_widening is True,
+                reviewed_published=body.reviewed_published,
             )
         )
 
@@ -479,7 +497,32 @@ def create_app(
         tenant_id: Tenant, actor: Actor, agent_id: str, version: int
     ) -> JSONResponse:
         reports = await deps.plane.check_version_grants(tenant_id, actor, agent_id, version)
-        return out({"ok": not any(r.problems for r in reports), "grants": reports})
+        return out({"ok": all(r.ok for r in reports), "grants": [r.as_dict() for r in reports]})
+
+    @app.get("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/review")
+    async def review(tenant_id: Tenant, actor: Actor, agent_id: str, version: int) -> JSONResponse:
+        """What a draft or pending version changes about access, for its editor or an admin.
+
+        Only an admin gets the grants with their live titles and parents; the diff and the
+        picks (who chose which object from their own Notion) go to either."""
+        found = await deps.plane.version_review(tenant_id, actor, agent_id, version)
+        return out(
+            {
+                "grants": None if found.reports is None else [r.as_dict() for r in found.reports],
+                "live_problem": found.live_problem,
+                "widens": None if found.diff is None else found.diff.widens,
+                "published": None if found.diff is None else found.diff.published,
+                "changes": None
+                if found.diff is None
+                else [
+                    {"kind": c.kind, "what": c.what, "widens": c.widens} for c in found.diff.changes
+                ],
+                "picks": {
+                    nid: {"picked_by": p.picked_by, "picked_at": p.picked_at}
+                    for nid, p in found.picks.items()
+                },
+            }
+        )
 
     # --- members ---
 
@@ -632,6 +675,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.budgets import PostgresBudgetStore
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
+    from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
     from agentos.schema_version import require_current_schema
     from agentos.sessions import PostgresSessionStore
@@ -687,6 +731,8 @@ async def _real_lifespan(app: FastAPI):
             pauses=PostgresPauseStore(pool),
             switches=PostgresSwitchStore(pool),
             unit_of_work=PostgresUnitOfWork(pool),
+            grant_picks=PostgresGrantPickStore(pool),
+            require_grant_picker=settings.require_grant_picker,
         )
         app.state.deps.tenants = directory
         yield
@@ -713,6 +759,20 @@ def build_process_app(
         operator = operator_from_environment(environ)
         return create_app(None, None, operator, lifespan=_real_lifespan, port=port)
     slack = HttpSlackOidc(sign_in.client_id, sign_in.client_secret)
+    try:
+        picker_config = picker_from_settings(
+            settings.notion_oauth_client_id, settings.notion_oauth_client_secret
+        )
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
+    if settings.require_grant_picker and picker_config is None:
+        raise SystemExit(
+            "AGENTOS_REQUIRE_GRANT_PICKER is set but the picker is not configured: set "
+            "NOTION_OAUTH_CLIENT_ID and NOTION_OAUTH_CLIENT_SECRET"
+        )
+    picker = (
+        None if picker_config is None else Picker(picker_config, HttpNotionOAuth(picker_config))
+    )
     return create_app(
         None,
         None,
@@ -720,6 +780,7 @@ def build_process_app(
         lifespan=_real_lifespan,
         port=port,
         console=Console(sign_in, slack),
+        picker=picker,
     )
 
 

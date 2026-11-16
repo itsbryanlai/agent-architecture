@@ -18,14 +18,20 @@ tenant-level credentials.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 import httpx
 from notion_client.errors import RequestTimeoutError
 
 from agentos.config import AgentVersion
-from agentos.connectors.notion import NotionAPI, check_grant, check_page_grant
+from agentos.connectors.notion import (
+    LiveObject,
+    NotionAPI,
+    check_grant,
+    check_page_grant,
+    describe_object,
+)
 
 # What the Notion client raises when the request never got an answer: its own
 # timeout, any httpx transport failure, and the OS-level connection errors and
@@ -59,6 +65,67 @@ class GrantReport:
     kind: str = "database"
     problems: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # A short category when something is wrong (see ``REASONS``); None when the grant is fine.
+    reason: str | None = None
+    # What Notion says the object is called and where it sits, now. The creator's label is
+    # ``grant``; ``label_differs`` is set when the two do not match once normalised.
+    live_title: str | None = None
+    parent: str | None = None
+    label_differs: bool = False
+    # False on a report cut down for a creator (see ``without_detail``).
+    detail: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems and self.reason is None
+
+    def without_detail(self) -> GrantReport:
+        """The report a creator sees: ok or a problem category, no schema, text or titles."""
+        return GrantReport(
+            self.grant, self.database_id, self.kind, reason=self.reason, detail=False
+        )
+
+    def as_dict(self) -> dict:
+        """The JSON form: everything for an admin, ok and a category for anyone else."""
+        base = {"grant": self.grant, "database_id": self.database_id, "kind": self.kind}
+        base["ok"] = self.ok
+        base["reason"] = self.reason
+        if not self.detail:
+            return base
+        return base | {
+            "problems": self.problems,
+            "notes": self.notes,
+            "live_title": self.live_title,
+            "parent": self.parent,
+            "label_differs": self.label_differs,
+        }
+
+
+# Why a grant has a problem, as far as a non-admin may be told.
+NOT_SHARED = "not_shared_with_integration"
+NOT_FOUND = "not_found"
+WRONG_TYPE = "wrong_type"
+MAPPING = "mapping_mismatch"
+UNREADABLE = "unreadable"
+REASONS = (NOT_SHARED, NOT_FOUND, WRONG_TYPE, MAPPING, UNREADABLE)
+
+
+def _reason_of(err: Exception) -> str:
+    status = getattr(err, "status", None)
+    if status in (403, 404):
+        return NOT_SHARED
+    if status == 400:
+        return WRONG_TYPE
+    return UNREADABLE
+
+
+def _same_name(a: str, b: str) -> bool:
+    return " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
+
+
+def _with_live(report: GrantReport, live: LiveObject) -> GrantReport:
+    differs = live.title is not None and not _same_name(report.grant, live.title)
+    return replace(report, live_title=live.title, parent=live.parent, label_differs=differs)
 
 
 class GrantChecker(Protocol):
@@ -137,22 +204,33 @@ class NotionGrantChecker:
                     raise
                 what = f"database '{grant.name}' cannot be read with this token"
                 reports.append(
-                    GrantReport(grant.name, grant.id, problems=[f"{what} ({type(err).__name__})"])
+                    GrantReport(
+                        grant.name,
+                        grant.id,
+                        problems=[f"{what} ({type(err).__name__})"],
+                        reason=_reason_of(err),
+                    )
                 )
                 continue
-            reports.append(
-                GrantReport(
-                    grant.name,
-                    grant.id,
-                    problems=list(result.problems),
-                    notes=list(result.notes),
-                )
+            report = GrantReport(
+                grant.name,
+                grant.id,
+                problems=list(result.problems),
+                notes=list(result.notes),
+                reason=MAPPING if result.problems else None,
             )
+            reports.append(_with_live(report, await describe_object(api, "database", grant.id)))
         for page_grant in pages:
             seen = _ReadErrors(api)
             problems = await check_page_grant(seen, page_grant)
             for err in seen.errors:
                 if not _is_grant_problem(err):
                     raise err
-            reports.append(GrantReport(page_grant.name, page_grant.id, "page", problems))
+            reason = None
+            if problems:
+                reason = _reason_of(seen.errors[0]) if seen.errors else NOT_FOUND
+            report = GrantReport(page_grant.name, page_grant.id, "page", problems, reason=reason)
+            if not seen.errors:
+                report = _with_live(report, await describe_object(api, "page", page_grant.id))
+            reports.append(report)
         return reports

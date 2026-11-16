@@ -439,3 +439,21 @@ async def two_tenants():
     async with worker:
         yield h
     await wf_env.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _publish_acknowledges_widening(request, monkeypatch):
+    """Most tests are about something else, and a first publish widens access, so a direct
+    ``ControlPlane.publish_version`` call acknowledges it unless the test says otherwise.
+    ``test_grant_review`` exercises the acknowledgement itself and gets the real behaviour."""
+    if request.module.__name__.endswith("test_grant_review"):
+        return
+    from agentos.control import ControlPlane
+
+    real = ControlPlane.publish_version
+
+    async def publish(self, *args, **kwargs):
+        kwargs.setdefault("acknowledge_widening", True)
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ControlPlane, "publish_version", publish)

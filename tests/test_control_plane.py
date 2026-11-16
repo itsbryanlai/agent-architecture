@@ -164,8 +164,7 @@ async def test_an_admin_approves_their_own_submission_and_the_event_shows_both_i
     await plane.add_agent(TENANT, ROOT, "it-helper", helper_block())
     await plane.submit_version(TENANT, ROOT, "it-helper", 1)
     await plane.publish_version(TENANT, ROOT, "it-helper", 1)
-    event = audit.events[-1]
-    assert event.kind == "agent_publish"
+    event = next(e for e in audit.events if e.kind == "agent_publish")
     assert (event.requester_user_id, event.approver_user_id) == (ROOT, ROOT)
 
     await pending_version_for(plane, "second", OWNER)
@@ -346,16 +345,19 @@ async def test_each_action_writes_one_event_with_ids_and_a_hash_and_no_definitio
         ("member_role", plane.change_role(TENANT, ROOT, "U_NEW", "admin")),
         ("member_remove", plane.drop_member(TENANT, ROOT, "U_NEW")),
     ]
-    for count, (kind, step) in enumerate(steps, start=1):
+    count = 0
+    for kind, step in steps:
         await step
+        # The first publish widens access, so it also records the acknowledgement.
+        count += 2 if kind == "agent_publish" else 1
         assert len(audit.events) == count, kind
-        assert audit.events[-1].kind == kind
+        assert audit.events[count - (2 if kind == "agent_publish" else 1)].kind == kind
 
     for event in audit.events:
         assert event.tenant_id == TENANT
         assert event.event_key.startswith(f"{TENANT}:audit:control:{event.kind}:")
         assert PROMPT not in repr(event)
-        if event.kind.startswith("agent_"):
+        if event.kind.startswith(("agent_", "widening_")):
             assert (event.agent_id, event.input_sha256) == (
                 "it-helper",
                 canonical_sha256(definition),

@@ -108,10 +108,19 @@ def t(path: str, tenant: str = TENANT) -> str:
     return f"/tenants/{tenant}{path}"
 
 
+async def published_number(h: Harness, agent: str) -> str:
+    now = await h.agents.published(TENANT, agent)
+    return "none" if now is None else str(now.version)
+
+
 async def seen(h: Harness, agent: str = "it-helper", version: int = 1) -> dict:
     """The publish body of an admin who read the version just now: the hash it carries."""
     record = await h.agents.get_version(TENANT, agent, version)
-    return {"definition_sha256": (record and record.definition_sha256) or "none"}
+    return {
+        "definition_sha256": (record and record.definition_sha256) or "none",
+        "acknowledge_widening": True,
+        "reviewed_published": await published_number(h, agent),
+    }
 
 
 def kinds(h: Harness) -> list[str]:
@@ -231,6 +240,7 @@ async def test_the_agent_lifecycle_through_the_api(h):
         "agent_reject",
         "agent_submit",
         "agent_publish",
+        "widening_confirm",
         "agent_draft",
         "agent_draft",
     ]
@@ -537,7 +547,7 @@ async def test_check_grants_reports_each_grant(h):
         [report] = clean.json()["grants"]
         assert report["grant"] == "IT requests"
         assert report["database_id"] == DB_ID
-        assert report["problems"] == []
+        assert report["ok"] is True and report["reason"] is None
 
         schema = default_schema()
         schema["Agent request ID"] = {"id": "reqid1", "type": "people"}
@@ -546,7 +556,7 @@ async def test_check_grants_reports_each_grant(h):
         broken = await c.post(t("/agents/it-helper/versions/1/check-grants"))
         assert broken.status_code == 200
         assert broken.json()["ok"] is False
-        assert "request_id" in broken.json()["grants"][0]["problems"][0]
+        assert "request_id" in broken.json()["grants"][0]["problems"][0]  # an admin sees the detail
 
 
 async def test_check_grants_is_for_editors_and_admins(h):

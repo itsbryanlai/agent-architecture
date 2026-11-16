@@ -875,6 +875,10 @@ COUNTS = {"total": 4, "guests": 1, "external": 1}
 API = f"/tenants/{TENANT}"
 
 
+ACK = {"acknowledge_widening": True, "reviewed_published": "none"}
+ACK_FORM = {"widening": "yes", "reviewed_published": "none"}
+
+
 async def sha_of(agents, version: int = 1) -> str:
     """The hash an admin who opened the version just now was shown."""
     return (await agents.get_version(TENANT, "it-helper", version)).definition_sha256
@@ -895,18 +899,18 @@ async def test_api_publish_without_confirmation_is_409_and_with_it_is_200():
     async with client as c:
         refused = await c.post(
             f"{API}/agents/it-helper/versions/1/publish",
-            json={"definition_sha256": await sha_of(_agents)},
+            json={**ACK, "definition_sha256": await sha_of(_agents)},
         )
         assert refused.status_code == 409
         assert "confirm_audience" in refused.json()["error"]
         stale = await c.post(
             f"{API}/agents/it-helper/versions/1/publish",
-            json={"confirm_audience": {**COUNTS, "total": 3}, "definition_sha256": sha},
+            json={"confirm_audience": {**COUNTS, "total": 3}, **ACK, "definition_sha256": sha},
         )
         assert stale.status_code == 409 and "changed" in stale.json()["error"]
         done = await c.post(
             f"{API}/agents/it-helper/versions/1/publish",
-            json={"confirm_audience": COUNTS, "definition_sha256": sha},
+            json={"confirm_audience": COUNTS, **ACK, "definition_sha256": sha},
         )
         assert done.status_code == 200 and done.json()["status"] == "published"
     assert "audience_confirm" in [e.kind for e in audit.events]
@@ -919,7 +923,7 @@ async def test_api_publish_of_a_channel_outside_the_audience_is_409():
     async with client as c:
         refused = await c.post(
             f"{API}/agents/it-helper/versions/1/publish",
-            json={"confirm_audience": COUNTS, "definition_sha256": sha},
+            json={"confirm_audience": COUNTS, **ACK, "definition_sha256": sha},
         )
     assert refused.status_code == 409 and OTHER_CHAN in refused.json()["error"]
 
@@ -931,7 +935,7 @@ async def test_api_publish_is_502_when_slack_cannot_be_read():
     async with client as c:
         refused = await c.post(
             f"{API}/agents/it-helper/versions/1/publish",
-            json={"confirm_audience": COUNTS, "definition_sha256": await sha_of(agents)},
+            json={"confirm_audience": COUNTS, **ACK, "definition_sha256": await sha_of(agents)},
         )
     assert refused.status_code == 502
 
@@ -1012,13 +1016,14 @@ async def test_the_console_publishes_only_with_the_box_ticked_and_current_counts
     async with using(c):
         token = await csrf_token(c)
         unticked = await post(
-            c, f"{VERSION_URL}/publish", token, definition_sha256=await sha_of(h.agents)
+            c, f"{VERSION_URL}/publish", token, **ACK_FORM, definition_sha256=await sha_of(h.agents)
         )
         assert unticked.status_code == 409 and "confirm" in unticked.text
         stale = await post(
             c,
             f"{VERSION_URL}/publish",
             token,
+            **ACK_FORM,
             definition_sha256=await sha_of(h.agents),
             confirm="yes",
             total="3",
@@ -1030,6 +1035,7 @@ async def test_the_console_publishes_only_with_the_box_ticked_and_current_counts
             c,
             f"{VERSION_URL}/publish",
             token,
+            **ACK_FORM,
             definition_sha256=await sha_of(h.agents),
             confirm="yes",
             total="x",
@@ -1042,6 +1048,7 @@ async def test_the_console_publishes_only_with_the_box_ticked_and_current_counts
             c,
             f"{VERSION_URL}/publish",
             token,
+            **ACK_FORM,
             definition_sha256=await sha_of(h.agents),
             confirm="yes",
             total="4",
@@ -1066,6 +1073,7 @@ async def test_the_console_shows_a_publish_refused_for_a_mapped_channel():
             c,
             f"{VERSION_URL}/publish",
             token,
+            **ACK_FORM,
             definition_sha256=await sha_of(h.agents),
             confirm="yes",
             total="4",

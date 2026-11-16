@@ -68,6 +68,16 @@ or all writes off and on; each change is audited as ``switch_off`` or ``switch_o
 admin reads every switch. A creator reads the state of the agents they created and the
 tenant-wide switches that stop them, and never changes one.
 
+Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
+title and parent of each granted object, the creator's label and any mismatch, and the
+problems. A creator gets ok or a problem category per grant and nothing else (no property
+names or types, no titles). The version review (``version_review``) adds the diff against
+the published version. A version that widens access is published only with
+``acknowledge_widening``; the acknowledgement is audited as ``widening_confirm``. With the
+picker required (``require_grant_picker``), submit refuses a grant that is new since the
+published version and was not chosen from the creator's own Notion (``record_grant_picks``,
+audited as ``grant_pick``).
+
 A refused action is not audited yet.
 
 Every change and its audit event are one unit of work (``unit_of_work.py``): one tenant
@@ -82,11 +92,12 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from agentos import ids
+from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
 from agentos.agent_store import (
     PENDING,
     AgentNotFound,
@@ -118,7 +129,20 @@ from agentos.budgets import (
     parse_amount,
 )
 from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
-from agentos.grant_checker import GrantChecker, GrantProblems, GrantReport
+from agentos.connectors.notion import normalize_id
+from agentos.grant_checker import (
+    GrantChecker,
+    GrantCheckUnavailable,
+    GrantProblems,
+    GrantReport,
+)
+from agentos.grant_picks import (
+    GrantNotPicked,
+    GrantPickStore,
+    InMemoryGrantPickStore,
+    PickedObject,
+    PickRecord,
+)
 from agentos.members import (
     ADMIN,
     CREATOR,
@@ -202,6 +226,30 @@ def _channel_only(pause: PauseRecord) -> EffectiveAudience:
     return EffectiveAudience(True, (pause.channel,), False, (), True)
 
 
+@dataclass
+class VersionReview:
+    """What an approver (or the creator) is shown about a version's access.
+
+    ``reports`` are the live grant reports, only for an admin and only while the version is a
+    draft or pending; ``live_problem`` says why there are none when Notion could not be read.
+    ``diff`` compares with the published version. ``picks`` are the agent's picks by
+    normalised Notion ID.
+    """
+
+    reports: list[GrantReport] | None = None
+    live_problem: str | None = None
+    diff: AccessDiff | None = None
+    picks: dict[str, PickRecord] = field(default_factory=dict)
+
+
+def _all_grant_ids(agent: AgentVersion) -> dict[str, str]:
+    """Normalised ID -> label of every Notion grant of a version."""
+    ids_: dict[str, str] = {}
+    for grant in (*agent.grants.notion_databases, *agent.grants.notion_pages):
+        ids_[normalize_id(grant.id)] = grant.name
+    return ids_
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -217,7 +265,11 @@ class ControlPlane:
         pauses: PauseStore | None = None,
         switches: SwitchStore | None = None,
         unit_of_work: UnitOfWork | None = None,
+        grant_picks: GrantPickStore | None = None,
+        require_grant_picker: bool = False,
     ):
+        self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
+        self._require_picker = require_grant_picker
         self._switches = InMemorySwitchStore() if switches is None else switches
         self._pauses = InMemoryPauseStore() if pauses is None else pauses
         self._audience = audience
@@ -231,7 +283,9 @@ class ControlPlane:
         self._grant_checker = grant_checker
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
         self._uow = (
-            InMemoryUnitOfWork(agents, members, audit, self._budgets, self._switches, self._pauses)
+            InMemoryUnitOfWork(
+                agents, members, audit, self._budgets, self._switches, self._pauses, self._picks
+            )
             if unit_of_work is None
             else unit_of_work
         )
@@ -260,14 +314,19 @@ class ControlPlane:
             raise Forbidden(f"'{actor}' may not do this in tenant '{tenant_id}'")
         return role
 
-    async def _require_editor(self, tenant_id: str, actor: str, agent_id: str) -> None:
-        """An admin, or the creator of this agent."""
+    async def _require_editor(self, tenant_id: str, actor: str, agent_id: str) -> str:
+        """An admin, or the creator of this agent. Returns the actor's role."""
         role = await self._require_role(tenant_id, actor, ADMIN, CREATOR)
         agent = await self._agents.get_agent(tenant_id, agent_id)
         if agent is None:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         if role != ADMIN and agent.created_by != actor:
             raise Forbidden(f"'{actor}' did not create agent '{agent_id}'")
+        return role
+
+    async def require_agent_editor(self, tenant_id: str, actor: str, agent_id: str) -> None:
+        """Raise ``Forbidden`` unless the actor is an admin or created this agent."""
+        await self._require_editor(tenant_id, actor, agent_id)
 
     async def _admin_count(
         self, tenant_id: str, config_admins: tuple[str, ...], conn: Any = None
@@ -412,12 +471,43 @@ class ControlPlane:
     async def check_version_grants(
         self, tenant_id: str, actor: str, agent_id: str, version: int
     ) -> list[GrantReport]:
-        """Check a version's Notion database grants. Read-only; editors and admins."""
-        await self._require_editor(tenant_id, actor, agent_id)
+        """Check a version's Notion grants. Read-only; editors and admins.
+
+        An admin gets the full report. Anyone else gets ok or a problem category per grant
+        and nothing about the objects (schema, property names, titles).
+        """
+        role = await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
-        return await self._grant_checker.check(tenant_id, record.agent())
+        reports = await self._grant_checker.check(tenant_id, record.agent())
+        return reports if role == ADMIN else [r.without_detail() for r in reports]
+
+    async def version_review(
+        self, tenant_id: str, actor: str, agent_id: str, version: int
+    ) -> VersionReview:
+        """The access review of a version for an editor or admin (see ``VersionReview``)."""
+        role = await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        review = VersionReview(picks=await self._picks.for_agent(tenant_id, agent_id))
+        if record.status not in ("draft", PENDING):
+            return review
+        review.diff = await self._access_diff(tenant_id, agent_id, record.agent())
+        if role == ADMIN:
+            try:
+                review.reports = await self._grant_checker.check(tenant_id, record.agent())
+            except GrantCheckUnavailable:
+                review.live_problem = "Notion could not be read just now"
+        return review
+
+    async def _access_diff(self, tenant_id: str, agent_id: str, new: AgentVersion) -> AccessDiff:
+        published = await self._agents.published(tenant_id, agent_id)
+        old_audience = None if published is None else await self._effective(tenant_id, published)
+        diff = diff_access(published, new, old_audience, await self._effective(tenant_id, new))
+        diff.published = "none" if published is None else str(published.version)
+        return diff
 
     async def audience_view(
         self, tenant_id: str, actor: str, agent_id: str, version: int, count: bool = True
@@ -690,12 +780,68 @@ class ControlPlane:
         request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
+        await self._require_picked(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.submit(tenant_id, agent_id, version, actor, conn=conn)
             await self._record(
                 "agent_submit", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
         return record
+
+    async def _require_picked(self, tenant_id: str, agent_id: str, version: int) -> None:
+        """With the picker required, a grant new since the published version must have been
+        chosen from the creator's own Notion. Grants an admin already approved are kept."""
+        if not self._require_picker:
+            return
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            return  # the store refuses it with its own message
+        published = await self._agents.published(tenant_id, agent_id)
+        approved = set() if published is None else set(_all_grant_ids(published))
+        picked = await self._picks.for_agent(tenant_id, agent_id)
+        missing = {
+            nid: label
+            for nid, label in _all_grant_ids(record.agent()).items()
+            if nid not in approved and nid not in picked
+        }
+        if missing:
+            names = ", ".join(f"'{label}' ({nid})" for nid, label in missing.items())
+            raise GrantNotPicked(
+                f"not chosen from your Notion: {names}. Use 'Choose from Notion' on the "
+                "version page, then submit again."
+            )
+
+    async def record_grant_picks(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        objects: list[PickedObject],
+        request_id: str | None = None,
+    ) -> None:
+        """Remember that the actor chose these objects from their own Notion for this agent.
+
+        ``objects`` must come from a listing made with the actor's own Notion token
+        (``notion_picker``); the plane trusts its caller for that, as for the actor.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        if not objects:
+            return
+        async with self._uow.begin(tenant_id) as conn:
+            await self._picks.record(tenant_id, agent_id, objects, actor, self._clock(), conn=conn)
+            await self._record(
+                "grant_pick",
+                tenant_id,
+                actor,
+                version=record,
+                target=",".join(normalize_id(o.id) for o in objects)[:300],
+                request_id=request_id,
+                conn=conn,
+            )
 
     async def withdraw_version(
         self,
@@ -744,6 +890,8 @@ class ControlPlane:
         request_id: str | None = None,
         confirm_audience: dict[str, int] | None = None,
         reviewed_sha256: str | None = None,
+        acknowledge_widening: bool = False,
+        reviewed_published: str | None = None,
     ) -> AgentVersionRecord:
         """Publish a pending version. Only an admin, who may be its submitter.
 
@@ -752,10 +900,17 @@ class ControlPlane:
         with ``VersionChanged`` when the version carries another. The console and the API
         always pass it; without one, the version pending when the checks begin is the one
         published, and it must still be that one when the change is made.
+
+        A version that widens access compared with the published one (see ``access_diff``)
+        is refused with ``WideningNotAcknowledged`` unless ``acknowledge_widening`` is true.
+        ``reviewed_published`` is the published version number (or ``"none"``) the approver's
+        diff was computed against; another one is refused with ``VersionChanged``. The console
+        and the API always pass it; without one the current published version is used.
         """
         await self._require_role(tenant_id, actor, ADMIN)
         pending = await self._agents.get_version(tenant_id, agent_id, version)
         confirmed: AudienceSummary | None = None
+        widening: AccessDiff | None = None
         if pending is not None and pending.status == PENDING:
             if reviewed_sha256 is None:
                 reviewed_sha256 = pending.definition_sha256
@@ -764,12 +919,23 @@ class ControlPlane:
             # Any other status is refused by the store below, with its own reason.
             await self._check_mapped_channels(tenant_id, pending.agent())
             reports = await self._grant_checker.check(tenant_id, pending.agent())
-            if any(report.problems for report in reports):
+            if not all(report.ok for report in reports):
                 raise GrantProblems(reports)
             if self._audience is not None:
                 confirmed = await self._confirmed_audience(
                     tenant_id, pending.agent(), confirm_audience
                 )
+            diff = await self._access_diff(tenant_id, agent_id, pending.agent())
+            if reviewed_published is not None and reviewed_published != diff.published:
+                raise version_changed(agent_id, version)
+            if diff.widens:
+                if not acknowledge_widening:
+                    raise WideningNotAcknowledged(
+                        "this version widens access: "
+                        + "; ".join(c.text() for c in diff.changes if c.widens)
+                        + ". Review it and publish again with acknowledge_widening."
+                    )
+                widening = diff
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.publish(
                 tenant_id, agent_id, version, actor, reviewed_sha256=reviewed_sha256, conn=conn
@@ -784,6 +950,18 @@ class ControlPlane:
                 request_id=request_id,
                 conn=conn,
             )
+            if widening is not None:
+                await self._record(
+                    "widening_confirm",
+                    tenant_id,
+                    actor,
+                    version=record,
+                    requester=record.submitted_by,
+                    approver=actor,
+                    target=f"{sum(c.widens for c in widening.changes)} widening change(s)",
+                    request_id=request_id,
+                    conn=conn,
+                )
             if confirmed is not None:
                 counts = confirmed.confirmation()
                 await self._record(

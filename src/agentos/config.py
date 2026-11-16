@@ -136,6 +136,11 @@ class Settings:
     slack_client_id: str | None = None
     slack_client_secret: str | None = field(default=None, repr=False)
     console_url: str | None = None
+    # The Notion public integration behind "Choose from Notion" (see ``notion_picker``), and
+    # whether a new grant must have been chosen there before a version can be submitted.
+    notion_oauth_client_id: str | None = None
+    notion_oauth_client_secret: str | None = field(default=None, repr=False)
+    require_grant_picker: bool = False
 
     def require(self, name: str) -> str:
         """Return a required setting, or fail with a message naming the variable.
@@ -203,6 +208,9 @@ def load_settings() -> Settings:
         slack_client_id=env.get("SLACK_CLIENT_ID") or None,
         slack_client_secret=env.get("SLACK_CLIENT_SECRET") or None,
         console_url=env.get("AGENTOS_CONSOLE_URL") or None,
+        notion_oauth_client_id=env.get("NOTION_OAUTH_CLIENT_ID") or None,
+        notion_oauth_client_secret=env.get("NOTION_OAUTH_CLIENT_SECRET") or None,
+        require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
     )
 
 

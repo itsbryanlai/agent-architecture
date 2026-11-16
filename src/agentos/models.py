@@ -251,6 +251,8 @@ BUDGET_AUDIT_KINDS = ("budget_set",)
 SWITCH_AUDIT_KINDS = ("switch_off", "switch_on")
 # A reprice of a month's unpriced usage belongs to the tenant, run by an owner from the command line.
 USAGE_AUDIT_KINDS = ("usage_repriced",)
+# Choosing grants from Notion, and an approver accepting that a version widens access.
+ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 AUDIT_KINDS = (
     ("answer", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
@@ -259,6 +261,7 @@ AUDIT_KINDS = (
     + BUDGET_AUDIT_KINDS
     + SWITCH_AUDIT_KINDS
     + USAGE_AUDIT_KINDS
+    + ACCESS_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")

@@ -9,8 +9,12 @@ and [`docs/decisions.md`](docs/decisions.md).
 The code here is a walking skeleton of that design, built on Temporal
 (Python SDK), Postgres, Slack and Notion. It covers one path end to end:
 
-1. A Slack DM (or an @mention in a channel) reaches the gateway, which
-   signal-with-starts a `ConversationWorkflow` for that thread.
+1. A Slack DM (or an @mention in a channel) reaches the gateway, which stores
+   the event in Postgres and answers Slack at once. A relay loop in the gateway
+   then signal-with-starts a `ConversationWorkflow` for that thread, and retries
+   until Temporal takes it, so a Temporal outage never loses or repeats a message.
+   Temporal history holds IDs and small values only: the text of the message, the
+   model's reply, each tool call's input and a task's draft live in Postgres.
 2. Claude answers using Notion read tools (`search_items`, `my_items`), or
    asks to create an item.
 3. Creating an item starts a `TaskWorkflow`, which DMs the requester an
@@ -26,7 +30,9 @@ approval card is sent, and the comment is posted only after **Submit**, exactly
 once, and only on items in a database the agent was granted. Every approval
 card has an **Edit** button: it opens a form prefilled with the draft, and
 saving replaces the draft and asks for a fresh approval (the old buttons stop
-working). A request can be edited up to 5 times.
+working). A request can be edited up to 5 times. Each edit is stored as a new
+revision of the draft, and an approval names the revision it approved, so what
+runs is exactly what the requester saw.
 
 One deployment can serve several tenants (see [Several tenants](#several-tenants)).
 Tenants and agents live in the database (see
@@ -640,16 +646,18 @@ uv run python -m agentos.retention set --tenant acme --messages-days 180 --tool-
 
 | Setting | Default | What goes |
 |---|---|---|
-| `messages_days` | 365 | A conversation's messages, once its newest message is older than this (a thread is never cut in the middle) |
-| `tool_outputs_days` | 90 | Tool output text older than this, in a conversation with no newer message |
-| `idempotency_days` | 90 | Idempotency records older than this |
+| `messages_days` | 365 | A conversation's messages, once its newest message is older than this (a thread is never cut in the middle), and a thread's stored specialist idle for longer than this |
+| `tool_outputs_days` | 90 | Tool output text, tool inputs and stored model replies older than this, in a conversation with no newer message; and the drafts of a task whose newest revision is older than this |
+| `idempotency_days` | 90 | Idempotency records older than this, and inbound Slack events (and saved Edit forms) delivered longer ago than this |
 | `sessions_days` | 1 | Console sessions, this many days after they expired (they are also purged at sign-in) |
 
 The first three are never shorter than the longest a task can live: an agent definition may
 ask for at most 168 hours of approval and a 60-day watch, so the floor is 68 days. `set` refuses
 a lower value, and the nightly job raises a lower stored one to it, so nothing a live approval or
-follow-up still needs is deleted. Audit and usage rows are kept (append-only by design), as are `external_writes`,
-`task_links` and agent definitions.
+follow-up still needs is deleted. The record of when an agent's owner was last mentioned in a
+refusal (`owner_pings`) is purged after two days. Audit and usage rows are kept (append-only by
+design), as are `external_writes`, `task_links` and agent definitions. An inbound event the relay
+has not yet delivered is never purged.
 
 ## Run
 
@@ -1152,7 +1160,9 @@ This is the end-to-end proof that the work outlives the process.
 1. With the worker and gateway running, DM the bot: "My laptop battery is
    swelling, please file a request."
 2. An approval card arrives in your DM. Click **Submit**.
-3. Straight away, kill the worker (Ctrl-C in terminal 1).
+3. Straight away, kill the worker (Ctrl-C in terminal 1). To see the intake survive
+   a Temporal outage too, DM the bot while the worker is down: Slack gets its answer
+   from the gateway, and the reply arrives once the worker is back.
 4. Restart it: `uv run python -m agentos.worker`.
 5. Check Notion: there is **exactly one** new item in the database, with a
    hidden "Agent request ID" ending in `:create`. The thread shows one "Filed"
@@ -1168,6 +1178,8 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | Path | What it is |
 |---|---|
 | `src/agentos/gateway/app.py` | HTTP ingress: Slack events, Slack button clicks, Notion webhook |
+| `src/agentos/gateway/relay.py` | The loop that signals conversation workflows with the events the gateway stored |
+| `src/agentos/content_store.py` | Where message text, model replies, tool inputs and task drafts live while Temporal carries references |
 | `src/agentos/worker.py` | Temporal worker running both workflows and all activities |
 | `src/agentos/workflows/` | `ConversationWorkflow` (turn loop) and `TaskWorkflow` (approval, create, follow-up) |
 | `src/agentos/activities.py` | All I/O the workflows do |

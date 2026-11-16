@@ -73,6 +73,11 @@ Last reviewed 2026-11-14.
 - **Why:** an admin who turns an agent off during an incident expects nothing more to happen, and a card shown before a pause or a membership change should not outlive it.
 - **Consequence:** one gate in front of every activity that acts for an agent applies the agent, writes and connector switches by effect (model, read, write, poll). A switched-off specialist is not offered to a front door.
 
+### Content stays out of Temporal history, with two exceptions for the transition
+- **Decision:** what people write, what the model replies, each tool call's input and a task's draft live in Postgres under IDs, and Temporal carries the IDs. Deleting a thread's rows deletes what was said in it. The gateway stores a Slack event and answers at once; a relay loop signals the workflow.
+- **Deviation 1:** a conversation or task that was running when this change was deployed keeps carrying content in its history until it ends, because histories recorded before the change must still replay. A message signalled by an older gateway has its text inline and is run the way it was; every message after the deploy is content-free, also in a thread that began before it. A task started before keeps its payload in its history until it finishes.
+- **Deviation 2:** two small strings can still reach history: the field names a model chose in an invalid tool input, which are told back to it as the reason the call did not run, and a failure reason from an activity (fixed texts from the connector). Neither is what a person wrote or a document held.
+
 ### A creator reads only the agents they created
 - **Decision:** a creator lists and reads only the agents they created: definitions, versions, usage, budgets and switches follow one rule, enforced in `ControlPlane`, which the console and the API both call. An agent that belongs to someone else answers "not found", as an agent that does not exist does. Admins read every agent.
 - **Why:** a definition holds the system prompt and the access an agent was granted. Before this, usage, budgets and switches were limited to a creator's own agents but definitions were not, so the rule depended on which page asked.

@@ -68,6 +68,11 @@ Last reviewed 2026-11-14.
 - **Limits:** only code we own gets fixed; most failures (logins, permissions, outages) are routed elsewhere, not to the coding agent. The agent can't change safety fields, never deploys, and runs in a separate cell with no production credentials. Details in [architecture.md §12](architecture.md).
 - **Rollout:** detection and the circuit breaker first (v2), human-approved fixes next (v3), automatic deploy only for low-risk read-tool fixes later.
 
+### An agent that is off, or no longer allowed, stops its pending approvals
+- **Decision:** turning an agent off cancels a write the requester already approved that has not run. The card says the agent was turned off by an admin and that nothing was changed, and the task ends without a follow-up watch. A channel pause, or the requester leaving the agent's audience, also stops pending cards: the task re-checks both immediately before the write, refuses with a fixed line on the card, and ends.
+- **Why:** an admin who turns an agent off during an incident expects nothing more to happen, and a card shown before a pause or a membership change should not outlive it.
+- **Consequence:** one gate in front of every activity that acts for an agent applies the agent, writes and connector switches by effect (model, read, write, poll). A switched-off specialist is not offered to a front door.
+
 ## Open questions
 
 | # | Question | Suggested default |

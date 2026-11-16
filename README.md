@@ -466,7 +466,7 @@ gateway. Nothing turned off is held for later, and work already finished is not 
 
 | Switch | What it stops |
 |---|---|
-| An agent | Every turn of that agent gets "<agent name> is turned off by an admin." The model is not called, nothing is billed and no usage row is written. This is checked before the budget. |
+| An agent | Every turn of that agent gets "<agent name> is turned off by an admin." The model is not called, nothing is billed and no usage row is written. This is checked before the budget. It also stops everything else the agent does: a read tool already dispatched returns an error without calling Notion, follow-up polling ends with no post, and the agent is not offered to a front door as a specialist. Pending approval cards stop too: Submit on one, or a write approved but not yet run, writes nothing, and the card says the agent is turned off by an admin and that nothing was changed. |
 | All agents | The same reply for every agent of the organisation. |
 | A connector (`notion`) | Its tool calls return an error the model passes on, knowledge search refuses, and the approval step of a comment is refused. Page events are dropped, and a full indexing run or its prune step stops with a failure instead of reading or deleting anything. Follow-up polling makes no Notion call and the task keeps watching, so the next poll after the switch is back on carries on. A write approved before the switch went off is refused. |
 | All writes | Read-only mode. Agents can still draft and the approval card is posted. Clicking Submit gets "Writes are turned off by your admin; nothing was changed." in the card's conversation, and the card stays, so Submit works again once writes are back on. A write that was approved before the switch went off, but had not run yet, is refused before the call to Notion: the task ends, tells the requester that nothing was changed and that they can ask again later, and is not held. |
@@ -884,6 +884,8 @@ model call, no tool. Direct messages and other channels are unaffected. A thread
 already running in the channel is paused too, from its next message. The agent's creator and
 the tenant's admins each get a direct message once per pause, naming the agent, the channel
 and the reason, never any content.
+
+**Pending approval cards.** A pause does not leave the agent's cards live. Just before an approved write runs, the task checks again that the channel is not paused and that the requester is still in the audience of the agent's current published version. If either fails, nothing is written and the card says "<agent name> can no longer act for you here; nothing was changed." The task ends; the requester can ask again once the agent is available to them.
 
 **Resuming.** The agent page and the version page list the paused channels with the reason,
 the time and how many people are in each channel now (total, guests, from other workspaces).

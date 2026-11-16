@@ -401,6 +401,10 @@ audit insert for `budget_set` is refused:
 uv run python scripts/migrate.py
 ```
 
+Budget checks read a monthly rollup, `usage_month_totals` (migration `026`), which each
+recorded call and each reprice updates in the same transaction. The migration fills it from
+the usage rows already stored, so run it before the worker starts on the new code.
+
 ## Kill switches
 
 An admin can turn things off at once, from the console's **Switches** page, through the API,

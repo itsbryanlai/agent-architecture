@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
+from agentos.connectors.notion_limiter import NotionLimiter
 from agentos.models import NOTION_TEXT_MAX, SIGNATURE_NAME_MAX, NotionItem
 
 if TYPE_CHECKING:
@@ -160,6 +161,8 @@ class RealNotionAPI:
     One layer owns retries, and it is Temporal's. The SDK's own retries on 429
     and 5xx are off, and each request has a timeout well under the activity
     timeout, so a slow Notion fails the attempt instead of keeping it running.
+    Every request first takes a token from the integration's ``NotionLimiter`` (see there
+    for the rate and the two priorities); one tenant has one integration, so one limiter.
     ``http_client`` lets a test supply a client with a mocked transport.
     """
 
@@ -168,13 +171,22 @@ class RealNotionAPI:
         token: str,
         timeout_ms: int = REQUEST_TIMEOUT_MS,
         http_client: httpx.AsyncClient | None = None,
+        limiter: NotionLimiter | None = None,
     ):
+        import httpx
         from notion_client import AsyncClient
 
+        # Every request this integration sends waits here first, whichever method sent it.
+        self.limiter = limiter or NotionLimiter()
+        http_client = http_client or httpx.AsyncClient()
+        http_client.event_hooks["request"].append(self._wait_for_allowance)
         self._client = AsyncClient(
             auth=token, timeout_ms=timeout_ms, retry=False, client=http_client
         )
         self._data_sources: dict[str, list[str]] = {}
+
+    async def _wait_for_allowance(self, request: httpx.Request) -> None:
+        await self.limiter.acquire()
 
     async def _data_source_ids(self, database_id: str) -> list[str]:
         key = normalize_id(database_id)

@@ -755,7 +755,26 @@ tenant's published set: a publish or import that would break them is refused.
 
 Grants are read from the published version when a tool runs, not when the
 worker starts. A grant removed by a new published version applies to the next
-call, including a write that was approved before.
+call, including a write that was approved before. A turn's model calls and its
+audience check, on the other hand, use the version the turn started with, so a
+publish in the middle of a turn does not change its prompt.
+
+`max_writes_per_turn` in a definition (a whole number from 1 to 10, default 2) is how
+many writes one model reply may start. Each write is an approval card in the
+requester's DMs. The agent's other write calls in that reply, and a write repeated
+in it, get an error result that tells the model so. A definition that leaves it out
+keeps the default.
+
+```yaml
+max_steps: 6
+max_writes_per_turn: 2   # optional
+```
+
+A thread handed to a specialist is remembered in the `threads` table (migration
+`025`), so it keeps its specialist when the conversation workflow closes after a week
+of silence and starts again. The same migration adds `owner_pings`: a refusal tells the
+asker to ask the agent's owner and mentions them, which pages them, so it does so once
+a day for each person in each place and names the owner without a mention after that.
 
 Tenant settings stay in the YAML file: `tenant_id`, `slack_team_id`,
 `default_agent`, `channels`, `notion_workspace_id` and `secrets`. The worker and
@@ -1111,6 +1130,7 @@ The Temporal UI shows the `…:task:…` workflow resuming where it stopped.
 | `src/agentos/switches.py` | Kill switches: the table, the checks, and the operator command |
 | `src/agentos/unit_of_work.py` | One transaction and the tenant lock for a change and its audit event |
 | `src/agentos/stores.py` | Chat history, idempotency records and task links (Postgres, in-memory) |
+| `src/agentos/threads.py` | The agent a thread was handed to, and the day an agent's owner was last mentioned in a refusal |
 | `scripts/init_db.sql` | Database schema, applied by Compose on first start |
 | `scripts/migrate.py` | Applies the migrations a database lacks and records them in `schema_migrations` |
 | `src/agentos/schema_version.py` | The start-up check that the database has every migration the code expects |

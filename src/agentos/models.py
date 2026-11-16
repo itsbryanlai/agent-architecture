@@ -1,9 +1,16 @@
 """Data types shared by the gateway, the workflows and the activities.
 
 Everything here is passed through Temporal, so each type is a plain dataclass
-of primitives, lists, dicts and other dataclasses. Workflows carry only
-references and small values: chat history lives in Postgres, never in these
-objects.
+of primitives, lists, dicts and other dataclasses. A signal, a workflow argument
+or an activity argument carries IDs and small values, never chat or document
+content: the text a person wrote, the model's reply, a tool call's input and a
+task's payload are kept in Postgres (``agentos.content_store``, chat history)
+and read there by the activities that need them.
+
+Two classes keep fields that held content before that change (``InboundMessage.text``,
+``TaskSpec.payload``, ``EditRequest.fields``) because histories recorded then still
+replay on them. A message, task or edit made now leaves them empty and sets the field
+that names the stored content (``text_stored``, ``draft_ref``, ``edit_id``).
 """
 
 from __future__ import annotations
@@ -19,16 +26,21 @@ from agentos.slack_format import escape_slack
 OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
 HAND_OFF_ANNOUNCEMENT = "{agent} here, picking this up."
+NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
+CUT_SHORT = "\n\n(reply cut short)"
 
 
 @dataclass
 class InboundMessage:
     event_id: str  # Slack event_id, used to drop duplicates
     user_id: str  # Slack user ID of the sender
-    text: str
+    text: str  # empty when ``text_stored``: the text is in ``inbound_events`` under the event ID
     channel: str
     thread_ts: str  # thread root ts (event.thread_ts or event.ts)
     channel_kind: str  # "im" or "channel"
+    # True when the gateway kept the text in ``inbound_events`` and the signal carries none.
+    # A signal recorded before that has the text inline and is handled as it was.
+    text_stored: bool = False
 
 
 @dataclass
@@ -88,6 +100,23 @@ class ToolCall:
     problem: str = ""
 
 
+def assistant_blocks(resp: LLMResponse) -> list[dict]:
+    """The assistant turn to store: the model's own blocks when available.
+
+    A tool call the blocks lack is added, so every call has its ``tool_use`` block.
+    """
+    blocks = [dict(b) for b in resp.content]
+    if not blocks and resp.text:
+        blocks.append({"type": "text", "text": resp.text})
+    listed = {b.get("id") for b in blocks if b.get("type") == "tool_use"}
+    for call in resp.tool_calls:
+        if call.id not in listed:
+            blocks.append(
+                {"type": "tool_use", "id": call.id, "name": call.name, "input": call.input}
+            )
+    return blocks
+
+
 @dataclass
 class Citation:
     """One numbered source the model may cite, like "[3]"."""
@@ -131,6 +160,50 @@ class Usage:
 
 
 @dataclass
+class ToolCallRef:
+    """A tool call as the workflow sees it: what it is, never what the model put in it.
+
+    The input is stored by tool-use ID (``tool_inputs``) and read by the activity that runs
+    the call. ``input_sha256`` lets the workflow tell two identical calls apart without
+    reading either; ``target`` is the specialist a ``hand_off`` names, when it is a
+    well-formed agent ID, else empty.
+    """
+
+    id: str
+    name: str
+    kind: str = ""
+    problem: str = ""
+    input_sha256: str = ""
+    target: str = ""
+
+
+@dataclass
+class StepResult:
+    """What one model step decided, with the content left in Postgres.
+
+    The assistant message is stored under the step key by the ``call_model`` activity. A
+    final reply (no ``tool_calls``) waits in ``model_steps`` until the activity that shows it
+    stores it in history.
+    """
+
+    stop_reason: str
+    tool_calls: list[ToolCallRef] = field(default_factory=list)
+    has_text: bool = False
+
+
+@dataclass
+class DraftOutcome:
+    """What drafting a task stored: the revision, or why the model's input cannot be a task.
+
+    ``error`` is worded for the model and holds no content (a missing field, a length).
+    """
+
+    error: str = ""
+    revision: int = 0
+    database_id: str = ""
+
+
+@dataclass
 class LLMResponse:
     text: str | None
     tool_calls: list[ToolCall]
@@ -147,10 +220,17 @@ class LLMResponse:
 class TaskSpec:
     ctx: TurnContext
     tool_name: str
-    # The frozen, validated item to create. What the requester approves is
-    # exactly what runs; nothing changes this after the card is posted.
+    # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
+    # ``revision``). A task recorded before that carries its frozen payload here.
     payload: dict
     approval_nonce: str
+    # The task ID the draft revisions are stored under; empty on a task that carries its payload.
+    draft_ref: str = ""
+    # The revision the card shows and the approval names. An edit stores the next revision and
+    # a new nonce, so an approval always binds to one (revision, nonce).
+    revision: int = 0
+    # The Notion database the task writes to (a reference). Empty until a comment's page is resolved.
+    database_id: str = ""
 
 
 @dataclass
@@ -226,18 +306,25 @@ class EditRequest:
 
     nonce: str  # the nonce of the draft being edited
     user_id: str  # Slack user ID of whoever submitted the form
-    fields: dict  # str -> str; keys are the tool's editable fields
+    fields: dict  # str -> str; keys are the tool's editable fields. Empty when ``edit_id`` is set
+    # The ``inbound_events`` row that holds the saved values; empty on an edit recorded with them inline.
+    edit_id: str = ""
 
 
 @dataclass
 class DraftView:
-    """What the task's "draft" query returns: the current draft and its nonce."""
+    """What the task's "draft" query returns: which draft is current, and its nonce.
+
+    A task made now returns no field values: ``revision`` names the row of ``task_drafts``
+    that holds them. ``fields`` is filled only for a task that carries its payload.
+    """
 
     tool_name: str
-    fields: dict  # current editable values
+    fields: dict  # current editable values; empty when ``revision`` is set
     nonce: str
     requester_user_id: str
     editable: bool  # True only while awaiting approval and under the edit limit
+    revision: int = 0
 
 
 AGENT_AUDIT_KINDS = (

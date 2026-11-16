@@ -3,11 +3,18 @@
 Rules this workflow keeps:
 
 * History stays small and free of content. Chat history lives in Postgres; the
-  workflow carries the conversation reference, an inbox of pending messages and
-  the recently seen event IDs. Each turn reloads history inside an activity.
-  Tool output text is stored by the activity that ran the tool, and the
-  workflow carries only references to it; the append activity puts the text
-  into history.
+  workflow carries the conversation reference, an inbox of pending messages (IDs, no
+  text) and the recently seen event IDs. What a person wrote, what the model replied,
+  each tool call's input and a task's payload are stored by the activities that handle
+  them, and the workflow carries only references and values derived from them (whether a
+  message had text, a tool call's name and an input hash, a draft revision). Each turn
+  reloads history inside an activity. Tool output text is stored by the activity that ran
+  the tool, and the workflow carries only references to it.
+* The legacy path. A message signalled before content left history carries its text, and
+  its turn is run the way it was then (``call_llm`` and the activities that take content as
+  arguments), so a history recorded then replays. A message from the gateway sets
+  ``text_stored`` and runs the content-free path, behind the ``content-refs`` marker. A
+  turn is entirely one or the other.
 * Links are never written by the model. The model cites sources by number;
   the workflow carries only the numbers and page IDs (citations), and the
   reply activity builds the Sources line from stored page metadata.
@@ -25,8 +32,8 @@ Rules this workflow keeps:
   same reply, get an error result. Input that does not fit a tool's schema gets one too.
 * A reply the model cut off at its token limit is posted with a note when it is text,
   and runs no tool when it has tool calls: each gets an error result asking for less.
-* A reply is stored in history only after it was shown, so a Slack failure never leaves
-  history claiming the user saw an answer.
+* A reply is stored in history only after it was shown (``finalize_model_reply`` does both,
+  in that order), so a Slack failure never leaves history claiming the user saw an answer.
 * A front door hands a thread to one of its configured specialists with the
   ``hand_off`` tool. Nothing outside the workflow runs for it. The specialist
   answers the same message, announces itself, and owns the rest of the thread:
@@ -66,17 +73,22 @@ with workflow.unsafe.imports_passed_through():
     from agentos.config import AgentVersion
     from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
+        CUT_SHORT,
         EDITABLE_FIELDS,
         HAND_OFF_ANNOUNCEMENT,
+        NO_ANSWER,
         OUT_OF_STEPS,
         READ_KIND,
         TURN_FAILED,
         Citation,
         ConversationRef,
+        DraftOutcome,
         InboundMessage,
         LLMResponse,
+        StepResult,
         TaskSpec,
         ToolCall,
+        ToolCallRef,
         ToolResult,
         TurnContext,
         check_field,
@@ -87,7 +99,6 @@ with workflow.unsafe.imports_passed_through():
 IDLE_TIMEOUT = timedelta(days=7)
 SEEN_LIMIT = 500
 MAX_CITATIONS = 200
-NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
 TOOL_NOT_COMPLETED = "The tool call did not complete."
 STEP_LIMIT_REACHED = "step limit reached"
 HAND_OFF_ACCEPTED = "Handed to {agent}. They will answer now."
@@ -99,7 +110,6 @@ HAND_OFF_UNAVAILABLE = (
 )
 HAND_OFF_PREFIX = "h1:"
 MAX_TOKENS_STOP = "max_tokens"
-CUT_SHORT = "\n\n(reply cut short)"
 CUT_OFF = "Your reply was cut off. Try again with less."
 DUPLICATE_WRITE = "Not run: identical to an earlier call in this reply."
 WRITE_LIMIT = (
@@ -122,6 +132,8 @@ PATCH_MANIFEST_KINDS = "manifest-tool-kinds"
 PATCH_CUT_OFF = "cut-off-replies"
 PATCH_STORE_AFTER_SHOWN = "store-reply-after-shown"
 PATCH_THREAD_AGENT = "thread-agent-row"
+# A turn whose message text is in ``inbound_events``: the content-free commands (see the module doc).
+PATCH_CONTENT_REFS = "content-refs"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
@@ -138,6 +150,8 @@ class _TurnState:
         self.reply_stored = False
         # True once the thread has been handed to a specialist in this turn.
         self.handed_off = False
+        # True for a turn run on the content-free path: it needs no marker of an older change.
+        self.refs = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -233,7 +247,7 @@ class ConversationWorkflow:
             await self._fail_turn(err, ref, m, conv_id, state)
         except (ChildWorkflowError, WorkflowAlreadyStartedError) as err:
             # A task that could not be started is a failed turn like a failed activity.
-            if not workflow.patched(PATCH_CHILD_FAILURE):
+            if not (state.refs or workflow.patched(PATCH_CHILD_FAILURE)):
                 raise
             await self._fail_turn(err, ref, m, conv_id, state)
 
@@ -251,7 +265,7 @@ class ConversationWorkflow:
         if state.ctx is None or state.placeholder_ts is None:
             # No placeholder to replace, so the user would get no reply at
             # all: post the failure notice as a new message instead.
-            if workflow.patched(PATCH_EARLY_FAILURE_NOTICE):
+            if state.refs or workflow.patched(PATCH_EARLY_FAILURE_NOTICE):
                 await self._notify_early_failure(ref, m)
             return
         await self._recover(conv_id, state)
@@ -357,24 +371,36 @@ class ConversationWorkflow:
 
     async def _run_turn(self, m: InboundMessage, conv_id: str, state: "_TurnState") -> None:
         ref = self._ref()
+        # A message whose text the gateway kept in Postgres runs the content-free path. The
+        # marker is asked only then, so a history recorded before it replays without it.
+        state.refs = m.text_stored and workflow.patched(PATCH_CONTENT_REFS)
+        refs = state.refs
         agent: AgentVersion = await self._load_agent(ref.tenant_id, ref.agent_id)
         ctx = self._turn_context(ref, agent, m)
         state.event_id = m.event_id
-        if workflow.patched(PATCH_AUDIENCE) and not await self._audience_allows(agent, ctx, m):
+        if (refs or workflow.patched(PATCH_AUDIENCE)) and not await self._audience_allows(
+            agent, ctx, m
+        ):
             return
-        if not m.text.strip() and workflow.patched(PATCH_EMPTY_MESSAGE):
-            # A bare mention: nothing to answer, and an empty text block stored in
-            # history would be rejected by the model on every later call.
-            await workflow.execute_activity_method(
-                AgentActivities.post_in_thread,
-                args=[ctx, EMPTY_MESSAGE_REPLY, ids.empty_message_key(m.event_id, ctx.agent_id)],
+        if refs:
+            has_text: bool = await workflow.execute_activity_method(
+                AgentActivities.ingest_message,
+                args=[ctx.tenant_id, conv_id, m.event_id],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
-            return
-        await self._append(
-            ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]
-        )
+            if not has_text:
+                await self._reply_empty_message(ctx, m)
+                return
+        else:
+            if not m.text.strip() and workflow.patched(PATCH_EMPTY_MESSAGE):
+                # A bare mention: nothing to answer, and an empty text block stored in
+                # history would be rejected by the model on every later call.
+                await self._reply_empty_message(ctx, m)
+                return
+            await self._append(
+                ctx, conv_id, f"{m.event_id}:user", "user", [{"type": "text", "text": m.text}]
+            )
         placeholder_ts: str = await workflow.execute_activity_method(
             AgentActivities.post_placeholder,
             args=[ctx, f"{m.event_id}:ph"],
@@ -390,16 +416,32 @@ class ConversationWorkflow:
         step = 0
         while step < agent.max_steps:
             key = f"{m.event_id}:{key_prefix}s{step}"
-            resp: LLMResponse = await workflow.execute_activity_method(
-                AgentActivities.call_llm,
-                args=[ctx, conv_id],
-                start_to_close_timeout=LLM_TIMEOUT,
-                retry_policy=RETRY,
-            )
+            calls: list[ToolCall] | list[ToolCallRef]
+            if refs:
+                outcome: StepResult = await workflow.execute_activity_method(
+                    AgentActivities.call_model,
+                    args=[ctx, conv_id, key],
+                    start_to_close_timeout=LLM_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                calls, stop_reason = outcome.tool_calls, outcome.stop_reason
+            else:
+                resp: LLMResponse = await workflow.execute_activity_method(
+                    AgentActivities.call_llm,
+                    args=[ctx, conv_id],
+                    start_to_close_timeout=LLM_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                calls, stop_reason = resp.tool_calls, resp.stop_reason
             # The model stopped at its token limit: text may end mid-sentence and a tool
             # call's input may be missing its end.
-            cut_off = resp.stop_reason == MAX_TOKENS_STOP and workflow.patched(PATCH_CUT_OFF)
-            if not resp.tool_calls:
+            cut_off = stop_reason == MAX_TOKENS_STOP and (refs or workflow.patched(PATCH_CUT_OFF))
+            if not calls:
+                if refs:
+                    await self._reply_stored(
+                        ctx, state, placeholder_ts, key, cut_off and outcome.has_text
+                    )
+                    return
                 text = resp.text or NO_ANSWER
                 content = list(resp.content) or [{"type": "text", "text": text}]
                 if not any(b.get("type") == "text" for b in content):
@@ -410,20 +452,21 @@ class ConversationWorkflow:
                 )
                 return
 
-            await self._append(
-                ctx, conv_id, f"{key}:assistant", "assistant", _assistant_blocks(resp)
-            )
+            if not refs:
+                await self._append(
+                    ctx, conv_id, f"{key}:assistant", "assistant", _assistant_blocks(resp)
+                )
             # From here until the results are stored, history has tool_use
             # blocks with no tool_result; a failure must close them.
-            state.pending_tool_ids = [call.id for call in resp.tool_calls]
+            state.pending_tool_ids = [call.id for call in calls]
             # One hand-off per turn, whatever the loaded agent lists. A cut-off reply
             # runs nothing, a hand-off included.
-            hand_off = (
-                None if state.handed_off or cut_off else _accepted_hand_off(agent, resp.tool_calls)
-            )
+            hand_off = None if state.handed_off or cut_off else _accepted_hand_off(agent, calls)
             unavailable: ToolResult | None = None
-            if hand_off is not None and workflow.patched(PATCH_AUDIENCE):
-                unavailable = await self._unreachable_hand_off(ctx, state, m, hand_off)
+            if hand_off is not None and (refs or workflow.patched(PATCH_AUDIENCE)):
+                unavailable = await self._unreachable_hand_off(
+                    ctx, m, hand_off, _hand_off_target(agent, hand_off) or ""
+                )
                 if unavailable is not None:
                     hand_off = None
             # A hand-off starts nothing outside the workflow and the specialist
@@ -431,7 +474,7 @@ class ConversationWorkflow:
             if (
                 step == agent.max_steps - 1
                 and hand_off is None
-                and workflow.patched(PATCH_STEP_LIMIT)
+                and (refs or workflow.patched(PATCH_STEP_LIMIT))
             ):
                 # No step is left to use the results, so nothing runs: a write
                 # tool started now would act with nobody to report it.
@@ -441,10 +484,7 @@ class ConversationWorkflow:
                         ctx.tenant_id,
                         conv_id,
                         f"{key}:results",
-                        [
-                            ToolResult(call.id, STEP_LIMIT_REACHED, is_error=True)
-                            for call in resp.tool_calls
-                        ],
+                        [ToolResult(call.id, STEP_LIMIT_REACHED, is_error=True) for call in calls],
                     ],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
@@ -468,7 +508,7 @@ class ConversationWorkflow:
                         ctx.tenant_id,
                         conv_id,
                         f"{key}:results",
-                        [ToolResult(call.id, CUT_OFF, is_error=True) for call in resp.tool_calls],
+                        [ToolResult(call.id, CUT_OFF, is_error=True) for call in calls],
                     ],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
@@ -482,13 +522,14 @@ class ConversationWorkflow:
                 # took over. The specialist is loaded and announced before the
                 # results are stored, so a failure there leaves the thread with
                 # the front door and history that never claims a hand-off.
+                target = _hand_off_target(agent, hand_off) or ""
                 results = [
-                    ToolResult(call.id, HAND_OFF_ACCEPTED.format(agent=call.input["agent"]))
+                    ToolResult(call.id, HAND_OFF_ACCEPTED.format(agent=target))
                     if call is hand_off
                     else ToolResult(call.id, HAND_OFF_NOT_RUN, is_error=True)
-                    for call in resp.tool_calls
+                    for call in calls
                 ]
-                agent, ctx, placeholder_ts = await self._hand_off(m, state, hand_off)
+                agent, ctx, placeholder_ts = await self._hand_off(m, state, target)
                 await workflow.execute_activity_method(
                     AgentActivities.append_tool_results,
                     args=[ctx.tenant_id, conv_id, f"{key}:results", results],
@@ -500,23 +541,23 @@ class ConversationWorkflow:
                 step = 0
                 continue
             first_markers: list[int] = []
-            for call in resp.tool_calls:
+            for call in calls:
                 first_markers.append(self.next_marker)
                 if call.name == "search_knowledge":
                     self.next_marker += SEARCH_RESULTS
-            refused = self._refused_calls(agent, resp.tool_calls)
+            refused = self._refused_calls(agent, calls)
             outcomes = await asyncio.gather(
                 *[
                     self._dispatch(ctx, agent, conv_id, call, first_marker, unavailable)
                     if i not in refused
                     else _resolved(refused[i])
-                    for i, (call, first_marker) in enumerate(zip(resp.tool_calls, first_markers))
+                    for i, (call, first_marker) in enumerate(zip(calls, first_markers))
                 ],
                 return_exceptions=True,
             )
             failed = [o for o in outcomes if isinstance(o, BaseException)]
             if failed:
-                if workflow.patched(PATCH_PARTIAL_TOOL_RESULTS):
+                if refs or workflow.patched(PATCH_PARTIAL_TOOL_RESULTS):
                     # A call that succeeded may already have had an effect (a
                     # write task started, a card sent): keep its result and
                     # close only the calls that failed.
@@ -530,7 +571,7 @@ class ConversationWorkflow:
                                 ToolResult(call.id, TOOL_NOT_COMPLETED, is_error=True)
                                 if isinstance(outcome, BaseException)
                                 else outcome
-                                for call, outcome in zip(resp.tool_calls, outcomes)
+                                for call, outcome in zip(calls, outcomes)
                             ],
                         ],
                         start_to_close_timeout=ACTIVITY_TIMEOUT,
@@ -577,7 +618,7 @@ class ConversationWorkflow:
         stores the failure notice in its place.
         """
         citations = list(self.citations) if model_answer else []
-        if not workflow.patched(PATCH_STORE_AFTER_SHOWN):
+        if not (state.refs or workflow.patched(PATCH_STORE_AFTER_SHOWN)):
             await self._append(ctx, conv_id, step_key, "assistant", content)
             state.reply_stored = True
         await workflow.execute_activity_method(
@@ -590,19 +631,52 @@ class ConversationWorkflow:
             await self._append(ctx, conv_id, step_key, "assistant", content)
             state.reply_stored = True
 
-    def _kind(self, call: ToolCall) -> str:
+    async def _reply_empty_message(self, ctx: TurnContext, m: InboundMessage) -> None:
+        """Answer a message with no text: ask what the person wants. Nothing is stored."""
+        await workflow.execute_activity_method(
+            AgentActivities.post_in_thread,
+            args=[ctx, EMPTY_MESSAGE_REPLY, ids.empty_message_key(m.event_id, ctx.agent_id)],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+
+    async def _reply_stored(
+        self,
+        ctx: TurnContext,
+        state: "_TurnState",
+        placeholder_ts: str,
+        key: str,
+        cut_short: bool,
+    ) -> None:
+        """Show the model's final reply, which ``call_model`` stored under ``key``.
+
+        The activity posts it and then keeps it in history, so a reply that was not shown is
+        not stored; recovery stores the failure notice in its place.
+        """
+        await workflow.execute_activity_method(
+            AgentActivities.finalize_model_reply,
+            args=[ctx, placeholder_ts, key, list(self.citations), cut_short],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        state.reply_stored = True
+
+    def _kind(self, call: ToolCall | ToolCallRef) -> str:
         """What the call is: "read", the kind of task a write becomes, or "" for no tool.
 
         The ``call_llm`` activity reads it from the connector manifests. A call recorded before
-        it did is told by name, as this workflow did then.
+        it did is told by name, as this workflow did then. A call without its input is
+        always marked.
         """
-        if workflow.patched(PATCH_MANIFEST_KINDS):
+        if isinstance(call, ToolCallRef) or workflow.patched(PATCH_MANIFEST_KINDS):
             return call.kind
         if call.name in LEGACY_READ_TOOLS:
             return READ_KIND
         return call.name if call.name in EDITABLE_FIELDS else ""
 
-    def _refused_calls(self, agent: AgentVersion, calls: list[ToolCall]) -> dict[int, ToolResult]:
+    def _refused_calls(
+        self, agent: AgentVersion, calls: list[ToolCall] | list[ToolCallRef]
+    ) -> dict[int, ToolResult]:
         """The calls that must not run, by position, each with the error the model reads.
 
         Input that does not fit the tool's schema. A write the model already made in this
@@ -611,18 +685,21 @@ class ConversationWorkflow:
         """
         refused: dict[int, ToolResult] = {}
         for i, call in enumerate(calls):
-            if call.problem and workflow.patched(PATCH_TOOL_INPUT):
+            if call.problem and (
+                isinstance(call, ToolCallRef) or workflow.patched(PATCH_TOOL_INPUT)
+            ):
                 refused[i] = ToolResult(call.id, call.problem, is_error=True)
         writes = [
             i for i, c in enumerate(calls) if i not in refused and self._kind(c) in EDITABLE_FIELDS
         ]
-        if not writes or not workflow.patched(PATCH_WRITE_LIMIT):
+        refs = bool(calls) and isinstance(calls[0], ToolCallRef)
+        if not writes or not (refs or workflow.patched(PATCH_WRITE_LIMIT)):
             return refused
         seen: set[tuple[str, str]] = set()
         started = 0
         for i in writes:
             call = calls[i]
-            made = (call.name, json.dumps(call.input, sort_keys=True, default=str))
+            made = (call.name, _input_key(call))
             if made in seen:
                 refused[i] = ToolResult(call.id, DUPLICATE_WRITE, is_error=True)
                 continue
@@ -671,7 +748,11 @@ class ConversationWorkflow:
         return False
 
     async def _unreachable_hand_off(
-        self, ctx: TurnContext, state: "_TurnState", m: InboundMessage, call: ToolCall
+        self,
+        ctx: TurnContext,
+        m: InboundMessage,
+        call: ToolCall | ToolCallRef,
+        target: str,
     ) -> ToolResult | None:
         """The tool error for a hand-off to a specialist the asker may not use, or None.
 
@@ -679,7 +760,6 @@ class ConversationWorkflow:
         checked again here before the thread is switched. A refused hand-off leaves the
         thread with the front door; the model is told the specialist is unavailable.
         """
-        target = call.input["agent"]
         specialist = await self._load_agent(ctx.tenant_id, target)
         specialist_ctx = self._turn_context(
             ConversationRef(ctx.tenant_id, target, ctx.channel, ctx.thread_ts), specialist, m
@@ -725,7 +805,7 @@ class ConversationWorkflow:
         )
 
     async def _hand_off(
-        self, m: InboundMessage, state: "_TurnState", call: ToolCall
+        self, m: InboundMessage, state: "_TurnState", target: str
     ) -> tuple[AgentVersion, TurnContext, str]:
         """Give the thread to the specialist the front door chose.
 
@@ -737,7 +817,6 @@ class ConversationWorkflow:
         """
         ref = self._ref()
         assert state.ctx is not None and state.placeholder_ts is not None
-        target = call.input["agent"]
         specialist = await self._load_agent(ref.tenant_id, target)
         new_ref = ConversationRef(ref.tenant_id, target, ref.channel, ref.thread_ts)
         ctx = self._turn_context(new_ref, specialist, m)
@@ -767,7 +846,7 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
-        if workflow.patched(PATCH_THREAD_AGENT):
+        if state.refs or workflow.patched(PATCH_THREAD_AGENT):
             # So the thread keeps its specialist when this workflow closes and starts again.
             # The thread already shows the hand-off, so a failure to store it is logged only.
             try:
@@ -800,7 +879,7 @@ class ConversationWorkflow:
         ctx: TurnContext,
         agent: AgentVersion,
         conv_id: str,
-        call: ToolCall,
+        call: ToolCall | ToolCallRef,
         first_marker: int,
         unavailable: ToolResult | None = None,
     ) -> ToolResult:
@@ -816,13 +895,17 @@ class ConversationWorkflow:
         kind = self._kind(call)
         if kind == READ_KIND:
             return await workflow.execute_activity_method(
-                AgentActivities.run_read_tool,
+                AgentActivities.run_stored_read_tool
+                if isinstance(call, ToolCallRef)
+                else AgentActivities.run_read_tool,
                 args=[ctx, conv_id, call, first_marker],
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
         if kind in EDITABLE_FIELDS:
             # A write never runs here: it becomes a task that asks the requester first.
+            if isinstance(call, ToolCallRef):
+                return await self._start_stored_task(ctx, conv_id, call, kind)
             return await self._start_task(ctx, agent, call, kind)
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
@@ -841,10 +924,7 @@ class ConversationWorkflow:
                 return ToolResult(call.id, error, is_error=True)
             # The task resolves the item and checks the grant before any card.
             payload = {"item": item.strip(), "comment": comment.strip()}
-            drafted = (
-                f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
-                "Nothing is posted until they click Submit."
-            )
+            drafted = _drafted_text(kind, ctx)
         else:
             title = call.input.get("title")
             details = call.input.get("details")
@@ -866,10 +946,7 @@ class ConversationWorkflow:
                 "details": details.strip(),
                 "database_id": agent.grants.notion_databases[0].id,
             }
-            drafted = (
-                f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
-                "Nothing is filed until they click Submit."
-            )
+            drafted = _drafted_text(kind, ctx)
         spec = TaskSpec(
             ctx=ctx,
             tool_name=kind,
@@ -883,6 +960,60 @@ class ConversationWorkflow:
             parent_close_policy=ParentClosePolicy.ABANDON,
         )
         return ToolResult(call.id, drafted)
+
+    async def _start_stored_task(
+        self, ctx: TurnContext, conv_id: str, call: ToolCallRef, kind: str
+    ) -> ToolResult:
+        """Start the task for a write call whose input is stored: the draft is made by an activity.
+
+        The task starts with a reference to revision 1 of its draft and the approval nonce; the
+        title, details or comment never pass through the workflow.
+        """
+        task_id = ids.task_id(ctx.tenant_id, str(workflow.uuid4()))
+        outcome: DraftOutcome = await workflow.execute_activity_method(
+            AgentActivities.draft_task,
+            args=[ctx, conv_id, call, task_id],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        if outcome.error:
+            return ToolResult(call.id, outcome.error, is_error=True)
+        spec = TaskSpec(
+            ctx=ctx,
+            tool_name=kind,
+            payload={},
+            approval_nonce=str(workflow.uuid4()),
+            draft_ref=task_id,
+            revision=outcome.revision,
+            database_id=outcome.database_id,
+        )
+        await workflow.start_child_workflow(
+            TaskWorkflow.run,
+            spec,
+            id=task_id,
+            parent_close_policy=ParentClosePolicy.ABANDON,
+        )
+        return ToolResult(call.id, _drafted_text(kind, ctx))
+
+
+def _drafted_text(kind: str, ctx: TurnContext) -> str:
+    """What the model is told after a write became a task waiting for approval."""
+    if kind == "add_comment":
+        return (
+            f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is posted until they click Submit."
+        )
+    return (
+        f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
+        "Nothing is filed until they click Submit."
+    )
+
+
+def _input_key(call: ToolCall | ToolCallRef) -> str:
+    """What makes two calls the same call: the input itself, or its hash when it is not carried."""
+    if isinstance(call, ToolCallRef):
+        return call.input_sha256
+    return json.dumps(call.input, sort_keys=True, default=str)
 
 
 async def _resolved(result: ToolResult) -> ToolResult:
@@ -902,22 +1033,30 @@ def _typed(tp, value):
         return value
 
 
-def _hand_off_target(agent: AgentVersion, call: ToolCall) -> str | None:
+def _named_target(call: ToolCall | ToolCallRef) -> object:
+    """The agent a ``hand_off`` call names: from its input, or from the value derived from it."""
+    if isinstance(call, ToolCallRef):
+        return call.target or None
+    return call.input.get("agent") if isinstance(call.input, dict) else None
+
+
+def _hand_off_target(agent: AgentVersion, call: ToolCall | ToolCallRef) -> str | None:
     """The specialist a ``hand_off`` call names, if this agent may hand to it."""
-    target = call.input.get("agent") if isinstance(call.input, dict) else None
+    target = _named_target(call)
     if call.name == HAND_OFF_TOOL and isinstance(target, str) and target in agent.specialists:
         return target
     return None
 
 
-def _accepted_hand_off(agent: AgentVersion, calls: list[ToolCall]) -> ToolCall | None:
+def _accepted_hand_off(
+    agent: AgentVersion, calls: list[ToolCall] | list[ToolCallRef]
+) -> ToolCall | ToolCallRef | None:
     """The first valid ``hand_off`` in a response; any later one is refused."""
     return next((c for c in calls if _hand_off_target(agent, c) is not None), None)
 
 
-def _target_text(call: ToolCall) -> str:
-    target = call.input.get("agent") if isinstance(call.input, dict) else None
-    return str(target)
+def _target_text(call: ToolCall | ToolCallRef) -> str:
+    return str(_named_target(call))
 
 
 def _assistant_blocks(resp: LLMResponse) -> list[dict]:

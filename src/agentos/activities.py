@@ -30,6 +30,13 @@ Rules kept here:
 * Tool output text is stored by the activity that ran the tool and is put into
   chat history by ``append_tool_results``. Workflow history carries only a
   reference (``ToolResult.stored``), never the text a tool read.
+* Chat and document content stays out of Temporal history (``agentos.content_store``): the
+  activities that handle it take IDs and read or write the text in Postgres themselves.
+  ``ingest_message`` appends the text a person wrote; ``call_model`` stores the model's
+  reply, and each tool call's input by ID, and returns only what the workflow decides on;
+  ``finalize_model_reply`` shows a stored reply; the tool and task activities read inputs
+  and task payloads by reference. The older activities that take content as an argument
+  (``call_llm``, ``finalize_reply``, ``run_read_tool``) stay for histories recorded before.
 * Retrieved document text is untrusted data. It is wrapped in ``<source>`` tags
   and the system prompt tells the model never to follow instructions in it.
   Knowledge comes only from the agent's own granted pages, and each page is
@@ -60,7 +67,7 @@ from typing import NoReturn, TypeVar
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from agentos import ids
+from agentos import ids, task_notices
 from agentos.agent_store import AgentStore
 from agentos.audience import (
     OFF,
@@ -73,7 +80,7 @@ from agentos.audience import (
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
-from agentos.config import AgentVersion, Settings, embed_max_distance
+from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors import notion_errors
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest, require_idempotency, screen
 from agentos.connectors.notion import (
@@ -82,6 +89,7 @@ from agentos.connectors.notion import (
     normalize_id,
 )
 from agentos.connectors.notion_limiter import bulk_priority
+from agentos.content_store import ContentStore, InMemoryContentStore, StoredStep
 from agentos.history_view import prepare_for_model
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
@@ -98,14 +106,22 @@ from agentos.knowledge.search import (
 from agentos.knowledge.store import KnowledgeStore
 from agentos.llm import LLMClient
 from agentos.models import (
+    CUT_SHORT,
+    EDITABLE_FIELDS,
+    NO_ANSWER,
     AuditEvent,
     Citation,
+    DraftOutcome,
     LLMResponse,
     NotionItem,
+    StepResult,
     TaskSpec,
     ToolCall,
+    ToolCallRef,
     ToolResult,
     TurnContext,
+    assistant_blocks,
+    check_field,
 )
 from agentos.slack_client import SlackLookupError
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
@@ -266,8 +282,10 @@ class AgentActivities:
         external_writes: ExternalWriteStore | None = None,
         threads: ThreadStore | None = None,
         owner_pings: OwnerPingStore | None = None,
+        content: ContentStore | None = None,
     ):
         self.settings = settings
+        self.content = content or InMemoryContentStore()
         self.threads = threads or InMemoryThreadStore()
         self.owner_pings = owner_pings or InMemoryOwnerPingStore()
         # Tests move the day the owner is mentioned for by replacing this.
@@ -323,6 +341,15 @@ class AgentActivities:
             self.record_audience_refusal,
             self.thread_agent,
             self.remember_thread_agent,
+            self.ingest_message,
+            self.call_model,
+            self.finalize_model_reply,
+            self.run_stored_read_tool,
+            self.draft_task,
+            self.prepare_stored_comment,
+            self.apply_edit,
+            self.post_task_notice,
+            self.watch_notion_item,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -433,23 +460,48 @@ class AgentActivities:
         if refusal is not None:
             raise _non_retryable(refusal)
 
-    async def _gate_write(self, spec: TaskSpec, task_id: str, target: str, idem_key: str):
+    async def _spec_payload(self, spec: TaskSpec) -> dict:
+        """The task's payload: the revision its ``draft_ref`` names, else what it carries.
+
+        A write reads the revision the approval named (``spec.revision``), never the latest.
+        """
+        if not spec.draft_ref:
+            return spec.payload
+        payload = await self.content.get_draft(spec.ctx.tenant_id, spec.draft_ref, spec.revision)
+        if payload is None:
+            raise ApplicationError(
+                f"task draft revision {spec.revision} is missing",
+                type="ValueError",
+                non_retryable=True,
+            )
+        return payload
+
+    async def _gate_write(self, spec: TaskSpec, task_id: str, idem_key: str, target_field: str):
         """Refuse an approved write, before any external call, while a switch covers it.
 
         The approval and the refusal are audited (the write as an error), and the
         failure is non-retryable, so the task ends with the reason and nothing was
-        changed. The requester can ask again later.
+        changed. The requester can ask again later. ``target_field`` names the payload
+        field that holds what the write is aimed at (a page or a database).
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
         if refusal is None:
             return
-        await self._record_approval(spec, task_id, target)
-        await self._record_write(spec, task_id, idem_key, target, "error")
+        payload = await self._spec_payload(spec)
+        target = payload[target_field]
+        await self._record_approval(spec, payload, task_id, target)
+        await self._record_write(spec, payload, task_id, idem_key, target, "error")
         raise _non_retryable(refusal)
 
     async def _check_method(
-        self, spec: TaskSpec, task_id: str, target: str, idem_key: str, method: str
+        self,
+        spec: TaskSpec,
+        payload: dict,
+        task_id: str,
+        target: str,
+        idem_key: str,
+        method: str,
     ) -> None:
         """Stop an approved write whose idempotency method no connector manifest declares.
 
@@ -460,8 +512,8 @@ class AgentActivities:
         try:
             require_idempotency(method)
         except ValueError as err:
-            await self._record_approval(spec, task_id, target)
-            await self._record_write(spec, task_id, idem_key, target, "error")
+            await self._record_approval(spec, payload, task_id, target)
+            await self._record_write(spec, payload, task_id, idem_key, target, "error")
             raise _non_retryable(err) from err
 
     async def _requester(self, spec: TaskSpec, task_id: str, agent: AgentVersion) -> dict:
@@ -591,11 +643,14 @@ class AgentActivities:
             )
         )
 
-    async def _record_approval(self, spec: TaskSpec, task_id: str, target: str) -> None:
+    async def _record_approval(
+        self, spec: TaskSpec, payload: dict, task_id: str, target: str
+    ) -> None:
         """Record that the requester approved exactly this payload, before it runs.
 
         The task workflow accepts a decision only from the requester, so the
         approver is the requester. Nothing reaches this activity until then.
+        ``payload`` is the revision the approval named; the event holds its hash.
         """
         ctx = spec.ctx
         await self._record(
@@ -605,13 +660,14 @@ class AgentActivities:
             task_id=task_id,
             tool=spec.tool_name,
             target=target,
-            input_sha256=canonical_sha256(spec.payload),
+            input_sha256=canonical_sha256(payload),
             approver_user_id=ctx.requester_user_id,
         )
 
     async def _record_write(
         self,
         spec: TaskSpec,
+        payload: dict,
         task_id: str,
         idem_key: str,
         target: str,
@@ -627,7 +683,7 @@ class AgentActivities:
             task_id=task_id,
             tool=spec.tool_name,
             target=target,
-            input_sha256=canonical_sha256(spec.payload),
+            input_sha256=canonical_sha256(payload),
             output_sha256=None if output is None else canonical_sha256(output),
             approver_user_id=ctx.requester_user_id,
         )
@@ -757,6 +813,12 @@ class AgentActivities:
         # Before the budget and before any model call: an agent or a tenant switched off
         # answers with a fixed text, bills nothing and records no usage row.
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        return await self._model_response(ctx, conversation_id, refusal)
+
+    async def _model_response(
+        self, ctx: TurnContext, conversation_id: str, refusal: Exception | None
+    ) -> LLMResponse:
+        """One model call for the thread, unless a switch or a budget answers instead."""
         agent = await self._pinned(ctx)
         if isinstance(refusal, AgentOff):
             log_stop(ctx.tenant_id, ctx.agent_id, refusal.switch)
@@ -822,6 +884,118 @@ class AgentActivities:
         """The call with what the connector manifests say about it (see ``screen``)."""
         kind, problem = screen(call.name, call.input)
         return replace(call, kind=kind, problem=problem)
+
+    # --- conversation, content kept in Postgres ----------------------------------------------
+
+    @activity.defn(name="ingest_message")
+    async def ingest_message(self, tenant_id: str, conversation_id: str, event_id: str) -> bool:
+        """Append the text a person wrote to the thread's history; False when it has none.
+
+        The gateway stored the text under the event ID (``inbound_events``) before the
+        workflow heard of the message, so the text never passed through Temporal. A message
+        with nothing but whitespace is not stored: the model rejects an empty text block on
+        every later call. A repeat appends nothing twice, because the step key is fixed.
+        """
+        self._log("ingest_message", tenant_id, "-")
+        self._runtime(tenant_id)
+        row = await self.content.get_inbound(tenant_id, event_id)
+        if row is None:
+            raise ApplicationError(
+                "the inbound event is missing", type="ValueError", non_retryable=True
+            )
+        if row.get("consumed"):
+            # A retry after the text was taken: history has it already.
+            return bool(row.get("had_text"))
+        text = row.get("text")
+        had_text = isinstance(text, str) and bool(text.strip())
+        if had_text:
+            await self.history.append(
+                tenant_id,
+                conversation_id,
+                f"{event_id}:user",
+                "user",
+                [{"type": "text", "text": text}],
+            )
+        # History keeps the text now; the inbound row keeps only its IDs.
+        await self._consume(tenant_id, event_id, row, had_text)
+        return had_text
+
+    async def _consume(self, tenant_id: str, event_id: str, row: dict, had_text: bool) -> None:
+        stub = {k: v for k, v in row.items() if k not in ("text", "fields")}
+        stub.update(consumed=True, had_text=had_text)
+        await self.content.consume_inbound(tenant_id, event_id, stub, self.clock())
+
+    @activity.defn(name="call_model")
+    async def call_model(self, ctx: TurnContext, conversation_id: str, step_key: str) -> StepResult:
+        """One model step. The reply is stored; what comes back is only what the workflow decides on.
+
+        The model's answer is stored first, under ``step_key`` (``model_steps``), so an attempt
+        that runs again after the model answered reads it instead of asking again, and its
+        tool-call IDs are the ones already stored. A step that calls tools is then appended to
+        history, and each call's input is stored by tool-use ID. A final reply is not appended
+        here: ``finalize_model_reply`` stores it once it has been shown.
+        """
+        self._log("call_model", ctx.tenant_id, ctx.agent_id)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
+        if step is None:
+            resp = await self._model_response(ctx, conversation_id, refusal)
+            step = await self.content.put_step(
+                ctx.tenant_id, conversation_id, step_key, _stored_step(resp)
+            )
+        uses = [b for b in step.content if b.get("type") == "tool_use"]
+        if uses:
+            await self.history.append(
+                ctx.tenant_id, conversation_id, f"{step_key}:assistant", "assistant", step.content
+            )
+            for block in uses:
+                await self.content.put_tool_input(
+                    ctx.tenant_id, conversation_id, block["id"], block.get("input")
+                )
+        return StepResult(
+            stop_reason=step.stop_reason,
+            tool_calls=[_call_ref(block) for block in uses],
+            has_text=_has_text(step),
+        )
+
+    @activity.defn(name="finalize_model_reply")
+    async def finalize_model_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        step_key: str,
+        citations: list[Citation],
+        cut_short: bool,
+    ) -> None:
+        """Show the reply ``call_model`` stored under ``step_key``, then keep it in history.
+
+        Like ``finalize_reply`` for a model answer: a Sources line from the citations, Markdown
+        converted to Slack, an "answer" audit event. ``cut_short`` adds the note for a reply the
+        model cut off. History stores the reply only once Slack has shown it, so a failure to
+        post never leaves history claiming the user saw an answer.
+        """
+        self._log("finalize_model_reply", ctx.tenant_id, ctx.agent_id)
+        conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+        step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
+        if step is None or step.reply_text is None:
+            raise ApplicationError(
+                "the stored reply is missing", type="ValueError", non_retryable=True
+            )
+        text = step.reply_text
+        shown = text + CUT_SHORT if cut_short else text
+        footer = await self._sources_footer(ctx, text, citations)
+        slack = self._runtime(ctx.tenant_id).slack
+        await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(shown) + footer)
+        await self._record(
+            ctx,
+            "answer",
+            ids.audit_answer_key(conversation_id, placeholder_ts),
+            conversation_id=conversation_id,
+            output_sha256=canonical_sha256(shown),
+        )
+        await self.history.append(
+            ctx.tenant_id, conversation_id, f"{step_key}:assistant", "assistant", step.content
+        )
 
     @activity.defn(name="post_placeholder")
     async def post_placeholder(self, ctx: TurnContext, idem_key: str) -> str:
@@ -893,6 +1067,33 @@ class AgentActivities:
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        return await self._run_read(ctx, conversation_id, call, first_marker, refusal)
+
+    @activity.defn(name="run_stored_read_tool")
+    async def run_stored_read_tool(
+        self, ctx: TurnContext, conversation_id: str, call: ToolCallRef, first_marker: int
+    ) -> ToolResult:
+        """``run_read_tool`` for a call whose input is stored by tool-use ID, not passed in."""
+        self._log("run_stored_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        found, tool_input = await self.content.get_tool_input(
+            ctx.tenant_id, conversation_id, call.id
+        )
+        if not found:
+            raise ApplicationError(
+                "the tool call's input is missing", type="ValueError", non_retryable=True
+            )
+        full = ToolCall(call.id, call.name, tool_input if isinstance(tool_input, dict) else {})
+        return await self._run_read(ctx, conversation_id, full, first_marker, refusal)
+
+    async def _run_read(
+        self,
+        ctx: TurnContext,
+        conversation_id: str,
+        call: ToolCall,
+        first_marker: int,
+        refusal: Exception | None,
+    ) -> ToolResult:
         citations: list[Citation] = []
         if isinstance(refusal, AgentOff):
             # A call dispatched before the agent was turned off. The model gets an error
@@ -1006,12 +1207,15 @@ class AgentActivities:
         existing = await self.idem.get(ctx.tenant_id, key)
         if existing is not None:
             return existing["ts"]
+        payload = await self._spec_payload(spec)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
-        grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
+        grant = self._connector_for(ctx.tenant_id, agent).grant_for(payload["database_id"])
         line = await self._card_requester_line(spec, task_id, agent)
         dm = await self._runtime(ctx.tenant_id).slack.open_dm(ctx.requester_user_id)
-        blocks = approval_card_blocks(spec, task_id, agent.name, grant.name, requester_line=line)
-        text = _card_text(spec, grant.name)
+        blocks = approval_card_blocks(
+            spec, task_id, agent.name, grant.name, requester_line=line, payload=payload
+        )
+        text = _card_text(spec, payload, grant.name)
         return await self._post_once(ctx.tenant_id, key, dm, text, None, blocks)
 
     async def _card_requester_line(
@@ -1024,7 +1228,9 @@ class AgentActivities:
 
     @activity.defn(name="update_card")
     async def update_card(self, spec: TaskSpec, task_id: str, card_ts: str, text: str) -> None:
-        await self._replace_card(spec, task_id, card_ts, f"{text}: {_subject(spec)}")
+        payload = await self._spec_payload(spec)
+        subject = task_notices.subject(spec.tool_name, payload)
+        await self._replace_card(spec, task_id, card_ts, f"{text}: {subject}")
 
     @activity.defn(name="update_card_line")
     async def update_card_line(self, spec: TaskSpec, task_id: str, card_ts: str, line: str) -> None:
@@ -1059,13 +1265,22 @@ class AgentActivities:
         record = await self.idem.get(ctx.tenant_id, f"{task_id}:card")
         slack = self._runtime(ctx.tenant_id).slack
         channel = record["channel"] if record else await slack.open_dm(ctx.requester_user_id)
+        payload = await self._spec_payload(spec)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
-        grant = self._connector_for(ctx.tenant_id, agent).grant_for(spec.payload["database_id"])
+        grant = self._connector_for(ctx.tenant_id, agent).grant_for(payload["database_id"])
         line = await self._card_requester_line(spec, task_id, agent)
         blocks = approval_card_blocks(
-            spec, task_id, agent.name, grant.name, edited=True, requester_line=line
+            spec,
+            task_id,
+            agent.name,
+            grant.name,
+            edited=True,
+            requester_line=line,
+            payload=payload,
         )
-        await slack.update_message(channel, card_ts, _card_text(spec, grant.name), blocks=blocks)
+        await slack.update_message(
+            channel, card_ts, _card_text(spec, payload, grant.name), blocks=blocks
+        )
 
     @activity.defn(name="prepare_comment")
     async def prepare_comment(self, spec: TaskSpec) -> dict:
@@ -1077,9 +1292,30 @@ class AgentActivities:
         ctx = spec.ctx
         await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
+        return await self._resolve_comment(spec, spec.payload)
+
+    @activity.defn(name="prepare_stored_comment")
+    async def prepare_stored_comment(self, spec: TaskSpec) -> DraftOutcome:
+        """``prepare_comment`` for a task whose payload is a stored draft.
+
+        The resolved payload is stored as the next revision, which the card then shows and the
+        approval names; nothing was shown or approved before it. A retry finds it stored.
+        """
+        ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        self._log("prepare_stored_comment", ctx.tenant_id, ctx.agent_id)
+        revision = spec.revision + 1
+        resolved = await self.content.get_draft(ctx.tenant_id, spec.draft_ref, revision)
+        if resolved is None:
+            resolved = await self._resolve_comment(spec, await self._spec_payload(spec))
+            await self.content.put_draft(ctx.tenant_id, spec.draft_ref, revision, resolved)
+        return DraftOutcome(revision=revision, database_id=resolved["database_id"])
+
+    async def _resolve_comment(self, spec: TaskSpec, payload: dict) -> dict:
+        ctx = spec.ctx
         try:
             connector = await self._connector(ctx.tenant_id, ctx.agent_id)
-            item = await connector.resolve_item(spec.payload["item"])
+            item = await connector.resolve_item(payload["item"])
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -1091,23 +1327,158 @@ class AgentActivities:
             "database_id": item.database_id,
             "item_title": item.title,
             "item_url": item.url,
-            "comment": spec.payload["comment"],
+            "comment": payload["comment"],
         }
+
+    @activity.defn(name="draft_task")
+    async def draft_task(
+        self, ctx: TurnContext, conversation_id: str, call: ToolCallRef, task_id: str
+    ) -> DraftOutcome:
+        """Freeze what the model asked a write tool for, as revision 1 of the task's draft.
+
+        Reads the call's stored input, checks it the way the model is told ("needs a non-empty
+        'title'", a length), and stores exactly the fields that will be created. The payload is
+        shown on the approval card and run as it is; the workflow never sees it. ``error`` is
+        the line for the model when the input cannot be a task.
+        """
+        self._log("draft_task", ctx.tenant_id, ctx.agent_id, tool=call.kind)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if refusal is not None:
+            if isinstance(refusal, AgentOff):
+                return DraftOutcome(error=agent_off_text(agent.name))
+            raise _non_retryable(refusal)
+        found, raw = await self.content.get_tool_input(ctx.tenant_id, conversation_id, call.id)
+        if not found:
+            raise ApplicationError(
+                "the tool call's input is missing", type="ValueError", non_retryable=True
+            )
+        tool_input = raw if isinstance(raw, dict) else {}
+        kind = call.kind
+        if kind == "add_comment":
+            item, comment = tool_input.get("item"), tool_input.get("comment")
+            if not isinstance(item, str) or not item.strip():
+                return DraftOutcome(error=f"{kind} needs a non-empty 'item'.")
+            if not isinstance(comment, str) or not comment.strip():
+                return DraftOutcome(error=f"{kind} needs a non-empty 'comment'.")
+            if error := check_field(kind, "comment", comment.strip()):
+                return DraftOutcome(error=error)
+            # The task resolves the item and checks the grant before any card.
+            payload = {"item": item.strip(), "comment": comment.strip()}
+        elif kind in EDITABLE_FIELDS:
+            title, details = tool_input.get("title"), tool_input.get("details")
+            if not isinstance(title, str) or not title.strip():
+                return DraftOutcome(error=f"{kind} needs a non-empty 'title'.")
+            if not isinstance(details, str) or not details.strip():
+                return DraftOutcome(error=f"{kind} needs a non-empty 'details'.")
+            if not agent.grants.notion_databases:
+                return DraftOutcome(error="This agent has no Notion database to create items in.")
+            for name, value in (("title", title), ("details", details)):
+                if error := check_field(kind, name, value.strip()):
+                    return DraftOutcome(error=error)
+            # The payload is reduced to exactly the fields that will be created, and
+            # frozen here: the approval card shows it and the task runs it as is.
+            payload = {
+                "title": title.strip(),
+                "details": details.strip(),
+                "database_id": agent.grants.notion_databases[0].id,
+            }
+        else:
+            return DraftOutcome(error=f"Unknown tool '{call.name}'.")
+        await self.content.put_draft(ctx.tenant_id, task_id, 1, payload)
+        return DraftOutcome(revision=1, database_id=payload.get("database_id", ""))
+
+    @activity.defn(name="apply_edit")
+    async def apply_edit(self, spec: TaskSpec, edit_id: str) -> bool:
+        """Store a saved edit as the next revision of the draft; False when it does not fit.
+
+        The values come from the ``inbound_events`` row the gateway wrote (``edit_id``); the
+        workflow only names it. Every field is checked again as the model's first draft is,
+        so an accepted value always fits Notion and the card. The new revision is the old one
+        with the edited fields replaced; the old one is left as it is.
+        """
+        ctx = spec.ctx
+        self._log("apply_edit", ctx.tenant_id, ctx.agent_id)
+        if await self.content.get_draft(ctx.tenant_id, spec.draft_ref, spec.revision + 1):
+            return True  # a retry: the revision is stored and the form's values are cleared
+        row = await self.content.get_inbound(ctx.tenant_id, edit_id)
+        limits = EDITABLE_FIELDS.get(spec.tool_name, {})
+        fields = (row or {}).get("fields")
+        if not row or row.get("task_id") != spec.draft_ref or not isinstance(fields, dict):
+            log.warning("ignored edit: no stored form for this task tenant_id=%s", ctx.tenant_id)
+            return False
+        if set(fields) != set(limits):
+            log.warning(
+                "ignored edit: fields are not the editable ones tenant_id=%s", ctx.tenant_id
+            )
+            return False
+        clean: dict = {}
+        for key, value in fields.items():
+            text = value.strip() if isinstance(value, str) else ""
+            if not text or check_field(spec.tool_name, key, text):
+                log.warning("ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id)
+                return False
+            clean[key] = text
+        current = await self._spec_payload(spec)
+        await self.content.put_draft(
+            ctx.tenant_id, spec.draft_ref, spec.revision + 1, {**current, **clean}
+        )
+        await self._consume(ctx.tenant_id, edit_id, row, True)
+        return True
+
+    @activity.defn(name="post_task_notice")
+    async def post_task_notice(
+        self,
+        spec: TaskSpec,
+        task_id: str,
+        kind: str,
+        idem_key: str,
+        reason: str = "",
+        status: str = "",
+        days: int = 0,
+    ) -> str:
+        """Post one of the task's thread lines (``agentos.task_notices``), written from the stored draft.
+
+        The workflow names the kind, and the small values that are not content (a failure
+        reason, a status, a number of days); the title or comment the line mentions is read
+        here. Lines about the item a create made read it from the write's stored result and
+        fall back to the approved title when no result was stored.
+        """
+        ctx = spec.ctx
+        self._log("post_task_notice", ctx.tenant_id, ctx.agent_id, kind=kind)
+        payload = await self._spec_payload(spec)
+        subject, url = task_notices.subject(spec.tool_name, payload), payload.get("item_url", "")
+        if kind in task_notices.ITEM_NOTICES:
+            stored = await self.writes.result(ctx.tenant_id, f"{task_id}:create")
+            if stored is not None:
+                item = _item_from_ref(stored)
+                subject, url = item.title, item.url
+        text = task_notices.notice_text(
+            kind,
+            subject=subject,
+            reason=reason,
+            url=url,
+            status=status,
+            requester=ctx.requester_user_id,
+            days=days,
+        )
+        return await self._post_once(ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts)
 
     @activity.defn(name="add_notion_comment")
     async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
         ctx = spec.ctx
-        self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
-        page_id = spec.payload["page_id"]
         idem_key = f"{task_id}:comment"
-        await self._gate_write(spec, task_id, page_id, idem_key)
-        await self._check_method(spec, task_id, page_id, idem_key, "marker_text")
+        await self._gate_write(spec, task_id, idem_key, "page_id")
+        self._log("add_notion_comment", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        page_id = payload["page_id"]
+        await self._check_method(spec, payload, task_id, page_id, idem_key, "marker_text")
         # The live published version, not the turn's pinned one, on purpose: a grant revoked
         # since this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
-        text = spec.payload["comment"]
-        await self._record_approval(spec, task_id, page_id)
+        text = payload["comment"]
+        await self._record_approval(spec, payload, task_id, page_id)
         try:
             await connector.resolve_item(page_id)
             comment_id = await self._write_once(
@@ -1120,25 +1491,30 @@ class AgentActivities:
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
-                await self._record_write(spec, task_id, idem_key, page_id, "error")
+                await self._record_write(spec, payload, task_id, idem_key, page_id, "error")
                 raise _non_retryable(err) from err
             _reraise(err)
-        await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
+        await self._record_write(
+            spec, payload, task_id, idem_key, page_id, "ok", {"comment_id": comment_id}
+        )
         return comment_id
 
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
+        """Create the approved item once. A task with a stored draft gets back the page ID and
+        status only: the title and link are content, and the workflow does not carry them."""
         ctx = spec.ctx
-        self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
-        database_id = spec.payload["database_id"]
         idem_key = f"{task_id}:create"
-        await self._gate_write(spec, task_id, database_id, idem_key)
-        await self._check_method(spec, task_id, database_id, idem_key, "marker_property")
+        await self._gate_write(spec, task_id, idem_key, "database_id")
+        self._log("create_notion_item", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        database_id = payload["database_id"]
+        await self._check_method(spec, payload, task_id, database_id, idem_key, "marker_property")
         # The live published version, not the turn's pinned one, on purpose: a grant revoked
         # since this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
-        await self._record_approval(spec, task_id, database_id)
+        await self._record_approval(spec, payload, task_id, database_id)
         try:
             connector.grant_for(database_id)
             requester = await self._requester(spec, task_id, agent)
@@ -1148,8 +1524,8 @@ class AgentActivities:
                 find=lambda: connector.find_item(database_id, idem_key),
                 write=lambda: connector.create_item(
                     database_id,
-                    spec.payload["title"],
-                    spec.payload["details"],
+                    payload["title"],
+                    payload["details"],
                     idem_key,
                     notion_user_id=requester["notion_user_id"],
                     requester_line=requester["line"],
@@ -1159,14 +1535,14 @@ class AgentActivities:
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
-                await self._record_write(spec, task_id, idem_key, database_id, "error")
+                await self._record_write(spec, payload, task_id, idem_key, database_id, "error")
                 raise _non_retryable(err) from err
             _reraise(err)
         await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
         await self._record_write(
-            spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
+            spec, payload, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
         )
-        return item
+        return _without_content(spec, item)
 
     @activity.defn(name="reconcile_notion_item")
     async def reconcile_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem | None:
@@ -1178,21 +1554,22 @@ class AgentActivities:
         ctx = spec.ctx
         await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("reconcile_notion_item", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         idem_key = f"{task_id}:create"
         ref = await self.writes.result(ctx.tenant_id, idem_key)
         item = (
             _item_from_ref(ref)
             if ref is not None
-            else await connector.find_item(spec.payload["database_id"], idem_key)
+            else await connector.find_item(payload["database_id"], idem_key)
         )
         if item is None:
             return None
         await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
         await self._record_write(
-            spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
+            spec, payload, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
         )
-        return item
+        return _without_content(spec, item)
 
     @activity.defn(name="reconcile_notion_comment")
     async def reconcile_notion_comment(self, spec: TaskSpec, task_id: str) -> str | None:
@@ -1200,16 +1577,19 @@ class AgentActivities:
         ctx = spec.ctx
         await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("reconcile_notion_comment", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         idem_key = f"{task_id}:comment"
-        page_id = spec.payload["page_id"]
+        page_id = payload["page_id"]
         comment_id = await self.writes.result(ctx.tenant_id, idem_key)
         if comment_id is None:
             await connector.resolve_item(page_id)
             comment_id = await connector.find_comment(page_id, idem_key)
         if comment_id is None:
             return None
-        await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
+        await self._record_write(
+            spec, payload, task_id, idem_key, page_id, "ok", {"comment_id": comment_id}
+        )
         return comment_id
 
     @activity.defn(name="get_notion_item")
@@ -1217,6 +1597,20 @@ class AgentActivities:
         """Read one item. Takes IDs only: the watch polls this thousands of times."""
         refusal = await self._gate_refusal(tenant_id, agent_id, Effect.POLL)
         self._log("get_notion_item", tenant_id, agent_id)
+        return await self._poll_item(tenant_id, agent_id, page_id, refusal)
+
+    @activity.defn(name="watch_notion_item")
+    async def watch_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
+        """``get_notion_item`` for a task whose title is not carried by its workflow: only the
+        page ID and the status come back."""
+        refusal = await self._gate_refusal(tenant_id, agent_id, Effect.POLL)
+        self._log("watch_notion_item", tenant_id, agent_id)
+        item = await self._poll_item(tenant_id, agent_id, page_id, refusal)
+        return NotionItem(page_id=item.page_id, url="", title="", status=item.status)
+
+    async def _poll_item(
+        self, tenant_id: str, agent_id: str, page_id: str, refusal: Exception | None
+    ) -> NotionItem:
         if isinstance(refusal, AgentOff):
             # The agent is off: the task ends the watch, with no post. No Notion call is made.
             raise _non_retryable(refusal)
@@ -1368,6 +1762,7 @@ class AgentActivities:
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
         self._log("check_before_write", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         if isinstance(refusal, AgentOff):
             line = agent_off_card_text(agent.name)
@@ -1376,11 +1771,11 @@ class AgentActivities:
         else:
             return None
         if spec.tool_name == "add_comment":
-            target, idem_key = spec.payload["page_id"], f"{task_id}:comment"
+            target, idem_key = payload["page_id"], f"{task_id}:comment"
         else:
-            target, idem_key = spec.payload["database_id"], f"{task_id}:create"
-        await self._record_approval(spec, task_id, target)
-        await self._record_write(spec, task_id, idem_key, target, "error")
+            target, idem_key = payload["database_id"], f"{task_id}:create"
+        await self._record_approval(spec, payload, task_id, target)
+        await self._record_write(spec, payload, task_id, idem_key, target, "error")
         return line
 
     @activity.defn(name="record_audience_refusal")
@@ -1404,6 +1799,39 @@ class AgentActivities:
         )
 
 
+def _stored_step(resp: LLMResponse) -> StoredStep:
+    """What the model returned, as it is stored for the step: its blocks and, for a final reply, its text."""
+    if resp.tool_calls:
+        return StoredStep(resp.stop_reason, assistant_blocks(resp), None)
+    text = resp.text or NO_ANSWER
+    content = [dict(b) for b in resp.content] or [{"type": "text", "text": text}]
+    if not any(b.get("type") == "text" for b in content):
+        content.append({"type": "text", "text": text})
+    return StoredStep(resp.stop_reason, content, text)
+
+
+def _has_text(step: StoredStep) -> bool:
+    """Whether the model wrote text of its own (a final reply with none shows ``NO_ANSWER``)."""
+    if step.reply_text is not None:
+        return step.reply_text != NO_ANSWER
+    return any(b.get("type") == "text" and str(b.get("text", "")).strip() for b in step.content)
+
+
+def _call_ref(block: dict) -> ToolCallRef:
+    """What the workflow may know about a tool call: never its input, only values derived from it."""
+    name, tool_input = block.get("name", ""), block.get("input")
+    kind, problem = screen(name, tool_input)
+    target = tool_input.get("agent") if isinstance(tool_input, dict) else None
+    return ToolCallRef(
+        id=block["id"],
+        name=name,
+        kind=kind,
+        problem=problem,
+        input_sha256=canonical_sha256(tool_input),
+        target=target if isinstance(target, str) and AGENT_ID_PATTERN.fullmatch(target) else "",
+    )
+
+
 def _format_items(items: list[NotionItem]) -> str:
     if not items:
         return "No matching items."
@@ -1419,18 +1847,18 @@ def _format_items(items: list[NotionItem]) -> str:
     return "<items>\n" + "\n".join(lines) + "\n</items>"
 
 
-def _subject(spec: TaskSpec) -> str:
-    """The short name of what a task is about, for card and thread lines."""
-    if spec.tool_name == "add_comment":
-        return spec.payload.get("item_title") or spec.payload["item"]
-    return spec.payload["title"]
+def _without_content(spec: TaskSpec, item: NotionItem) -> NotionItem:
+    """``item`` as a task's workflow may carry it: a task with a stored draft gets no title or link."""
+    if not spec.draft_ref:
+        return item
+    return NotionItem(page_id=item.page_id, url="", title="", status=item.status)
 
 
-def _card_text(spec: TaskSpec, db_name: str) -> str:
+def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
     """The plain-text fallback of the approval card."""
     if spec.tool_name == "add_comment":
-        return escape_slack(f"Approve comment on {spec.payload['item_title']}")
-    return escape_slack(f"Approve new item in {db_name}: {spec.payload['title']}")
+        return escape_slack(f"Approve comment on {payload['item_title']}")
+    return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
 
 
 def approval_card_blocks(
@@ -1440,16 +1868,18 @@ def approval_card_blocks(
     db_name: str,
     edited: bool = False,
     requester_line: str | None = None,
+    payload: dict | None = None,
 ) -> list:
     """The approval card: the frozen payload, who it runs as, Submit / Edit / Cancel.
 
     The button value carries the task workflow ID and the approval nonce. The
     task workflow accepts a click only if the nonce matches the current draft
     and the clicker is the requester. An edit issues a new nonce, so buttons on
-    an older version of the card stop working.
+    an older version of the card stop working. ``payload`` is the revision the card shows;
+    it defaults to the payload the spec carries.
     """
     value = json.dumps({"task_id": task_id, "nonce": spec.approval_nonce})
-    shown = dict(spec.payload)
+    shown = dict(spec.payload if payload is None else payload)
     if "item_title" in shown:
         # A Notion title can be 2000 characters; the card's head is not the approved text.
         shown["item_title"] = shown["item_title"][:200]

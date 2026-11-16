@@ -5,12 +5,16 @@ Rules this workflow keeps:
 * Writes never run without approval. Only the requester can approve, and the
   approval nonce on the click must match the one on the card. Anything else is
   ignored and the workflow keeps waiting.
-* What was approved is exactly what runs: the payload in ``TaskSpec`` is frozen
-  before the card is posted. The only thing that changes it is an edit by the
-  requester, which replaces the draft, issues a new nonce (so a click on an
-  older version of the card no longer matches) and needs a fresh approval. At
-  most ``MAX_EDITS`` edits are accepted per task, and the expiry and reminder
-  window starts again from each edit.
+* What was approved is exactly what runs: the payload is frozen before the card is posted,
+  as revision 1 of the task's draft in Postgres (``task_drafts``); the spec carries the
+  reference (``draft_ref``, ``revision``) and the nonce, never the text. The only thing that
+  changes it is an edit by the requester, which stores the next revision, issues a new nonce
+  (so a click on an older version of the card no longer matches) and needs a fresh approval.
+  An approval binds to one (revision, nonce): the write activities read that revision, and
+  a decision that arrives while an edit is being stored is ignored. At most ``MAX_EDITS``
+  edits are accepted per task, and the expiry and reminder window starts again from each
+  edit. A task recorded before drafts were stored carries its payload in the spec and runs
+  the way it did then.
 * A comment may only target a page in a database the agent was granted. That
   is checked before the card is posted and again before the comment is made.
 * Exactly once, by the write activities and their lease in Postgres (see
@@ -22,8 +26,9 @@ Rules this workflow keeps:
   carries on as filed. If it is not, the task says it could not confirm and points to
   the tracker. It never says nothing was filed after retries ran out.
 * Logs carry IDs only, never the comment, the title or the details.
-* History stays small: after creation the workflow keeps only the item's page
-  ID, title, URL and last status.
+* History stays small and free of content: after creation the workflow keeps only the item's
+  page ID and last status. The lines posted in the thread that name the title, the comment
+  or a link are written by the ``post_task_notice`` activity from the stored draft.
 """
 
 from __future__ import annotations
@@ -36,12 +41,14 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from agentos import task_notices
     from agentos.activities import AgentActivities
     from agentos.config import AgentVersion
     from agentos.connectors.notion import normalize_id
     from agentos.models import (
         EDITABLE_FIELDS,
         ApprovalDecision,
+        DraftOutcome,
         DraftView,
         EditRequest,
         ExternalUpdate,
@@ -67,6 +74,8 @@ MAX_EDITS = 5
 RECONCILE_PATCH = "reconcile-on-exhaustion"
 # Histories recorded before the pre-write check never ask it, so they replay without it.
 PRE_WRITE_PATCH = "pre-write-audience"
+# Histories recorded before a task's payload was stored in Postgres carry it in the spec.
+DRAFT_REFS_PATCH = "draft-refs"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -79,6 +88,10 @@ class TaskWorkflow:
     @workflow.init
     def __init__(self, spec: TaskSpec) -> None:
         self._spec = spec
+        # A task whose payload is a stored draft: the spec names the revision, not the text.
+        self._refs = bool(spec.draft_ref)
+        # An edit being stored; while it is, a decision or a second edit is ignored.
+        self._edit_pending: EditRequest | None = None
         self._state = "drafted"
         self._decision: ApprovalDecision | None = None
         self._page_key: str | None = None
@@ -91,16 +104,20 @@ class TaskWorkflow:
         spec = self._spec
         return DraftView(
             tool_name=spec.tool_name,
-            fields={k: spec.payload[k] for k in EDITABLE_FIELDS.get(spec.tool_name, {})},
+            fields={}
+            if self._refs
+            else {k: spec.payload[k] for k in EDITABLE_FIELDS.get(spec.tool_name, {})},
             nonce=spec.approval_nonce,
             requester_user_id=spec.ctx.requester_user_id,
             editable=self._can_edit(),
+            revision=spec.revision,
         )
 
     def _can_edit(self) -> bool:
         return (
             self._state == "awaiting_approval"
             and self._decision is None
+            and self._edit_pending is None
             and self._edits < MAX_EDITS
         )
 
@@ -116,6 +133,13 @@ class TaskWorkflow:
             return
         if e.user_id != spec.ctx.requester_user_id:
             workflow.logger.warning("ignored edit: sender is not the requester")
+            return
+        if self._refs or e.edit_id:
+            if self._refs and e.edit_id:
+                # The values are in ``inbound_events``; ``apply_edit`` checks and stores them.
+                self._edit_pending = e
+            else:
+                workflow.logger.warning("ignored edit: it does not match how this draft is kept")
             return
         limits = EDITABLE_FIELDS.get(spec.tool_name, {})
         fields = e.fields if isinstance(e.fields, dict) else {}
@@ -145,6 +169,9 @@ class TaskWorkflow:
     def decision(self, d: ApprovalDecision) -> None:
         if self._decision is not None:
             return
+        if self._edit_pending is not None:
+            workflow.logger.warning("ignored decision: an edit is being saved")
+            return
         # Only the requester may decide, and only with the nonce from the card.
         # The channel a click came from proves nothing, so it is not checked.
         if d.nonce != self._spec.approval_nonce:
@@ -162,6 +189,8 @@ class TaskWorkflow:
 
     @workflow.run
     async def run(self, spec: TaskSpec) -> str:
+        if self._refs:
+            workflow.patched(DRAFT_REFS_PATCH)
         try:
             return await self._run(spec)
         except ActivityError:
@@ -171,13 +200,7 @@ class TaskWorkflow:
             if self._state not in ("drafted", "awaiting_approval"):
                 raise
             task_id = workflow.info().workflow_id
-            await self._try(
-                AgentActivities.post_in_thread,
-                spec.ctx,
-                f"I couldn't carry on with '{escape_slack(_subject(self._spec))}': "
-                "something went wrong on my side. Please ask me again.",
-                f"{task_id}:failed",
-            )
+            await self._notice(task_notices.CARRY_ON_FAILED, f"{task_id}:failed", task_id)
             self._state = "failed"
             return self._state
 
@@ -191,7 +214,12 @@ class TaskWorkflow:
         if spec.tool_name == "add_comment":
             # Resolve the item and check its database is granted before any card.
             try:
-                payload: dict = await self._act(AgentActivities.prepare_comment, spec)
+                if self._refs:
+                    resolved: DraftOutcome = await self._act(
+                        AgentActivities.prepare_stored_comment, spec
+                    )
+                else:
+                    payload: dict = await self._act(AgentActivities.prepare_comment, spec)
             except ActivityError as err:
                 if _is_agent_off(err):
                     await self._act(
@@ -211,7 +239,12 @@ class TaskWorkflow:
                 )
                 self._state = "failed"
                 return self._state
-            self._spec = dataclasses.replace(spec, payload=payload)
+            if self._refs:
+                self._spec = dataclasses.replace(
+                    spec, revision=resolved.revision, database_id=resolved.database_id
+                )
+            else:
+                self._spec = dataclasses.replace(spec, payload=payload)
         card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
 
@@ -222,6 +255,9 @@ class TaskWorkflow:
         reminded = remind >= expires
         reminder_key = f"{task_id}:reminder"
         while self._decision is None:
+            if self._edit_pending is not None:
+                await self._store_edit(self._edit_pending)
+                continue
             if self._refresh_due:
                 # An edit was accepted: redraw the card with the new nonce and
                 # restart the expiry and reminder window from now.
@@ -237,19 +273,17 @@ class TaskWorkflow:
             next_stop = expires if reminded else remind
             try:
                 await workflow.wait_condition(
-                    lambda: self._decision is not None or self._refresh_due,
+                    lambda: (
+                        self._decision is not None
+                        or self._refresh_due
+                        or self._edit_pending is not None
+                    ),
                     timeout=next_stop - elapsed,
                 )
             except TimeoutError:
                 if not reminded and workflow.now() - started >= remind:
                     reminded = True
-                    await self._try(
-                        AgentActivities.post_in_thread,
-                        ctx,
-                        f"Reminder: <@{ctx.requester_user_id}>, the request "
-                        f"'{escape_slack(_subject(self._spec))}' is waiting for your approval in your DMs.",
-                        reminder_key,
-                    )
+                    await self._notice(task_notices.REMINDER, reminder_key, task_id)
 
         spec = self._spec
         if self._decision is None:
@@ -284,7 +318,8 @@ class TaskWorkflow:
         if spec.tool_name == "add_comment":
             return await self._run_comment(spec, task_id, card_ts, agent.name)
 
-        title = spec.payload["title"]
+        title = "" if self._refs else spec.payload["title"]
+        database_id = spec.database_id if self._refs else spec.payload["database_id"]
 
         # --- execute exactly once ------------------------------------------------
         self._state = "executing"
@@ -299,7 +334,7 @@ class TaskWorkflow:
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(AgentActivities.reconcile_notion_item, spec, task_id)
                 if found is None:
-                    tracker = f"https://www.notion.so/{normalize_id(spec.payload['database_id'])}"
+                    tracker = f"https://www.notion.so/{normalize_id(database_id)}"
                     await self._try(
                         AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
                     )
@@ -316,28 +351,26 @@ class TaskWorkflow:
                 await self._try(
                     AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
                 )
-                await self._try(
-                    AgentActivities.post_in_thread,
-                    ctx,
-                    f"I couldn't file '{escape_slack(title)}': {escape_slack(reason)}",
+                await self._notice(
+                    task_notices.FAILED_CREATE,
                     f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
                 )
                 self._state = "failed"
                 return self._state
             item = found
 
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Submitted")
-        await self._try(
-            AgentActivities.post_in_thread,
-            ctx,
-            f"Filed: {escape_slack(item.title)} ({item.url}). I'll tell you here when it's done.",
-            f"{task_id}:filed",
+        await self._notice(
+            task_notices.FILED, f"{task_id}:filed", task_id, subject=item.title, url=item.url
         )
 
         # --- watch until done ----------------------------------------------------
         self._state = "watching"
         self._page_key = normalize_id(item.page_id)
-        done_values = _done_values(agent, spec.payload["database_id"])
+        done_values = _done_values(agent, database_id)
         poll = timedelta(minutes=agent.follow_up.poll_interval_minutes)
         stale_after = timedelta(days=agent.follow_up.stale_after_days)
         max_watch = timedelta(days=agent.follow_up.max_watch_days)
@@ -349,11 +382,8 @@ class TaskWorkflow:
         while True:
             elapsed = workflow.now() - watch_start
             if elapsed >= max_watch:
-                await self._try(
-                    AgentActivities.post_in_thread,
-                    ctx,
-                    f"I've stopped watching '{escape_slack(item.title)}'.",
-                    f"{task_id}:stopped",
+                await self._notice(
+                    task_notices.STOPPED_WATCH, f"{task_id}:stopped", task_id, subject=item.title
                 )
                 self._state = "done"
                 return self._state
@@ -367,7 +397,12 @@ class TaskWorkflow:
 
             try:
                 current: NotionItem = await self._act(
-                    AgentActivities.get_notion_item, ctx.tenant_id, ctx.agent_id, item.page_id
+                    AgentActivities.watch_notion_item
+                    if self._refs
+                    else AgentActivities.get_notion_item,
+                    ctx.tenant_id,
+                    ctx.agent_id,
+                    item.page_id,
                 )
             except ActivityError as err:
                 if _is_agent_off(err):
@@ -375,25 +410,23 @@ class TaskWorkflow:
                     self._state = "cancelled"
                     return self._state
                 if _is_permanent(err):
-                    await self._try(
-                        AgentActivities.post_in_thread,
-                        ctx,
-                        f"I've stopped watching '{escape_slack(item.title)}': I can no longer "
-                        "read it. It may have been deleted or moved out of the databases "
-                        "I can access.",
+                    await self._notice(
+                        task_notices.STOPPED_UNREADABLE,
                         f"{task_id}:stopped",
+                        task_id,
+                        subject=item.title,
                     )
                     self._state = "done"
                     return self._state
                 workflow.logger.warning("watch poll failed after retries; still watching")
                 continue
             if current.status in done_values:
-                await self._try(
-                    AgentActivities.post_in_thread,
-                    ctx,
-                    f"Your request '{escape_slack(current.title)}' was marked "
-                    f"{escape_slack(current.status or '')}.",
+                await self._notice(
+                    task_notices.DONE,
                     f"{task_id}:done",
+                    task_id,
+                    subject=current.title,
+                    status=current.status or "",
                 )
                 self._state = "done"
                 return self._state
@@ -403,12 +436,12 @@ class TaskWorkflow:
                 last_change = now
             elif not stale_sent and now - last_change >= stale_after:
                 stale_sent = True
-                await self._try(
-                    AgentActivities.post_in_thread,
-                    ctx,
-                    f"No movement on '{escape_slack(current.title)}' in "
-                    f"{agent.follow_up.stale_after_days} days.",
+                await self._notice(
+                    task_notices.STALE,
                     f"{task_id}:stale",
+                    task_id,
+                    subject=current.title,
+                    days=agent.follow_up.stale_after_days,
                 )
             item = NotionItem(
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
@@ -432,9 +465,9 @@ class TaskWorkflow:
         self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
     ) -> str:
         """Post the approved comment once. There is nothing to watch afterwards."""
-        ctx = spec.ctx
         self._state = "executing"
-        title = spec.payload["item_title"]
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
         try:
             await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
@@ -448,12 +481,11 @@ class TaskWorkflow:
                     await self._try(
                         AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
                     )
-                    await self._try(
-                        AgentActivities.post_in_thread,
-                        ctx,
-                        "I couldn't confirm whether the comment was posted; "
-                        f"please check {spec.payload['item_url']}",
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_COMMENT,
                         f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
                     )
                     self._state = "failed"
                     return self._state
@@ -462,23 +494,89 @@ class TaskWorkflow:
                 await self._try(
                     AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
                 )
-                await self._try(
-                    AgentActivities.post_in_thread,
-                    ctx,
-                    f"I couldn't comment on '{escape_slack(title)}': {escape_slack(reason)}",
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
                     f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
                 )
                 self._state = "failed"
                 return self._state
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
-        await self._try(
-            AgentActivities.post_in_thread,
-            ctx,
-            f"Commented on {escape_slack(title)} ({spec.payload['item_url']}).",
+        await self._notice(
+            task_notices.COMMENTED,
             f"{task_id}:commented",
+            task_id,
+            subject=title,
+            url=item_url,
         )
         self._state = "done"
         return self._state
+
+    async def _store_edit(self, e: EditRequest) -> None:
+        """Store the saved edit as the next revision of the draft, then redraw the card.
+
+        The new revision and its nonce replace the old only once the activity has stored
+        it, and a decision is ignored until then (see ``decision``).
+        """
+        try:
+            applied: bool = await self._act(AgentActivities.apply_edit, self._spec, e.edit_id)
+        except ActivityError:
+            applied = False
+        self._edit_pending = None
+        if not applied:
+            workflow.logger.warning("ignored edit: the stored values were not accepted")
+            return
+        self._spec = dataclasses.replace(
+            self._spec,
+            revision=self._spec.revision + 1,
+            approval_nonce=str(workflow.uuid4()),
+        )
+        self._edits += 1
+        self._refresh_due = True
+
+    async def _notice(
+        self,
+        kind: str,
+        idem_key: str,
+        task_id: str,
+        *,
+        subject: str = "",
+        reason: str = "",
+        url: str = "",
+        status: str = "",
+        days: int = 0,
+    ) -> None:
+        """Post one of the task's thread lines; a failure to post does not end the task.
+
+        A task with a stored draft names only the kind: ``post_task_notice`` reads the title
+        or comment it mentions. A task that carries its payload writes the line here, from
+        ``subject`` and ``url``.
+        """
+        ctx = self._spec.ctx
+        if self._refs:
+            await self._try(
+                AgentActivities.post_task_notice,
+                self._spec,
+                task_id,
+                kind,
+                idem_key,
+                reason,
+                status,
+                days,
+            )
+            return
+        text = task_notices.notice_text(
+            kind,
+            subject=subject or _subject(self._spec),
+            reason=reason,
+            url=url,
+            status=status,
+            requester=ctx.requester_user_id,
+            days=days,
+        )
+        await self._try(AgentActivities.post_in_thread, ctx, text, idem_key)
 
     async def _try(self, method, *args) -> None:
         """Run an activity whose failure must not end the task (a card redraw, a notice)."""
@@ -531,9 +629,8 @@ class TaskWorkflow:
 
 
 def _subject(spec: TaskSpec) -> str:
-    if spec.tool_name == "add_comment":
-        return spec.payload["item_title"]
-    return spec.payload["title"]
+    """The title a task that carries its payload is about (empty for one with a stored draft)."""
+    return task_notices.subject(spec.tool_name, spec.payload)
 
 
 def _is_permanent(err: ActivityError) -> bool:

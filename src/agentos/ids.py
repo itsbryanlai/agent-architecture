@@ -145,3 +145,8 @@ def audience_pause_notice_key(
 def scope_gone_notice_key(tenant: str, scope: str, recipient: str, first_seen: str) -> str:
     """The idempotency key of the direct message that tells one person a scope's root page is gone."""
     return f"{tenant}:scope-gone-notice:{scope}:{first_seen}:{recipient}"
+
+
+def edit_event_id(unique: str) -> str:
+    """The ``inbound_events`` row that holds one saved Edit form (not a Slack event)."""
+    return f"edit:{unique}"

@@ -10,13 +10,18 @@ object means the defaults below. What is purged:
 
 * conversation messages, per conversation: only a conversation whose newest message is older
   than the limit, so a thread is never cut in the middle;
-* tool outputs: older than the limit, in a conversation with no newer message;
+* tool outputs, tool inputs and model steps (what the model replied, kept until it was shown):
+  older than the tool-output limit, in a conversation with no newer message;
+* inbound events already delivered to their workflow, and the saved Edit forms among them, older
+  than the idempotency limit (an event not yet delivered is never purged);
+* the drafts of a task whose newest revision is older than the tool-output limit;
+* threads (the specialist a thread was handed to) idle for longer than the messages limit;
+* mentions of an agent's owner (``owner_pings``) older than two days, which is all they are read for;
 * idempotency records older than the limit;
 * sessions, a number of days after they expired (a session is purged at login too).
 
 Never purged: audit and usage rows (append-only by design, and the app role has no DELETE on
-them), ``external_writes``, ``task_links`` and agent definitions. There are no stored inbound
-events to purge. A limit is never below the longest task life a definition may hold: the
+them), ``external_writes``, ``task_links`` and agent definitions. A limit is never below the longest task life a definition may hold: the
 largest approval window and the largest watch that validation allows (``config.py``), plus a
 day. ``set`` refuses a lower value, and the job raises a stored lower value to it, so a row a
 live approval or follow-up watch still reads is never deleted, whatever version an agent is
@@ -83,6 +88,8 @@ DEFAULT_DAYS = {
     "idempotency_days": 90,
     "sessions_days": 1,
 }
+# An owner is mentioned in a refusal once a day for each person and place; a row is read only for that.
+OWNER_PING_DAYS = 2
 # Kinds a live task may still need are held to the tenant's longest task life.
 TASK_BOUND = ("messages_days", "tool_outputs_days", "idempotency_days")
 # The longest a task can live: the largest approval window and watch a definition may hold, and a day.
@@ -171,12 +178,28 @@ class PurgeCounts:
     idempotency: int = 0
     sessions: int = 0
     more: bool = False
+    tool_inputs: int = 0
+    model_steps: int = 0
+    inbound_events: int = 0
+    task_drafts: int = 0
+    threads: int = 0
+    owner_pings: int = 0
 
     def add(self, other: PurgeCounts) -> None:
         self.messages += other.messages
         self.tool_outputs += other.tool_outputs
         self.idempotency += other.idempotency
         self.sessions += other.sessions
+        self.tool_inputs += other.tool_inputs
+        self.model_steps += other.model_steps
+        self.inbound_events += other.inbound_events
+        self.task_drafts += other.task_drafts
+        self.threads += other.threads
+        self.owner_pings += other.owner_pings
+
+    def kinds(self) -> dict[str, int]:
+        """The rows deleted, per kind, for a log line or the command line."""
+        return {k: v for k, v in vars(self).items() if k != "more"}
 
 
 class RetentionStore(Protocol):
@@ -226,6 +249,72 @@ class PostgresRetentionStore:
                 {"t": tenant_id, "cutoff": cutoff("tool_outputs_days"), "limit": limit},
             )
             counts.tool_outputs = cur.rowcount
+            # What the model said and was asked for in a conversation is purged with that
+            # conversation's tool outputs: nothing reads it once the conversation is idle.
+            for table, key, attr in (
+                ("tool_inputs", "tool_use_id", "tool_inputs"),
+                ("model_steps", "step_key", "model_steps"),
+            ):
+                cur = await conn.execute(
+                    f"""
+                    DELETE FROM {table} o
+                    WHERE (o.tenant_id, o.conversation_id, o.{key}) IN (
+                      SELECT t.tenant_id, t.conversation_id, t.{key} FROM {table} t
+                      WHERE t.tenant_id = %(t)s AND t.created_at < %(cutoff)s
+                        AND NOT EXISTS (
+                          SELECT 1 FROM conversation_messages m
+                          WHERE m.tenant_id = t.tenant_id
+                            AND m.conversation_id = t.conversation_id
+                            AND m.created_at >= %(cutoff)s)
+                      LIMIT %(limit)s)
+                    """,
+                    {"t": tenant_id, "cutoff": cutoff("tool_outputs_days"), "limit": limit},
+                )
+                setattr(counts, attr, cur.rowcount)
+            cur = await conn.execute(
+                """
+                DELETE FROM task_drafts
+                WHERE tenant_id = %(t)s AND task_id IN (
+                  SELECT task_id FROM task_drafts WHERE tenant_id = %(t)s
+                  GROUP BY task_id HAVING MAX(created_at) < %(cutoff)s LIMIT %(limit)s)
+                """,
+                {"t": tenant_id, "cutoff": cutoff("tool_outputs_days"), "limit": limit},
+            )
+            counts.task_drafts = cur.rowcount
+            cur = await conn.execute(
+                """
+                DELETE FROM inbound_events
+                WHERE (tenant_id, event_id) IN (
+                  SELECT tenant_id, event_id FROM inbound_events
+                  WHERE tenant_id = %(t)s AND delivered_at < %(cutoff)s LIMIT %(limit)s)
+                """,
+                {"t": tenant_id, "cutoff": cutoff("idempotency_days"), "limit": limit},
+            )
+            counts.inbound_events = cur.rowcount
+            cur = await conn.execute(
+                """
+                DELETE FROM threads
+                WHERE (tenant_id, thread_key) IN (
+                  SELECT tenant_id, thread_key FROM threads
+                  WHERE tenant_id = %(t)s AND updated_at < %(cutoff)s LIMIT %(limit)s)
+                """,
+                {"t": tenant_id, "cutoff": cutoff("messages_days"), "limit": limit},
+            )
+            counts.threads = cur.rowcount
+            cur = await conn.execute(
+                """
+                DELETE FROM owner_pings
+                WHERE (tenant_id, agent_id, channel, asker_user_id) IN (
+                  SELECT tenant_id, agent_id, channel, asker_user_id FROM owner_pings
+                  WHERE tenant_id = %(t)s AND notified_on < %(day)s LIMIT %(limit)s)
+                """,
+                {
+                    "t": tenant_id,
+                    "day": (now - timedelta(days=OWNER_PING_DAYS)).date(),
+                    "limit": limit,
+                },
+            )
+            counts.owner_pings = cur.rowcount
             cur = await conn.execute(
                 """
                 DELETE FROM conversation_messages
@@ -259,9 +348,7 @@ class PostgresRetentionStore:
             counts.sessions = cur.rowcount
         # A kind that deleted a full batch may have more due. Messages go by whole conversations,
         # so one batch may delete more rows than ``limit``.
-        counts.more = (
-            max(counts.tool_outputs, counts.messages, counts.idempotency, counts.sessions) >= limit
-        )
+        counts.more = max(v for k, v in counts.kinds().items()) >= limit
         return counts
 
 
@@ -298,12 +385,9 @@ class RetentionActivities:
         counts = await self._store.purge_batch(tenant_id, policy, self._clock())
         # Counts only; never a row's content.
         log.info(
-            "tenant_id=%s retention messages=%d tool_outputs=%d idempotency=%d sessions=%d",
+            "tenant_id=%s retention %s",
             tenant_id,
-            counts.messages,
-            counts.tool_outputs,
-            counts.idempotency,
-            counts.sessions,
+            " ".join(f"{kind}={n}" for kind, n in counts.kinds().items()),
         )
         return counts
 
@@ -377,9 +461,8 @@ async def run(tenant: str | None, schedule: bool, clock=_utcnow) -> None:
         for tenant_id in selected:
             total = await purge_all(store, tenant_id, clock)
             print(
-                f"tenant_id={tenant_id} messages={total.messages} "
-                f"tool_outputs={total.tool_outputs} idempotency={total.idempotency} "
-                f"sessions={total.sessions}"
+                f"tenant_id={tenant_id} "
+                + " ".join(f"{kind}={n}" for kind, n in total.kinds().items())
             )
     finally:
         await pool.close()
@@ -435,8 +518,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(run_set(build_set_parser().parse_args(argv[1:])))
     parser = argparse.ArgumentParser(
         description=(
-            "Delete a tenant's expired conversation messages, tool outputs, idempotency "
-            "records and sessions. Audit and usage rows are kept. "
+            "Delete a tenant's expired conversation messages, stored content, idempotency "
+            "records, idle threads and sessions. Audit and usage rows are kept. "
             "To change a tenant's limits: python -m agentos.retention set --help"
         )
     )

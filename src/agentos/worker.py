@@ -39,6 +39,7 @@ from agentos.config import (
     validate_worker_capacity,
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.content_store import PostgresContentStore
 from agentos.crypto_keys import LocalKeyStore, check_keys, startup_key_failure
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
@@ -335,6 +336,7 @@ async def main() -> None:
             external_writes=PostgresExternalWriteStore(pool),
             threads=PostgresThreadStore(pool),
             owner_pings=PostgresOwnerPingStore(pool),
+            content=PostgresContentStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

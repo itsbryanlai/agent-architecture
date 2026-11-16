@@ -26,6 +26,7 @@ from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
 from agentos.gateway.app import create_app
+from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from agentos.slack_client import FakeSlack
@@ -343,6 +344,12 @@ def gateway(directory, secret):
     return TestClient(app), temporal
 
 
+async def delivered(client) -> int:
+    """Let the gateway's relay hand what it stored to Temporal."""
+    d = client.app.state.deps
+    return await InboundRelay(d.content, d.tenants, d.temporal_client).deliver_once()
+
+
 def event_for(team: str, event_id: str) -> dict:
     payload = im_event()
     payload["team_id"] = team
@@ -354,11 +361,13 @@ async def test_the_gateway_serves_a_tenant_added_after_start_without_a_restart(s
     store, clock = InMemoryTenantStore(acme()), Clock()
     client, temporal = gateway(TenantDirectory(store, clock=clock), secret)
     post_event(client, secret, event_for(GLOBEX_TEAM, "Ev1"))
+    await delivered(client)
     assert temporal.signal_with_starts == []
 
     clock.advance(2)
     await import_tenant(store, globex())
     post_event(client, secret, event_for(GLOBEX_TEAM, "Ev2"))
+    await delivered(client)
 
     assert [c["arg"].tenant_id for c in temporal.signal_with_starts] == [GLOBEX]
     assert temporal.signal_with_starts[0]["id"].startswith(f"{GLOBEX}:")
@@ -368,6 +377,7 @@ async def test_the_gateway_answers_nothing_for_a_tenant_disabled_while_running(s
     store, clock = InMemoryTenantStore(acme(), globex()), Clock()
     client, temporal = gateway(TenantDirectory(store, ttl_seconds=15, clock=clock), secret)
     post_event(client, secret, event_for(GLOBEX_TEAM, "Ev1"))
+    await delivered(client)
     assert len(temporal.signal_with_starts) == 1
 
     await store.set_enabled(GLOBEX, False)
@@ -375,8 +385,10 @@ async def test_the_gateway_answers_nothing_for_a_tenant_disabled_while_running(s
     response = post_event(client, secret, event_for(GLOBEX_TEAM, "Ev2"))
 
     assert response.status_code == 200
+    await delivered(client)
     assert len(temporal.signal_with_starts) == 1
     assert post_event(client, secret, event_for(TEAM, "Ev3")).status_code == 200
+    await delivered(client)
     assert len(temporal.signal_with_starts) == 2
 
 

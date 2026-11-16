@@ -53,7 +53,12 @@ async def shown(h, action: str) -> dict[str, str]:
     if action != "publish":
         return {}
     record = await h.agents.get_version(TENANT, "it-helper", 1)
-    return {"definition_sha256": record.definition_sha256}
+    now = await h.agents.published(TENANT, "it-helper")
+    return {
+        "definition_sha256": record.definition_sha256,
+        "widening": "yes",
+        "reviewed_published": "none" if now is None else str(now.version),
+    }
 
 
 async def status_of_version(h, version=1) -> str:
@@ -233,11 +238,18 @@ async def test_a_creator_creates_edits_and_submits_and_an_admin_publishes(h):
 
     record = await h.agents.get_version(TENANT, "it-helper", 1)
     assert record.status == "published" and record.approved_by == ADMIN2
-    assert kinds(h) == ["agent_create", "agent_edit", "agent_submit", "agent_publish"]
+    assert kinds(h) == [
+        "agent_create",
+        "agent_edit",
+        "agent_submit",
+        "agent_publish",
+        "widening_confirm",
+    ]
     assert [e.identity for e in h.audit.events] == [
         f"user:{OWNER}",
         f"user:{OWNER}",
         f"user:{OWNER}",
+        f"user:{ADMIN2}",
         f"user:{ADMIN2}",
     ]
 

@@ -109,7 +109,14 @@ class FakeSlack:
 
 
 class ConsoleHarness:
-    def __init__(self, console_url: str = CONSOLE_URL, single_tenant: bool = False, audience=None):
+    def __init__(
+        self,
+        console_url: str = CONSOLE_URL,
+        single_tenant: bool = False,
+        audience=None,
+        picker=None,
+        require_grant_picker: bool = False,
+    ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
@@ -139,13 +146,25 @@ class ConsoleHarness:
             clock=self.clock,
             pauses=self.pauses,
             switches=self.switches,
+            require_grant_picker=require_grant_picker,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)
         self.app = create_app(
-            self.plane, self.tenants, SlackSession(), sessions=self.sessions, console=self.console
+            self.plane,
+            self.tenants,
+            SlackSession(),
+            sessions=self.sessions,
+            console=self.console,
+            picker=picker,
         )
         self.base_url = console_url
+        self._picker = picker
+
+    def picker_state(self):
+        """Everything the picker holds, for a test that looks for what must not be kept."""
+        p = self._picker
+        return None if p is None else (vars(p.sessions), vars(p.oauth), p.config)
 
     async def seed_members(self) -> None:
         await self.members.add_member(TENANT, ADMIN2, "admin", ROOT)

@@ -48,6 +48,9 @@ SEEDS = {
     "VALUES (%(t)s, 'writes', '', 'u')",
     "tenants": "INSERT INTO tenants (tenant_id, slack_team_id, default_agent) "
     "VALUES (%(t)s, 'T-' || %(t)s, 'a')",
+    "grant_picks": "INSERT INTO grant_picks "
+    "(tenant_id, agent_id, notion_id, kind, picked_by, picked_at) "
+    "VALUES (%(t)s, 'a', 'n', 'page', 'u', now())",
     "external_writes": "INSERT INTO external_writes "
     "(tenant_id, idem_key, state, lease_until, lease_token) "
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
@@ -72,6 +75,7 @@ PRIVILEGES = {
     "kill_switches": "SELECT INSERT DELETE",
     "tenants": "SELECT INSERT UPDATE",
     "external_writes": "SELECT INSERT UPDATE",
+    "grant_picks": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }

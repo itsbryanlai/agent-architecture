@@ -128,6 +128,8 @@ def test_an_audience_round_trips_through_the_definition(audience):
 @pytest.mark.parametrize(
     "audience, message",
     [
+        ({}, "reaches nobody"),
+        (["C0AAAA111"], "audience"),
         ({"channels": []}, "reaches nobody"),
         ({"channels": "C0AAAA111"}, "channels"),
         ({"channels": ["general"]}, "Slack channel ID"),
@@ -141,21 +143,10 @@ def test_an_audience_round_trips_through_the_definition(audience):
     ],
 )
 def test_a_malformed_audience_is_refused(audience, message):
+    """Fails if a definition whose audience is empty, not a mapping or malformed is accepted."""
+    block = helper_block()
+    block["audience"] = audience
     with pytest.raises(ConfigError, match=message):
-        parse_agent("it-helper", helper_block(**audience), 1)
-
-
-def test_an_empty_audience_reaches_nobody_and_is_refused():
-    block = helper_block()
-    block["audience"] = {}
-    with pytest.raises(ConfigError, match="reaches nobody"):
-        parse_agent("it-helper", block, 1)
-
-
-def test_audience_must_be_a_mapping():
-    block = helper_block()
-    block["audience"] = ["C0AAAA111"]
-    with pytest.raises(ConfigError, match="audience"):
         parse_agent("it-helper", block, 1)
 
 
@@ -176,33 +167,6 @@ def test_a_mapped_channel_of_an_agent_without_audience_is_fine():
 
 
 # --- the Slack lookups ----------------------------------------------------------------
-
-
-async def test_fake_slack_describes_users_groups_channels_and_the_workspace():
-    slack = FakeSlack(
-        users={"U_GUEST": SlackUser("U_GUEST", TEAM, is_restricted=True)},
-        groups={GROUP: [ALICE]},
-        channel_members={CHAN: [ALICE, "U_GUEST"]},
-    )
-    assert await slack.user_info(ALICE) == SlackUser(ALICE, TEAM)
-    assert (await slack.user_info("U_GUEST")).is_restricted is True
-    assert await slack.usergroup_members(GROUP) == [ALICE]
-    assert await slack.channel_members(CHAN) == [ALICE, "U_GUEST"]
-    assert {u.id for u in await slack.list_users()} >= {"U_GUEST"}
-    assert [name for name, _ in slack.calls] == [
-        "user_info",
-        "user_info",
-        "usergroup_members",
-        "channel_members",
-        "list_users",
-    ]
-
-
-async def test_fake_slack_can_fail_lookups():
-    slack = FakeSlack()
-    slack.fail_lookups(SlackLookupError("ratelimited", transient=True))
-    with pytest.raises(SlackLookupError):
-        await slack.user_info(BOB)
 
 
 # --- the rules ------------------------------------------------------------------------
@@ -813,10 +777,16 @@ async def test_a_page_view_may_reuse_the_workspace_list_but_a_publish_reads_it_a
     assert [n for n, _ in slack.lookups()].count("list_users") == 2
 
 
-async def test_publish_needs_the_confirmation_and_names_the_counts():
+@pytest.mark.parametrize(
+    "audience, counts",
+    [({"channels": [CHAN]}, "4 people"), ({}, "people")],
+    ids=["with an audience", "without an audience"],
+)
+async def test_publish_needs_the_confirmation_and_names_the_counts(audience, counts):
+    """Fails if a version is published without the audience confirmation, with or without an audience set."""
     plane, agents, audit, *_ = publish_world()
-    await pending(plane, channels=[CHAN])
-    with pytest.raises(AudienceNotConfirmed, match="4 people") as err:
+    await pending(plane, **audience)
+    with pytest.raises(AudienceNotConfirmed, match=counts) as err:
         await plane.publish_version(TENANT, ADMIN, "it-helper", 1)
     assert "confirm_audience" in str(err.value)
     assert (await agents.get_version(TENANT, "it-helper", 1)).status == "pending"
@@ -859,13 +829,6 @@ async def test_publish_when_slack_cannot_be_read_is_refused_and_nothing_changes(
             TENANT, ADMIN, "it-helper", 1, confirm_audience={"total": 4, "guests": 1, "external": 1}
         )
     assert (await agents.get_version(TENANT, "it-helper", 1)).status == "pending"
-
-
-async def test_a_definition_without_audience_is_confirmed_like_any_other():
-    plane, *_ = publish_world()
-    await pending(plane)
-    with pytest.raises(AudienceNotConfirmed):
-        await plane.publish_version(TENANT, ADMIN, "it-helper", 1)
 
 
 # --- the API and the console ---------------------------------------------------------
@@ -960,6 +923,7 @@ VERSION_URL = f"/ui/{TENANT}/agents/it-helper/versions/1"
 
 
 async def test_the_version_page_shows_the_audience_and_the_people_it_reaches():
+    """Fails if the version page leaves out the audience, the people counts or the counts the confirm form posts."""
     h, _ = console_world()
     await console_pending(h, channels=[CHAN], dm="everyone")
     c = await h.signed_in(CONSOLE_ADMIN)
@@ -969,8 +933,8 @@ async def test_the_version_page_shows_the_audience_and_the_people_it_reaches():
     assert "default (no audience set)" not in page
     assert "4 people" in page and "1 guest" in page and "1 from another workspace" in page
     assert 'name="confirm"' in page
-    for field, value in COUNTS.items():
-        assert f'name="{field}" value="{value}"' in page or field == "total"
+    for field in ("guests", "external"):
+        assert f'name="{field}" value="{COUNTS[field]}"' in page
 
 
 async def test_a_definition_without_audience_is_marked_as_the_default():

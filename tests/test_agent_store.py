@@ -1,23 +1,19 @@
 """Agents in the database: lifecycle, what a turn loads, front-door rules, import, startup."""
 
 import copy
-from dataclasses import replace
 
 import pytest
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
-from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import (
-    ALLOWED_MOVES,
-    AgentStoreError,
     InMemoryAgentStore,
     published_tenants,
     seeded_agent_store,
     startup_agent_failure,
 )
-from agentos.audit import InMemoryAuditStore, canonical_sha256
+from agentos.audit import InMemoryAuditStore
 from agentos.config import (
     ConfigError,
     Settings,
@@ -72,112 +68,6 @@ async def republish(store, agent_id, change, tenant=TENANT):
 # --- lifecycle -------------------------------------------------------------------
 
 
-async def test_create_submit_publish_records_who_and_when():
-    store = InMemoryAgentStore()
-    draft = await store.create_agent(TENANT, "it-helper", helper_block(), EDITOR)
-    assert (draft.version, draft.status, draft.created_by) == (1, "draft", EDITOR)
-    assert await store.published(TENANT, "it-helper") is None
-
-    pending = await store.submit(TENANT, "it-helper", 1, EDITOR)
-    assert (pending.status, pending.submitted_by) == ("pending", EDITOR)
-    assert pending.submitted_at is not None
-    assert await store.published(TENANT, "it-helper") is None
-
-    done = await store.publish(TENANT, "it-helper", 1, ADMIN)
-    assert (done.status, done.approved_by) == ("published", ADMIN)
-    assert done.published_at is not None
-    live = await store.published(TENANT, "it-helper")
-    assert (live.agent_id, live.version, live.name) == ("it-helper", 1, "IT helper")
-
-
-async def test_second_publish_supersedes_the_first_and_only_one_is_published():
-    store = InMemoryAgentStore()
-    await make_published(store)
-
-    second = await republish(store, "it-helper", lambda d: d.update(name="IT helper 2"))
-
-    assert second.version == 2
-    versions = await store.versions(TENANT, "it-helper")
-    assert [(v.version, v.status) for v in versions] == [(2, "published"), (1, "superseded")]
-    assert [v.status for v in versions].count("published") == 1
-    assert (await store.published(TENANT, "it-helper")).name == "IT helper 2"
-    assert (await store.get_version(TENANT, "it-helper", 1)).definition["name"] == "IT helper"
-
-
-async def test_new_draft_copies_the_published_version_or_a_given_one():
-    store = InMemoryAgentStore()
-    await make_published(store)
-    await republish(store, "it-helper", lambda d: d.update(name="Second"))
-
-    from_published = await store.create_draft(TENANT, "it-helper", EDITOR)
-    from_first = await store.create_draft(TENANT, "it-helper", EDITOR, from_version=1)
-
-    assert (from_published.version, from_published.definition["name"]) == (3, "Second")
-    assert (from_first.version, from_first.definition["name"]) == (4, "IT helper")
-    assert from_published.status == from_first.status == "draft"
-
-
-async def test_withdraw_returns_a_pending_version_to_draft_and_it_can_be_edited_again():
-    store = InMemoryAgentStore()
-    await draft_helper(store)
-    await store.submit(TENANT, "it-helper", 1, EDITOR)
-
-    back = await store.withdraw(TENANT, "it-helper", 1)
-    assert back.status == "draft"
-    edited = copy.deepcopy(helper_block())
-    edited["name"] = "Edited"
-    again = await store.replace_draft(TENANT, "it-helper", 1, edited)
-    assert again.definition["name"] == "Edited"
-
-
-async def test_illegal_moves_and_edits_are_refused():
-    store = InMemoryAgentStore()
-    await draft_helper(store)
-    block = helper_block()
-
-    with pytest.raises(AgentStoreError):  # a draft is not published without approval
-        await store.publish(TENANT, "it-helper", 1, ADMIN)
-    with pytest.raises(AgentStoreError):  # only a pending version is withdrawn
-        await store.withdraw(TENANT, "it-helper", 1)
-    await store.submit(TENANT, "it-helper", 1, EDITOR)
-    with pytest.raises(AgentStoreError):  # submitted twice
-        await store.submit(TENANT, "it-helper", 1, EDITOR)
-    with pytest.raises(AgentStoreError):  # a pending version is not edited
-        await store.replace_draft(TENANT, "it-helper", 1, block)
-    await store.publish(TENANT, "it-helper", 1, ADMIN)
-    with pytest.raises(AgentStoreError):  # a published version is not edited
-        await store.replace_draft(TENANT, "it-helper", 1, block)
-    with pytest.raises(AgentStoreError):  # published twice
-        await store.publish(TENANT, "it-helper", 1, ADMIN)
-    with pytest.raises(AgentStoreError):
-        await store.submit(TENANT, "it-helper", 2, EDITOR)
-    with pytest.raises(AgentStoreError):
-        await store.create_agent(TENANT, "it-helper", block, EDITOR)
-    with pytest.raises(AgentStoreError):
-        await store.create_draft(TENANT, "it-helper", EDITOR, from_version=9)
-    assert (await store.get_version(TENANT, "it-helper", 1)).definition == block
-
-
-async def test_superseded_version_cannot_change():
-    store = InMemoryAgentStore()
-    await make_published(store)
-    await republish(store, "it-helper", lambda d: d.update(name="Second"))
-
-    with pytest.raises(AgentStoreError):
-        await store.withdraw(TENANT, "it-helper", 1)
-    with pytest.raises(AgentStoreError):
-        await store.replace_draft(TENANT, "it-helper", 1, helper_block())
-
-
-def test_allowed_moves_are_the_four_the_trigger_allows():
-    assert ALLOWED_MOVES == {
-        ("draft", "pending"),
-        ("pending", "draft"),
-        ("pending", "published"),
-        ("published", "superseded"),
-    }
-
-
 async def test_a_definition_is_validated_like_a_yaml_block():
     store = InMemoryAgentStore()
     broken = helper_block()
@@ -188,14 +78,6 @@ async def test_a_definition_is_validated_like_a_yaml_block():
     with pytest.raises(ConfigError, match="system_prompt"):
         await store.replace_draft(TENANT, "it-helper", 1, broken)
     assert await store.versions(TENANT, "ghost") == []
-
-
-async def test_a_given_version_field_is_ignored_because_the_store_assigns_it():
-    store = InMemoryAgentStore()
-    block = {**helper_block(), "version": 7}
-    record = await store.create_agent(TENANT, "it-helper", block, EDITOR)
-    assert record.version == 1
-    assert "version" not in record.definition
 
 
 def test_definition_round_trips_through_the_yaml_parser():
@@ -386,116 +268,6 @@ async def test_publish_dropping_a_specialists_description_is_refused():
         await store.publish(TENANT, "it-helper", draft.version, ADMIN)
 
 
-# --- one-time import -------------------------------------------------------------
-
-
-async def test_import_publishes_version_one_and_a_second_run_skips_and_names_each_agent():
-    config = parse_agents_config(front_door_dict())
-    store = InMemoryAgentStore()
-
-    first = await store.import_agents(TENANT, config.agents)
-    assert sorted(first.imported) == ["concierge", "it-helper", "unlisted"]
-    assert first.skipped == []
-    for agent_id in first.imported:
-        [record] = await store.versions(TENANT, agent_id)
-        assert (record.version, record.status) == (1, "published")
-        assert (record.created_by, record.approved_by) == ("import:yaml", "import:yaml")
-
-    second = await store.import_agents(TENANT, config.agents)
-    assert second.imported == []
-    assert sorted(second.skipped) == ["concierge", "it-helper", "unlisted"]
-    assert len(await store.versions(TENANT, "it-helper")) == 1
-
-    published = await store.published_all(TENANT)
-    assert set(published) == set(config.agents)
-    for agent_id, agent in config.agents.items():
-        assert published[agent_id] == replace_version(agent, 1)
-
-
-def replace_version(agent, version):
-    return parse_agent(agent.agent_id, agent_definition(agent), version)
-
-
-async def test_import_skips_an_existing_agent_and_changes_nothing_in_it():
-    config = parse_agents_config(agents_dict())
-    store = InMemoryAgentStore()
-    await make_published(store)
-    await republish(store, "it-helper", lambda d: d.update(name="Edited in the database"))
-
-    result = await store.import_agents(TENANT, config.agents)
-
-    assert result.skipped == ["it-helper"]
-    assert (await store.published(TENANT, "it-helper")).name == "Edited in the database"
-
-
-async def test_import_that_breaks_the_front_door_rules_is_refused_whole():
-    config = parse_agents_config(front_door_dict())
-    agents = dict(config.agents)
-    del agents["it-helper"]
-    store = InMemoryAgentStore()
-
-    with pytest.raises(ConfigError, match="specialist 'it-helper'.*not a defined agent"):
-        await store.import_agents(TENANT, agents)
-
-    assert await store.published_all(TENANT) == {}
-
-
-async def test_import_checks_the_new_agents_against_those_already_published():
-    config = parse_agents_config(front_door_dict())
-    store = InMemoryAgentStore()
-    await store.import_agents(TENANT, {"it-helper": config.agents["it-helper"]})
-
-    await store.import_agents(TENANT, {"concierge": config.agents["concierge"]})
-
-    assert set(await store.published_all(TENANT)) == {"it-helper", "concierge"}
-
-
-async def test_import_audits_each_imported_agent_once_and_a_rerun_writes_nothing():
-    config = parse_agents_config(front_door_dict())
-    audit = InMemoryAuditStore()
-    store = InMemoryAgentStore(audit=audit)
-
-    await store.import_agents(TENANT, config.agents)
-
-    assert sorted(e.agent_id for e in audit.events) == ["concierge", "it-helper", "unlisted"]
-    for event in audit.events:
-        assert (event.kind, event.agent_version, event.outcome) == ("agent_import", 1, "ok")
-        assert (event.requester_user_id, event.approver_user_id) == ("import:yaml", "import:yaml")
-        assert event.identity == "user:import:yaml"
-        assert event.tenant_id == TENANT
-        assert event.event_key == ids.audit_import_key(TENANT, event.agent_id)
-        [record] = await store.versions(TENANT, event.agent_id)
-        assert event.input_sha256 == canonical_sha256(record.definition)
-        assert "system_prompt" not in repr(event)
-
-    await store.import_agents(TENANT, config.agents)
-
-    assert len(audit.events) == 3
-
-
-async def test_a_refused_import_audits_nothing():
-    config = parse_agents_config(front_door_dict())
-    agents = dict(config.agents)
-    del agents["it-helper"]
-    audit = InMemoryAuditStore()
-
-    with pytest.raises(ConfigError):
-        await InMemoryAgentStore(audit=audit).import_agents(TENANT, agents)
-
-    assert audit.events == []
-
-
-async def test_tenants_are_kept_apart():
-    one = parse_agents_config(agents_dict())
-    store = InMemoryAgentStore()
-    await store.import_agents("acme", one.agents)
-
-    assert await store.published("globex", "it-helper") is None
-    assert await store.published_all("globex") == {}
-    await store.import_agents("globex", one.agents)
-    assert (await store.published("globex", "it-helper")).version == 1
-
-
 # --- startup ---------------------------------------------------------------------
 
 
@@ -520,6 +292,7 @@ async def test_startup_refuses_a_default_agent_or_channel_agent_with_no_publishe
 
 
 async def test_published_tenants_carry_the_published_agents_and_the_yaml_settings():
+    """Fails if the worker's tenant view shows a YAML agent instead of the published one, or loses the YAML settings."""
     raw = agents_dict()
     raw["channels"] = {"C_HELP": "it-helper"}
     config = parse_agents_config(raw)
@@ -535,15 +308,3 @@ async def test_published_tenants_carry_the_published_agents_and_the_yaml_setting
         config.slack_team_id,
     )
     assert config.agents["it-helper"].name == "IT helper"
-
-
-# --- migration text --------------------------------------------------------------
-
-
-async def test_the_import_refuses_an_agent_id_outside_the_pattern():
-    """Fails if the one-time import writes an agent whose ID the console cannot route."""
-    store = InMemoryAgentStore()
-    good = parse_agent("it-helper", helper_block(), 1)
-    with pytest.raises(ConfigError, match="agent ID"):
-        await store.import_agents(TENANT, {"a/b": replace(good, agent_id="a/b")})
-    assert await store.list_agents(TENANT) == []

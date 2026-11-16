@@ -4,10 +4,10 @@ again. Who is added to a channel is the admins' business: a join, of anyone, pau
 
 import copy
 import json
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -58,7 +58,6 @@ from tests.console_harness import ROOT as CONSOLE_ADMIN
 from tests.console_harness import ConsoleHarness, csrf_token, post, using
 from tests.test_gateway import FakeTemporalClient, signed_headers
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
 CHAN = "C0AAAA111"
 OTHER_CHAN = "C0BBBB222"
 THIRD_CHAN = "C0CCCC333"
@@ -231,12 +230,16 @@ async def test_the_owner_and_every_admin_are_told_once_and_nobody_else():
 
 
 async def test_the_notice_carries_the_channel_and_reason_and_no_content():
+    """Fails if the notice to the owner and admins says anything but the agent, the channel and the fixed reason."""
     w = World()
     await w.event(CHAN)
-    for post_ in w.dms():
-        assert post_["thread_ts"] is None
-        assert "shared" in post_["text"].lower()
-        assert len(post_["text"]) < 400
+    expected = (
+        f"IT helper is paused in <#{CHAN}> because the channel was shared with another "
+        "organisation. It will not answer there until the owner or an admin reviews who can "
+        "see the channel and resumes it in the console."
+    )
+    assert [post_["text"] for post_ in w.dms()] == [expected] * len(w.dms())
+    assert w.dms() and all(post_["thread_ts"] is None for post_ in w.dms())
 
 
 async def test_a_new_pause_after_a_resume_tells_again():
@@ -449,21 +452,17 @@ async def paused_world() -> World:
 COUNTS = {"total": 2, "guests": 1, "external": 0}
 
 
-async def test_the_owner_resumes_with_the_fresh_counts():
+@pytest.mark.parametrize("who", [OWNER, MEMBER_ADMIN], ids=["the owner", "an admin"])
+async def test_the_owner_or_an_admin_resumes_with_the_fresh_counts(who):
+    """Fails if the owner or an admin cannot resume a paused channel, or the resume is not audited with the counts."""
     w = await paused_world()
-    record = await w.plane.resume_channel(TENANT, OWNER, "it-helper", CHAN, COUNTS)
-    assert (record.resumed_by, record.resumed_at is not None) == (OWNER, True)
+    record = await w.plane.resume_channel(TENANT, who, "it-helper", CHAN, COUNTS)
+    assert (record.resumed_by, record.resumed_at is not None) == (who, True)
     assert await w.paused() == []
     (event,) = [e for e in w.audit.events if e.kind == "audience_resume"]
-    assert (event.agent_id, event.agent_version, event.approver_user_id) == ("it-helper", 1, OWNER)
+    assert (event.agent_id, event.agent_version, event.approver_user_id) == ("it-helper", 1, who)
     assert event.target == f"{CHAN} total=2 guests=1 external=0"
-    assert event.requester_user_id == OWNER
-
-
-async def test_an_admin_resumes_any_agent():
-    w = await paused_world()
-    await w.plane.resume_channel(TENANT, MEMBER_ADMIN, "it-helper", CHAN, COUNTS)
-    assert await w.paused() == []
+    assert event.requester_user_id == who
 
 
 async def test_another_creator_and_a_stranger_cannot_resume():
@@ -569,11 +568,14 @@ async def test_the_agent_page_shows_the_paused_channel_the_reason_and_fresh_coun
 
 
 async def test_the_version_page_shows_the_paused_channels_too():
+    """Fails if the version page leaves out a paused channel row with its channel and reason."""
     h = await console_world()
     c = await h.signed_in(CONSOLE_ADMIN)
     async with using(c):
         page = (await c.get(f"{AGENT_URL}/versions/1")).text
-    assert "Paused channels" in page and CHAN in page
+    rows = re.findall(r"<tr>.*?</tr>", page, re.DOTALL)
+    (paused_row,) = [r for r in rows if "shared with another organisation" in r]
+    assert f"<code>{CHAN}</code>" in paused_row
 
 
 async def test_the_console_resumes_only_with_the_box_ticked_and_current_counts():

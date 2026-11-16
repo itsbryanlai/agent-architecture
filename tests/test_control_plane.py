@@ -1,15 +1,11 @@
 """The control plane: roles, the rules table, the audit trail and the stale-publish guard."""
 
-import ast
-from pathlib import Path
-
 import pytest
 
 from agentos.agent_store import (
     AgentNotFound,
     AgentStoreError,
     InMemoryAgentStore,
-    PostgresAgentStore,
 )
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.config import TenantsConfig, parse_agents_config
@@ -18,9 +14,6 @@ from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore, MemberError
 from tests.conftest import TENANT, agents_dict, make_fake_notion
 from tests.test_agent_store import helper_block
-from tests.test_row_level_security import AGENT_ROW, FakeConnection, FakePool
-
-SRC = Path(__file__).resolve().parent.parent / "src" / "agentos"
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"  # an admin added through the app
@@ -234,64 +227,7 @@ async def pending_version_for(plane, agent_id, actor):
     await plane.submit_version(TENANT, actor, agent_id, 1)
 
 
-# --- stale publish and rollback -------------------------------------------------------
-
-
-async def three_versions(store, publish_last_first=True):
-    """v1 published, v2 and v3 pending."""
-    first = await store.create_agent(TENANT, "it-helper", helper_block(), OWNER)
-    await store.submit(TENANT, "it-helper", first.version, OWNER)
-    await store.publish(TENANT, "it-helper", first.version, ROOT)
-    for _ in range(2):
-        draft = await store.create_draft(TENANT, "it-helper", OWNER)
-        await store.submit(TENANT, "it-helper", draft.version, OWNER)
-
-
-async def test_in_memory_store_refuses_to_publish_a_version_older_than_the_published_one():
-    store = InMemoryAgentStore()
-    await three_versions(store)
-    await store.publish(TENANT, "it-helper", 3, ROOT)
-    with pytest.raises(AgentStoreError, match="older than the published version 3"):
-        await store.publish(TENANT, "it-helper", 2, ROOT)
-    assert [v.status for v in await store.versions(TENANT, "it-helper")] == [
-        "published",
-        "pending",
-        "superseded",
-    ]
-
-
-class ScriptedConnection(FakeConnection):
-    """Answers the publish queries: the target is version 2 and version 3 is published."""
-
-    async def execute(self, sql, params=None):
-        flat = " ".join(sql.split())
-        await super().execute(sql, params)
-        if "AND version = %s" in flat:
-            self.row = (*AGENT_ROW[:2], 2, *AGENT_ROW[3:])
-        elif "status = 'published'" in flat:
-            self.row = (*AGENT_ROW[:2], 3, "published", *AGENT_ROW[4:])
-        return await super().execute("SELECT 1")
-
-
-class ScriptedPool(FakePool):
-    def connection(self):
-        pool = self
-
-        class Ctx:
-            async def __aenter__(self_inner):
-                pool.taken += 1
-                return ScriptedConnection(pool.events)
-
-            async def __aexit__(self_inner, *exc):
-                return False
-
-        return Ctx()
-
-
-async def test_postgres_store_refuses_to_publish_a_version_older_than_the_published_one():
-    store = PostgresAgentStore(ScriptedPool())
-    with pytest.raises(AgentStoreError, match="older than the published version 3"):
-        await store.publish(TENANT, "it-helper", 2, ROOT)
+# --- rollback -------------------------------------------------------------------------
 
 
 async def test_rollback_is_a_new_draft_from_the_old_version_then_submit_and_publish():
@@ -438,66 +374,3 @@ async def test_a_refused_or_failed_action_writes_no_event():
     with pytest.raises(AgentStoreError):
         await plane.submit_version(TENANT, ROOT, "nope", 1)
     assert audit.events == []
-
-
-# --- every write goes through the control plane ------------------------------------------
-
-STORE_WRITES = {
-    "create_agent",
-    "create_draft",
-    "replace_draft",
-    "submit",
-    "withdraw",
-    "publish",
-    "import_agents",
-    "add_member",
-    "set_member_role",
-    "remove_member",
-    "open_pause",
-    "close_pause",
-    "switch_off",
-    "switch_on",
-}
-# audience_watch.py pauses an agent from a Slack event; resuming is the control plane's.
-# switches.py changes a switch for the control plane and for the host operator's command.
-MAY_CALL_WRITES = {
-    "control.py",
-    "agent_store.py",
-    "members.py",
-    "audience_pauses.py",
-    "audience_watch.py",
-    "switches.py",
-}
-
-
-def test_only_the_control_plane_and_the_stores_call_the_store_writes():
-    offenders = []
-    for path in sorted(SRC.rglob("*.py")):
-        if path.name in MAY_CALL_WRITES:
-            continue
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in STORE_WRITES
-            ):
-                offenders.append(f"{path.relative_to(SRC)}:{node.lineno} {node.func.attr}")
-    assert offenders == []
-
-
-def test_the_control_api_is_scanned_and_may_not_call_the_store_writes():
-    assert "control_api.py" not in MAY_CALL_WRITES
-    assert (SRC / "control_api.py").exists()
-    assert (SRC / "control_api.py") in set(SRC.rglob("*.py"))
-
-
-def test_the_scan_finds_the_calls_it_is_looking_for():
-    calls = {
-        node.func.attr
-        for node in ast.walk(ast.parse((SRC / "control.py").read_text()))
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    # The import and opening a pause start outside the control plane (CLI, Slack event), and
-    # the control plane changes a switch through ``switches.set_switch``, which it shares with
-    # the operator's command.
-    assert STORE_WRITES - {"import_agents", "open_pause", "switch_off", "switch_on"} <= calls

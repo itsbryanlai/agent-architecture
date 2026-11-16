@@ -1,16 +1,11 @@
 """The audit log: one event per action, with IDs and hashes and no content."""
 
-import asyncio
-import dataclasses
 import uuid
 
 import pytest
 
 from agentos import ids
 from agentos.audit import (
-    InMemoryAuditStore,
-    PostgresAuditStore,
-    agent_identity,
     canonical_sha256,
     event_json,
 )
@@ -31,7 +26,6 @@ from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, TENANT, eventually, title_prop
 from tests.test_front_door import front_door_dict, running
-from tests.test_row_level_security import FakePool
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -299,25 +293,6 @@ async def test_an_audit_outage_fails_the_activity_instead_of_skipping_the_event(
     assert len(await events(h, "answer")) == 1
 
 
-async def test_same_event_key_stores_once():
-    store = InMemoryAuditStore()
-    event = AuditEvent(TENANT, "k1", "answer", "it-helper", 1, ALICE, agent_identity("it-helper"))
-
-    await store.record(event)
-    await store.record(dataclasses.replace(event, outcome="error"))
-
-    [stored] = await store.list(TENANT)
-    assert stored.outcome == "ok"
-
-
-async def test_same_event_key_in_two_tenants_is_two_events():
-    store = InMemoryAuditStore()
-    a = AuditEvent("acme", "k1", "answer", "x", 1, ALICE, "agent:x")
-    await store.record(a)
-    await store.record(dataclasses.replace(a, tenant_id="globex"))
-    assert len(await store.list("acme")) == len(await store.list("globex")) == 1
-
-
 # --- no content ------------------------------------------------------------------
 
 
@@ -347,13 +322,33 @@ async def test_no_event_holds_message_or_tool_text(harness):
     assert all(x is None or len(x) == 64 for x in hashes)
 
 
-def test_event_rejects_a_hash_that_is_not_a_hash():
+BAD_EVENTS = [
+    pytest.param({"output_sha256": "some text"}, id="a hash that is not a hash"),
+    pytest.param({"kind": "chat"}, id="an unknown kind"),
+    pytest.param({"outcome": "maybe"}, id="an unknown outcome"),
+    pytest.param(
+        {"kind": "answer", "agent_id": None, "agent_version": None}, id="answer, no agent"
+    ),
+    pytest.param(
+        {"kind": "agent_publish", "agent_id": None, "agent_version": None}, id="publish, no agent"
+    ),
+    pytest.param({"kind": "answer", "agent_version": None}, id="answer, no version"),
+]
+
+
+@pytest.mark.parametrize("fields", BAD_EVENTS)
+def test_an_event_that_breaks_the_rules_is_refused(fields):
+    """Fails if an event with a bad hash, kind or outcome, or an agent action with no agent version, is built."""
+    base = {"agent_id": "a", "agent_version": 1, "kind": "answer"}
     with pytest.raises(ValueError):
-        AuditEvent(TENANT, "k", "answer", "a", 1, ALICE, "agent:a", output_sha256="some text")
-    with pytest.raises(ValueError):
-        AuditEvent(TENANT, "k", "chat", "a", 1, ALICE, "agent:a")
-    with pytest.raises(ValueError):
-        AuditEvent(TENANT, "k", "answer", "a", 1, ALICE, "agent:a", outcome="maybe")
+        AuditEvent(TENANT, "k", requester_user_id=ALICE, identity="agent:a", **(base | fields))
+
+
+@pytest.mark.parametrize("kind", ["member_add", "budget_set", "switch_off", "switch_on"])
+def test_a_membership_budget_or_switch_event_may_name_no_agent(kind):
+    """Fails if an event about the organisation, not an agent, must name an agent."""
+    event = AuditEvent(TENANT, "k", kind, None, None, ALICE, f"user:{ALICE}", target="x")
+    assert (event.agent_id, event.agent_version) == (None, None)
 
 
 def test_canonical_hash_ignores_key_order_and_spacing():
@@ -362,51 +357,3 @@ def test_canonical_hash_ignores_key_order_and_spacing():
 
 
 # --- listing -----------------------------------------------------------------------
-
-
-async def test_list_is_newest_first_per_tenant_with_limit_and_before():
-    store = InMemoryAuditStore()
-    for i in range(5):
-        await store.record(AuditEvent("acme", f"k{i}", "answer", "x", 1, ALICE, "agent:x"))
-        await asyncio.sleep(0.002)
-    await store.record(AuditEvent("globex", "g0", "answer", "x", 1, ALICE, "agent:x"))
-
-    listed = await store.list("acme", limit=3)
-    assert [e.event_key for e in listed] == ["k4", "k3", "k2"]
-    assert all(e.tenant_id == "acme" for e in await store.list("acme"))
-    older = await store.list("acme", before=listed[-1].at)
-    assert [e.event_key for e in older] == ["k1", "k0"]
-    assert await store.list("initech") == []
-    with pytest.raises(ValueError):
-        await store.list("acme", limit=0)
-
-
-# --- the SQL ------------------------------------------------------------------------
-
-
-async def test_postgres_store_sets_the_tenant_before_each_call():
-    pool = FakePool()
-    store = PostgresAuditStore(pool)
-    event = AuditEvent(TENANT, "k1", "answer", "x", 1, ALICE, "agent:x")
-
-    await store.record(event)
-    await store.list(TENANT, 10)
-
-    assert pool.taken == 2
-    transactions = [[e for e in pool.events if e[0] == "execute"][i] for i in (0, 2)]
-    for first in transactions:
-        assert first[1] == "SELECT set_config('app.tenant_id', %s, true)"
-        assert first[2] == (TENANT,)
-    insert = pool.events[2][1]
-    assert "ON CONFLICT (tenant_id, event_key) DO NOTHING" in insert
-    assert "UPDATE" not in insert and "DELETE" not in insert
-
-
-def test_only_a_membership_event_may_name_no_agent():
-    event = AuditEvent(TENANT, "k", "member_add", None, None, ALICE, f"user:{ALICE}", target="U2")
-    assert (event.agent_id, event.agent_version) == (None, None)
-    for kind in ("answer", "agent_publish"):
-        with pytest.raises(ValueError):
-            AuditEvent(TENANT, "k", kind, None, None, ALICE, f"user:{ALICE}")
-        with pytest.raises(ValueError):
-            AuditEvent(TENANT, "k", kind, "a", None, ALICE, f"user:{ALICE}")

@@ -263,18 +263,6 @@ async def test_sessions_are_unique_per_sign_in(h):
     assert len(h.sessions._rows) == 2
 
 
-async def test_a_local_http_console_url_drops_the_secure_flag_and_only_then():
-    local = ConsoleHarness("http://127.0.0.1:8100")
-    async with local.client() as c:
-        login = await c.get("/login")
-        assert "secure" not in set_cookie(login, "agentos_login").lower()
-        response = await local.sign_in_as(c, ROOT)
-        cookie = set_cookie(response, "agentos_session").lower()
-        assert "secure" not in cookie and "httponly" in cookie and "samesite=lax" in cookie
-    assert local.sign_in.secure_cookies is False
-    assert ConsoleHarness().sign_in.secure_cookies is True
-
-
 async def test_an_expired_session_is_refused_and_a_live_one_is_not(h):
     c = await h.signed_in(OWNER)
     async with using(c):
@@ -428,10 +416,6 @@ async def test_the_real_client_turns_a_network_failure_into_a_sign_in_error():
     assert "secret-bearing" not in str(err.value)
 
 
-def test_a_fake_id_token_is_three_parts():
-    assert id_token({"a": 1}).count(".") == 2
-
-
 # --- settings and the bind rules ----------------------------------------------------
 
 
@@ -490,9 +474,17 @@ def test_a_console_url_that_is_not_https_or_local_http_is_refused(url):
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8100", "http://localhost:3000"])
-def test_a_local_http_url_with_a_port_is_allowed_without_secure_cookies(url):
+async def test_a_local_http_url_with_a_port_is_allowed_without_secure_cookies(url):
+    """Fails if a local http console URL is refused, or its cookies keep the Secure flag."""
     config = sign_in_from_settings(full(url))
     assert config.secure_cookies is False and config.console_url == url
+    local = ConsoleHarness(url)
+    async with local.client() as c:
+        login = await c.get("/login")
+        assert "secure" not in set_cookie(login, "agentos_login").lower()
+        response = await local.sign_in_as(c, ROOT)
+        cookie = set_cookie(response, "agentos_session").lower()
+        assert "secure" not in cookie and "httponly" in cookie and "samesite=lax" in cookie
 
 
 def test_a_public_bind_needs_sign_in_configured():

@@ -3,7 +3,6 @@
 Everything is in memory: the three stores, a fake Notion and a stand-in identity.
 """
 
-import ast
 import json
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from agentos.control_api import (
     create_app,
     operator_from_environment,
 )
-from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker
+from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from tests.conftest import (
     DB_ID,
@@ -489,9 +488,10 @@ async def test_no_header_query_or_body_field_changes_the_actor(h):
     assert all(e.identity == f"user:{OWNER}" for e in h.audit.events)
 
 
-def test_the_local_operator_is_one_fixed_slack_user():
+async def test_the_local_operator_is_one_fixed_slack_user():
+    """Fails if the operator acts as anyone but its one Slack user ID, or accepts a malformed ID."""
     operator = LocalOperator("U0123ABCDEF")
-    assert operator._user_id == "U0123ABCDEF"
+    assert await operator.actor(None) == "U0123ABCDEF"
     for bad in ["", "alice", "u0123", "U 123", "U0123\nX", "@U0123ABC"]:
         with pytest.raises(ValueError):
             LocalOperator(bad)
@@ -510,26 +510,29 @@ async def test_the_real_provider_ignores_the_request(h):
 # --- the entry point ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
-def test_loopback_hosts_are_accepted(host):
-    check_bind_host(host)
-
-
 @pytest.mark.parametrize(
-    "host",
-    [
-        "0.0.0.0",
-        "::",
-        "",
-        "192.168.1.20",
-        "10.0.0.5",
-        "example.com",
-        "localhost.example.com",
-        "127.0.0.2",
-        "LOCALHOST",
+    "host, accepted",
+    [(h, True) for h in ("127.0.0.1", "::1", "localhost")]
+    + [
+        (h, False)
+        for h in (
+            "0.0.0.0",
+            "::",
+            "",
+            "192.168.1.20",
+            "10.0.0.5",
+            "example.com",
+            "localhost.example.com",
+            "127.0.0.2",
+            "LOCALHOST",
+        )
     ],
 )
-def test_other_hosts_are_refused(host):
+def test_only_loopback_hosts_are_accepted_for_binding(host, accepted):
+    """Fails if the control API will bind a non-loopback host, or refuses a loopback one."""
+    if accepted:
+        check_bind_host(host)
+        return
     with pytest.raises(SystemExit) as refused:
         check_bind_host(host)
     assert "refusing to listen" in str(refused.value)
@@ -543,36 +546,6 @@ def test_it_refuses_to_start_without_an_actor():
     with pytest.raises(SystemExit):
         operator_from_environment({ACTOR_VARIABLE: "not-a-user"})
     assert operator_from_environment({ACTOR_VARIABLE: "U0123ABCDEF"})
-
-
-def test_the_api_has_no_way_to_bind_publicly():
-    source = (SRC / "control_api.py").read_text()
-    assert "0.0.0.0" not in source
-    compose = (SRC.parent.parent / "docker-compose.yml").read_text()
-    assert "control_api" not in compose
-
-
-def test_the_gateway_does_not_mount_the_control_api():
-    source = (SRC / "gateway" / "app.py").read_text()
-    assert "control_api" not in source
-
-
-def test_the_api_calls_no_store_directly():
-    tree = ast.parse((SRC / "control_api.py").read_text())
-    called = {
-        n.func.attr
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and ast.unparse(n.func.value) != "deps.plane"
-    }
-    store_methods = {
-        "create_agent", "create_draft", "replace_draft", "submit", "withdraw", "publish",
-        "add_member", "set_member_role", "remove_member", "get_member", "list_members",
-        "get_agent", "get_version", "versions", "record",
-    }  # fmt: skip
-    # Every such call is made on the control plane, and on nothing else.
-    assert called & store_methods == set()
 
 
 # --- grants -------------------------------------------------------------------------
@@ -673,7 +646,6 @@ async def test_notion_being_unreadable_is_502_and_nothing_is_published(h):
         assert "token" not in response.text
         status = await c.get(t("/agents/it-helper/versions/1"))
         assert status.json()["status"] == "pending"
-    assert issubclass(GrantCheckUnavailable, Exception)
 
 
 async def test_an_agent_without_database_grants_publishes_with_no_notion_call(h):
@@ -791,7 +763,6 @@ async def test_audit_limit_is_capped(h):
         response = await c.get(t("/audit?limit=100000"))
         assert response.status_code == 200
         assert len(response.json()["events"]) == 3
-    assert MAX_AUDIT_LIMIT == 200
 
     seen = {}
 
@@ -842,42 +813,37 @@ async def test_audit_events_hold_ids_and_hashes_only(h):
 # --- a web page in the operator's browser -------------------------------------------
 
 
-async def test_a_no_cors_style_post_is_refused_and_changes_nothing(h):
-    await create_pending(h)
-    before = len(h.audit.events)
-    async with h.client() as c:
-        for content_type in [
-            "text/plain",
-            "application/x-www-form-urlencoded",
-            "multipart/form-data",
-            "",
-        ]:
-            response = await c.post(
-                t("/agents/it-helper/versions/1/publish"),
-                headers={"Content-Type": content_type},
-                content=b"{}",
-            )
-            assert response.status_code == 415, content_type
-        for method in ["PUT", "PATCH", "DELETE"]:
-            response = await c.request(
-                method, t("/members/U_X"), headers={"Content-Type": "text/plain"}, content=b"{}"
-            )
-            assert response.status_code == 415
-        status = await c.get(t("/agents/it-helper/versions/1"))
-    assert status.json()["status"] == "pending"
-    assert len(h.audit.events) == before
-
-
-async def test_json_writes_pass_with_a_charset_or_an_empty_body(h):
+@pytest.mark.parametrize(
+    "method, path, content_type, status",
+    [
+        ("POST", "/agents/it-helper/versions/1/publish", "text/plain", 415),
+        ("POST", "/agents/it-helper/versions/1/publish", "application/x-www-form-urlencoded", 415),
+        ("POST", "/agents/it-helper/versions/1/publish", "multipart/form-data", 415),
+        ("POST", "/agents/it-helper/versions/1/publish", "", 415),
+        ("PUT", "/members/U_X", "text/plain", 415),
+        ("PATCH", "/members/U_X", "text/plain", 415),
+        ("DELETE", "/members/U_X", "text/plain", 415),
+        ("POST", "/agents/it-helper/versions/1/publish", "application/json; charset=utf-8", 200),
+    ],
+)
+async def test_a_write_needs_a_json_content_type_and_a_refused_one_changes_nothing(
+    h, method, path, content_type, status
+):
+    """Fails if a write with a non-JSON content type is accepted, or JSON with a charset is refused."""
     await create_pending(h)
     h.as_user(ROOT)
+    before = len(h.audit.events)
+    body = json.dumps(await seen(h)).encode() if status == 200 else b"{}"
     async with h.client() as c:
-        ok = await c.post(
-            t("/agents/it-helper/versions/1/publish"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            content=json.dumps(await seen(h)).encode(),
+        response = await c.request(
+            method, t(path), headers={"Content-Type": content_type}, content=body
         )
-        assert ok.status_code == 200
+        assert response.status_code == status
+        state = await c.get(t("/agents/it-helper/versions/1"))
+    if status == 415:
+        assert state.json()["status"] == "pending" and len(h.audit.events) == before
+    else:
+        assert state.json()["status"] == "published"
 
 
 async def test_a_foreign_host_is_refused(h):

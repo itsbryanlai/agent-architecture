@@ -431,24 +431,24 @@ async def test_load_agent_one_argument_compat():
     assert (await several.load_agent(GLOBEX, "it-helper")).agent_id == "it-helper"
 
 
-def test_the_console_refuses_to_start_when_a_tenants_notion_key_is_unset(monkeypatch):
+@pytest.mark.parametrize(
+    "globex_key_set", [False, True], ids=["a key is unset", "every key is set"]
+)
+def test_the_console_starts_only_when_every_tenants_notion_key_is_set(monkeypatch, globex_key_set):
+    """Fails if the console starts with a tenant's Notion key unset, names the wrong tenant, or refuses to start with every key set."""
     from agentos.tenants import notion_key_failure
 
     tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
     monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
-    monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
+    if globex_key_set:
+        monkeypatch.setenv("NOTION_TOKEN_GLOBEX", token_source.token_hex(8))
+    else:
+        monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
 
     message = notion_key_failure(tenants)
 
-    assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
-    assert "NOTION_TOKEN_ACME" not in message
-
-
-def test_the_console_starts_when_every_tenants_notion_key_is_set(monkeypatch):
-    from agentos.tenants import notion_key_failure
-
-    tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
-    monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
-    monkeypatch.setenv("NOTION_TOKEN_GLOBEX", token_source.token_hex(8))
-
-    assert notion_key_failure(tenants) is None
+    if globex_key_set:
+        assert message is None
+    else:
+        assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
+        assert "NOTION_TOKEN_ACME" not in message

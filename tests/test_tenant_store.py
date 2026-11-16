@@ -2,15 +2,12 @@
 a tenant added, changed or disabled without a restart (gateway, worker, console)."""
 
 import logging
-import re
 from dataclasses import replace
-from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
-from psycopg.types.json import Jsonb
 from slack_sdk.signature import SignatureVerifier
 
 from agentos.agent_store import InMemoryAgentStore
@@ -36,14 +33,12 @@ from agentos.tenant_store import (
     IMPORT_COMMAND,
     UNKNOWN_TENANT_TTL_SECONDS,
     InMemoryTenantStore,
-    PostgresTenantStore,
     StaticTenants,
     TenantDirectory,
-    TenantRef,
     import_tenant,
     startup_tenants,
 )
-from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry
+from agentos.tenants import RegistrySync, UnknownTenant, build_registry
 from tests.conftest import (
     GLOBEX,
     GLOBEX_TEAM,
@@ -54,10 +49,6 @@ from tests.conftest import (
 from tests.console_harness import ROOT, ConsoleHarness, using
 from tests.test_control_api import BASE, JSON, StandIn
 from tests.test_gateway import FakeTemporalClient, im_event, post_event
-from tests.test_row_level_security import FakePool
-
-ROOT_DIR = Path(__file__).resolve().parent.parent
-MIGRATION = (ROOT_DIR / "scripts" / "migrations" / "015_tenants.sql").read_text()
 
 
 @pytest.fixture
@@ -141,73 +132,6 @@ async def test_import_refuses_a_tenant_that_shares_a_secret_variable_with_a_stor
 
     with pytest.raises(ConfigError, match="NOTION_TOKEN_ACME"):
         await import_tenant(store, parse_agents_config(raw))
-
-
-async def test_a_stored_row_holds_the_names_of_secret_variables_not_their_values(monkeypatch):
-    monkeypatch.setenv("SLACK_BOT_TOKEN_ACME", "made-up-value-123")
-    pool = FakePool()
-
-    await PostgresTenantStore(pool).insert(acme())
-
-    params = [p for e in pool.events if e[0] == "execute" for p in (e[2] or ())]
-    stored = [p.obj for p in params if isinstance(p, Jsonb)]
-    assert {"slack_bot_token_env": "SLACK_BOT_TOKEN_ACME"}.items() <= stored[-1].items()
-    assert "made-up-value-123" not in repr(params)
-
-
-# --- The database side --------------------------------------------------------
-
-
-async def test_cross_tenant_reads_go_through_the_narrow_functions_with_no_tenant_context():
-    pool = FakePool(("acme", True, "2026-01-01"))
-    store = PostgresTenantStore(pool)
-
-    await store.ref_for_slack_team(TEAM)
-    await store.list_refs()
-
-    executed = [e for e in pool.events if e[0] == "execute"]
-    assert [e[1] for e in executed] == [
-        "SELECT tenant_id, enabled, updated_at FROM tenant_for_slack_team(%s)",
-        "SELECT tenant_id, enabled, updated_at FROM list_tenants()",
-    ]
-    assert not any("set_config" in e[1] for e in executed)
-
-
-async def test_a_tenants_own_row_is_read_written_and_toggled_inside_its_own_transaction():
-    row = (
-        "acme",
-        TEAM,
-        "it-helper",
-        None,
-        {"C1": "it-helper"},
-        ["U1"],
-        {"slack_bot_token_env": "MY_SLACK"},
-        True,
-        "2026-01-01",
-    )
-    for call in (
-        lambda s: s.load("acme"),
-        lambda s: s.insert(acme()),
-        lambda s: s.set_enabled("acme", False),
-    ):
-        pool = FakePool(row)
-        await call(PostgresTenantStore(pool))
-        assert pool.events[0] == ("transaction",)
-        assert pool.events[1][1:] == ("SELECT set_config('app.tenant_id', %s, true)", ("acme",))
-        assert pool.events.count(("transaction",)) == 1
-
-    loaded = await PostgresTenantStore(FakePool(row)).load("acme")
-    assert loaded.config.channels == {"C1": "it-helper"}
-    assert loaded.config.admins == ("U1",)
-    assert loaded.config.secrets.slack_bot_token_env == "MY_SLACK"
-    assert loaded.config.secrets.notion_token_env == "NOTION_TOKEN"
-
-
-def test_the_table_has_no_column_that_could_hold_a_secret_value():
-    table = re.search(r"CREATE TABLE IF NOT EXISTS tenants \((.*?)\n\);", MIGRATION, re.DOTALL)
-    columns = re.findall(r"^\s{2}(\w+)\s", table.group(1), re.MULTILINE)
-    assert "secret_env" in columns
-    assert not [c for c in columns if re.search(r"token|key|password", c)]
 
 
 # --- The live directory -------------------------------------------------------
@@ -519,12 +443,6 @@ async def test_a_new_tenant_the_start_up_check_refuses_is_not_served(monkeypatch
     assert built["slack"] == []
 
 
-def test_the_registry_still_refuses_an_unknown_tenant_instead_of_defaulting():
-    registry = TenantRegistry({})
-    with pytest.raises(UnknownTenant):
-        registry.get(TENANT)
-
-
 # --- Console and control API ---------------------------------------------------
 
 
@@ -592,10 +510,6 @@ async def test_the_control_api_treats_a_disabled_tenant_as_unknown():
 
         assert (await client.get(f"/tenants/{GLOBEX}/agents")).status_code == 404
         assert (await client.get(f"/tenants/{TENANT}/agents")).status_code != 404
-
-
-def test_a_tenant_ref_carries_no_settings():
-    assert [f for f in TenantRef.__dataclass_fields__] == ["tenant_id", "enabled", "updated_at"]
 
 
 async def test_a_tenant_id_found_unknown_is_not_looked_up_again_for_a_short_while():

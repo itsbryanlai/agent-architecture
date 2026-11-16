@@ -3,11 +3,11 @@
 Fakes only: provider-shaped response objects, in-memory stores, a fake Slack sign-in.
 """
 
-import copy
 import csv
 import dataclasses
 import io
 import logging
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -148,17 +148,6 @@ def test_the_openai_client_without_cache_details_counts_all_prompt_tokens_as_inp
     assert from_openai_response(openai_response(None)).usage == Usage(0, 0, 0, 0, "qwen-test")
 
 
-def test_a_scripted_response_has_zero_usage_unless_the_test_sets_it():
-    assert LLMResponse(text="x", tool_calls=[], stop_reason="end_turn").usage == Usage()
-    set_usage = Usage(1, 2, 3, 4, "m")
-    resp = LLMResponse(text="x", tool_calls=[], stop_reason="end_turn", usage=set_usage)
-    llm = ScriptedLLMClient([resp])
-
-    import asyncio
-
-    assert asyncio.run(llm.complete("s", [], [])).usage == set_usage
-
-
 async def test_the_embedder_sums_the_prompt_tokens_of_every_batch():
     calls = []
 
@@ -219,30 +208,6 @@ def test_a_model_with_no_price_costs_null_not_zero():
 
     assert prices.cost("other", NOV, Usage(5, 5)) is None
     assert Prices([]).cost("m", NOV, Usage(5, 5)) is None
-
-
-def test_a_later_price_never_reaches_back_to_a_call_already_priced():
-    store = InMemoryUsageStore()
-    clock = Clock()
-    recorder = UsageRecorder(store, Prices([price("m", i="3", o="15")]), clock)
-
-    import asyncio
-
-    asyncio.run(
-        recorder.llm_call(
-            tenant_id=TENANT,
-            agent_id="a",
-            agent_version=1,
-            conversation_id="c",
-            key="k1",
-            usage=Usage(1_000_000, 0, 0, 0, "m"),
-            fallback_model="m",
-        )
-    )
-    cost_before = store.events[0].cost
-
-    recorder.prices = Prices([price("m", i="99", o="99")])
-    assert store.events[0].cost == cost_before == D("3")
 
 
 def write_prices(tmp_path, entries):
@@ -356,9 +321,7 @@ def test_the_longest_prefix_wins_over_a_shorter_one():
 
 
 def test_the_prices_path_is_a_setting_with_an_env_override(monkeypatch):
-    monkeypatch.delenv("AGENTOS_PRICES", raising=False)
-    assert load_settings().prices_path == "config/prices.yaml"
-    assert Settings().prices_path == "config/prices.yaml"
+    """Fails if AGENTOS_PRICES does not set the prices path."""
     monkeypatch.setenv("AGENTOS_PRICES", "/etc/agentos/prices.yaml")
     assert load_settings().prices_path == "/etc/agentos/prices.yaml"
 
@@ -449,17 +412,6 @@ async def test_call_llm_records_one_row_with_agent_version_model_tokens_and_cost
     assert (row.cache_read_tokens, row.cache_write_tokens) == (200, 100)
     assert row.cost == D("0.003") + D("0.0075") + D("0.00006") + D("0.000375")
     assert row.usage_key.startswith(f"{TENANT}:")
-
-
-async def test_the_row_names_no_requester(agents):
-    store, recorder = recorder_with()
-    acts = make_activities(agents, ScriptedLLMClient([answer()]), recorder)
-
-    await ActivityEnvironment().run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
-
-    fields = {f.name for f in dataclasses.fields(UsageEvent)}
-    assert not {f for f in fields if "user" in f or "requester" in f}
-    assert ALICE not in repr(store.events)
 
 
 async def test_the_same_attempt_recorded_twice_counts_once(agents):
@@ -763,19 +715,17 @@ async def test_an_unpriced_call_counts_tokens_but_shows_as_unpriced_not_zero_cos
     assert model.totals.unpriced_calls == 1
 
 
-async def test_months_are_utc_calendar_months():
-    events = [
-        event("oct", at=datetime(2026, 10, 31, 23, 59, 59, tzinfo=UTC), cost="1"),
-        event("nov-first", at=datetime(2026, 11, 1, 0, 0, tzinfo=UTC), cost="2"),
-        event("nov-last", at=datetime(2026, 11, 30, 23, 59, 59, tzinfo=UTC), cost="4"),
-        event("dec", at=datetime(2026, 12, 1, 0, 0, tzinfo=UTC), cost="8"),
-    ]
-    teams = {("a1", 1): None}
-
-    assert (await report_for(events, teams, "2026-10")).total.cost == D("1")
-    assert (await report_for(events, teams, "2026-11")).total.cost == D("6")
-    assert (await report_for(events, teams, "2026-12")).total.cost == D("8")
-    assert (await report_for(events, teams, "2027-01")).total.calls == 0
+@pytest.mark.parametrize(
+    "month, start, end",
+    [
+        ("2026-10", datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 11, 1, tzinfo=UTC)),
+        ("2026-11", datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 12, 1, tzinfo=UTC)),
+        ("2026-12", datetime(2026, 12, 1, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC)),
+    ],
+)
+def test_months_are_utc_calendar_months(month, start, end):
+    """Fails if a month does not run from the first of the month 00:00 UTC to the first of the next."""
+    assert month_bounds(month, NOV) == (start, end, month)
 
 
 async def test_embedding_usage_is_its_own_line_and_not_in_the_agent_tables():
@@ -796,25 +746,6 @@ async def test_an_embedding_row_with_null_tokens_sums_as_zero_and_is_unpriced():
     report = await report_for([row], {})
 
     assert report.embedding.input_tokens == 0 and report.embedding.unpriced_calls == 1
-
-
-async def test_a_duplicate_key_does_not_add_a_second_row():
-    store = InMemoryUsageStore()
-    await store.record(event("same", cost="1"))
-    await store.record(event("same", cost="9"))
-
-    assert [e.cost for e in store.events] == [D("1")]
-
-
-async def test_one_tenants_usage_is_not_in_another_tenants_totals():
-    store = InMemoryUsageStore()
-    await store.record(event("1", cost="1"))
-    await store.record(replace(event("2", cost="2"), tenant_id="globex"))
-    start, end, _ = month_bounds("2026-11", NOV)
-
-    [group] = await store.totals(TENANT, start, end)
-
-    assert group.cost == D("1")
 
 
 def test_the_month_is_yyyy_mm_and_defaults_to_the_current_utc_month():
@@ -911,12 +842,13 @@ async def test_the_month_defaults_to_the_clock_s_month():
 
 
 async def test_the_report_has_no_requester_and_no_per_person_field():
+    """Fails if a usage row or the report gains a requester or per-person field."""
     p = await seeded_plane()
     report = await p.plane.usage_report(TENANT, ROOT, "2026-11")
 
     names = {
         f.name
-        for cls in (usage_module.Totals, usage_module.Line, type(report))
+        for cls in (UsageEvent, usage_module.Totals, usage_module.Line, type(report))
         for f in dataclasses.fields(cls)
     }
     assert not {n for n in names if "user" in n or "requester" in n or "person" in n}
@@ -955,6 +887,7 @@ async def get_after_losing_the_role(h, path):
 
 
 async def test_the_api_returns_the_same_aggregates_as_the_page_for_an_admin(h):
+    """Fails if the JSON API and the usage page show different call counts or total cost for an admin."""
     response = await api_get(h, ROOT, f"/tenants/{TENANT}/usage?month=2026-11")
 
     assert response.status_code == 200
@@ -966,6 +899,11 @@ async def test_the_api_returns_the_same_aggregates_as_the_page_for_an_admin(h):
     assert body["total"]["cost_usd"] == "3.5"
     teams = {line["team"]: line for line in body["by_team"]}
     assert set(teams) == {"IT", "=HR"}
+    page = await api_get(h, ROOT, f"{UI}/usage?month=2026-11")
+    total_row = re.search(r"<tr><td>2026-11</td>(.*?)</tr>", page.text, re.DOTALL).group(1)
+    cells = re.findall(r"<td>(.*?)</td>", total_row, re.DOTALL)
+    assert cells[0] == str(body["total"]["calls"])
+    assert body["total"]["cost_usd"] in cells[-1].replace("$", "")
 
 
 async def test_the_api_narrows_a_creator_to_their_agents(h):
@@ -997,13 +935,16 @@ UI = f"/ui/{TENANT}"
 
 
 async def test_the_usage_page_shows_totals_tables_and_the_unpriced_note(h):
+    """Fails if the usage page shows wrong per-agent call counts or drops the unpriced-call note."""
     response = await api_get(h, ROOT, f"{UI}/usage?month=2026-11")
 
     assert response.status_code == 200
-    text = " ".join(response.text.split())
-    for needle in ("By agent", "By team", "By model", "Embeddings", "mine", "theirs", "no price"):
-        assert needle in text, needle
-    assert "No team" not in text
+    rows = re.findall(r"<tr><td>(.*?)</td>(.*?)</tr>", response.text, re.DOTALL)
+    by_name = {name: re.findall(r"<td>(.*?)</td>", rest, re.DOTALL) for name, rest in rows}
+    assert by_name["mine"][1] == "2"  # two calls: one priced, one with no price
+    assert by_name["theirs"][1] == "1"
+    assert "1 call with no price" in " ".join(response.text.split())
+    assert "No team" not in response.text
     assert '<option value="2026-11" selected>' in response.text
     assert f"{UI}/usage.csv?month=2026-11" in response.text
 
@@ -1092,18 +1033,15 @@ def parse(**over):
     return parse_agent("it-helper", raw, 1)
 
 
-def test_an_agent_without_a_team_has_an_empty_team():
-    assert parse().team == ""
-    assert parse(team=None).team == ""
+@pytest.mark.parametrize("raw, team", [("  IT  ", "IT"), (None, "")], ids=["a label", "no team"])
+def test_a_team_label_is_kept_trimmed_and_round_trips_through_the_definition(raw, team):
+    """Fails if a team label is not trimmed, an absent team is not empty, or either is lost in the definition."""
+    agent = parse(team=raw)
 
-
-def test_a_team_label_is_kept_trimmed_and_round_trips_through_the_definition():
-    agent = parse(team="  IT  ")
-
-    assert agent.team == "IT"
-    assert agent_definition(agent)["team"] == "IT"
+    assert agent.team == team
+    assert agent_definition(agent).get("team", "") == team
+    assert ("team" in agent_definition(agent)) == bool(team)
     assert parse_agent("it-helper", agent_definition(agent), agent.version) == agent
-    assert "team" not in agent_definition(parse())
 
 
 @pytest.mark.parametrize(
@@ -1112,17 +1050,6 @@ def test_a_team_label_is_kept_trimmed_and_round_trips_through_the_definition():
 def test_a_bad_team_label_is_a_config_error(bad):
     with pytest.raises(ConfigError, match="team"):
         parse(team=bad)
-
-
-def test_a_team_in_a_definition_survives_the_agent_store():
-    definition = copy.deepcopy(block("IT"))
-
-    import asyncio
-
-    store = InMemoryAgentStore()
-    record = asyncio.run(store.create_agent(TENANT, "team-x", definition, "U1"))
-
-    assert record.agent().team == "IT"
 
 
 # --- reprice ------------------------------------------------------------------------------

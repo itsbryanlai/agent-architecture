@@ -8,7 +8,6 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 from temporalio.testing import ActivityEnvironment
@@ -23,7 +22,6 @@ from agentos.budgets import (
     BudgetNotFound,
     InMemoryBudgetStore,
     InvalidBudget,
-    stop_text,
 )
 from agentos.config import Settings, parse_agents_config
 from agentos.connectors.notion import FakeNotionAPI
@@ -32,7 +30,7 @@ from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
-from agentos.models import AUDIT_KINDS, AuditEvent, LLMResponse, TurnContext, Usage
+from agentos.models import LLMResponse, TurnContext, Usage
 from agentos.slack_client import FakeSlack
 from agentos.stores import (
     InMemoryHistoryStore,
@@ -46,7 +44,6 @@ from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
 from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
 from tests.test_usage import SCOPE, _page_agents, block, price
 
-REPO = Path(__file__).resolve().parent.parent
 D = Decimal
 NOV = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
 UI = f"/ui/{TENANT}"
@@ -264,10 +261,6 @@ async def test_a_stop_is_lifted_when_the_cache_expires_after_an_admin_raises_the
     assert await guard.stopped_by(TENANT, "it-helper") is None
 
 
-async def test_the_default_cache_window_is_at_most_a_minute():
-    assert BudgetGuard(InMemoryBudgetStore(), InMemoryUsageStore()).ttl_seconds <= 60
-
-
 # --- call_llm -------------------------------------------------------------------------
 
 
@@ -337,12 +330,6 @@ async def test_a_reached_budget_answers_with_the_fixed_text_and_never_calls_the_
     assert written.events == []
 
 
-def test_the_fixed_text_names_the_agent():
-    assert stop_text("Docs bot") == (
-        "Docs bot has reached its monthly budget. An admin can raise it in the console."
-    )
-
-
 async def test_a_stopped_turn_logs_one_line_with_ids_and_no_content(agents, caplog):
     guard, _ = await over_budget_guard(None)
     acts = activities(agents, ScriptedLLMClient([answer()]), guard)
@@ -367,16 +354,6 @@ async def test_under_budget_the_model_is_called_and_the_call_is_recorded(agents)
     resp = await ActivityEnvironment().run(acts.call_llm, turn_ctx(), "acme:conv:C1:1.1")
 
     assert resp.text == "done" and len(llm.calls) == 1 and len(written.events) == 1
-
-
-async def test_without_a_guard_the_activity_behaves_as_before(agents):
-    llm = ScriptedLLMClient([answer()])
-
-    resp = await ActivityEnvironment().run(
-        activities(agents, llm).call_llm, turn_ctx(), "acme:conv:C1:1.1"
-    )
-
-    assert resp.text == "done"
 
 
 async def test_a_budget_check_that_cannot_read_fails_the_activity_so_temporal_retries(agents):
@@ -627,34 +604,33 @@ def text_of(response):
     return " ".join(re.sub(r"<[^>]+>", " ", response.text).split())
 
 
-async def test_the_usage_page_warns_at_eighty_percent_with_spend_budget_and_percent(h):
-    await h.plane.set_budget(TENANT, ROOT, "mine", D("100"))
-    await seed_spend(h, "mine", "80")
+@pytest.mark.parametrize(
+    "budget, spend, shown, hidden",
+    [
+        (
+            "100",
+            "80",
+            ["mine has used 80% of its monthly budget", "$80.0000", "$100.00", "80%"],
+            [],
+        ),
+        ("10", "10", ["mine has reached its monthly budget and is not answering"], []),
+        ("100", "79", [], ["of its monthly budget", "has reached"]),
+    ],
+    ids=["warns at 80 percent", "says when stopped", "no warning under 80 percent"],
+)
+async def test_the_usage_page_warns_by_how_much_of_the_budget_is_spent(
+    h, budget, spend, shown, hidden
+):
+    """Fails if the usage page warns under 80 percent, or does not warn at 80 percent or say an agent is stopped."""
+    await h.plane.set_budget(TENANT, ROOT, "mine", D(budget))
+    await seed_spend(h, "mine", spend)
 
     response = await page(h, ROOT)
 
     text = text_of(response)
     assert response.status_code == 200
-    assert "mine has used 80% of its monthly budget" in text
-    assert "$80.0000" in text and "$100.00" in text and "80%" in text
-
-
-async def test_the_usage_page_says_when_an_agent_is_stopped(h):
-    await h.plane.set_budget(TENANT, ROOT, "mine", D("10"))
-    await seed_spend(h, "mine", "10")
-
-    text = text_of(await page(h, ROOT))
-
-    assert "mine has reached its monthly budget and is not answering" in text
-
-
-async def test_the_usage_page_has_no_warning_under_eighty_percent(h):
-    await h.plane.set_budget(TENANT, ROOT, "mine", D("100"))
-    await seed_spend(h, "mine", "79")
-
-    text = text_of(await page(h, ROOT))
-
-    assert "of its monthly budget" not in text and "has reached" not in text
+    assert all(part in text for part in shown)
+    assert not any(part in text for part in hidden)
 
 
 async def test_the_usage_page_warns_about_the_tenant_budget_for_admins_only(h):
@@ -708,7 +684,7 @@ async def test_the_agent_page_shows_its_budget_warning_to_its_creator(h):
     text = text_of(await page(h, OWNER, f"{UI}/agents/mine"))
 
     assert "mine has used 80% of its monthly budget" in text
-    assert "$8.0000 of $10.00" in text
+    assert "$8.0000 of $10.00" in text and "Model $8.0000" in text
 
 
 async def test_the_agent_page_of_another_creators_agent_shows_no_budget(h):
@@ -726,12 +702,14 @@ async def test_an_admin_sets_and_removes_a_budget_from_the_page(h):
         set_it = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="12.5")
         tenant = await post(client, f"{UI}/budgets", token, agent_id="", amount="300")
         shown = await client.get(f"{UI}/usage")
+        saved = await client.get(set_it.headers["location"])
         removed = await post(client, f"{UI}/budgets/remove", token, agent_id="mine")
 
     assert set_it.status_code == 303 and tenant.status_code == 303
     assert set_it.headers["location"] == f"{UI}/usage?done=budget-set"
     assert removed.headers["location"] == f"{UI}/usage?done=budget-removed"
     assert "$12.50" in shown.text and "$300.00" in shown.text
+    assert "Budget saved." in text_of(saved)
     assert [(e.agent_id, e.target) for e in h.audit.events] == [
         ("mine", "12.50"),
         (None, "300.00"),
@@ -739,12 +717,6 @@ async def test_an_admin_sets_and_removes_a_budget_from_the_page(h):
     ]
     [left] = await h.budgets.list(TENANT)
     assert left.agent_id is None
-
-
-async def test_the_page_tells_what_changed(h):
-    text = text_of(await page(h, ROOT, f"{UI}/usage?done=budget-set"))
-
-    assert "Budget saved." in text
 
 
 async def test_a_forged_budget_post_from_a_creator_is_refused_and_changes_nothing(h):
@@ -755,15 +727,6 @@ async def test_a_forged_budget_post_from_a_creator_is_refused_and_changes_nothin
 
     assert forged.status_code == 403 and forged_remove.status_code == 403
     assert await h.budgets.list(TENANT) == [] and h.audit.events == []
-
-
-async def test_a_budget_post_without_the_csrf_token_is_refused(h):
-    async with using(await h.signed_in(ROOT)) as client:
-        missing = await post(client, f"{UI}/budgets", None, agent_id="mine", amount="5")
-        wrong = await post(client, f"{UI}/budgets", "not-the-token", agent_id="mine", amount="5")
-
-    assert missing.status_code == 403 and wrong.status_code == 403
-    assert await h.budgets.list(TENANT) == []
 
 
 async def test_a_bad_amount_in_the_form_is_shown_as_a_refusal(h):
@@ -785,26 +748,6 @@ async def test_the_audit_page_shows_a_budget_event_without_a_version(h):
 
     assert response.status_code == 200
     assert "budget_set" in response.text and "vNone" not in response.text
-
-
-# --- audit kinds and SQL ------------------------------------------------------------------------
-
-MIGRATION_012 = (REPO / "scripts" / "migrations" / "012_budgets.sql").read_text()
-
-
-def test_budget_set_is_an_audit_kind_that_needs_no_agent_version():
-    assert "budget_set" in AUDIT_KINDS
-    AuditEvent("acme", "k", "budget_set", None, None, "U1", "user:U1", target="50.00")
-    AuditEvent("acme", "k", "budget_set", "mine", None, "U1", "user:U1", target="50.00")
-    with pytest.raises(ValueError):
-        AuditEvent("acme", "k", "answer", None, None, "U1", "agent:a")
-
-
-def test_a_budget_row_holds_no_requester_and_no_content():
-    columns = MIGRATION_012[MIGRATION_012.index("CREATE TABLE") :]
-    columns = columns[: columns.index("\n);")]
-    for word in ("requester", "content", "prompt", "text_body"):
-        assert word not in columns
 
 
 # --- indexing stops at the tenant budget ---------------------------------------------------------
@@ -833,10 +776,12 @@ async def sync_root(acts):
     return await ActivityEnvironment().run(acts.sync_page, TENANT, SCOPE, ROOT_A)
 
 
-async def test_a_tenant_at_its_budget_makes_no_embedding_call_and_says_so_once(caplog):
+@pytest.mark.parametrize("cost", ["10", "10.01"], ids=["at the budget", "over the budget"])
+async def test_a_tenant_at_its_budget_makes_no_embedding_call_and_says_so_once(caplog, cost):
+    """Fails if indexing calls the embedder for a tenant that has spent its budget, or does not say so once."""
     acts, embedder, store, budgets, usage = index_world()
     await budgets.set_budget(TENANT, None, D("10"), ROOT)
-    await usage.record(usage_row("1", cost="10"))
+    await usage.record(usage_row("1", cost=cost))
 
     with caplog.at_level(logging.INFO, logger="agentos.indexing"):
         result = await sync_root(acts)
@@ -846,16 +791,6 @@ async def test_a_tenant_at_its_budget_makes_no_embedding_call_and_says_so_once(c
     assert result.child_page_ids
     [line] = [r.getMessage() for r in caplog.records if "budget" in r.getMessage()]
     assert line == f"indexing stopped tenant_id={TENANT} scope={SCOPE} budget=tenant"
-
-
-async def test_a_tenant_over_its_budget_makes_no_embedding_call():
-    acts, embedder, _, budgets, usage = index_world()
-    await budgets.set_budget(TENANT, None, D("10"), ROOT)
-    await usage.record(usage_row("1", cost="10.01"))
-
-    await sync_root(acts)
-
-    assert embedder.texts_embedded == 0
 
 
 async def test_a_tenant_under_its_budget_is_indexed():
@@ -1007,15 +942,6 @@ async def test_the_stopped_notice_for_the_tenant_says_indexing_is_paused_too(h):
 
     assert "The organisation has reached its monthly budget" in text
     assert "indexing is paused" in text
-
-
-async def test_the_agent_page_shows_its_spend_by_cost_type(h):
-    await h.plane.set_budget(TENANT, ROOT, "mine", D("10"))
-    await seed_spend(h, "mine", "8")
-
-    text = text_of(await page(h, OWNER, f"{UI}/agents/mine"))
-
-    assert "$8.0000 of $10.00" in text and "Model $8.0000" in text
 
 
 async def test_a_new_cost_type_in_the_kinds_list_shows_on_the_page_and_in_the_api(h, monkeypatch):

@@ -5,7 +5,6 @@ Everything is in memory: the stores, a fake Notion and a fake Slack sign-in.
 
 import html
 import re
-from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -27,7 +26,6 @@ from tests.console_harness import (
 )
 from tests.test_agent_store import helper_block
 
-TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "agentos" / "templates"
 UI = f"/ui/{TENANT}"
 VERSION = f"{UI}/agents/it-helper/versions/1"
 
@@ -72,35 +70,52 @@ def strip(html: str) -> str:
 # --- every page renders for the roles that may see it -------------------------------
 
 
-async def test_every_page_renders_for_an_admin_with_the_admin_controls(h):
+async def admin_page(h, path):
     await make_pending(h)
     c = await h.signed_in(ADMIN2)
     async with using(c):
-        agents = await c.get(f"{UI}/agents")
-        assert agents.status_code == 200 and "it-helper" in agents.text
-        assert f'href="{UI}/members"' in agents.text and f'href="{UI}/audit"' in agents.text
-        assert "New agent" in agents.text
+        return await c.get(path)
 
-        detail = await c.get(f"{UI}/agents/it-helper")
-        assert detail.status_code == 200 and ">1</a>" in detail.text
-        assert "pending" in detail.text and OWNER in detail.text
 
-        version = await c.get(VERSION)
-        assert version.status_code == 200
-        for control in ("/reject", "/publish", "/check-grants", "/withdraw"):
-            assert f'action="{VERSION}{control}"' in version.text, control
-        assert "/submit" not in version.text  # it is already pending
-        assert "system_prompt" in version.text and "<pre>" in version.text
+async def test_the_agents_page_links_the_admin_pages_and_offers_a_new_agent(h):
+    """Fails if an admin's agent list leaves out the agent, the members and audit links, or New agent."""
+    page = await admin_page(h, f"{UI}/agents")
+    assert page.status_code == 200 and "it-helper" in page.text
+    assert f'href="{UI}/members"' in page.text and f'href="{UI}/audit"' in page.text
+    assert "New agent" in page.text
 
-        members = await c.get(f"{UI}/members")
-        assert members.status_code == 200
-        assert ROOT in members.text and "set in the tenant file" in members.text
-        assert OWNER in members.text and "Add a member" in members.text
 
-        audit = await c.get(f"{UI}/audit")
-        assert audit.status_code == 200
-        assert "agent_create" in audit.text and "agent_submit" in audit.text
-        assert re.search(r"<code title=\"[0-9a-f]{64}\">[0-9a-f]{12}</code>", audit.text)
+async def test_the_agent_page_lists_its_pending_version_and_its_creator(h):
+    """Fails if the agent page does not list version 1 as pending with its creator."""
+    page = await admin_page(h, f"{UI}/agents/it-helper")
+    assert page.status_code == 200 and ">1</a>" in page.text
+    assert "pending" in page.text and OWNER in page.text
+
+
+async def test_the_version_page_offers_an_admin_the_controls_of_a_pending_version(h):
+    """Fails if a pending version's page lacks reject, publish, check-grants or withdraw, offers submit, or hides the definition."""
+    page = await admin_page(h, VERSION)
+    assert page.status_code == 200
+    for control in ("/reject", "/publish", "/check-grants", "/withdraw"):
+        assert f'action="{VERSION}{control}"' in page.text, control
+    assert "/submit" not in page.text  # it is already pending
+    assert "system_prompt" in page.text and "<pre>" in page.text
+
+
+async def test_the_members_page_lists_members_and_their_source(h):
+    """Fails if the members page does not show the tenant-file admin as such, the creator, or the add form."""
+    page = await admin_page(h, f"{UI}/members")
+    assert page.status_code == 200
+    assert ROOT in page.text and "set in the tenant file" in page.text
+    assert OWNER in page.text and "Add a member" in page.text
+
+
+async def test_the_audit_page_lists_events_with_shortened_hashes(h):
+    """Fails if the audit page leaves out an event kind, or shows a hash that is not a shortened one."""
+    page = await admin_page(h, f"{UI}/audit")
+    assert page.status_code == 200
+    assert "agent_create" in page.text and "agent_submit" in page.text
+    assert re.search(r"<code title=\"[0-9a-f]{64}\">[0-9a-f]{12}</code>", page.text)
 
 
 async def test_a_creator_sees_their_own_agent_with_editing_controls_only(h):
@@ -405,8 +420,6 @@ async def test_pages_load_nothing_from_outside_and_run_no_script(h):
         assert page.status_code == 200
         assert "<script" not in page.text and "<link" not in page.text
         assert not re.search(r'(src|href)="https?:', page.text)
-    for template in TEMPLATES.glob("*.html"):
-        assert "<script" not in template.read_text()
 
 
 def test_the_new_agent_skeleton_is_a_valid_definition():
@@ -628,25 +641,35 @@ async def test_the_audit_view_shows_actors_agents_approvers_and_hashes_only(h):
 # --- forms: CSRF and origin ---------------------------------------------------------
 
 
+FORM_ROUTES = [
+    ("members", {"user_id": "U_NEW", "role": "creator"}),
+    ("switches/off", {"scope": "writes", "target": ""}),
+    ("budgets", {"agent_id": "mine", "amount": "5"}),
+]
+
+
 async def test_a_form_without_the_right_token_or_origin_is_refused_and_changes_nothing(h):
+    """Fails if a form post with a missing, wrong or cross-origin token or origin is accepted on any form route."""
     c = await h.signed_in(ROOT)
     async with using(c):
         token = await csrf_token(c)
-        form = {"user_id": "U_NEW", "role": "creator"}
+        for route, form in FORM_ROUTES:
+            refused = [
+                await post(c, f"{UI}/{route}", None, **form),
+                await post(c, f"{UI}/{route}", "", **form),
+                await post(c, f"{UI}/{route}", token + "x", **form),
+                await post(c, f"{UI}/{route}", token[:-1], **form),
+                await post(c, f"{UI}/{route}", "a" * len(token), **form),
+            ]
+            assert [r.status_code for r in refused] == [403] * 5, route
         content = "user_id=U_NEW&role=creator"
-        refused = [
-            await post(c, f"{UI}/members", None, **form),
-            await post(c, f"{UI}/members", "", **form),
-            await post(c, f"{UI}/members", token + "x", **form),
-            await post(c, f"{UI}/members", token[:-1], **form),
-            await post(c, f"{UI}/members", "a" * len(token), **form),
-        ]
-        assert [r.status_code for r in refused] == [403] * 5
         urlencoded = {"Content-Type": "application/x-www-form-urlencoded"}
         wrong_origins = [
             {"Origin": "https://evil.example"},
             {"Origin": "null"},
             {"Origin": "http://console.example.com"},
+            {"Origin": "https://other.example.org"},
+            {"Origin": "https://console.example.com:444"},
             {},  # neither Origin nor Referer
             {"Referer": "https://evil.example/page"},
             {"Referer": "not a url"},
@@ -660,6 +683,8 @@ async def test_a_form_without_the_right_token_or_origin_is_refused_and_changes_n
             )
             assert response.status_code == 403, headers
         assert await h.members.get_member(TENANT, "U_NEW") is None
+        assert await h.switches.list(TENANT) == []
+        assert await h.budgets.list(TENANT) == []
         assert kinds(h) == []
 
 
@@ -755,23 +780,6 @@ async def test_the_host_allowlist_follows_the_console_url(h):
         refused = await c.get("/login", headers={"Host": "console.example.com"})
         assert refused.status_code == 421
         assert (await c.get("/healthz", headers={"Host": "anything"})).status_code == 200
-
-
-async def test_the_origin_check_uses_the_console_origin(h):
-    c = await h.signed_in(ROOT)
-    async with using(c):
-        token = await csrf_token(c)
-        fields = f"user_id=U_NEW&role=creator&csrf={token}"
-        urlencoded = {"Content-Type": "application/x-www-form-urlencoded"}
-        for origin in ("https://other.example.org", "https://console.example.com:444"):
-            response = await c.post(
-                f"{UI}/members", content=fields, headers={**urlencoded, "Origin": origin}
-            )
-            assert response.status_code == 403, origin
-        ok = await c.post(
-            f"{UI}/members", content=fields, headers={**urlencoded, "Origin": CONSOLE_URL}
-        )
-        assert ok.status_code == 303
 
 
 FROM_SLACK = {

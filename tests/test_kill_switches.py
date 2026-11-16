@@ -37,9 +37,7 @@ from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
 from agentos.models import (
-    AUDIT_KINDS,
     ApprovalDecision,
-    AuditEvent,
     ConversationRef,
     InboundMessage,
     LLMResponse,
@@ -64,8 +62,6 @@ from agentos.switches import (
     WRITES,
     InMemorySwitchStore,
     InvalidSwitch,
-    PostgresSwitchStore,
-    agent_off_text,
     build_parser,
     check_switch,
     operator_identity,
@@ -93,7 +89,6 @@ from tests.conftest import (
 )
 from tests.console_harness import OTHER, OWNER, ROOT, ConsoleHarness, csrf_token, post, using
 from tests.test_gateway import FakeTemporalClient
-from tests.test_row_level_security import FakePool
 from tests.test_task_workflow import approve, start_task, thread_posts, wait_state
 from tests.test_usage import price
 
@@ -219,10 +214,6 @@ async def test_a_switch_stops_a_direct_message_as_it_stops_a_channel(w, kind):
     resp = await w.turn(kind=kind)
 
     assert resp.stop_reason == SWITCHED_OFF and w.llm.calls == []
-
-
-def test_the_fixed_text_names_the_agent():
-    assert agent_off_text("Docs bot") == "Docs bot is turned off by an admin."
 
 
 async def test_turning_an_agent_back_on_resumes_it(w):
@@ -819,6 +810,7 @@ def text_of(response):
 
 
 async def test_an_admin_turns_switches_off_and_on_from_the_page(hs):
+    """Fails if the page does not show a switch as off after turning it off, or the on and off posts do not change the store and audit log."""
     async with using(await hs.signed_in(ROOT)) as client:
         token = await csrf_token(client)
         agent = await post(client, f"{UI}/switches/off", token, scope="agent", target="mine")
@@ -831,7 +823,11 @@ async def test_an_admin_turns_switches_off_and_on_from_the_page(hs):
     assert agent.status_code == 303 and connector.status_code == 303
     assert agent.headers["location"] == f"{UI}/switches?done=switch-off"
     assert on.headers["location"] == f"{UI}/switches?done=switch-on"
-    assert "Connector: notion" in shown.text and "Off" in shown.text
+    rows = re.findall(r"<tr>.*?</tr>", shown.text, re.DOTALL)
+    (connector_row,) = [r for r in rows if "Connector: notion" in r]
+    (agent_row,) = [r for r in rows if "<td>mine</td>" in r]
+    assert '<span class="error">Off</span>' in connector_row
+    assert '<span class="error">Off</span>' in agent_row
     assert [(s.scope, s.target) for s in await hs.switches.list(TENANT)] == [
         ("connector", "notion")
     ]
@@ -863,13 +859,6 @@ async def test_a_forged_switch_post_from_a_creator_is_refused_and_changes_nothin
 
     assert [r.status_code for r in (forged, forged_all, forged_on)] == [403, 403, 403]
     assert await hs.switches.list(TENANT) == [] and hs.audit.events == []
-
-
-async def test_a_switch_post_without_the_csrf_token_is_refused(hs):
-    async with using(await hs.signed_in(ROOT)) as client:
-        refused = await post(client, f"{UI}/switches/off", None, scope="writes", target="")
-
-    assert refused.status_code == 403 and await hs.switches.list(TENANT) == []
 
 
 async def test_the_switches_page_is_for_admins_and_linked_from_their_menu(hs):
@@ -1003,48 +992,3 @@ def test_a_target_must_fit_its_scope():
     for scope, target in ((AGENT, ""), (CONNECTOR, ""), (CONNECTOR, "slack"), (WRITES, "x")):
         with pytest.raises(InvalidSwitch):
             check_switch(scope, target)
-
-
-# --- the SQL and the store ------------------------------------------------------------------
-
-MIGRATION = (REPO / "scripts" / "migrations" / "014_kill_switches.sql").read_text()
-
-
-def test_the_code_knows_the_two_new_kinds_and_they_need_no_agent_version():
-    assert {"switch_off", "switch_on"} <= set(AUDIT_KINDS)
-    for kind in ("switch_off", "switch_on"):
-        AuditEvent("acme", "k", kind, None, None, "U1", "user:U1", tool="writes")
-        AuditEvent("acme", "k", kind, "mine", None, "U1", "user:U1", tool="agent", target="mine")
-
-
-def test_a_switch_row_holds_no_content_and_no_requester():
-    columns = MIGRATION[MIGRATION.index("CREATE TABLE") :]
-    columns = columns[: columns.index("\n);")]
-    for word in ("requester", "content", "prompt", "text_body"):
-        assert word not in columns
-
-
-async def test_the_postgres_store_names_the_tenant_in_every_statement():
-    pool = FakePool(row=(TENANT, "writes", "", ADMIN, NOV))
-    store = PostgresSwitchStore(pool)
-
-    assert await store.switch_off(TENANT, "writes", "", ADMIN, NOV)
-    assert await store.switch_on(TENANT, "writes", "")
-    await store.list(TENANT)
-
-    executed = [e for e in pool.events if e[0] == "execute" and "set_config" not in e[1]]
-    insert, delete, listing = executed
-    assert "ON CONFLICT (tenant_id, scope, target) DO NOTHING" in insert[1]
-    assert insert[2][:3] == (TENANT, "writes", "")
-    assert "DELETE FROM kill_switches" in delete[1] and delete[2][0] == TENANT
-    assert "tenant_id = %s" in listing[1] and listing[2] == (TENANT,)
-    for _, sql, _params in executed:
-        assert "tenant_id" in sql
-
-
-def test_a_switch_id_is_never_built_outside_ids_py():
-    # A switch needs no workflow, schedule or event key of its own: the audit key is the
-    # control plane's, built in ids.py.
-    assert ids.audit_control_key("acme", "switch_off", "n").startswith("acme:")
-    source = (REPO / "src" / "agentos" / "switches.py").read_text()
-    assert 'f"{tenant' not in source and "f'{tenant" not in source

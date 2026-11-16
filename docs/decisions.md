@@ -2,29 +2,41 @@
 
 Status values: **Decided** (agreed by the product owner), **Proposed** (recommended, awaiting confirmation), **Open** (needs input).
 
-Last reviewed 2026-11-14.
+Last reviewed 2026-11-16. What each decision means for the code today is in [status.md](status.md).
 
 | ID | Decision | Status |
 |---|---|---|
 | D-01 | v1 is an agent builder for approved creators plus a front-door assistant. Company assistant and broader scope go on the roadmap | Decided |
 | D-02 | The architecture targets agents that do work (actions, approvals, multi-day follow-up) from day one | Decided |
-| D-03 | Multi-tenant SaaS with a cell architecture. A customer-hosted deployment later is a single-tenant cell | Decided |
+| D-03 | Multi-tenant SaaS with a cell architecture. A customer-hosted deployment later is a single-tenant cell. Today there is one cell | Decided |
 | D-04 | Thin custom agent loop on Temporal. No LangChain, LangGraph, or CrewAI | Decided |
 | D-05 | Slack is the only chat platform in v1 | Decided |
 | D-06 | Only creators approved by an admin can create agents | Decided |
 | D-07 | Each agent is its own principal with access grants set by its creator. The creator is accountable for whether the agent's audience may see or change what the agent can reach | Decided |
-| D-08 | MCP as the connector contract, wrapped by our runtime for credentials, grants, risk class, idempotency, and audit | Decided |
+| D-08 | MCP as the connector contract, wrapped by our runtime for credentials, grants, risk class, idempotency, and audit. **Deferred, not decided against** (D-28): the runtime reads a connector manifest and calls Notion directly | Decided |
 | D-09 | Retrieval is filtered by the agent's granted scopes inside the vector search, then re-checked against the source | Decided |
 | D-10 | Conversations and tasks are separate workflows. Tasks are child workflows with `ABANDON` as parent-close policy | Decided |
-| D-11 | All write actions need approval by an authorized person by default. Only a tenant admin can relax this, per action | Decided |
-| D-12 | Chat history and tool outputs live outside Temporal. Temporal payloads are encrypted with a per-tenant KMS key | Decided |
+| D-11 | All write actions need approval by an authorized person by default. Only a tenant admin can relax this, per action (relaxing is not built: every write needs the requester's approval) | Decided |
+| D-12 | Chat history and tool outputs live outside Temporal. Temporal payloads are encrypted with a per-tenant key. **Amended by D-27:** the key is a local versioned file, not a KMS key | Decided |
 | D-13 | v1 write action: add items to a Notion database (such as a request tracker) and comment on them, with durable follow-up until the item's status reaches done. Jira moves to v2 | Decided |
 | D-14 | Python on the Temporal Python SDK; Postgres with row-level security; pgvector for v1 | Decided |
-| D-15 | Connectors are defined by a manifest (risk class, idempotency, attribution, watch, indexing) on top of MCP or OpenAPI. Two tiers: certified (by us, exactly-once guaranteed) and custom (by tenant admins, conservative defaults) | Proposed |
-| D-16 | Connector self-repair (roadmap): connector failures go into a Temporal remediation workflow (one per failure signature) with a circuit breaker; a sandboxed coding agent proposes fixes; humans approve deploys; failed writes are never replayed automatically | Proposed |
-| D-17 | Requester-scoped tools: the runtime fills in the requester's identity (the LLM can't set it) and answers where the question was asked, since the audience rule (D-07) covers visibility. The requester's own account is used only for systems whose API can't filter by person, and those answers go only to a DM | Decided |
-| D-18 | Agents, versions and members live in Postgres behind one service layer that holds every role check and audits every change. A tenant's first admins come from its config file; an admin may approve their own submission, and the audit records it | Decided |
+| D-15 | Connectors are defined by a manifest (risk class, idempotency, attribution, watch, indexing) on top of MCP or OpenAPI. Two tiers: certified (by us, exactly-once guaranteed) and custom (by tenant admins, conservative defaults). Today the manifest carries risk, idempotency, requester scoping and input schema; the MCP and OpenAPI layer and the tiers are deferred (D-28) | Proposed |
+| D-16 | Connector self-repair (roadmap, design in [design/self-repair.md](design/self-repair.md)): connector failures go into a Temporal remediation workflow (one per failure signature) with a circuit breaker; a sandboxed coding agent proposes fixes; humans approve deploys; failed writes are never replayed automatically | Proposed |
+| D-17 | Requester-scoped tools: the runtime fills in the requester's identity (the LLM can't set it) and answers where the question was asked, since the audience rule (D-07) covers visibility. The requester's own account is used only for systems whose API can't filter by person, and those answers go only to a DM (the user-delegation exception is not built) | Decided |
+| D-18 | Agents, versions and members live in Postgres behind one service layer that holds every role check and audits every change, in the same transaction as the change. A tenant's first admins come from its config file; an admin may approve their own submission, and the audit records it | Decided |
 | D-19 | The control plane is a separate process from the Slack gateway. It listens on loopback with a fixed operator until Sign in with Slack is configured; then it may be public, with server-side sessions, CSRF tokens and a browser guard that lets only page navigations in from other sites | Decided |
+| D-20 | Tenants live in Postgres, not in the YAML file. The file is imported once; every process serves from the table through a short cache, so a tenant can be added, changed or disabled without a restart | Decided |
+| D-21 | Monthly dollar budgets per tenant and per agent stop spend, and spend that cannot be measured stops it too. A reached tenant budget also stops indexing | Decided |
+| D-22 | Kill switches (an agent, all agents, a connector, all writes) apply on the next step, and turning an agent off also cancels a write the requester already approved that has not run | Decided |
+| D-23 | A channel pause, or the requester leaving the agent's audience, also stops pending approval cards: the task re-checks both just before the write | Decided |
+| D-24 | Audience changes are watched only for a channel shared with another organisation. People joining a channel are not watched | Decided |
+| D-25 | Qwen is a second chat provider, and embeddings may come from any OpenAI-compatible endpoint, including a local Ollama model. The embedding vector size is fixed at 1024 | Decided |
+| D-26 | Chat and document content stays out of Temporal history: it lives in Postgres under IDs. Workflows that were running at the deploy keep their earlier shape until they end | Decided |
+| D-27 | Payload keys are local versioned files per tenant (`<tenant>/vN`), bound to the workflow ID, rotated by a command. Amends D-12: no KMS yet | Decided |
+| D-28 | MCP, OpenAPI adapters and the certified/custom connector tiers are **deferred, not decided against**. Notion is called directly behind a manifest. Amends D-08 and D-15 | Decided |
+| D-29 | A publish approves a content: the version carries the hash of the definition it was submitted with, and publishing a different hash is refused | Decided |
+| D-30 | A creator lists and reads only the agents they created; admins read every agent | Decided |
+| D-31 | Bounds on how long a task can live: an approval window of at most 168 hours, a follow-up watch of at most 60 days, and a retention floor of 68 days for the data a live task still needs | Decided |
 
 ## Context for the main decisions
 
@@ -37,14 +49,14 @@ Last reviewed 2026-11-14.
 - **Why:** this matches how teams think about a shared bot ("the IT helpdesk can see the IT space"), behaves the same for everyone who asks, and makes retrieval simpler and faster.
 - **Alternatives considered:** acting on behalf of each user (agents behave differently for each person, and every user must connect every account); "channel-safe" knowledge only (too restrictive for team agents).
 - **Risks and the guardrails that come with this decision:**
-  - *A creator over-shares:* grants can't exceed the creator's own access; the admin approves publishing and any wider grants; the creator confirms an explicit audience summary when deploying.
+  - *A creator over-shares:* the admin approves publishing and any wider grants, and sees each grant's live title and parent, a warning when the creator's label differs, and a diff against the published version; the creator confirms an explicit audience summary when deploying. Where the Notion picker is configured, a new grant must also be picked from the creator's own Notion account, so it cannot exceed what they can see. Without the picker the admin's approval is the only check.
   - *The audience changes after deploy:* a Slack Connect share of the channel is watched and pauses the agent in that channel until the creator confirms again. Who is added to a channel is the admins' responsibility and pauses nothing.
-  - *The creator leaves:* grants are re-checked every night against the creator's access and suspended if it no longer holds; the agent's owner and the admin are notified.
+  - *The creator leaves:* target, not built: grants re-checked every night against the creator's access and suspended if it no longer holds, with the owner and the admin notified.
   - *Questions about one person's own records:* see D-17.
 
 ### D-13 Notion as the first write action
 - **Why Notion works:** many teams already run request trackers as Notion databases. Notion's integration access model (only pages explicitly shared with the integration) maps directly onto agent grants, and Notion is also a knowledge source, so one connector covers both.
-- **What it costs us:** Notion has no native idempotency key, so we add a hidden request-ID property and query before creating. "Done" depends on each database's own status property, so creators map it when granting a database. Notion's low API rate limits mean we need per-tenant queuing. Details in [architecture.md §7](architecture.md).
+- **What it costs us:** Notion has no native idempotency key, so we add a hidden request-ID property that makes a write findable, and Postgres decides which attempt writes (a lease per idempotency key); the lookup before creating is a check, not the guard. "Done" depends on each database's own status property, so creators map it when granting a database. Notion's low API rate limits mean we need per-tenant queuing. Details in [architecture.md §7](architecture.md).
 - **Positioning effect:** we no longer start head to head with IT-ticketing products (Moveworks, ServiceNow). The first demo becomes "requests to any team tracked in Notion", which is broader but less of a ready-made helpdesk story. Jira and ServiceNow follow in v2.
 
 ### D-17 Requester-scoped data
@@ -65,23 +77,69 @@ Last reviewed 2026-11-14.
 ### D-16 Connector self-repair
 - **Why:** custom connectors are untested when they're added. Catching and fixing their failures quickly is what makes "bring any MCP server" credible.
 - **Why Temporal:** the fix process includes waits that can last days (human approval, watching a canary). Using the failure signature as the workflow ID groups many identical failures into one fix.
-- **Limits:** only code we own gets fixed; most failures (logins, permissions, outages) are routed elsewhere, not to the coding agent. The agent can't change safety fields, never deploys, and runs in a separate cell with no production credentials. Details in [architecture.md §12](architecture.md).
+- **Limits:** only code we own gets fixed; most failures (logins, permissions, outages) are routed elsewhere, not to the coding agent. The agent can't change safety fields, never deploys, and runs in a separate cell with no production credentials. Details in [design/self-repair.md](design/self-repair.md).
 - **Rollout:** detection and the circuit breaker first (v2), human-approved fixes next (v3), automatic deploy only for low-risk read-tool fixes later.
 
-### An agent that is off, or no longer allowed, stops its pending approvals
-- **Decision:** turning an agent off cancels a write the requester already approved that has not run. The card says the agent was turned off by an admin and that nothing was changed, and the task ends without a follow-up watch. A channel pause, or the requester leaving the agent's audience, also stops pending cards: the task re-checks both immediately before the write, refuses with a fixed line on the card, and ends.
-- **Why:** an admin who turns an agent off during an incident expects nothing more to happen, and a card shown before a pause or a membership change should not outlive it.
-- **Consequence:** one gate in front of every activity that acts for an agent applies the agent, writes and connector switches by effect (model, read, write, poll). A switched-off specialist is not offered to a front door.
+### D-20 Tenants in Postgres
+- **Decision:** after a one-time import of the YAML file, the `tenants` table is the source of truth for the Slack workspace, the enabled flag, the default agent, channel routing, admins, the Notion workspace and the names of the secret variables. A secret value is never stored. The gateway and the console re-read the table every 15 seconds, the worker every 5, so adding, changing or disabling a tenant needs no restart. An empty table stops a process with a message naming the import.
+- **Why:** several tenants share one deployment, and a settings change should not need a deploy. Row-level security hides other tenants' rows; the two reads that cross tenants go through narrow `SECURITY DEFINER` functions.
+- **Consequence:** editing the YAML afterwards changes nothing. There is no console page for tenant settings yet.
 
-### Content stays out of Temporal history, with two exceptions for the transition
+### D-21 Budgets and their stop
+- **Decision:** an admin sets a monthly dollar budget for the tenant and for each agent; at or over it the agent answers with a fixed text and calls no model. The tenant budget also stops indexing's embedding calls. Spend that cannot be measured is not zero: a budgeted scope with an unpriced row this month, or a call whose usage row could not be saved, is stopped until the rows are priced or the cache window passes.
+- **Why:** a limit that lets unmetered spend through is not a limit. Overspend is bounded, not zero: the other processes' spend in one cache window, plus the calls in flight, plus one call's cost.
+- **Consequence:** the worker refuses to start with no price for its chat or embedding model, and prices are matched by name, alias or dated prefix. Deviation: a dropped usage row marks the scope unmetered only in that worker process for one window.
+
+### D-22 Kill switches, and what "agent off" means
+- **Decision:** an admin turns an agent, every agent, a connector or all writes off, and on again; each applies on the next step, with no cache. Turning an agent off stops everything it does: new model calls, read tools already dispatched, follow-up polling (the watch ends), its offer to a front door as a specialist, and **a write the requester already approved that has not run**. The card says the agent was turned off by an admin and that nothing was changed, and the task ends without a follow-up watch. A connector that is off makes polling fail retryably, so the task keeps watching.
+- **Why:** an admin who turns an agent off during an incident expects nothing more to happen.
+- **Consequence:** one gate in front of every activity that acts for an agent applies the agent, writes and connector switches by effect (model, read, write, poll). Only an admin changes a switch. The host operator can use the same switches from the command line, audited as `operator:<OS login>`.
+
+### D-23 A pause or a lost audience stops pending approval cards
+- **Decision:** a channel pause, or the requester leaving the agent's audience, stops cards that are already pending. The task re-checks both immediately before the write, refuses with a fixed line on the card ("<agent name> can no longer act for you here; nothing was changed.") and ends; the requester can ask again once the agent is available to them. A check that cannot be completed stops the write too.
+- **Why:** a card shown before a pause or a membership change should not outlive it.
+- **Consequence:** the task workflow has a pre-write check, behind a workflow version marker so histories recorded before it replay unchanged.
+
+### D-24 Audience watch is limited to shared channels
+- **Decision:** an agent is paused in a channel when the channel is shared with another organisation (Slack Connect). A person joining a channel, guest or not, pauses nothing: who is added to a channel is the admins' responsibility, and a guest or outside person who asks the agent is still refused by the audience check.
+- **Why:** a share is a fact the event itself carries, so it needs no Slack lookup and has no "could not check" case. Joins are frequent and ambiguous.
+- **Status:** built and verified with fakes only; not yet run against a real Slack Connect channel.
+- **Resuming:** the agent's creator or an admin confirms a fresh count of the people in the channel, as at publish.
+
+### D-25 Qwen and local embeddings
+- **Decision:** the worker can use Qwen (an OpenAI-compatible endpoint) instead of Claude, chosen once at start, and embeddings come from any OpenAI-compatible endpoint, such as a local Ollama model (`bge-m3`). The vector size is fixed by the index column at 1024, so every embedding model must produce it.
+- **Why:** testing and development without paying a hosted provider; chat history is stored in one format whichever provider is used.
+- **Consequence:** the default Claude model is still the production path (Q-1). Each page records its embedding model, so changing the model re-embeds everything and searches compare only chunks of the model in use.
+
+### D-26 Content stays out of Temporal history
 - **Decision:** what people write, what the model replies, each tool call's input and a task's draft live in Postgres under IDs, and Temporal carries the IDs. Deleting a thread's rows deletes what was said in it. The gateway stores a Slack event and answers at once; a relay loop signals the workflow.
 - **Deviation 1:** a conversation or task that was running when this change was deployed keeps carrying content in its history until it ends, because histories recorded before the change must still replay. A message signalled by an older gateway has its text inline and is run the way it was; every message after the deploy is content-free, also in a thread that began before it. A task started before keeps its payload in its history until it finishes.
 - **Deviation 2:** two small strings can still reach history: the field names a model chose in an invalid tool input, which are told back to it as the reason the call did not run, and a failure reason from an activity (fixed texts from the connector). Neither is what a person wrote or a document held.
 
-### A creator reads only the agents they created
+### D-27 Payload keys are local versioned files (amends D-12)
+- **Decision:** each tenant's Temporal payloads are encrypted with AES-256-GCM under a key kept as a local file (`<tenant>.key`, then `<tenant>.vN.key` after a rotation), owner-only and outside the repo. The key ID `<tenant>/vN` travels with the payload and the workflow ID is the associated data. `python -m agentos.tenant_keys rotate` adds a version; old versions stay so older histories read. A payload with no encrypted tag is refused unless `AGENTOS_ALLOW_PLAINTEXT_PAYLOADS` is set.
+- **Why:** it keeps tenants' payloads apart and makes a key swap possible before a cloud key service is chosen. The key store is the one seam where a KMS replaces local files.
+- **Known limit:** the `workflow.patched` marker records are written by the Temporal SDK core outside the codec and carry only patch IDs. Not built: KMS and crypto-shredding.
+
+### D-28 MCP and the connector tiers are deferred, not decided against
+- **Decision:** the runtime calls Notion through its own connector, behind a manifest that holds each tool's risk class, idempotency method, requester scoping and input schema. There is no MCP client, no OpenAPI adapter, and no certified/custom tiers. This amends D-08 and D-15: the contract stays the goal and is reopened when a second connector is built, since a connector's write safety depends on the system, not on the transport.
+- **Why:** one connector does not need a protocol layer, and certified write actions are tested one at a time anyway.
+- **Consequence:** architecture §7 keeps the design under a "Target" label.
+
+### D-29 Approving is approving a content
+- **Decision:** submit stores the SHA-256 of the definition the version was submitted with. A publish names the hash the approver was shown and is refused if the version carries another, which a withdraw, an edit and a resubmit under the same number would produce. The `agent_publish` event records the reviewed hash. The API refuses a publish with no hash.
+- **Why:** an admin's approval is the control that compensates for what the platform cannot yet check about a grant, so it must bind to what was read.
+- **Consequence:** a pending version shown before the hash existed has to be reopened before it is published.
+
+### D-30 A creator reads only the agents they created
 - **Decision:** a creator lists and reads only the agents they created: definitions, versions, usage, budgets and switches follow one rule, enforced in `ControlPlane`, which the console and the API both call. An agent that belongs to someone else answers "not found", as an agent that does not exist does. Admins read every agent.
 - **Why:** a definition holds the system prompt and the access an agent was granted. Before this, usage, budgets and switches were limited to a creator's own agents but definitions were not, so the rule depended on which page asked.
 - **Consequence:** the caller's role and owned agents are resolved once per request into a `Principal` that plane calls accept, so a page makes one role lookup instead of one per call.
+
+### D-31 How long a task can live
+- **Decision:** an agent definition may ask for an approval window of at most 168 hours (default 72) and a follow-up watch of at most 60 days (default 30). Retention for conversation messages, tool outputs and idempotency records is never shorter than the longest a task can live: 168 hours rounded up to 7 days, plus 60, plus 1, is 68 days. Setting a lower value is refused; the nightly job raises a lower stored one.
+- **Why:** nothing a live approval or follow-up still needs may be purged under it.
+- **Consequence:** audit and usage rows, external writes, task links and agent definitions are exempt from retention.
 
 ## Open questions
 
@@ -89,7 +147,7 @@ Last reviewed 2026-11-14.
 |---|---|---|
 | Q-1 | Default LLM provider, and do tenants need to bring their own key in v1? | Claude via the LLM gateway; bring-your-own key in v2 |
 | Q-2 | Hosting cloud and region strategy (EU data residency at launch?) | Pick one cloud; plan an EU cell early |
-| Q-3 | Default retention for conversation history and audit data | 90 days for history, 1 year for audit; configurable per tenant |
+| Q-3 | Default retention for conversation history and audit data | 90 days for history, 1 year for audit; configurable per tenant. Built so far: per-tenant limits for conversation data with a 68-day floor (D-31), defaults 365 days for messages and 90 for tool outputs; audit rows are not purged |
 | Q-4 | Pricing unit (per seat, per active user, per action) | Affects metering; per active user plus action volume tiers |
-| Q-5 | Are approvals by other people (a manager approving) needed in v1, or only self-approval? | Self-approval only in v1 |
+| ~~Q-5~~ | Are approvals by other people (a manager approving) needed in v1, or only self-approval? | **Closed: self-approval only.** The code accepts a decision only from the requester; approval by other people is on the v2 roadmap |
 | Q-6 | Does v1 need Slack Enterprise Grid (one tenant across many workspaces)? | Design the data model for it; test against a single workspace first |

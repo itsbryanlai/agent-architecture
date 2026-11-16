@@ -269,6 +269,16 @@ say "Then import the agents into the database, once. An agent already imported i
 say "skipped, so do this after the property_ids are in the file:"
 step "uv run python -m agentos.agent_store import"
 printf '\n'
+note "Optional, for the console's Choose from Notion picker (a public Notion integration;"
+note "its redirect URI is <AGENTOS_CONSOLE_URL>/auth/notion/callback; see the README, Web console):"
+step "export NOTION_OAUTH_CLIENT_ID='<paste here>'   NOTION_OAUTH_CLIENT_SECRET='<paste here>'"
+step "export AGENTOS_REQUIRE_GRANT_PICKER=1"
+if [[ -z "${NOTION_OAUTH_CLIENT_ID:-}" || -z "${NOTION_OAUTH_CLIENT_SECRET:-}" ]]; then
+  TODO+=("Optional: export NOTION_OAUTH_CLIENT_ID and NOTION_OAUTH_CLIENT_SECRET (and AGENTOS_REQUIRE_GRANT_PICKER=1), then uv run python scripts/migrate.py for migration 020")
+elif [[ -z "${AGENTOS_REQUIRE_GRANT_PICKER:-}" ]]; then
+  TODO+=("Optional: export AGENTOS_REQUIRE_GRANT_PICKER=1 to refuse grants not picked from Notion")
+fi
+printf '\n'
 say "Then run, each in its own terminal:"
 step "uv run python -m agentos.worker"
 step "uv run uvicorn agentos.gateway.app:app --port 8000"

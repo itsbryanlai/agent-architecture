@@ -989,6 +989,30 @@ tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
 `NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. The process
 refuses to start, naming the unset variable, when any tenant's is missing.
 
+**Choose from Notion (optional).** A creator may grant only what their own Notion account
+can see. With the picker on, "Choose from Notion" on a draft signs the creator in to
+Notion, lists what their token can search, and records their picks (migration `020`; a new
+install gets the table from `scripts/init_db.sql`). Submit then refuses a grant that is new
+since the published version and was not picked. The creator's Notion token is used once to
+list and is never stored.
+
+1. In Notion (notion.so/profile/integrations), create a **public** integration. Under
+   OAuth Domain & URIs add the redirect URI `<AGENTOS_CONSOLE_URL>/auth/notion/callback`.
+   Copy its OAuth client ID and secret.
+2. Export, in the console's shell:
+
+```bash
+export NOTION_OAUTH_CLIENT_ID=...           # the public integration's OAuth client ID
+export NOTION_OAUTH_CLIENT_SECRET=...       # its OAuth client secret
+export AGENTOS_REQUIRE_GRANT_PICKER=1       # optional: refuse unpicked new grants at submit
+```
+
+Setting only one of the two OAuth variables, or `AGENTOS_REQUIRE_GRANT_PICKER` without
+both, stops the process at start. Without them, behaviour is as before: the admin still
+sees each grant's live title and parent, a warning when the creator's label differs, and a
+diff against the published version, and must tick a box to publish a version that widens
+access. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
+
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or
 `http://localhost:<port>`, where cookies are not `Secure` (a browser would not send

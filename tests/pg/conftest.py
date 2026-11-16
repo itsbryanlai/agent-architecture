@@ -47,8 +47,62 @@ SKIP_REASON = (
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
-        if Path(str(item.fspath)).is_relative_to(Path(__file__).parent):
-            item.add_marker(pytest.mark.pg)
+        if not Path(str(item.fspath)).is_relative_to(Path(__file__).parent):
+            continue
+        callspec = getattr(item, "callspec", None)
+        if callspec is not None and callspec.params.get("store_kind") == "fake":
+            continue  # a contract test run against the in-memory twin needs no Postgres
+        item.add_marker(pytest.mark.pg)
+
+
+@pytest.fixture(params=["fake", "real"])
+def store_kind(request) -> str:
+    """Which twin a contract test runs against: the in-memory fake or the Postgres store."""
+    return request.param
+
+
+def postgres_store_classes() -> dict[str, type]:
+    """Every ``Postgres*Store`` class under src/agentos, found by importing the package."""
+    import inspect
+    import pkgutil
+
+    import agentos
+
+    found: dict[str, type] = {}
+    for info in pkgutil.walk_packages(agentos.__path__, "agentos."):
+        module = importlib.import_module(info.name)
+        for name, cls in inspect.getmembers(module, inspect.isclass):
+            if (
+                name.startswith("Postgres")
+                and name.endswith("Store")
+                and cls.__module__ == module.__name__
+            ):
+                found[name] = cls
+    return found
+
+
+# Filled by the fixture below: the Postgres store classes some test in this folder built.
+CONSTRUCTED: set[str] = set()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def register_constructed_stores() -> Iterator[None]:
+    """Records each Postgres*Store a test constructs, for the coverage guard."""
+    patched: list[tuple[type, object]] = []
+    for name, cls in postgres_store_classes().items():
+        original = cls.__init__
+
+        def init(self, *args, _name=name, _original=original, **kwargs):
+            CONSTRUCTED.add(_name)
+            _original(self, *args, **kwargs)
+
+        cls.__init__ = init
+        patched.append((cls, original))
+    try:
+        yield
+    finally:
+        for cls, original in patched:
+            cls.__init__ = original
 
 
 def load_migrate():
@@ -133,6 +187,20 @@ def db(databases: Databases) -> TestDatabase:
 async def pool(db: TestDatabase) -> AsyncIterator[AsyncConnectionPool]:
     """A pool of app-role connections to the shared database."""
     pool = db.pool()
+    await pool.open()
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
+@pytest.fixture
+async def store_pool(store_kind: str, request) -> AsyncIterator[AsyncConnectionPool | None]:
+    """The app-role pool for a contract test's real run; None for the in-memory twin."""
+    if store_kind == "fake":
+        yield None
+        return
+    pool = request.getfixturevalue("db").pool()
     await pool.open()
     try:
         yield pool

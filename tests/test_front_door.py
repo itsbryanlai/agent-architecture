@@ -16,6 +16,7 @@ from agentos.activities import AgentActivities
 from agentos.agent_store import seeded_agent_store
 from agentos.config import TASK_QUEUE, ConfigError, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
+from agentos.knowledge.search import ITEM_RULES
 from agentos.llm import ScriptedLLMClient
 from agentos.models import ConversationRef, InboundMessage, LLMResponse, ToolCall
 from agentos.slack_client import FakeSlack
@@ -49,6 +50,11 @@ THREAD = "1700000000.000100"
 CONV_ID = ids.conversation_id(TENANT, CHANNEL, THREAD)
 ANNOUNCEMENT = "IT helper here, picking this up."
 NOT_RUN = "Not run: the conversation was handed to a specialist."
+
+
+def with_item_rules(prompt: str) -> str:
+    """The system prompt an agent with the Notion item tools is given."""
+    return f"{prompt}\n\n{ITEM_RULES}"
 
 
 def front_door_dict(concierge_steps: int = 4) -> dict:
@@ -271,8 +277,8 @@ async def test_hand_off_specialist_answers_same_message(fd):
     assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Report it to IT."]
     assert [u["ts"] for u in h.slack.updates()] == [p["ts"] for p in placeholders]
     assert announcements(h) == []
-    assert h.llm.calls[0]["system"] == "You answer general questions."
-    assert h.llm.calls[1]["system"] == "You help employees with IT requests."
+    assert h.llm.calls[0]["system"] == with_item_rules("You answer general questions.")
+    assert h.llm.calls[1]["system"] == with_item_rules("You help employees with IT requests.")
     # The specialist sees the hand-off in history, but is not offered the tool.
     assert "hand_off" not in tool_names(h.llm.calls[1])
     result = h.llm.calls[1]["messages"][-1]["content"][0]
@@ -292,7 +298,7 @@ async def test_next_message_goes_to_specialist(fd):
     await eventually(lambda: len(h.slack.updates()) >= 3)
 
     third = h.llm.calls[2]
-    assert third["system"] == "You help employees with IT requests."
+    assert third["system"] == with_item_rules("You help employees with IT requests.")
     assert "hand_off" not in tool_names(third)
     assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "First.", "Second."]
 
@@ -307,7 +313,7 @@ async def test_hand_off_to_unlisted_agent_refused(fd):
     result = h.llm.calls[1]["messages"][-1]["content"][0]
     assert result["is_error"] is True
     assert result["content"] == "unlisted is not one of this agent's specialists."
-    assert h.llm.calls[1]["system"] == "You answer general questions."
+    assert h.llm.calls[1]["system"] == with_item_rules("You answer general questions.")
     assert announcements(h) == []
     assert h.slack.updates()[0]["text"] == "I will handle it myself."
 
@@ -333,7 +339,7 @@ async def test_second_hand_off_in_one_response_refused(fd):
         assert results[call_id]["is_error"] is True
         assert results[call_id]["content"] == NOT_RUN
     assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Done."]
-    assert h.llm.calls[1]["system"] == "You help employees with IT requests."
+    assert h.llm.calls[1]["system"] == with_item_rules("You help employees with IT requests.")
 
 
 async def test_hand_off_step_keys_unique(fd):
@@ -411,7 +417,7 @@ async def test_specialist_survives_continue_as_new(fd):
     await converse(h, "it-helper", message("Ev1"))
     await eventually(lambda: h.slack.updates())
 
-    assert h.llm.calls[0]["system"] == "You help employees with IT requests."
+    assert h.llm.calls[0]["system"] == with_item_rules("You help employees with IT requests.")
     assert "hand_off" not in tool_names(h.llm.calls[0])
     assert [u["text"] for u in h.slack.updates()] == ["As the specialist."]
 
@@ -445,7 +451,7 @@ async def test_specialist_failure_recovers_as_specialist(fd, caplog):
     )
     await eventually(lambda: len(h.slack.updates()) >= 3)
 
-    assert h.llm.calls[2]["system"] == "You help employees with IT requests."
+    assert h.llm.calls[2]["system"] == with_item_rules("You help employees with IT requests.")
     assert h.slack.updates()[2]["text"] == "Back again."
 
 
@@ -518,7 +524,7 @@ async def test_specialist_load_failure_keeps_the_thread_with_the_front_door(fd, 
     )
     await eventually(lambda: len(h.slack.updates()) >= 2)
 
-    assert h.llm.calls[-1]["system"] == "You answer general questions."
+    assert h.llm.calls[-1]["system"] == with_item_rules("You answer general questions.")
 
 
 async def test_other_calls_beside_a_hand_off_are_not_run(fd):
@@ -562,7 +568,7 @@ async def test_second_hand_off_in_a_turn_refused_even_if_specialist_lists_specia
         assert result["tool_use_id"] == "tu_h2"
         assert result["is_error"] is True
         assert result["content"] == "Only one hand-off is allowed per turn."
-        assert h.llm.calls[2]["system"] == "You help employees with IT requests."
+        assert h.llm.calls[2]["system"] == with_item_rules("You help employees with IT requests.")
         assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, "Staying here."]
 
 

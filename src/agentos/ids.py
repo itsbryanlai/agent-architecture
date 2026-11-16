@@ -11,6 +11,11 @@ def conversation_id(tenant: str, channel: str, thread_ts: str) -> str:
     return f"{tenant}:conv:{channel}:{thread_ts}"
 
 
+def thread_key(tenant: str, channel: str, thread_ts: str) -> str:
+    """The key of a Slack thread in the ``threads`` table."""
+    return f"{tenant}:thread:{channel}:{thread_ts}"
+
+
 def task_id(tenant: str, uuid: str) -> str:
     return f"{tenant}:task:{uuid}"
 

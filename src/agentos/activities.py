@@ -10,7 +10,9 @@ Rules kept here:
   built from the grants of the agent's current published version, read from
   the agent store at call time, which checks every call before it is sent. A
   grant removed by a new published version applies to the next call, also for
-  a write that was approved earlier.
+  a write that was approved earlier. A turn's model steps and audience check
+  read the version the turn started with instead (``_pinned``), so a publish
+  in the middle of a turn does not change its prompt or tools.
 * The requester comes from ``TurnContext`` / ``TaskSpec``, which the runtime
   filled in from the Slack event. Requester-scoped tool fields (the person
   whose records are read) are filled in here, never by the LLM.
@@ -49,8 +51,10 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import NoReturn, TypeVar
 
 from temporalio import activity
@@ -58,13 +62,20 @@ from temporalio.exceptions import ApplicationError
 
 from agentos import ids
 from agentos.agent_store import AgentStore
-from agentos.audience import OFF, UNAVAILABLE, AudienceChecker, AudienceDecision, no_longer_act_text
+from agentos.audience import (
+    OFF,
+    PAUSED,
+    UNAVAILABLE,
+    AudienceChecker,
+    AudienceDecision,
+    no_longer_act_text,
+)
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
 from agentos.config import AgentVersion, Settings, embed_max_distance
 from agentos.connectors import notion_errors
-from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
+from agentos.connectors.manifest import MANIFEST_DIR, load_manifest, require_idempotency, screen
 from agentos.connectors.notion import (
     ConnectorError,
     NotionConnector,
@@ -119,14 +130,22 @@ from agentos.switches import (
     read_state,
 )
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
+from agentos.threads import (
+    InMemoryOwnerPingStore,
+    InMemoryThreadStore,
+    OwnerPingStore,
+    ThreadStore,
+)
 from agentos.usage import UsageRecorder
 from agentos.workflows import WRITE_LEASE_SECONDS
 
 log = logging.getLogger("agentos.activities")
 
-READ_TOOLS = ("search_items", "my_items", "search_knowledge")
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
+# Published versions are immutable, so one is kept per (tenant, agent, version). A worker
+# holds the versions its running turns use, and few of them.
+VERSION_CACHE_SIZE = 256
 
 # An attempt that takes over from one that may have sent a write looks for the result
 # this many times, this far apart, before it writes again. Notion's search can lag.
@@ -245,8 +264,15 @@ class AgentActivities:
         pauses: PauseStore | None = None,
         switches: SwitchStore | None = None,
         external_writes: ExternalWriteStore | None = None,
+        threads: ThreadStore | None = None,
+        owner_pings: OwnerPingStore | None = None,
     ):
         self.settings = settings
+        self.threads = threads or InMemoryThreadStore()
+        self.owner_pings = owner_pings or InMemoryOwnerPingStore()
+        # Tests move the day the owner is mentioned for by replacing this.
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self._versions: OrderedDict[tuple[str, str, int], AgentVersion] = OrderedDict()
         self.writes = external_writes or InMemoryExternalWriteStore()
         self.visibility_tries = VISIBILITY_TRIES
         self.visibility_interval = VISIBILITY_INTERVAL
@@ -295,6 +321,8 @@ class AgentActivities:
             self.check_audience,
             self.check_before_write,
             self.record_audience_refusal,
+            self.thread_agent,
+            self.remember_thread_agent,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -333,6 +361,34 @@ class AgentActivities:
             raise ApplicationError(
                 f"unknown agent '{agent_id}'", type="ValueError", non_retryable=True
             )
+        return agent
+
+    async def _pinned(self, ctx: TurnContext) -> AgentVersion:
+        """The version of the agent the turn started with, however often it was published since.
+
+        A turn is pinned: the model steps and the audience check of one turn read the same
+        prompt, tools and specialists, and the audit and usage rows that name
+        ``ctx.agent_version`` describe what actually ran. Activities that act with the agent's
+        grants do not use this: they read the live published version (``_agent``), so a grant
+        revoked after a turn started still stops what that turn proposed.
+        """
+        key = (ctx.tenant_id, ctx.agent_id, ctx.agent_version)
+        cached = self._versions.get(key)
+        if cached is not None:
+            self._versions.move_to_end(key)
+            return cached
+        self._runtime(ctx.tenant_id)
+        record = await self.agents.get_version(ctx.tenant_id, ctx.agent_id, ctx.agent_version)
+        if record is None:
+            raise ApplicationError(
+                f"unknown version {ctx.agent_version} of agent '{ctx.agent_id}'",
+                type="ValueError",
+                non_retryable=True,
+            )
+        agent = record.agent()
+        self._versions[key] = agent
+        while len(self._versions) > VERSION_CACHE_SIZE:
+            self._versions.popitem(last=False)
         return agent
 
     def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
@@ -391,6 +447,22 @@ class AgentActivities:
         await self._record_approval(spec, task_id, target)
         await self._record_write(spec, task_id, idem_key, target, "error")
         raise _non_retryable(refusal)
+
+    async def _check_method(
+        self, spec: TaskSpec, task_id: str, target: str, idem_key: str, method: str
+    ) -> None:
+        """Stop an approved write whose idempotency method no connector manifest declares.
+
+        The manifest says how a retried write avoids a duplicate; the activity makes the write
+        one way. When they disagree the write is refused before anything is sent, audited like
+        any other refused write, and not retried.
+        """
+        try:
+            require_idempotency(method)
+        except ValueError as err:
+            await self._record_approval(spec, task_id, target)
+            await self._record_write(spec, task_id, idem_key, target, "error")
+            raise _non_retryable(err) from err
 
     async def _requester(self, spec: TaskSpec, task_id: str, agent: AgentVersion) -> dict:
         """Who asked, as Notion will show it: ``{"notion_user_id", "line"}``.
@@ -685,7 +757,7 @@ class AgentActivities:
         # Before the budget and before any model call: an agent or a tenant switched off
         # answers with a fixed text, bills nothing and records no usage row.
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = await self._pinned(ctx)
         if isinstance(refusal, AgentOff):
             log_stop(ctx.tenant_id, ctx.agent_id, refusal.switch)
             return LLMResponse(
@@ -732,6 +804,7 @@ class AgentActivities:
                 )
                 raise _non_retryable(err) from err
             raise
+        resp.tool_calls = [self._screened(call) for call in resp.tool_calls]
         if self.usage is not None:
             await self.usage.llm_call(
                 tenant_id=ctx.tenant_id,
@@ -743,6 +816,12 @@ class AgentActivities:
                 fallback_model=self.settings.model,
             )
         return resp
+
+    @staticmethod
+    def _screened(call: ToolCall) -> ToolCall:
+        """The call with what the connector manifests say about it (see ``screen``)."""
+        kind, problem = screen(call.name, call.input)
+        return replace(call, kind=kind, problem=problem)
 
     @activity.defn(name="post_placeholder")
     async def post_placeholder(self, ctx: TurnContext, idem_key: str) -> str:
@@ -1022,6 +1101,9 @@ class AgentActivities:
         page_id = spec.payload["page_id"]
         idem_key = f"{task_id}:comment"
         await self._gate_write(spec, task_id, page_id, idem_key)
+        await self._check_method(spec, task_id, page_id, idem_key, "marker_text")
+        # The live published version, not the turn's pinned one, on purpose: a grant revoked
+        # since this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
         text = spec.payload["comment"]
@@ -1051,6 +1133,9 @@ class AgentActivities:
         database_id = spec.payload["database_id"]
         idem_key = f"{task_id}:create"
         await self._gate_write(spec, task_id, database_id, idem_key)
+        await self._check_method(spec, task_id, database_id, idem_key, "marker_property")
+        # The live published version, not the turn's pinned one, on purpose: a grant revoked
+        # since this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
         await self._record_approval(spec, task_id, database_id)
@@ -1172,6 +1257,39 @@ class AgentActivities:
             target=target_agent,
         )
 
+    @activity.defn(name="thread_agent")
+    async def thread_agent(
+        self, tenant_id: str, agent_id: str, channel: str, thread_ts: str
+    ) -> str:
+        """The agent that owns the thread: its specialist after a hand-off, else ``agent_id``.
+
+        ``agent_id`` is the agent the channel maps to, which the conversation starts with. A
+        stored specialist is used only while that agent still lists it and it is still
+        published, so a changed definition is never overridden by an old row.
+        """
+        self._runtime(tenant_id)
+        stored = await self.threads.agent_for(
+            tenant_id, ids.thread_key(tenant_id, channel, thread_ts)
+        )
+        if stored is None or stored == agent_id:
+            return agent_id
+        front = await self.agents.published(tenant_id, agent_id)
+        if front is None or stored not in front.specialists:
+            return agent_id
+        if await self.agents.published(tenant_id, stored) is None:
+            return agent_id
+        return stored
+
+    @activity.defn(name="remember_thread_agent")
+    async def remember_thread_agent(
+        self, tenant_id: str, channel: str, thread_ts: str, agent_id: str
+    ) -> None:
+        """Keep the specialist a thread was handed to, so it survives the workflow closing."""
+        await self._agent(tenant_id, agent_id)
+        await self.threads.set_agent(
+            tenant_id, ids.thread_key(tenant_id, channel, thread_ts), agent_id, self.clock()
+        )
+
     async def _audience_decision(self, ctx: TurnContext, agent: AgentVersion) -> AudienceDecision:
         """May the requester use ``agent`` in this place? A failed lookup raises.
 
@@ -1204,12 +1322,14 @@ class AgentActivities:
 
     @activity.defn(name="check_audience")
     async def check_audience(self, ctx: TurnContext) -> AudienceDecision:
-        """May the requester use this agent in this place? Read-only.
+        """May the requester use this agent in this place?
 
         Asker, place and agent come from ``ctx``, which the runtime built from the Slack
         event. A transient Slack failure is retried; any failure that survives the
         retries reaches the workflow as an error, which refuses the turn. On a refusal the
-        decision carries the agent's creator, for the reply to name. A channel where the
+        decision carries the agent's creator, for the reply to name, and says whether the
+        reply may mention them: the first refusal of an asker in a place each UTC day does,
+        later ones do not, so the creator is not paged every time. A channel where the
         agent is paused refuses with reason ``paused``, before any Slack lookup.
         """
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
@@ -1218,11 +1338,21 @@ class AgentActivities:
             # An agent that is off is not available to anyone: the turn, or a hand-off to it,
             # is refused with the fixed "turned off" reply.
             return AudienceDecision(False, OFF)
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = await self._pinned(ctx)
         decision = await self._audience_decision(ctx, agent)
         if not decision.allowed:
             record = await self.agents.get_agent(ctx.tenant_id, ctx.agent_id)
             decision.owner = None if record is None else record.created_by
+            if decision.owner and decision.reason not in (UNAVAILABLE, PAUSED):
+                # The reply mentions the owner, which pages them: once a day for each person
+                # in each place, so someone who keeps asking cannot keep paging the owner.
+                decision.notify_owner = await self.owner_pings.claim(
+                    ctx.tenant_id,
+                    ctx.agent_id,
+                    ctx.channel,
+                    ctx.requester_user_id,
+                    self.clock().astimezone(UTC).date(),
+                )
         return decision
 
     @activity.defn(name="check_before_write")

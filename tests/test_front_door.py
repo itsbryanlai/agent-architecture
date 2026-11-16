@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
+from temporalio.client import WorkflowExecutionStatus
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -44,6 +45,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.gateway_support import deliver_inbound
+from tests.replay_support import suggest_continue_as_new_after
 from tests.test_gateway import FakeTemporalClient, im_event, post_event
 from tests.test_llm_errors import StatusError
 
@@ -427,16 +429,30 @@ async def test_invalid_hand_off_on_last_step_runs_the_step_limit(fd_one_step):
 
 
 async def test_specialist_survives_continue_as_new(fd):
+    """Fails if a thread that continued as new forgets its specialist and goes back to the door."""
     h = fd
-    h.llm.queue(answer("As the specialist."))
+    h.llm.queue(
+        tool_turn(hand_off_to("it-helper")),
+        answer("As the specialist."),
+        answer("Still the specialist."),
+    )
 
-    # A continue-as-new passes the thread's current ref, here the specialist's.
-    await converse(h, "it-helper", message("Ev1"))
-    await eventually(lambda: h.slack.updates())
+    with suggest_continue_as_new_after(8):
+        handle = await converse(h, "concierge", message("Ev1"))
+        await eventually(lambda: len(h.slack.updates()) >= 2)
+        await h.client.get_workflow_handle(CONV_ID).signal(
+            ConversationWorkflow.message, message("Ev2", "and the charger?")
+        )
+        await eventually(lambda: len(h.slack.updates()) >= 3)
 
-    assert h.llm.calls[0]["system"] == with_item_rules("You help employees with IT requests.")
-    assert "hand_off" not in tool_names(h.llm.calls[0])
-    assert [u["text"] for u in h.slack.updates()] == ["As the specialist."]
+    first = await h.client.get_workflow_handle(CONV_ID, run_id=handle.result_run_id).describe()
+    assert first.status == WorkflowExecutionStatus.CONTINUED_AS_NEW
+    assert h.llm.calls[2]["system"] == with_item_rules("You help employees with IT requests.")
+    assert "hand_off" not in tool_names(h.llm.calls[2])
+    assert [u["text"] for u in h.slack.updates()][1:] == [
+        "As the specialist.",
+        "Still the specialist.",
+    ]
 
 
 async def test_specialist_failure_recovers_as_specialist(fd, caplog):

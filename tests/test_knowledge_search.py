@@ -2,7 +2,7 @@
 
 import re
 
-from temporalio.client import ScheduleOverlapPolicy
+from temporalio.client import ScheduleOverlapPolicy, WorkflowExecutionStatus
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
@@ -30,6 +30,7 @@ from tests.conftest import (
     eventually,
     knowledge_agents_dict,
 )
+from tests.replay_support import suggest_continue_as_new_after
 
 SCOPE_A = ids.knowledge_scope(ROOT_A)
 SCOPE_B = ids.knowledge_scope(ROOT_B)
@@ -344,30 +345,41 @@ async def test_earlier_turn_citation_resolves(kharness):
 
 
 async def test_markers_survive_continue_as_new(kharness):
+    """Fails if a continue-as-new drops the citations or restarts the numbering of source markers."""
     h = kharness
     await index_both(h)
-    carried = [Citation(12, SCOPE_A, plain(PAGE_A2))]
     h.llm.queue(
         tool_turn(call("tu_1", "reset your vpn password")),
-        answer("Both [12] and [13]."),
+        answer("First [1]."),
+        tool_turn(call("tu_2", "swollen batteries must be reported")),
+        answer("Again, from before [1]."),
     )
     thread = "1700000000.000700"
-    msg = InboundMessage("Ev-1", ALICE, "hi", CHANNEL, thread, "channel")
-    # The arguments a continue-as-new passes: inbox, seen, next_marker, citations.
-    await h.client.start_workflow(
-        ConversationWorkflow.run,
-        args=[ConversationRef(TENANT, "it-helper", CHANNEL, thread), None, None, 13, carried],
-        id=ids.conversation_id(TENANT, CHANNEL, thread),
-        task_queue=TASK_QUEUE,
-        start_signal="message",
-        start_signal_args=[msg],
-    )
-    await eventually(lambda: h.slack.updates())
 
-    stored = await h.history.load(TENANT, ids.conversation_id(TENANT, CHANNEL, thread))
-    assert '<source n="13"' in stored[2]["content"][0]["content"]
-    update = h.slack.updates()[0]["text"]
-    assert "Sources: [12] <" in update and "|Batteries>" in update and "[13] <" in update
+    with suggest_continue_as_new_after(8):
+        handle = await converse(h, "it-helper", thread)
+        await eventually(lambda: len(h.slack.updates()) >= 1)
+        conv = ids.conversation_id(TENANT, CHANNEL, thread)
+        await h.client.get_workflow_handle(conv).signal(
+            ConversationWorkflow.message,
+            InboundMessage("Ev-second", ALICE, "more", CHANNEL, thread, "channel"),
+        )
+        await eventually(lambda: len(h.slack.updates()) >= 2)
+
+    first = await h.client.get_workflow_handle(conv, run_id=handle.result_run_id).describe()
+    assert first.status == WorkflowExecutionStatus.CONTINUED_AS_NEW
+    stored = await h.history.load(TENANT, conv)
+    results = [
+        {int(n) for n in re.findall(r'<source n="(\d+)"', b["content"])}
+        for m in stored
+        if m["role"] == "user" and isinstance(m["content"], list)
+        for b in m["content"]
+        if b.get("type") == "tool_result"
+    ]
+    # The second run numbers its sources after the first run's, and [1] still resolves.
+    assert len(results) == 2 and all(results)
+    assert min(results[1]) > max(results[0])
+    assert "Sources: [1] <" in h.slack.updates()[1]["text"]
 
 
 def test_schedule_plan_creates_and_deletes():

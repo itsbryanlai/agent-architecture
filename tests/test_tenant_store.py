@@ -33,6 +33,7 @@ from agentos.slack_signin import SlackSession
 from agentos.stores import InMemoryTaskLinkStore
 from agentos.tenant_store import (
     IMPORT_COMMAND,
+    UNKNOWN_TENANT_TTL_SECONDS,
     InMemoryTenantStore,
     PostgresTenantStore,
     StaticTenants,
@@ -583,3 +584,25 @@ async def test_the_control_api_treats_a_disabled_tenant_as_unknown():
 
 def test_a_tenant_ref_carries_no_settings():
     assert [f for f in TenantRef.__dataclass_fields__] == ["tenant_id", "enabled", "updated_at"]
+
+
+async def test_a_tenant_id_found_unknown_is_not_looked_up_again_for_a_short_while():
+    """Fails if every request for an unknown tenant ID reads the database, or if the answer is
+    remembered past its time-to-live or for a tenant that does exist."""
+    store, clock = CountingStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=1000, clock=clock)
+    await directory.snapshot()
+    before = store.lists
+
+    assert await directory.get("no-such-tenant") is None
+    assert store.lists == before + 1
+    for _ in range(5):
+        assert await directory.get("no-such-tenant") is None
+    assert store.lists == before + 1
+
+    assert (await directory.get(TENANT)).tenant_id == TENANT
+    assert store.lists == before + 1
+
+    clock.advance(UNKNOWN_TENANT_TTL_SECONDS + 1)
+    assert await directory.get("no-such-tenant") is None
+    assert store.lists == before + 2

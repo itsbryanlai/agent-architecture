@@ -127,16 +127,39 @@ async def test_a_creator_sees_their_own_agent_with_editing_controls_only(h):
         assert "<textarea" not in pending.text
 
 
-async def test_a_creator_who_does_not_own_the_agent_sees_no_editing_controls(h):
+async def test_a_creator_cannot_open_an_agent_another_creator_made_and_it_is_not_listed(h):
+    """Fails if a creator sees another creator's agent in the list, or can open its pages
+    or its definition, or if an admin cannot."""
     await make_pending(h, OWNER)
     c = await h.signed_in(OTHER)
     async with using(c):
-        page = await c.get(VERSION)
-        assert page.status_code == 200 and "system_prompt" in page.text
-        for control in ("/submit", "/withdraw", "/publish", "/reject", "/check-grants", "/edit"):
-            assert control not in page.text, control
-        detail = await c.get(f"{UI}/agents/it-helper")
-        assert "/drafts" not in detail.text
+        listing = await c.get(f"{UI}/agents")
+        assert listing.status_code == 200 and "it-helper" not in listing.text
+        for path in (VERSION, f"{UI}/agents/it-helper", f"{UI}/agents/nobody"):
+            page = await c.get(path)
+            assert page.status_code == 404, path
+            assert "system_prompt" not in page.text
+    admin = await h.signed_in(ROOT)
+    async with using(admin):
+        assert "system_prompt" in (await admin.get(VERSION)).text
+
+
+async def test_before_sign_in_an_unknown_tenant_and_a_real_one_answer_alike(h):
+    """Fails if the JSON API or a console page tells a caller with no session which tenant IDs
+    exist, by status or by body."""
+    async with h.client() as c:
+        for path in ("/tenants/{}/agents", "/tenants/{}/me", "/ui/{}/agents"):
+            real = await c.get(path.format(TENANT), follow_redirects=False)
+            unknown = await c.get(path.format("no-such-tenant"), follow_redirects=False)
+            assert real.status_code == unknown.status_code, path
+            assert real.status_code in (303, 401)
+            assert real.text == unknown.text, path
+            assert real.headers.get("location") == unknown.headers.get("location")
+        signed = await h.signed_in(ROOT)
+    async with using(signed):
+        other = await signed.get(f"/tenants/{GLOBEX}/agents")
+        unknown = await signed.get("/tenants/no-such-tenant/agents")
+        assert (other.status_code, other.text) == (unknown.status_code, unknown.text)
 
 
 async def test_the_admin_pages_are_refused_to_a_creator_by_the_control_plane(h):

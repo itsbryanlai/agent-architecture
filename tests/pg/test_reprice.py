@@ -31,7 +31,7 @@ async def test_reprice_writes_an_adjustment_and_an_audit_event_the_app_role_then
     """Fails if the owner's reprice is not counted by the app role's totals, or leaves no audit event."""
     app = PostgresUsageStore(pool)
     await app.record(
-        UsageEvent(tenant, "k1", "llm", "a", 1, "m-2026", 1_000_000, 0, 0, 0, None, "c", AT)
+        UsageEvent(tenant, "k1", "llm", "aa", 1, "m-2026", 1_000_000, 0, 0, 0, None, "c", AT)
     )
     prices = Prices(
         [PriceEntry("m", date(2026, 1, 1), Decimal(3), Decimal(0), Decimal(0), Decimal(0))]

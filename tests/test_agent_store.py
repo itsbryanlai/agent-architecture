@@ -1,6 +1,7 @@
 """Agents in the database: lifecycle, what a turn loads, front-door rules, import, startup."""
 
 import copy
+from dataclasses import replace
 
 import pytest
 from temporalio.exceptions import ApplicationError
@@ -537,3 +538,12 @@ async def test_published_tenants_carry_the_published_agents_and_the_yaml_setting
 
 
 # --- migration text --------------------------------------------------------------
+
+
+async def test_the_import_refuses_an_agent_id_outside_the_pattern():
+    """Fails if the one-time import writes an agent whose ID the console cannot route."""
+    store = InMemoryAgentStore()
+    good = parse_agent("it-helper", helper_block(), 1)
+    with pytest.raises(ConfigError, match="agent ID"):
+        await store.import_agents(TENANT, {"a/b": replace(good, agent_id="a/b")})
+    assert await store.list_agents(TENANT) == []

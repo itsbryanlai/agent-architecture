@@ -51,7 +51,8 @@ async def test_tool_results_resolved_into_history(harness):
     assert block["type"] == "tool_result"
     assert block["tool_use_id"] == "tu_1"
     assert block["is_error"] is False
-    assert block["content"].startswith(f"- {DISTINCTIVE} (status: none) https://")
+    assert block["content"].startswith('<items>\n<item url="https://')
+    assert f'status="none">{DISTINCTIVE}</item>' in block["content"]
     # The model received the same full text on its second call.
     assert DISTINCTIVE in h.llm.calls[1]["messages"][2]["content"][0]["content"]
 

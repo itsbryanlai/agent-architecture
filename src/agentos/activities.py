@@ -51,7 +51,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import TypeVar
+from typing import NoReturn, TypeVar
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -63,19 +63,23 @@ from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
 from agentos.config import AgentVersion, Settings, embed_max_distance
+from agentos.connectors import notion_errors
 from agentos.connectors.manifest import MANIFEST_DIR, load_manifest
 from agentos.connectors.notion import (
     ConnectorError,
     NotionConnector,
     normalize_id,
 )
+from agentos.connectors.notion_limiter import bulk_priority
 from agentos.history_view import prepare_for_model
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
+    ITEM_RULES,
     KNOWLEDGE_RULES,
     SEARCH_CANDIDATES,
     PageChecker,
     cited_markers,
+    escape_attribute,
     format_sources,
     select_passages,
     sources_footer,
@@ -166,15 +170,27 @@ def _non_retryable(err: Exception) -> ApplicationError:
 def _is_client_error(err: Exception) -> bool:
     """A 4xx (other than 408 and 429) will not succeed on retry.
 
-    Notion's errors carry the HTTP status in ``status``; the Anthropic and
-    OpenAI SDK errors carry it in ``status_code``. Timeouts (408) and rate
-    limits (429) are transient, so they stay retryable.
+    A Notion API error is judged by its error code (``notion_errors``): a 409 conflict is
+    retried and a missing page is not. The Anthropic and OpenAI SDK errors carry the HTTP
+    status in ``status_code``, and anything else with a ``status`` is judged by it.
+    Timeouts (408) and rate limits (429) are transient, so they stay retryable.
     """
+    if notion_errors.is_notion_error(err):
+        return notion_errors.is_final(err)
     for attr in ("status", "status_code"):
         status = getattr(err, attr, None)
         if isinstance(status, int) and not isinstance(status, bool):
             return 400 <= status < 500 and status not in (408, 429)
     return False
+
+
+def _reraise(err: Exception) -> NoReturn:
+    """Raise a retryable error for Temporal to retry: as it is, or, when Notion named how
+    long to wait (``Retry-After`` on a 429), as a failure that carries that wait."""
+    delayed = notion_errors.retry_failure(err)
+    if delayed is not None:
+        raise delayed from err
+    raise err
 
 
 def _activity_ref(fallback_workflow_id: str) -> tuple[str, str, str, int]:
@@ -675,12 +691,13 @@ class AgentActivities:
                 return stopped
         messages = prepare_for_model(await self.history.load(ctx.tenant_id, conversation_id))
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
-        system = agent.system_prompt
+        # Every agent has the Notion read tools, whose output is page text people wrote.
+        system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
         if agent.grants.notion_pages:
             # Search is offered only to an agent that was granted pages, and
             # the model is told to treat what it returns as data.
             tools = tools + [self.knowledge_tool.llm_definition()]
-            system = f"{agent.system_prompt}\n\n{KNOWLEDGE_RULES}"
+            system = f"{system}\n\n{KNOWLEDGE_RULES}"
         if agent.specialists:
             # Only specialists this asker may use here are offered; if none, the
             # front door answers alone.
@@ -870,6 +887,20 @@ class AgentActivities:
                 return f"Unknown tool '{call.name}'.", True
         except ConnectorError as err:
             return str(err), True
+        except Exception as err:  # noqa: BLE001 - final Notion errors become a result, the rest re-raise
+            # Notion answered that it will not do this, now or on a retry (a revoked
+            # database, a refused key): the model gets an error result it can pass on and
+            # the turn goes on. Anything retryable is raised for Temporal.
+            if notion_errors.is_final(err):
+                log.warning(
+                    "read tool refused by notion tenant_id=%s agent_id=%s tool=%s code=%s",
+                    ctx.tenant_id,
+                    ctx.agent_id,
+                    call.name,
+                    getattr(err, "code", None),
+                )
+                return notion_errors.entry_for(err).text, True
+            _reraise(err)
         return _format_items(items), False
 
     # --- task ------------------------------------------------------------------------
@@ -947,7 +978,7 @@ class AgentActivities:
         except Exception as err:
             if _is_client_error(err):
                 raise _non_retryable(err) from err
-            raise
+            _reraise(err)
         return {
             "page_id": item.page_id,
             "database_id": item.database_id,
@@ -981,7 +1012,7 @@ class AgentActivities:
             if isinstance(err, ConnectorError) or _is_client_error(err):
                 await self._record_write(spec, task_id, idem_key, page_id, "error")
                 raise _non_retryable(err) from err
-            raise
+            _reraise(err)
         await self._record_write(spec, task_id, idem_key, page_id, "ok", {"comment_id": comment_id})
         return comment_id
 
@@ -1017,7 +1048,7 @@ class AgentActivities:
             if isinstance(err, ConnectorError) or _is_client_error(err):
                 await self._record_write(spec, task_id, idem_key, database_id, "error")
                 raise _non_retryable(err) from err
-            raise
+            _reraise(err)
         await self.links.link(ctx.tenant_id, normalize_id(item.page_id), task_id)
         await self._record_write(
             spec, task_id, idem_key, item.page_id, "ok", {"page_id": item.page_id}
@@ -1077,13 +1108,14 @@ class AgentActivities:
             raise ApplicationError(connector_off_text("notion"), type="ConnectorOff")
         try:
             connector = await self._connector(tenant_id, agent_id)
-            return await connector.get_item(page_id)
+            with bulk_priority():
+                return await connector.get_item(page_id)
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
             if _is_client_error(err):
                 raise _non_retryable(err) from err
-            raise
+            _reraise(err)
 
     @activity.defn(name="post_in_thread")
     async def post_in_thread(self, ctx: TurnContext, text: str, idem_key: str) -> str:
@@ -1169,12 +1201,16 @@ class AgentActivities:
 def _format_items(items: list[NotionItem]) -> str:
     if not items:
         return "No matching items."
+    # Titles and statuses are text people wrote in Notion: untrusted data, wrapped and
+    # escaped the way knowledge passages are, one line per item.
     lines = [
-        f"- {i.title} (status: {i.status or 'none'}) {i.url}" for i in items[:MAX_LISTED_ITEMS]
+        f'<item url="{escape_attribute(i.url)}" status="{escape_attribute(i.status or "none")}">'
+        f"{escape_attribute(i.title)}</item>"
+        for i in items[:MAX_LISTED_ITEMS]
     ]
     if len(items) > MAX_LISTED_ITEMS:
         lines.append(f"... and {len(items) - MAX_LISTED_ITEMS} more")
-    return "\n".join(lines)
+    return "<items>\n" + "\n".join(lines) + "\n</items>"
 
 
 def _subject(spec: TaskSpec) -> str:

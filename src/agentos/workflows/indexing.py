@@ -6,7 +6,9 @@ One workflow runs per (tenant, scope). Rules it keeps:
   page text is fetched, chunked, embedded and stored inside one activity per
   page and never reaches workflow history.
 * Walking the tree is breadth first from the root, at most two pages read at a
-  time (Notion rate limits) and at most ``MAX_PAGES_PER_SCOPE`` pages. The two pages of
+  time (this bounds the work in flight; it is not rate limiting: the Notion client's
+  per-tenant limiter in ``agentos.connectors.notion_limiter`` is, and it queues indexing
+  behind interactive requests) and at most ``MAX_PAGES_PER_SCOPE`` pages. The two pages of
   a step are one activity, so the grants are checked once for them. When the cap is hit
   it stops discovering new pages but still prunes with what it saw.
 * A page ends in one of three states (see ``agentos.knowledge.indexing``). A ``gone`` page

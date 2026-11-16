@@ -43,12 +43,14 @@ from datetime import datetime, timedelta
 from temporalio import activity
 
 from agentos import ids
-from agentos.activities import _activity_ref, _is_client_error, _non_retryable
+from agentos.activities import _activity_ref, _is_client_error, _non_retryable, _reraise
 from agentos.agent_store import AgentStore, with_published_agents
 from agentos.audience_watch import _is_user_id
 from agentos.budgets import TENANT, BudgetGuard
 from agentos.config import EMBED_DIMENSIONS
+from agentos.connectors import notion_errors
 from agentos.connectors.notion import NotionAPI, normalize_id
+from agentos.connectors.notion_limiter import bulk_priority
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.notion_text import (
     PageUnavailable,
@@ -265,7 +267,12 @@ class IndexActivities:
                 raise outcome
         return list(outcomes)
 
-    async def _sync_one(
+    async def _sync_one(self, *args, **kwargs) -> SyncResult:
+        """``_sync_one_page`` as bulk work: its Notion requests wait for interactive ones."""
+        with bulk_priority():
+            return await self._sync_one_page(*args, **kwargs)
+
+    async def _sync_one_page(
         self,
         runtime: TenantRuntime,
         tenant_id: str,
@@ -282,13 +289,13 @@ class IndexActivities:
         except PageUnavailable:
             log.info("page gone tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
             return SyncResult(skipped=True, status=GONE)
-        except Exception as err:
-            if getattr(err, "status", None) == 404:
+        except Exception as err:  # noqa: BLE001 - classified, then re-raised
+            if notion_errors.is_gone(err):
                 log.info("page gone tenant_id=%s scope=%s page_id=%s", tenant_id, scope, page_id)
                 return SyncResult(skipped=True, status=GONE)
             if _is_client_error(err):
                 return await self._failed(tenant_id, scope, page_id, err)
-            raise
+            _reraise(err)
         state = await self.store.page_state(tenant_id, scope, page_id)
         try:
             if ancestors is None:
@@ -296,12 +303,12 @@ class IndexActivities:
                     tenant_id, scope, root, page_id, parent_id, chains
                 )
             return await self._index(runtime, tenant_id, scope, page_id, page, state, ancestors)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - classified, then re-raised
             # Notion, the embedder or the store refused the request for good: retrying sends
             # the same request and fails the same way, and one page must not stop the run.
             if _is_client_error(err):
                 return await self._failed(tenant_id, scope, page_id, err, state)
-            raise
+            _reraise(err)
 
     async def _failed(
         self,
@@ -380,7 +387,8 @@ class IndexActivities:
             return result
         checker = PageChecker(runtime.notion_api)
         for scope, root in (await self._granted(runtime)).items():
-            chain = await checker.ancestry(page_id, root)
+            with bulk_priority():
+                chain = await checker.ancestry(page_id, root)
             if chain is not None:
                 synced = await self._sync_one(
                     runtime, tenant_id, scope, root, page_id, None, {}, ancestors=chain

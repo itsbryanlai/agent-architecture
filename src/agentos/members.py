@@ -6,9 +6,8 @@ the tenant YAML file's ``admins`` list, and ``control.py`` combines the two to
 decide a user's role. This module only stores rows.
 
 It is a module of its own, and not part of ``agent_store.py``, because members
-and agents change for different reasons and are checked by different rules; the
-write methods have names no other store uses, so the test that keeps writes
-inside ``control.py`` can find every call.
+and agents change for different reasons and are checked by different rules. Only
+``control.py`` writes to it: the route handlers are handed the ``ControlPlane``, not this store.
 """
 
 from __future__ import annotations

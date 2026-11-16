@@ -4,8 +4,10 @@ Every method takes the tenant and the ``actor``, a Slack user ID that the caller
 got from a verified identity and never from a request body. A method raises
 ``Forbidden`` when the actor's role does not allow the action, and otherwise
 makes the change and writes one audit event for it. This is the only module
-besides the stores themselves that calls their write methods; the write methods are named
-so that a test can find every call. Two things change state without passing through here,
+besides the stores themselves that calls their write methods. No test checks
+that; it holds by construction: the route handlers in ``control_api`` and ``web_ui``
+are handed the ``ControlPlane`` and no write store, so they can only change state
+through it. Two things change state without passing through here,
 each on purpose: the host operator's command ``python -m agentos.switches``, which must
 work with the console down and has no tenant file or role to check (it calls the same
 ``switches.set_switch`` in its own audited transaction, as ``operator:<login>``), and the

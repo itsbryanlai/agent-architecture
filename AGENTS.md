@@ -30,7 +30,7 @@ Run from the repository root.
     uv run ruff check .
     uv run ruff format --check .
     bash -n scripts/setup-wizard.sh
-    docker compose config --quiet
+    docker compose config --quiet       # needs AGENTOS_OWNER_DB_PASSWORD and AGENTOS_APP_DB_PASSWORD set (any value for the syntax check)
     uv run pytest <the test files for the change> -v
     uv run pytest tests/pg -m pg -v     # needs the Compose Postgres on 127.0.0.1:55432
     uv run python scripts/record_replay_fixtures.py --check
@@ -51,9 +51,9 @@ Before writing a test:
 
 What a test may assert:
 
-4. Never the text of a file: no `read_text()` of SQL, source, templates, README or config; no AST scans. Run SQL in the `pg` tier. What may be committed is checked when committing, not by a test.
+4. Never the text of a file: no `read_text()` of SQL, source, templates, README or config; no AST scans. Run SQL in the `pg` tier. What may be committed is checked when committing, not by a test. One exception: the activity-gate structural test in `tests/core/test_agent_gate.py`, which the design requires.
 5. Never a fake's own logic. A test whose subject is an `InMemory*` or `Fake*` class is deleted. Store behaviour is one contract suite, parametrized over the fake and the real store.
-6. Never a constant, a default or shipped config content. Test the mechanism that reads it, with one input.
+6. Never a constant, a default or shipped config content. Test the mechanism that reads it, with one input. One exception: `test_the_shipped_agent_files_still_parse` checks that the shipped example files parse.
 7. Never internals: no private attributes, no idempotency-key strings, no positional constructor arguments of a mock. Assert what a user, Slack, Notion or the database would see.
 8. The body proves the name. A test called "survives continue-as-new" performs a continue-as-new. "No content" asserts the exact text. No `or` in an assertion.
 9. Absence needs a settle point. To assert "only one" or "nothing posted", first cause a later observable event (a sentinel message and its reply), then count. Never right after the first event, never after a sleep.

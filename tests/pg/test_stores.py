@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -33,6 +33,7 @@ from agentos.stores import (
 )
 from agentos.switches import PostgresSwitchStore
 from agentos.tenant_store import PostgresTenantStore
+from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
 from agentos.usage import PostgresUsageStore, UsageEvent
 from tests.conftest import agents_dict
 from tests.pg.conftest import TestDatabase
@@ -549,3 +550,30 @@ async def test_external_writes_refuse_delete_and_a_row_for_another_tenant(
                 "VALUES (%s, 'x', 'claimed', now(), 't')",
                 (other_tenant,),
             )
+
+
+async def test_a_thread_keeps_the_agent_it_was_last_handed_to(pool, tenant: str, other_tenant: str):
+    """Fails if a thread forgets its specialist, or one tenant reads another's thread."""
+    store = PostgresThreadStore(pool)
+    assert await store.agent_for(tenant, f"{tenant}:thread:C1:1.0") is None
+    await store.set_agent(tenant, f"{tenant}:thread:C1:1.0", "it-helper", NOW)
+    await store.set_agent(tenant, f"{tenant}:thread:C1:1.0", "hr-helper", NOW + timedelta(days=1))
+    assert await store.agent_for(tenant, f"{tenant}:thread:C1:1.0") == "hr-helper"
+    assert await store.agent_for(other_tenant, f"{tenant}:thread:C1:1.0") is None
+
+
+async def test_the_owner_is_mentioned_once_a_day_per_agent_place_and_asker(
+    pool, tenant: str, other_tenant: str
+):
+    """Fails if a second refusal on the same UTC day mentions the owner again, or a new day, asker,
+    place or tenant is held back by another's mention."""
+    store = PostgresOwnerPingStore(pool)
+    day = date(2026, 11, 16)
+    assert await store.claim(tenant, "a", "C1", "U1", day) is True
+    assert await store.claim(tenant, "a", "C1", "U1", day) is False
+    assert await store.claim(tenant, "a", "C1", "U1", day - timedelta(days=1)) is False
+    assert await store.claim(tenant, "a", "C1", "U2", day) is True
+    assert await store.claim(tenant, "a", "C2", "U1", day) is True
+    assert await store.claim(tenant, "b", "C1", "U1", day) is True
+    assert await store.claim(other_tenant, "a", "C1", "U1", day) is True
+    assert await store.claim(tenant, "a", "C1", "U1", day + timedelta(days=1)) is True

@@ -1,6 +1,6 @@
 import pytest
 
-from agentos.config import ConfigError, parse_agents_config
+from agentos.config import ConfigError, agent_definition, parse_agent, parse_agents_config
 from tests.conftest import agents_dict
 
 
@@ -44,3 +44,24 @@ def test_bad_admins_are_rejected_with_the_tenant_named(admins, fragment):
         parse_agents_config(raw)
     assert "acme" in str(exc.value)
     assert fragment in str(exc.value)
+
+
+def _helper(**over) -> dict:
+    return {**agents_dict()["agents"]["it-helper"], **over}
+
+
+@pytest.mark.parametrize(("given", "limit"), [(None, 2), (1, 1), (10, 10)])
+def test_max_writes_per_turn_defaults_to_two_and_round_trips(given, limit):
+    """Fails if the write limit is lost between the definition and the agent, or a default is stored."""
+    agent = parse_agent("it-helper", _helper(max_writes_per_turn=given), 1)
+
+    assert agent.max_writes_per_turn == limit
+    assert ("max_writes_per_turn" in agent_definition(agent)) == (limit != 2)
+    assert parse_agent("it-helper", agent_definition(agent), 1) == agent
+
+
+@pytest.mark.parametrize("bad", [0, 11, -1, 2.5, "3", True, [2]], ids=repr)
+def test_max_writes_per_turn_outside_one_to_ten_is_refused(bad):
+    """Fails if a limit that is no whole number from 1 to 10 is accepted."""
+    with pytest.raises(ConfigError, match="max_writes_per_turn"):
+        parse_agent("it-helper", _helper(max_writes_per_turn=bad), 1)

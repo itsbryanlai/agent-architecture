@@ -109,7 +109,8 @@ async def test_two_messages_same_text_both_stored(harness):
     assert users == [["same"], ["same"]]
 
 
-async def test_failed_finalize_after_reply_stored_no_double_assistant(harness):
+async def test_failed_finalize_stores_only_the_failure_notice_never_a_reply_nobody_saw(harness):
+    """Fails if history keeps an answer Slack refused to show, or stores two assistant turns."""
     h = harness
     h.llm.queue(LLMResponse(text="The answer", tool_calls=[], stop_reason="end_turn"))
     h.slack.fail_next_update(ValueError("slack down"))
@@ -125,8 +126,8 @@ async def test_failed_finalize_after_reply_stored_no_double_assistant(harness):
     roles = [m["role"] for m in stored]
     assert roles == ["user", "assistant"]
     assert all(a != b for a, b in itertools.pairwise(roles))
-    assert text_of(stored[1]) == ["The answer"]
-    assert not any(TURN_FAILED in text_of(m) for m in stored)
+    assert text_of(stored[1]) == [TURN_FAILED]
+    assert not any("The answer" in text_of(m) for m in stored)
 
 
 async def test_post_once_logs_possible_duplicate(agents, caplog):

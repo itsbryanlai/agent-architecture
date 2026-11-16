@@ -327,6 +327,8 @@ NOT_GATED = {
     "update_card": "must still run to tell the requester the agent is off",
     "record_hand_off": "audit row of a hand-off that already happened",
     "record_audience_refusal": "audit row of a refusal",
+    "thread_agent": "reads which agent owns a thread; the workflow needs it to start a turn",
+    "remember_thread_agent": "stores which agent a thread was handed to; no model or connector",
 }
 
 

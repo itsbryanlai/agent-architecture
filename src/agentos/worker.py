@@ -86,7 +86,7 @@ def build_llm(settings: Settings) -> LLMClient:
     return AnthropicLLMClient(settings.require("anthropic_api_key"), settings.model)
 
 
-def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | None:
+def build_embedder(settings: Settings, tenants: TenantsConfig, http_client=None) -> Embedder | None:
     """Build the embedder, only when some published agent of any tenant has a Notion page grant.
 
     ``tenants`` carries each tenant's published agents (``published_tenants``).
@@ -109,12 +109,14 @@ def build_embedder(settings: Settings, tenants: TenantsConfig) -> Embedder | Non
             settings.embed_base_url,
             settings.embed_model,
             EMBED_DIMENSIONS,
+            http_client=http_client,
         )
     return OpenAICompatibleEmbedder(
         settings.require("qwen_api_key"),
         settings.require("qwen_base_url"),
         settings.embed_model,
         EMBED_DIMENSIONS,
+        http_client=http_client,
     )
 
 

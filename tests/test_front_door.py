@@ -77,7 +77,7 @@ def front_door_dict(concierge_steps: int = 4) -> dict:
 
 
 @asynccontextmanager
-async def running(raw: dict):
+async def running(raw: dict, interceptors=()):
     config = parse_agents_config(raw)
     wf_env = await WorkflowEnvironment.start_time_skipping()
     h = Harness(
@@ -109,6 +109,7 @@ async def running(raw: dict):
         task_queue=TASK_QUEUE,
         workflows=[ConversationWorkflow, TaskWorkflow],
         activities=acts.all(),
+        interceptors=list(interceptors),
     )
     async with worker:
         try:

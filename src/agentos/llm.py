@@ -10,6 +10,13 @@ Chat history and tool definitions are always in Anthropic Messages format. The
 Qwen client translates them to OpenAI format on the way out and translates the
 reply back, so nothing outside this module knows which provider is in use.
 
+Tool-call IDs are made by the model's server and are only unique in its own reply: an
+OpenAI-compatible endpoint may call the first tool ``call_0`` in every reply. Everything
+the runtime keys by an ID (stored tool output, the audit row of a call, a result in
+history) would then find an earlier step's row. So each client namespaces the IDs of a
+reply with a prefix of its own on the way in, and removes the prefix on the way out, so the
+server sees only the IDs it made.
+
 Each real client imports its SDK inside ``__init__``, so importing this module
 never needs an SDK to initialise and never fails for a missing key. Keys are
 passed in by the caller from settings and are never read, logged or printed
@@ -20,6 +27,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import uuid
 from typing import Protocol
 
 from agentos.models import LLMResponse, ToolCall, Usage
@@ -34,6 +43,51 @@ SDK_MAX_RETRIES = 0
 
 # Upper bound on tokens the model may generate per call, for every provider.
 MAX_TOKENS = 3072
+
+
+_NAMESPACED = re.compile(r"^t[0-9a-f]{8}-")
+
+
+def namespace_tool_calls(resp: LLMResponse) -> LLMResponse:
+    """``resp`` with every tool-call ID prefixed by one that no other reply has."""
+    if not resp.tool_calls:
+        return resp
+    prefix = f"t{uuid.uuid4().hex[:8]}-"
+    content = [
+        {**block, "id": prefix + block["id"]} if block.get("type") == "tool_use" else block
+        for block in resp.content
+    ]
+    calls = [ToolCall(prefix + c.id, c.name, c.input, c.kind, c.problem) for c in resp.tool_calls]
+    return LLMResponse(
+        text=resp.text,
+        tool_calls=calls,
+        stop_reason=resp.stop_reason,
+        content=content,
+        usage=resp.usage,
+    )
+
+
+def server_id(call_id: str) -> str:
+    """The tool-call ID as the model's server made it."""
+    return _NAMESPACED.sub("", call_id, count=1)
+
+
+def _for_server(messages: list[dict]) -> list[dict]:
+    """``messages`` with the tool-call IDs the server made, not the namespaced ones."""
+    out: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    block = {**block, "id": server_id(block["id"])}
+                elif isinstance(block, dict) and block.get("type") == "tool_result":
+                    block = {**block, "tool_use_id": server_id(block["tool_use_id"])}
+                blocks.append(block)
+            message = {**message, "content": blocks}
+        out.append(message)
+    return out
 
 
 class LLMClient(Protocol):
@@ -63,12 +117,12 @@ class AnthropicLLMClient:
             "model": self._model,
             "max_tokens": MAX_TOKENS,
             "system": system,
-            "messages": messages,
+            "messages": _for_server(messages),
         }
         if tools:
             kwargs["tools"] = tools
         resp = await self._client.messages.create(**kwargs)
-        return to_llm_response(resp)
+        return namespace_tool_calls(to_llm_response(resp))
 
 
 def to_llm_response(resp) -> LLMResponse:
@@ -156,7 +210,7 @@ class QwenLLMClient:
         if tools:
             kwargs["tools"] = to_openai_tools(tools)
         resp = await self._client.chat.completions.create(**kwargs)
-        return from_openai_response(resp)
+        return namespace_tool_calls(from_openai_response(resp))
 
 
 def to_openai_tools(tools: list[dict]) -> list[dict]:
@@ -200,7 +254,7 @@ def _user_to_openai(content) -> list[dict]:
             out.append(
                 {
                     "role": "tool",
-                    "tool_call_id": block["tool_use_id"],
+                    "tool_call_id": server_id(block["tool_use_id"]),
                     "content": _tool_result_text(block),
                 }
             )
@@ -224,7 +278,7 @@ def _assistant_to_openai(content) -> dict:
         elif kind == "tool_use":
             calls.append(
                 {
-                    "id": block["id"],
+                    "id": server_id(block["id"]),
                     "type": "function",
                     "function": {
                         "name": block["name"],

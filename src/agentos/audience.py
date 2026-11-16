@@ -66,6 +66,9 @@ class AudienceDecision:
     reason: str = OK
     # The agent's creator, who the refusal tells the asker to ask. Set on a refusal.
     owner: str | None = None
+    # Whether the reply mentions the owner. Off when the owner was already mentioned today
+    # for this asker in this place; the reply then names the owner without a mention.
+    notify_owner: bool = True
 
 
 # --- the audience in force -------------------------------------------------------------
@@ -282,11 +285,13 @@ def _mention(owner: str | None) -> str:
     return "a workspace admin"
 
 
-def refusal_text(agent_name: str, owner: str | None) -> str:
-    """The one fixed reply to an asker outside the audience. The name is escaped."""
-    return (
-        f"{escape_slack(agent_name)} isn't available to you here. Ask {_mention(owner)} for access."
-    )
+def refusal_text(agent_name: str, owner: str | None, notify_owner: bool = True) -> str:
+    """The one fixed reply to an asker outside the audience. The name is escaped.
+
+    With ``notify_owner`` off the owner is named without a mention, which would page them.
+    """
+    who = _mention(owner) if notify_owner or not owner else "the agent's owner"
+    return f"{escape_slack(agent_name)} isn't available to you here. Ask {who} for access."
 
 
 def unavailable_text(agent_name: str) -> str:
@@ -318,7 +323,7 @@ def decision_text(agent_name: str, decision: AudienceDecision) -> str:
         return paused_text(agent_name)
     if decision.reason == OFF:
         return agent_off_text(escape_slack(agent_name))
-    return refusal_text(agent_name, decision.owner)
+    return refusal_text(agent_name, decision.owner, decision.notify_owner)
 
 
 # --- refusals of the control plane -----------------------------------------------------

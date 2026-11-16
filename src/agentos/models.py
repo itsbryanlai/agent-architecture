@@ -69,11 +69,23 @@ class TurnContext:
     channel_kind: str
 
 
+# ``ToolCall.kind`` of a tool that only reads. A write's kind is the task that carries it out,
+# one of the keys of ``EDITABLE_FIELDS``.
+READ_KIND = "read"
+
+
 @dataclass
 class ToolCall:
     id: str
     name: str
     input: dict
+    # What the connector manifests say about this call, set by the ``call_llm`` activity and
+    # never by the model: ``kind`` is "read", the kind of task a write becomes
+    # ("create_item", "add_comment"), or "" for a tool no manifest offers; ``problem`` is why
+    # the input does not fit the tool's schema, worded for the model. Both are empty on a call
+    # recorded before they existed.
+    kind: str = ""
+    problem: str = ""
 
 
 @dataclass

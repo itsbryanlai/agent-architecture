@@ -271,3 +271,57 @@ def test_build_llm_selects_provider(monkeypatch):
     )
     assert isinstance(worker.build_llm(qwen_settings), FakeQwenClient)
     assert built[1] == ("qwen", ("k", "http://fake.invalid", "qwen3.7-plus", False))
+
+
+class FakeAnthropic:
+    """Stands in for ``AsyncAnthropic``: records each create call, answers with a tool call."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        block = SimpleNamespace(
+            type="tool_use",
+            id="toolu_1",
+            name="search_items",
+            input={"query": "x"},
+            model_dump=lambda **_: {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "search_items",
+                "input": {"query": "x"},
+            },
+        )
+        self._response = SimpleNamespace(content=[block], stop_reason="tool_use", usage=None)
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._response
+
+
+async def test_anthropic_tool_call_ids_are_namespaced_for_us_and_plain_for_the_server():
+    """Fails if two replies share a tool-call ID in history, or the server is sent an ID it did not make."""
+    from agentos.llm import AnthropicLLMClient
+
+    fake = FakeAnthropic()
+    client = AnthropicLLMClient.__new__(AnthropicLLMClient)
+    client._client, client._model = fake, "claude-test"
+
+    first = await client.complete("sys", [{"role": "user", "content": "hi"}], TOOLS)
+    second = await client.complete("sys", [{"role": "user", "content": "hi"}], TOOLS)
+
+    [one], [two] = first.tool_calls, second.tool_calls
+    assert one.id != two.id and one.id.endswith("-toolu_1") and two.id.endswith("-toolu_1")
+    assert first.content[0]["id"] == one.id
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": first.content},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": one.id, "content": "found"}],
+        },
+    ]
+    await client.complete("sys", history, TOOLS)
+    sent = fake.calls[-1]["messages"]
+    assert sent[1]["content"][0]["id"] == "toolu_1"
+    assert sent[2]["content"][0]["tool_use_id"] == "toolu_1"
+    assert history[1]["content"][0]["id"] == one.id, "the stored history is not rewritten"

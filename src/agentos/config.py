@@ -352,6 +352,9 @@ class ApprovalPolicy:
     reminder_after_hours: int = 24
 
 
+DEFAULT_MAX_WRITES_PER_TURN = 2
+MAX_WRITES_PER_TURN_RANGE = (1, 10)
+
 # Slack IDs: C for a public channel, G for a private one, S for a user group.
 _CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
 _USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
@@ -396,6 +399,9 @@ class AgentVersion:
     audience: Audience | None = None
     # An optional label the usage page groups cost by. Empty means no team.
     team: str = ""
+    # How many writes (each an approval card) one model reply may start; the rest of its
+    # write calls get an error result.
+    max_writes_per_turn: int = DEFAULT_MAX_WRITES_PER_TURN
 
 
 @dataclass
@@ -479,6 +485,7 @@ _AGENT_KEYS = frozenset(
         "description",
         "system_prompt",
         "max_steps",
+        "max_writes_per_turn",
         "grants",
         "follow_up",
         "approval",
@@ -657,6 +664,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         specialists=_parse_specialists(where, raw.get("specialists")),
         audience=_parse_audience(where, raw.get("audience")),
         team=_parse_team(where, raw.get("team")),
+        max_writes_per_turn=_parse_max_writes(where, raw.get("max_writes_per_turn")),
     )
 
 
@@ -688,6 +696,8 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
             entry["property_ids"] = property_ids
         databases.append(entry)
     optional: dict[str, Any] = {"team": agent.team} if agent.team else {}
+    if agent.max_writes_per_turn != DEFAULT_MAX_WRITES_PER_TURN:
+        optional["max_writes_per_turn"] = agent.max_writes_per_turn
     definition: dict[str, Any] = {
         "name": agent.name,
         "description": agent.description,
@@ -796,6 +806,18 @@ def channel_audience_problems(
 
 
 MAX_TEAM_LENGTH = 64
+
+
+def _parse_max_writes(where: str, raw: Any) -> int:
+    """The ``max_writes_per_turn`` limit: a whole number from 1 to 10, or absent for the default."""
+    if raw is None:
+        return DEFAULT_MAX_WRITES_PER_TURN
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"{where}: 'max_writes_per_turn' must be a whole number")
+    if not MAX_WRITES_PER_TURN_RANGE[0] <= raw <= MAX_WRITES_PER_TURN_RANGE[1]:
+        low, high = MAX_WRITES_PER_TURN_RANGE
+        raise ConfigError(f"{where}: 'max_writes_per_turn' must be from {low} to {high}")
+    return raw
 
 
 def _parse_team(where: str, raw: Any) -> str:

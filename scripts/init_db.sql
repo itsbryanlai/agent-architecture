@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 024 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 025 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -790,6 +790,55 @@ ALTER TABLE kill_switches DROP CONSTRAINT IF EXISTS kill_switches_agent_target_p
 ALTER TABLE kill_switches ADD CONSTRAINT kill_switches_agent_target_pattern
   CHECK (scope <> 'agent' OR target ~ '^[a-z][a-z0-9-]{1,39}$');
 
+-- Thread agents and owner mentions. Same as migration 025.
+CREATE TABLE IF NOT EXISTS threads (
+  tenant_id   text        NOT NULL,
+  thread_key  text        NOT NULL,
+  agent_id    text        NOT NULL,
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, thread_key)
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON threads FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON threads TO agentos_app;
+
+ALTER TABLE threads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE threads FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON threads;
+CREATE POLICY tenant_isolation ON threads
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+CREATE TABLE IF NOT EXISTS owner_pings (
+  tenant_id      text NOT NULL,
+  agent_id       text NOT NULL,
+  channel        text NOT NULL,
+  asker_user_id  text NOT NULL,
+  notified_on    date NOT NULL,   -- UTC day of the last mention
+  PRIMARY KEY (tenant_id, agent_id, channel, asker_user_id)
+);
+
+GRANT USAGE ON SCHEMA public TO agentos_app;
+REVOKE ALL ON owner_pings FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON owner_pings TO agentos_app;
+
+ALTER TABLE owner_pings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE owner_pings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON owner_pings;
+CREATE POLICY tenant_isolation ON owner_pings
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Agent IDs in the thread tables follow the pattern of migration 023.
+ALTER TABLE threads DROP CONSTRAINT IF EXISTS threads_agent_id_pattern;
+ALTER TABLE threads ADD CONSTRAINT threads_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
+ALTER TABLE owner_pings DROP CONSTRAINT IF EXISTS owner_pings_agent_id_pattern;
+ALTER TABLE owner_pings ADD CONSTRAINT owner_pings_agent_id_pattern
+  CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$');
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -801,5 +850,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('023'), ('024')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('023'), ('024'), ('025')
 ON CONFLICT DO NOTHING;

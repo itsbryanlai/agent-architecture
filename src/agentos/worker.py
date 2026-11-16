@@ -59,6 +59,7 @@ from agentos.switches import PostgresSwitchStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
 from agentos.tenants import RegistrySync, build_registry, require_tenant_secret
+from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
@@ -332,6 +333,8 @@ async def main() -> None:
             pauses=pauses,
             switches=switches,
             external_writes=PostgresExternalWriteStore(pool),
+            threads=PostgresThreadStore(pool),
+            owner_pings=PostgresOwnerPingStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

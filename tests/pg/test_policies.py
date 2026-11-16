@@ -56,6 +56,10 @@ SEEDS = {
     "grant_picks": "INSERT INTO grant_picks "
     "(tenant_id, agent_id, notion_id, kind, picked_by, picked_at) "
     "VALUES (%(t)s, 'aa', 'n', 'page', 'u', now())",
+    "threads": "INSERT INTO threads (tenant_id, thread_key, agent_id) VALUES (%(t)s, 'k', 'aa')",
+    "owner_pings": "INSERT INTO owner_pings "
+    "(tenant_id, agent_id, channel, asker_user_id, notified_on) "
+    "VALUES (%(t)s, 'aa', 'C1', 'u', '2026-11-16')",
     "external_writes": "INSERT INTO external_writes "
     "(tenant_id, idem_key, state, lease_until, lease_token) "
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
@@ -86,6 +90,8 @@ PRIVILEGES = {
     "tenants": "SELECT INSERT UPDATE",
     "external_writes": "SELECT INSERT UPDATE",
     "grant_picks": "SELECT INSERT UPDATE",
+    "threads": "SELECT INSERT UPDATE",
+    "owner_pings": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }

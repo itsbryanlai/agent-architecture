@@ -716,11 +716,13 @@ in `members`; the app role can delete rows there, and the audit log keeps the
 record. **A tenant with no `admins` can publish nothing**, because only an admin
 can publish.
 
-A refused action is not audited yet. Run `uv run python scripts/migrate.py` on an existing database.
+A refused control-plane action is not audited; the refusals that are (`audience_refused`, and a refused write recorded as `approval` then `write` with an error) are listed in [audit-events.md](audit-events.md). Run `uv run python scripts/migrate.py` on an existing database.
 
 ## Audit log
 
 What the audit log records, and how it is kept append-only, is in [architecture.md §10](architecture.md#10-data-and-storage). Audit rows are exempt from retention: they are kept until someone removes them outside the app.
+
+Every event kind, what it records and how to read it: [audit-events.md](audit-events.md).
 
 Print a tenant's events, newest first, as JSON lines:
 

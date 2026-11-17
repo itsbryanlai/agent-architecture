@@ -573,6 +573,8 @@ has not yet delivered is never purged.
 
 ## Run
 
+`scripts/dev-up.sh` starts all of this, the tunnels and the console in one command: see [local-run.md](local-run.md). By hand:
+
 ```bash
 docker compose up -d                                   # Postgres + Temporal
 uv run python -m agentos.worker                        # terminal 1
@@ -930,7 +932,7 @@ database password in `AGENTOS_DATABASE_URL` is empty or a development default.
 
 ## Slack tunnel and live checks
 
-The gateway is reached through a tunnel (`cloudflared tunnel --url http://localhost:8000` or `ngrok`). A quick tunnel's URL changes on every restart and it can drop after a laptop sleep or a network change, after which Slack messages get no reply. Check it before a live run:
+The gateway is reached through a tunnel (`cloudflared tunnel --url http://127.0.0.1:8000` or `ngrok`). A quick tunnel's URL changes on every restart and it can drop after a laptop sleep or a network change, after which Slack messages get no reply. Check it before a live run:
 
 ```bash
 curl -s <tunnel URL>/healthz      # expect {"ok":true}

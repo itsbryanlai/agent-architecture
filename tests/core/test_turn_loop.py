@@ -134,10 +134,10 @@ async def test_failing_placeholder_post_still_gets_a_reply(harness):
     h = harness
     real_post = h.slack.post_message
 
-    async def post(channel, text, thread_ts=None, blocks=None):
+    async def post(channel, text, thread_ts=None, blocks=None, metadata=None):
         if text == "Thinking…":
             raise ValueError("slack refused")
-        return await real_post(channel, text, thread_ts=thread_ts, blocks=blocks)
+        return await real_post(channel, text, thread_ts=thread_ts, blocks=blocks, metadata=metadata)
 
     h.slack.post_message = post  # type: ignore[method-assign]
 

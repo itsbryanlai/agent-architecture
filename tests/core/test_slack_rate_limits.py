@@ -16,7 +16,13 @@ from agentos.audit import InMemoryAuditStore
 from agentos.config import Settings, parse_agents_config
 from agentos.llm import ScriptedLLMClient
 from agentos.models import TurnContext
-from agentos.slack_client import FakeSlack, RealSlackPoster, SlackLookupError
+from agentos.slack_client import (
+    FakeSlack,
+    RealSlackPoster,
+    SlackHistoryUnavailable,
+    SlackLookupError,
+    post_metadata,
+)
 from agentos.stores import (
     InMemoryHistoryStore,
     InMemoryIdempotencyStore,
@@ -37,9 +43,12 @@ class FakeSlackServer:
     def __init__(self, script: list[tuple[int, str | None, dict]]):
         self.script = list(script)
         self.requests: list[str] = []
+        self.sent: list[dict] = []  # what each request carried, in the body or the query
 
     async def handle(self, request: web.Request) -> web.Response:
         self.requests.append(request.match_info["method"])
+        body = await request.json() if request.content_type == "application/json" else {}
+        self.sent.append({**dict(await request.post()), **body, **request.query})
         status, retry_after, body = self.script[0] if len(self.script) == 1 else self.script.pop(0)
         headers = {"Retry-After": retry_after} if retry_after is not None else {}
         return web.json_response(body, status=status, headers=headers)
@@ -155,3 +164,38 @@ async def test_post_waits_out_one_rate_limit(serve, no_waiting):
 
     assert await poster.post_message("C1", "hi") == "1.2"
     assert server.requests == ["chat.postMessage", "chat.postMessage"]
+
+
+@pytest.mark.parametrize("thread_ts", ["1.1", None], ids=["thread post", "top-level post"])
+async def test_a_post_is_marked_and_looked_up_with_metadata_over_the_wire(serve, thread_ts):
+    """Fails if the client stops sending the marker with a post, or reads history without asking for metadata."""
+    marker = post_metadata("m1")
+    found = {"ts": "5.5", "metadata": marker}
+    server, url = await serve(
+        [
+            (200, None, {"ok": True, "ts": "5.5"}),
+            (200, None, {"ok": True, "messages": [{"ts": "4.4"}, found]}),
+        ]
+    )
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    await poster.post_message("C1", "hi", thread_ts=thread_ts, metadata=marker)
+    ts = await poster.find_post("C1", thread_ts, "m1", since=1700000000.0)
+
+    assert server.sent[0]["metadata"] == marker
+    assert server.requests[1] == ("conversations.replies" if thread_ts else "conversations.history")
+    assert str(server.sent[1]["include_all_metadata"]).lower() in ("1", "true")
+    assert ts == "5.5"
+
+
+async def test_a_history_read_refused_for_a_missing_scope_names_the_scope(serve):
+    """Fails if Slack's missing_scope answer to a history read is not reported with the scope it names."""
+    _, url = await serve(
+        [(200, None, {"ok": False, "error": "missing_scope", "needed": "channels:history"})]
+    )
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    with pytest.raises(SlackHistoryUnavailable) as refused:
+        await poster.find_post("C1", None, "m1", since=1700000000.0)
+
+    assert (refused.value.code, refused.value.scope) == ("missing_scope", "channels:history")

@@ -33,6 +33,8 @@ uv run python -m agentos.worker                        # terminal 1
 uv run uvicorn agentos.gateway.app:app --port 8000     # terminal 2
 ```
 
+To run everything (Docker, migrations, tunnels, worker, gateway, console) with one command, see [`docs/local-run.md`](docs/local-run.md).
+
 Keep your tunnel pointed at port 8000. The Temporal web UI is at <http://localhost:8233>. DM the bot, or @mention it in a channel it has been invited to.
 
 ## Restart demo: exactly once, and follow-up that survives a crash

@@ -59,7 +59,7 @@ from agentos.switches import InMemorySwitchStore
 from agentos.temporal_client import tenant_data_converter
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, UsageEvent
-from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
@@ -445,6 +445,21 @@ async def audience_refusal(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def failed_turn(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(112 if stored else 111)
+    await start_conversation(r, "gone", thread, "hello", stored=stored)
+    await answered(r)
+    assert TURN_FAILED in said_text(r)
+    if stored:
+        # The discard runs after the failure notice; the history must hold it.
+        async def consumed() -> bool:
+            row = await r.acts.content.get_inbound(TENANT, f"Ev-{thread}")
+            return row is not None and bool(row.get("consumed"))
+
+        await eventually(consumed, timeout=30)
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 async def budget_stop(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(42 if stored else 41)
     await r.budgets.set_budget(TENANT, "hr-helper", Decimal(2), ADMIN)
@@ -619,6 +634,7 @@ for _name, _fn in {
     "hand_off": hand_off,
     "knowledge_answer": knowledge_answer,
     "audience_refusal": audience_refusal,
+    "failed_turn": failed_turn,
     "budget_stop": budget_stop,
     "switch_off": switch_off,
     "conversation_hop": conversation_hop,

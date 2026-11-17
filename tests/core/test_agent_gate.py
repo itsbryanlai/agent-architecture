@@ -330,6 +330,7 @@ NOT_GATED = {
     "thread_agent": "reads which agent owns a thread; the workflow needs it to start a turn",
     "remember_thread_agent": "stores which agent a thread was handed to; no model or connector",
     "ingest_message": "moves the text a person wrote from the inbound event into history",
+    "discard_message": "clears the inbound event's text when a turn ended before ingest; no model, connector or post",
     "finalize_model_reply": "posts the reply or the fixed off notice that call_model stored",
     "apply_edit": "stores the requester's saved edit as the next draft revision; no model or connector",
     "post_task_notice": "posts a fixed line about a task in its thread; no agent effect",

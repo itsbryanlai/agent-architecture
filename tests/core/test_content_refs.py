@@ -40,10 +40,12 @@ from agentos.models import (
     ToolCall,
     TurnContext,
 )
+from agentos.slack_client import SlackLookupError
 from agentos.stores import InMemoryTaskLinkStore
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, title_prop
+from tests.helpers.agents import helper_block, make_published
 from tests.helpers.conversation import stored_history
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event, signed_headers
 
@@ -656,4 +658,52 @@ async def test_a_retried_ingest_and_a_retried_edit_after_the_content_was_cleared
     ]
 
     assert again == [True, True]
+    assert len(await h.history.load(TENANT, CONV_ID)) == 1
+
+
+@pytest.mark.parametrize("ending", ["agent_missing", "audience_refused", "lookups_down"])
+async def test_a_turn_that_ends_before_ingest_clears_the_inbound_text(harness, ending):
+    """Fails if a turn that ends before ingest leaves the message text in inbound_events."""
+    h = harness
+    agent = "it-helper"
+    if ending == "agent_missing":
+        agent = "gone"
+        terminal = TURN_FAILED
+    elif ending == "audience_refused":
+        agent = "unlisted"
+        await make_published(h.agent_store, agent, helper_block())
+        terminal = "isn't available"
+    else:
+        h.slack.fail_lookups(SlackLookupError("slack_down", transient=False))
+        terminal = "couldn't check"
+    msg = await stored_message(h, "Ev1", S_USER)
+    await h.client.start_workflow(
+        ConversationWorkflow.run,
+        ConversationRef(TENANT, agent, CHANNEL, THREAD),
+        id=CONV_ID,
+        task_queue=TASK_QUEUE,
+        start_signal="message",
+        start_signal_args=[msg],
+    )
+    await eventually(lambda: any(terminal in p["text"] for p in h.slack.posts()))
+
+    async def consumed() -> bool:
+        row = await h.acts.content.get_inbound(TENANT, "Ev1")
+        return row is not None and bool(row.get("consumed"))
+
+    await eventually(consumed)
+    row = await h.acts.content.get_inbound(TENANT, "Ev1")
+    assert "text" not in row
+
+
+async def test_discarding_an_already_ingested_message_keeps_what_a_retried_ingest_reads(harness):
+    """Fails if discarding an already-ingested message overwrites the row ingest's retry reads."""
+    h = harness
+    await stored_message(h, "Ev1", "words")
+    env = ActivityEnvironment()
+
+    assert await env.run(h.acts.ingest_message, TENANT, CONV_ID, "Ev1") is True
+    await env.run(h.acts.discard_message, TENANT, "Ev1")
+
+    assert await env.run(h.acts.ingest_message, TENANT, CONV_ID, "Ev1") is True
     assert len(await h.history.load(TENANT, CONV_ID)) == 1

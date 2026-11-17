@@ -134,6 +134,7 @@ PATCH_STORE_AFTER_SHOWN = "store-reply-after-shown"
 PATCH_THREAD_AGENT = "thread-agent-row"
 # A turn whose message text is in ``inbound_events``: the content-free commands (see the module doc).
 PATCH_CONTENT_REFS = "content-refs"
+PATCH_DISCARD_INBOUND = "discard-unconsumed-inbound"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
@@ -152,6 +153,8 @@ class _TurnState:
         self.handed_off = False
         # True for a turn run on the content-free path: it needs no marker of an older change.
         self.refs = False
+        # True once ingest_message returned: it consumed the inbound row either way.
+        self.ingested = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -250,6 +253,16 @@ class ConversationWorkflow:
             if not (state.refs or workflow.patched(PATCH_CHILD_FAILURE)):
                 raise
             await self._fail_turn(err, ref, m, conv_id, state)
+        if state.refs and not state.ingested and workflow.patched(PATCH_DISCARD_INBOUND):
+            try:
+                await workflow.execute_activity_method(
+                    AgentActivities.discard_message,
+                    args=[ref.tenant_id, m.event_id],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+            except ActivityError as err:
+                self._log_failure(ref, err, "discard inbound")
 
     async def _fail_turn(
         self,
@@ -389,6 +402,7 @@ class ConversationWorkflow:
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
+            state.ingested = True
             if not has_text:
                 await self._reply_empty_message(ctx, m)
                 return

@@ -353,6 +353,7 @@ class AgentActivities:
             self.thread_agent,
             self.remember_thread_agent,
             self.ingest_message,
+            self.discard_message,
             self.call_model,
             self.finalize_model_reply,
             self.run_stored_read_tool,
@@ -995,6 +996,20 @@ class AgentActivities:
         stub = {k: v for k, v in row.items() if k not in ("text", "fields")}
         stub.update(consumed=True, had_text=had_text)
         await self.content.consume_inbound(tenant_id, event_id, stub, self.clock())
+
+    @activity.defn(name="discard_message")
+    async def discard_message(self, tenant_id: str, event_id: str) -> None:
+        """Clear an inbound event's text when its turn ended before ingest.
+
+        A row that is gone or already consumed is left as it is: a consumed row's
+        ``had_text`` is what a retried ingest reads.
+        """
+        self._log("discard_message", tenant_id, "-")
+        self._runtime(tenant_id)
+        row = await self.content.get_inbound(tenant_id, event_id)
+        if row is None or row.get("consumed"):
+            return
+        await self._consume(tenant_id, event_id, row, had_text=False)
 
     @activity.defn(name="call_model")
     async def call_model(self, ctx: TurnContext, conversation_id: str, step_key: str) -> StepResult:

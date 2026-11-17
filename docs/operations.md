@@ -835,6 +835,21 @@ add `channel_shared` (a channel was shared with another organisation), then save
 channels it is a member of. `slack/app-manifest.yaml` lists the same events and
 scopes.
 
+## Slack posts land once
+
+Slack has no idempotency key, so a retried post could appear twice. Each post carries a marker in its message metadata, and a retry that may have posted already looks the message up by that marker before posting again. The lookup reads the thread's replies, or the channel's recent history.
+
+**In the Slack app** (api.slack.com/apps), before relying on it:
+
+1. OAuth & Permissions → Scopes → **Bot Token Scopes**: add `channels:history`,
+   `groups:history` and `mpim:history`. `im:history` is already there.
+2. **Reinstall the app** to the workspace, then export the new bot token to the worker.
+
+Without a scope the worker still posts: a retry that cannot look the message up posts it again
+and logs `possible duplicate Slack post` with the tenant ID and key, and the log names the
+missing scope once per tenant. A public channel the bot has not joined refuses the lookup the
+same way. `slack/app-manifest.yaml` lists the same scopes.
+
 ## Web console
 
 The same process serves web pages for agents, versions, members, usage and the audit log,

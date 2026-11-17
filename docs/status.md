@@ -14,6 +14,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Nightly indexing, on-demand indexing | built | `workflows/indexing.py`, `index_knowledge.py` | A gone granted root waits for three runs or an admin confirmation |
 | Approval card: requester only, nonce, edit, expiry, reminder | built | `workflows/task.py`, `activities.py` | |
 | Exactly-once Notion create and comment | built | `activities.py` (`_write_once`), `external_writes` table | A target whose search lags longer than the look-before-write window can get a second item from a retry (accepted) |
+| Slack posts land once | built | `activities.py` (`_post_once`), `slack_client.py` (`find_post`) | Each post carries a marker in its message metadata and goes through the `external_writes` lease; a retry after a send looks the post up first. Needs the history scopes; without them a retry can repeat a post and logs it. Not yet run against a real workspace |
 | Pending cards stop for agent off, pause or lost audience | built | `activities.py` (`check_before_write`), `workflows/task.py` | |
 | Follow-up on status to "marked Done" | built | `workflows/task.py` | |
 | Long task watch: continue-as-new | built | `workflows/task.py`, `models.py` (`WatchState`) | `WatchState` carries references and small values only; a hop at 1000 events or when Temporal suggests it; a burst of pokes answered once per 60 s |

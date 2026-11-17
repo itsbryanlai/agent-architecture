@@ -33,8 +33,9 @@ agents:
               done_values: [Done]
               requested_by: Requested by
               request_id: Agent request ID
-            # Stable Notion property IDs. Run `uv run python -m agentos.check_grants`
-            # and paste the block it prints; the worker will not start without it.
+            # Stable Notion property IDs. Run `uv run python -m agentos.check_grants
+            # --tenant <tenant> --agent <agent>` on the draft and paste the block it prints;
+            # the worker will not start on a published agent without it.
             property_ids:
               title: title
               status: "<status property id>"

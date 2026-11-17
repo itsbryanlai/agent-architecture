@@ -118,7 +118,12 @@ pause
 stage "Start Postgres and Temporal"
 say "This runs: docker compose up -d"
 note "Postgres on localhost:55432, Temporal on localhost:7233 (web UI on http://localhost:8233)."
-if confirm "Start them now?"; then
+note "Compose needs two database passwords exported in this shell (you choose them; the wizard never reads them):"
+step "export AGENTOS_OWNER_DB_PASSWORD='<choose one>'   AGENTOS_APP_DB_PASSWORD='<choose one>'"
+if [[ -z "${AGENTOS_OWNER_DB_PASSWORD:-}" || -z "${AGENTOS_APP_DB_PASSWORD:-}" ]]; then
+  warn "one of them is not exported, so Compose cannot start Postgres yet"
+  TODO+=("Export AGENTOS_OWNER_DB_PASSWORD and AGENTOS_APP_DB_PASSWORD, then: docker compose up -d")
+elif confirm "Start them now?"; then
   docker compose up -d
   ok "services started"
 else
@@ -216,6 +221,24 @@ if confirm "Write them now?"; then
 else
   TODO+=("Set slack_team_id and the database id in config/agents.yaml")
 fi
+say ""
+say "Tenant settings live in the database. This imports the tenant section of"
+say "config/agents.yaml into the tenants table (a tenant already there is skipped):"
+step "uv run python -m agentos.tenant_store import"
+note "Needs Postgres from stage 2 and AGENTOS_DATABASE_URL exported (see the README, Database and migrations)."
+if [[ -z "${AGENTOS_DATABASE_URL:-}" ]]; then
+  warn "AGENTOS_DATABASE_URL is not exported, so the import cannot run yet"
+  TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+elif confirm "Import the tenant now?"; then
+  if uv run python -m agentos.tenant_store import; then
+    ok "tenant imported"
+  else
+    warn "the import failed; fix the cause above and run it again"
+    TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+  fi
+else
+  TODO+=("Import the tenant: uv run python -m agentos.tenant_store import")
+fi
 pause
 
 # ── 7 ─────────────────────────────────────────────────────────────────────
@@ -241,6 +264,20 @@ printf '\n'
 say "Then, with NOTION_TOKEN exported, check the Notion grant and print its"
 say "property IDs; paste the property_ids block it prints into config/agents.yaml:"
 step "uv run python -m agentos.check_grants"
+printf '\n'
+say "Then import the agents into the database, once. An agent already imported is"
+say "skipped, so do this after the property_ids are in the file:"
+step "uv run python -m agentos.agent_store import"
+printf '\n'
+note "Optional, for the console's Choose from Notion picker (a public Notion integration;"
+note "its redirect URI is <AGENTOS_CONSOLE_URL>/auth/notion/callback; see the README, Web console):"
+step "export NOTION_OAUTH_CLIENT_ID='<paste here>'   NOTION_OAUTH_CLIENT_SECRET='<paste here>'"
+step "export AGENTOS_REQUIRE_GRANT_PICKER=1"
+if [[ -z "${NOTION_OAUTH_CLIENT_ID:-}" || -z "${NOTION_OAUTH_CLIENT_SECRET:-}" ]]; then
+  TODO+=("Optional: export NOTION_OAUTH_CLIENT_ID and NOTION_OAUTH_CLIENT_SECRET (and AGENTOS_REQUIRE_GRANT_PICKER=1), then uv run python scripts/migrate.py for migration 020")
+elif [[ -z "${AGENTOS_REQUIRE_GRANT_PICKER:-}" ]]; then
+  TODO+=("Optional: export AGENTOS_REQUIRE_GRANT_PICKER=1 to refuse grants not picked from Notion")
+fi
 printf '\n'
 say "Then run, each in its own terminal:"
 step "uv run python -m agentos.worker"

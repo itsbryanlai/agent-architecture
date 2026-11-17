@@ -17,8 +17,54 @@ HISTORY_BUDGET_CHARS = 120_000
 TOOL_RESULT_MISSING = "The tool call did not complete."
 
 
+def char_len(message: dict) -> int:
+    """The size of one message, in characters of JSON, as ``window`` counts it.
+
+    The store keeps this number on each row, so the same count is used whether the window
+    is cut in SQL or in memory.
+    """
+    return len(json.dumps(message, ensure_ascii=False))
+
+
 def prepare_for_model(messages: list[dict]) -> list[dict]:
-    return window(close_open_tool_uses(messages))
+    return window(close_open_tool_uses(drop_empty_text(messages)))
+
+
+def _is_blank_text(block: object) -> bool:
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return False
+    text = block.get("text")
+    return not isinstance(text, str) or not text.strip()
+
+
+def drop_empty_text(messages: list[dict]) -> list[dict]:
+    """Remove text blocks with no visible text, and messages left with no content.
+
+    The model rejects an empty text block, for good, and a row written before empty
+    messages were refused stays in the thread. A user message that ends up empty is
+    dropped together with the plain assistant reply that answered it, so the thread
+    still alternates between user and assistant and still starts with the user.
+    """
+    kept: list[dict] = []
+    skip_reply = False
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, str):
+            blank = not content.strip()
+            cleaned = [] if blank else content
+        else:
+            cleaned = [b for b in content if not _is_blank_text(b)]
+            blank = not cleaned
+        if message["role"] == "assistant" and skip_reply:
+            skip_reply = False
+            if not _blocks(message, "tool_use"):
+                continue
+        if blank:
+            skip_reply = message["role"] == "user"
+            continue
+        skip_reply = False
+        kept.append(message if cleaned is content else {**message, "content": cleaned})
+    return kept
 
 
 def _blocks(message: dict, kind: str) -> list[dict]:
@@ -94,7 +140,7 @@ def window(messages: list[dict], budget: int = HISTORY_BUDGET_CHARS) -> list[dic
     is never separated from its tool_result. The newest such message is always
     kept, even when it alone is over budget.
     """
-    sizes = [len(json.dumps(m)) for m in messages]
+    sizes = [char_len(m) for m in messages]
     if sum(sizes) <= budget:
         return messages
     starts = [i for i, m in enumerate(messages) if _starts_a_turn(m)]

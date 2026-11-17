@@ -13,7 +13,7 @@
     <td>{{ e.outcome }}</td>
     <td>{{ e.requester_user_id }}</td>
     <td>{{ e.identity }}</td>
-    <td>{% if e.agent_id %}{{ e.agent_id }} v{{ e.agent_version }}{% endif %}</td>
+    <td>{% if e.agent_id %}{{ e.agent_id }}{% if e.agent_version is not none %} v{{ e.agent_version }}{% endif %}{% endif %}</td>
     <td>{{ e.approver_user_id or "" }}</td>
     <td>{{ e.tool or "" }} {{ e.target or "" }}</td>
     <td>{% if e.input_sha256 %}<code title="{{ e.input_sha256 }}">{{ e.input_sha256[:12] }}</code>{% endif %}</td>

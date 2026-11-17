@@ -1,6 +1,6 @@
 # Product
 
-Status: draft · Last updated 2026-11-06
+Status: draft · Last updated 2026-11-06 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (Confluence and Google Drive, the nudge offer, admin-adjustable approval policy and risk classes, the console's connectors page) are marked `target` there; this document's scope and roadmap are unchanged.
 
 ## One-line pitch
 
@@ -26,7 +26,7 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 
 ### 2. Agent creator (approved only)
 - Typically a team lead or ops person in HR, IT, Sales ops, or Finance. An admin has to grant them the creator role.
-- Configures: name, instructions, **access grants** (which knowledge scopes and actions the agent may use; only scopes the creator can access themselves), approval policy, and the **audience** (which channels and groups can reach it).
+- Configures: name, instructions, **access grants** (which knowledge scopes and actions the agent may use; with the Notion picker configured, only objects the creator's own Notion account can see. Not built yet: the nightly re-check, suspension if they lose access, and the notification), approval policy, and the **audience** (which channels and groups can reach it).
 - Is accountable for the audience: when deploying, they confirm who will be able to see what the agent can access.
 - Needs: a way to test before publishing, and a list of unanswered or failed questions after launch so they know what to fix.
 
@@ -46,7 +46,7 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 ## Product principles
 
 - **Meet people in Slack.** Never send an employee to a portal to finish something.
-- **Agents have their own access, and someone answers for it.** The creator grants access (never more than they have themselves) and decides who can reach the agent. The admin approves.
+- **Agents have their own access, and someone answers for it.** The creator grants access (never more than they have themselves: enforced for Notion by the picker once it is configured; not built yet: the nightly re-check, suspension and notification) and decides who can reach the agent. The admin approves.
 - **Ask before changing anything.** Write actions need approval by default. Only admins can relax that, and only for each action separately.
 - **Always show sources and identity.** Every answer is cited. Every action says whose account it used.
 - **Every agent has an owner.** Like a Slack channel, an agent has a named owner who answers for it.

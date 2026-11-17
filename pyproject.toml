@@ -29,7 +29,13 @@ packages = ["src/agentos"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# One event loop for the session: the shared Temporal test server lives on it.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
+markers = [
+    "pg: runs SQL against a local Postgres (127.0.0.1:55432, throwaway databases); skipped when it is down",
+]
 
 [tool.ruff]
 line-length = 100

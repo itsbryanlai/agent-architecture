@@ -25,6 +25,7 @@
   .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
   .notice { border-left: 4px solid var(--ok); padding: .4rem .8rem; background: #8881; }
   .error { border-left: 4px solid var(--bad); padding: .4rem .8rem; background: #8881; white-space: pre-wrap; }
+  .warn { border-left: 4px solid #b26b00; padding: .4rem .8rem; background: #8881; }
   .muted { color: var(--muted); }
   .status { font-size: 12px; padding: 0 .4rem; border: 1px solid var(--line); border-radius: 3px; }
   code { font-family: ui-monospace, monospace; font-size: 13px; }
@@ -38,8 +39,10 @@
   {% set base = "/ui/" ~ (ctx.tenant_id | urlencode) %}
   <nav>
     <a href="{{ base }}/agents">Agents</a>
+    <a href="{{ base }}/usage">Usage</a>
     {% if ctx.is_admin %}
     <a href="{{ base }}/members">Members</a>
+    <a href="{{ base }}/switches">Switches</a>
     <a href="{{ base }}/audit">Audit</a>
     {% endif %}
   </nav>

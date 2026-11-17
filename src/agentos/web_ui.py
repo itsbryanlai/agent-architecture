@@ -17,11 +17,14 @@ as text.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote
@@ -32,13 +35,26 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from agentos.access_diff import WideningNotAcknowledged
 from agentos.agent_store import PENDING, AgentNotFound
+from agentos.audience import AudienceError
+from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
-from agentos.control import ControlPlane
+from agentos.connectors.notion import normalize_id
+from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
+from agentos.grant_picks import GrantNotPicked
 from agentos.members import ADMIN, CREATOR, ROLES
-from agentos.sessions import SESSION_LIFETIME
+from agentos.notion_picker import (
+    NOTION_CALLBACK_PATH,
+    Flow,
+    NotionPickerError,
+)
+from agentos.notion_picker import (
+    authorize_url as notion_authorize_url,
+)
+from agentos.sessions import SESSION_LIFETIME, session_hash
 from agentos.slack_signin import (
     CALLBACK_PATH,
     LOGIN_COOKIE,
@@ -54,12 +70,15 @@ from agentos.slack_signin import (
     read_session_cookie,
     session_cookie_value,
 )
+from agentos.usage import NO_TEAM
 
 log = logging.getLogger("agentos.web_ui")
 
 CONSOLE_FORM_PREFIXES = ("/ui/", "/logout")
 MAX_FORM_BYTES = 256 * 1024
 AUDIT_PAGE = 50
+# Turning these off stops a whole organisation, so the form asks for a confirmation.
+CONFIRMED_SWITCHES = ("all_agents", "writes")
 
 SKELETON = """\
 name: My agent
@@ -83,9 +102,15 @@ NOTICES = {
     "withdrawn": "Withdrawn; the version is a draft again.",
     "rejected": "Rejected; the version is a draft again.",
     "published": "Published.",
+    "picked": "Recorded. The objects you chose can now be granted in the definition.",
+    "resumed": "Resumed; the agent answers in that channel again.",
     "member-added": "Member added.",
     "member-role": "Role changed.",
     "member-removed": "Member removed.",
+    "budget-set": "Budget saved.",
+    "budget-removed": "Budget removed.",
+    "switch-off": "Turned off. It takes effect on the next step.",
+    "switch-on": "Turned back on.",
 }
 
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -100,7 +125,27 @@ def _stamp(value: datetime | None) -> str:
     return "" if value is None else value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _usd(value: Decimal) -> str:
+    return f"${value:,.4f}"
+
+
+def _usd2(value: Decimal) -> str:
+    return f"${value:,.2f}"
+
+
 _env.filters["stamp"] = _stamp
+# A one-time token for a form that must not repeat, such as a new draft.
+_env.globals["new_token"] = lambda: uuid.uuid4().hex
+_env.globals["pause_reason"] = lambda code: REASON_TEXT.get(code, code)
+_env.filters["usd"] = _usd
+_env.filters["usd2"] = _usd2
+
+
+def recent_months(now: datetime, count: int = 12) -> list[str]:
+    """The current UTC month and the ones before it, newest first, as YYYY-MM."""
+    now = now.astimezone(UTC)
+    index = now.year * 12 + now.month - 1
+    return [f"{(i // 12):04d}-{(i % 12) + 1:02d}" for i in range(index, index - count, -1)]
 
 
 # --- definitions as YAML text ----------------------------------------------------------
@@ -138,6 +183,31 @@ def parse_definition(text: str) -> dict[str, Any]:
     return parsed
 
 
+def grant_rows(agent, review) -> list[dict[str, Any]]:
+    """The version's grants as table rows: the creator's label and ID, who picked each from
+    Notion, and (for an admin, on a draft or pending version) the live title and parent."""
+    live = {}
+    if review is not None and review.reports:
+        live = {normalize_id(r.database_id): r for r in review.reports}
+    picks = {} if review is None else review.picks
+    rows = []
+    for kind, grant in (
+        *(("database", g) for g in agent.grants.notion_databases),
+        *(("page", g) for g in agent.grants.notion_pages),
+    ):
+        key = normalize_id(grant.id)
+        rows.append(
+            {
+                "label": grant.name,
+                "kind": kind,
+                "id": grant.id,
+                "pick": picks.get(key),
+                "live": live.get(key),
+            }
+        )
+    return rows
+
+
 # --- one request -----------------------------------------------------------------------
 
 
@@ -148,6 +218,7 @@ class Ctx:
     tenant_id: str
     user_id: str
     role: str
+    principal: Principal
     csrf: str
     plane: ControlPlane
     config_admins: tuple[str, ...]
@@ -194,16 +265,28 @@ class WebUI:
         self.route("GET", base + "/agents", self.agents)
         self.route("POST", base + "/agents", self.add_agent)
         self.route("GET", agent, self.agent)
+        self.route("POST", agent + "/channels/{channel}/resume", self.resume_channel)
         self.route("POST", agent + "/drafts", self.new_draft)
         self.route("GET", version, self.version)
         self.route("POST", version + "/edit", self.edit_draft)
         self.route("POST", version + "/check-grants", self.check_grants)
+        self.route("POST", version + "/pick/start", self.pick_start)
+        self.route("GET", version + "/pick", self.pick_page)
+        self.route("POST", version + "/pick/choose", self.pick_choose)
+        app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
         self.route("POST", base + "/members", self.add_member)
         self.route("POST", base + "/members/{user_id}/role", self.change_role)
         self.route("POST", base + "/members/{user_id}/remove", self.drop_member)
         self.route("GET", base + "/audit", self.audit)
+        self.route("GET", base + "/usage", self.usage)
+        self.route("GET", base + "/usage.csv", self.usage_csv)
+        self.route("POST", base + "/budgets", self.set_budget)
+        self.route("POST", base + "/budgets/remove", self.remove_budget)
+        self.route("GET", base + "/switches", self.switches)
+        self.route("POST", base + "/switches/off", self.turn_off)
+        self.route("POST", base + "/switches/on", self.turn_on)
 
     # --- plumbing ---------------------------------------------------------------------
 
@@ -245,17 +328,23 @@ class WebUI:
                 "Wrong organisation", "This session belongs to another organisation.", 403
             )
         deps = self.deps
-        role = await deps.plane.role_of(tenant_id, session.user_id)
-        if role is None:
+        config = await deps.tenants.get(tenant_id)
+        if config is None:
+            # Unknown or disabled: a session of a disabled tenant stops working.
+            return _message(
+                "Not available", "This organisation is not available.", 403, back="/login"
+            )
+        principal = await deps.plane.principal(tenant_id, session.user_id)
+        if principal.role is None:
             return self.no_access()
-        config = deps.tenants.get(tenant_id)
         ctx = Ctx(
             tenant_id=tenant_id,
             user_id=session.user_id,
-            role=role,
+            role=principal.role,
+            principal=principal,
             csrf=session.csrf_secret,
             plane=deps.plane,
-            config_admins=() if config is None else config.admins,
+            config_admins=config.admins,
             now=deps.console.clock(),
         )
         if post:
@@ -313,7 +402,11 @@ class WebUI:
             log.error("console error: %s", type(err).__name__)
             return _message("Something went wrong", "Internal error.", 500, ctx, back)
         if rerender is not None:
-            return await rerender(status, str(err))
+            try:
+                return await rerender(status, str(err))
+            except AgentNotFound:
+                # The page to show again is one this person may not read.
+                pass
         return _message(_TITLES.get(status, "Refused"), str(err), status, ctx, back)
 
     def base(self, ctx: Ctx) -> str:
@@ -333,8 +426,8 @@ class WebUI:
     async def login(self, request: Request) -> Response:
         sign_in = self.deps.console.sign_in
         tenants = self.deps.tenants
-        only = None if tenants is None else tenants.only_tenant()
-        team = None if only is None else tenants.get(only).slack_team_id
+        only = None if tenants is None else await tenants.only_tenant()
+        team = None if only is None else (await tenants.get(only)).slack_team_id
         state, nonce = new_login_values()
         response = _redirect(authorize_url(sign_in, state, nonce, team))
         response.set_cookie(
@@ -366,11 +459,13 @@ class WebUI:
             return refused("Slack did not complete the sign-in.")
         try:
             tokens = await console.slack.exchange_code(code, sign_in.redirect_uri)
-            identity = identity_from_token_response(tokens, sign_in, login[1], console.clock())
+            identity = await identity_from_token_response(
+                tokens, sign_in, login[1], console.clock(), console.slack
+            )
         except SlackSignInError as err:
             log.warning("sign-in refused: %s", err)
             return refused("Sign-in could not be completed. Start again.", 503)
-        tenant_id = self.deps.tenants.by_slack_team(identity.team_id)
+        tenant_id = await self.deps.tenants.for_slack_team(identity.team_id)
         if tenant_id is None:
             return refused("This console is not set up for your Slack workspace.", 403)
         if await self.deps.plane.role_of(tenant_id, identity.user_id) is None:
@@ -415,7 +510,7 @@ class WebUI:
         error: str | None = None,
         notice: str | None = None,
     ) -> Response:
-        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.user_id)
+        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.principal)
         return _page(
             "agents.html",
             status,
@@ -447,22 +542,67 @@ class WebUI:
         return url if done is None else f"{url}?done={done}"
 
     async def agent(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
-        versions = await ctx.plane.versions(ctx.tenant_id, ctx.user_id, agent_id)
+        return await self.agent_page(request, ctx, agent_id, notice=self.notice(request))
+
+    async def agent_page(
+        self,
+        request: Request,
+        ctx: Ctx,
+        agent_id: str,
+        status: int = 200,
+        error: str | None = None,
+        notice: str | None = None,
+    ) -> Response:
+        versions = await ctx.plane.versions(ctx.tenant_id, ctx.principal, agent_id)
         if not versions:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         owner = await self.owner_of(ctx, agent_id)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.principal)
+        switches = await ctx.plane.switches(ctx.tenant_id, ctx.principal)
+        can_edit = self.can_edit(ctx, owner)
         return _page(
             "agent.html",
+            status,
             ctx=ctx,
             agent_id=agent_id,
+            budget=budgets.line_of(agent_id),
+            stopped_by=switches.stopped_by.get(agent_id),
+            writes_off=switches.writes.off,
             versions=versions,
-            can_edit=self.can_edit(ctx, owner),
-            notice=self.notice(request),
+            can_edit=can_edit,
+            paused=await self.paused_of(ctx, agent_id) if can_edit else [],
+            error=error,
+            notice=notice,
             base=self.base(ctx),
+            agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
         )
 
+    @staticmethod
+    async def paused_of(ctx: Ctx, agent_id: str):
+        return await ctx.plane.paused_channels(ctx.tenant_id, ctx.principal, agent_id)
+
+    async def resume_channel(self, request: Request, ctx: Ctx, agent_id: str, channel: str):
+        try:
+            await ctx.plane.resume_channel(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                channel,
+                confirm_audience=_audience_confirmation(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.agent_page(request, ctx, agent_id, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}?done=resumed")
+
     async def owner_of(self, ctx: Ctx, agent_id: str) -> str | None:
-        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.user_id)
+        if ctx.role == CREATOR:
+            # A creator reads only their own agents, so the principal already says.
+            return ctx.user_id if agent_id in ctx.principal.owned_agent_ids else None
+        agents = await ctx.plane.list_agents(ctx.tenant_id, ctx.principal)
         return next((a.created_by for a in agents if a.agent_id == agent_id), None)
 
     @staticmethod
@@ -475,7 +615,9 @@ class WebUI:
     async def new_draft(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
         raw = ctx.get("from_version").strip()
         from_version = int(raw) if raw.isdigit() else None
-        record = await ctx.plane.new_draft(ctx.tenant_id, ctx.user_id, agent_id, from_version)
+        record = await ctx.plane.new_draft(
+            ctx.tenant_id, ctx.user_id, agent_id, from_version, _form_request_id(ctx)
+        )
         return _redirect(self.version_url(ctx, agent_id, record.version, "draft"))
 
     async def version(self, request: Request, ctx: Ctx, agent_id: str, version: int) -> Response:
@@ -493,15 +635,34 @@ class WebUI:
         text: str | None = None,
         reports: list | None = None,
     ) -> Response:
-        record = await ctx.plane.get_version(ctx.tenant_id, ctx.user_id, agent_id, version)
+        record = await ctx.plane.get_version(ctx.tenant_id, ctx.principal, agent_id, version)
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         editor = self.can_edit(ctx, await self.owner_of(ctx, agent_id))
+        audience = await ctx.plane.audience_view(
+            ctx.tenant_id,
+            ctx.principal,
+            agent_id,
+            version,
+            count=(editor or ctx.is_admin) and record.status in ("draft", PENDING),
+        )
+        review = (
+            await ctx.plane.version_review(ctx.tenant_id, ctx.principal, agent_id, version)
+            if editor or ctx.is_admin
+            else None
+        )
+        picker = self.deps.picker
         return _page(
             "version.html",
             status,
             ctx=ctx,
             record=record,
+            audience=audience,
+            review=review,
+            grant_rows=grant_rows(record.agent(), review),
+            widens=bool(review and review.diff and review.diff.widens),
+            picker_enabled=picker is not None,
+            paused=await self.paused_of(ctx, agent_id) if editor or ctx.is_admin else [],
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
             is_draft=record.status == "draft",
@@ -509,7 +670,7 @@ class WebUI:
             error=error,
             notice=notice,
             reports=reports,
-            grants_ok=None if reports is None else not any(r.problems for r in reports),
+            grants_ok=None if reports is None else all(r.ok for r in reports),
             base=self.base(ctx),
             agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
             version_url=self.version_url(ctx, agent_id, version),
@@ -541,11 +702,102 @@ class WebUI:
     async def check_grants(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         try:
             reports = await ctx.plane.check_version_grants(
-                ctx.tenant_id, ctx.user_id, agent_id, version
+                ctx.tenant_id, ctx.principal, agent_id, version
             )
         except GrantCheckUnavailable:
             return await self.notion_down(request, ctx, agent_id, version)
         return await self.version_page(request, ctx, agent_id, version, reports=reports)
+
+    # --- Choose from Notion ---------------------------------------------------------
+
+    def picker_flow(self, request: Request, ctx: Ctx, agent_id: str, version: int) -> Flow:
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        token = parsed[1] if parsed else ""
+        return Flow(ctx.tenant_id, ctx.user_id, session_hash(token), agent_id, version)
+
+    async def pick_start(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        picker = self.deps.picker
+        if picker is None:
+            return _message("Not available", "Choosing from Notion is not set up.", 404, ctx)
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        state = picker.sessions.begin(self.picker_flow(request, ctx, agent_id, version), ctx.now)
+        return _redirect(notion_authorize_url(picker.config, self.deps.console.sign_in, state))
+
+    async def notion_callback(self, request: Request) -> Response:
+        """Notion sends the browser back here. The state must be one this session began."""
+        picker = self.deps.picker
+        session = await self.session_of(request)
+        if picker is None or session is None:
+            return _redirect("/login")
+        now = self.deps.console.clock()
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        flow = picker.sessions.finish(request.query_params.get("state", ""), now)
+        mine = (
+            flow is not None
+            and parsed is not None
+            and flow.session_hash == session_hash(parsed[1])
+            and flow.tenant_id == session.tenant_id
+            and flow.user_id == session.user_id
+        )
+        if not mine or flow is None:
+            return _message("Could not sign in", "That Notion sign-in is not valid.", 400)
+        back = self.version_url_for(flow)
+        code = request.query_params.get("code", "")
+        if request.query_params.get("error") or not code:
+            return _redirect(back)
+        try:
+            objects = await picker.oauth.list_visible(
+                code, picker.config.redirect_uri(self.deps.console.sign_in)
+            )
+        except NotionPickerError as err:
+            log.warning("notion picker failed: %s", err)
+            return _message(
+                "Notion unavailable",
+                "Couldn't list your Notion pages just now. Try again.",
+                page_status(502),
+            )
+        picker.sessions.store(flow, objects, now)
+        return _redirect(back + "/pick")
+
+    def version_url_for(self, flow: Flow) -> str:
+        return (
+            f"/ui/{flow.tenant_id}/agents/{quote(flow.agent_id, safe='')}/versions/{flow.version}"
+        )
+
+    async def pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        picker = self.deps.picker
+        flow = self.picker_flow(request, ctx, agent_id, version)
+        objects = None if picker is None else picker.sessions.listing(flow, ctx.now)
+        return _page(
+            "pick.html",
+            ctx=ctx,
+            objects=objects,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=self.version_url(ctx, agent_id, version),
+        )
+
+    async def pick_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        picker = self.deps.picker
+        flow = self.picker_flow(request, ctx, agent_id, version)
+        objects = None if picker is None else picker.sessions.listing(flow, ctx.now)
+        if objects is None:
+            return _message(
+                "Choose again",
+                "Your list from Notion has expired. Choose from Notion again.",
+                409,
+                ctx,
+                back=self.version_url(ctx, agent_id, version),
+            )
+        # Only a position in the listing the creator's own token produced can be chosen.
+        chosen = [obj for i, obj in enumerate(objects) if ctx.get(f"pick_{i}") == "yes"]
+        await ctx.plane.record_grant_picks(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        picker.sessions.drop(flow)
+        return _redirect(self.version_url(ctx, agent_id, version, "picked"))
 
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
         plane = ctx.plane
@@ -558,8 +810,19 @@ class WebUI:
         if action not in moves:
             return _message("Not found", "There is no such action.", 404, ctx)
         call, done = moves[action]
+        extra = {}
+        if action == "publish":
+            extra["confirm_audience"] = _audience_confirmation(ctx)
+            # The hash of the version the approver's page showed; the plane refuses a
+            # different one. A form without it is refused as a changed version.
+            extra["reviewed_sha256"] = ctx.get("definition_sha256").strip() or "none"
+            extra["acknowledge_widening"] = ctx.get("widening") == "yes"
+            extra["reviewed_published"] = ctx.get("reviewed_published").strip() or "unknown"
         try:
-            await call(ctx.tenant_id, ctx.user_id, agent_id, version)
+            await call(ctx.tenant_id, ctx.user_id, agent_id, version, **extra)
+        except (AudienceError, WideningNotAcknowledged, GrantNotPicked) as err:
+            status = page_status(status_of(err) or 409)
+            return await self.version_page(request, ctx, agent_id, version, status, str(err))
         except GrantProblems as err:
             return await self.version_page(
                 request, ctx, agent_id, version, 409, str(err), reports=err.reports
@@ -602,6 +865,79 @@ class WebUI:
         older = events[-1].seq if len(events) == AUDIT_PAGE else None
         return _page("audit.html", ctx=ctx, events=events, older=older, base=self.base(ctx))
 
+    async def usage(self, request: Request, ctx: Ctx) -> Response:
+        month = request.query_params.get("month") or None
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.principal, month)
+        budgets = await ctx.plane.budgets(ctx.tenant_id, ctx.principal)
+        return _page(
+            "usage.html",
+            ctx=ctx,
+            report=report,
+            budgets=budgets,
+            notice=self.notice(request),
+            months=recent_months(ctx.now),
+            no_team=NO_TEAM,
+            base=self.base(ctx),
+        )
+
+    async def set_budget(self, request: Request, ctx: Ctx) -> Response:
+        """An empty agent field is the tenant-wide budget."""
+        agent_id = ctx.get("agent_id").strip() or None
+        await ctx.plane.set_budget(ctx.tenant_id, ctx.user_id, agent_id, ctx.get("amount"))
+        return _redirect(self.base(ctx) + "/usage?done=budget-set")
+
+    async def remove_budget(self, request: Request, ctx: Ctx) -> Response:
+        agent_id = ctx.get("agent_id").strip() or None
+        await ctx.plane.remove_budget(ctx.tenant_id, ctx.user_id, agent_id)
+        return _redirect(self.base(ctx) + "/usage?done=budget-removed")
+
+    async def switches(
+        self, request: Request, ctx: Ctx, status: int = 200, error: str | None = None
+    ) -> Response:
+        """The kill switches, for admins. A creator reads an agent's state on its own page."""
+        if not ctx.is_admin:
+            raise Forbidden(f"'{ctx.user_id}' may not do this in tenant '{ctx.tenant_id}'")
+        return _page(
+            "switches.html",
+            status,
+            ctx=ctx,
+            view=await ctx.plane.switches(ctx.tenant_id, ctx.principal),
+            needs_confirm=CONFIRMED_SWITCHES,
+            error=error,
+            notice=self.notice(request),
+            base=self.base(ctx),
+        )
+
+    async def turn_off(self, request: Request, ctx: Ctx) -> Response:
+        """Turning off every agent or all writes also needs the confirm box ticked.
+
+        Only an admin gets the confirm step; anyone else goes straight to the control
+        plane, which refuses them."""
+        scope = ctx.get("scope")
+        if ctx.is_admin and scope in CONFIRMED_SWITCHES and ctx.get("confirm") != "yes":
+            what = "every agent of the organisation" if scope == "all_agents" else "every write"
+            return await self.switches(
+                request, ctx, 422, f"Tick the box to confirm: this stops {what}."
+            )
+        await ctx.plane.turn_off(ctx.tenant_id, ctx.user_id, scope, ctx.get("target").strip())
+        return _redirect(self.base(ctx) + "/switches?done=switch-off")
+
+    async def turn_on(self, request: Request, ctx: Ctx) -> Response:
+        await ctx.plane.turn_on(
+            ctx.tenant_id, ctx.user_id, ctx.get("scope"), ctx.get("target").strip()
+        )
+        return _redirect(self.base(ctx) + "/switches?done=switch-on")
+
+    async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
+        """The page's aggregates as a download. It only reads, so it is a GET."""
+        month = request.query_params.get("month") or None
+        report = await ctx.plane.usage_report(ctx.tenant_id, ctx.principal, month)
+        return Response(
+            report.csv_text(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="usage-{report.month}.csv"'},
+        )
+
 
 NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
 
@@ -612,6 +948,31 @@ _TITLES = {
     422: "Invalid",
     503: "Notion could not be reached",
 }
+
+
+def _audience_confirmation(ctx: Ctx) -> dict[str, int] | None:
+    """The counts the approver ticked the box for, or None when the box is not ticked.
+
+    A count that is not a plain number is treated as no confirmation.
+    """
+    if ctx.get("confirm") != "yes":
+        return None
+    counts = {name: ctx.get(name).strip() for name in ("total", "guests", "external")}
+    if not all(value.isdigit() and len(value) < 9 for value in counts.values()):
+        return None
+    return {name: int(value) for name, value in counts.items()}
+
+
+def _form_request_id(ctx: Ctx) -> str | None:
+    """The audit nonce for a form that carries a one-time token, or None without one.
+
+    The token is made when the page is rendered, so a double click or a resent form is one
+    request. It is hashed with the signed-in user, so no token is another user's.
+    """
+    token = ctx.get("request_id").strip()
+    if not (token.isalnum() and 16 <= len(token) <= 64):
+        return None
+    return hashlib.sha256(f"{ctx.user_id}\n{token}".encode()).hexdigest()
 
 
 def _same(a: str, b: str) -> bool:

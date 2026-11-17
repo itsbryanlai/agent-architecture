@@ -1,0 +1,570 @@
+"""Monthly budgets: a dollar limit per tenant and per agent, and the stop that enforces it.
+
+A budget is a positive amount in US dollars for the UTC calendar month. A tenant has at
+most one tenant-wide budget, which counts every model call and every embedding, and at
+most one budget per agent, which counts that agent's model calls over all its versions.
+No budget means no limit.
+
+``BudgetGuard`` is asked by ``call_llm`` before the provider is called. When the month's
+spend has reached a budget the activity answers with a fixed text and calls no model, so
+nothing is billed and no usage row is written. The spend comes from the monthly rollup the
+usage store keeps (``usage_month_totals``, updated with every usage row and every
+adjustment), so a read is a few rows however many calls the month has. It is read once per
+tenant at a time per process, at most once per ``ttl_seconds``: concurrent checks after the
+cache expires wait for that one read.
+Each cost the recorder stores is added to the cached figure at once (``note_recorded``), so
+one process never lets the window's own calls go uncounted. What the cache can still miss
+is spend from other worker processes and a call's cost before it returns. A call's cost is
+unknown until the provider answers, so one large call can take a scope past its budget by
+that call's own cost, and so can every call in flight when the budget is reached. The bound
+on overspend is therefore: the other processes' spend in one window, plus the calls in
+flight, plus one call's cost. A raised budget takes up to one window to lift a stop.
+
+Unknown spend is not zero spend. A scope with a budget is stopped, with its own fixed reply,
+when any of its rows this month has no price (``Spend.unpriced_calls``), or when a call's
+row could not be stored (``note_recorded``, for the cache window). Raising the budget does not
+clear it; pricing the rows does (``python -m agentos.usage reprice``). Spend and unpriced
+counts are also kept per cost type (``usage.KIND_LABELS``), so a budget line shows model and
+embedding spend side by side.
+
+Indexing asks ``BudgetGuard.tenant_stopped`` before each embedding call. It is the same
+cached read as the turn check, so a page can be embedded up to one window per worker process
+after the budget was reached, plus the pages already in flight. Embedding costs are small
+next to that overspend. The tenant scope's unpriced stop stops indexing the same way.
+
+If the budgets or the spend cannot be read, the check raises. The activity fails and
+Temporal retries it, so a read failure never lets a call through unchecked.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from typing import Any, Protocol
+
+from psycopg_pool import AsyncConnectionPool
+
+from agentos import usage as usage_module
+from agentos.models import LLMResponse
+from agentos.stores import joined_transaction, tenant_transaction
+from agentos.usage import LLM, UsageEvent, UsageGroup, UsageStore, month_bounds, utcnow
+
+log = logging.getLogger("agentos.budgets")
+
+STOP_REASON = "budget_reached"
+SPEND_UNKNOWN = "spend_unknown"  # the stop reason when spend cannot be measured
+AGENT = "agent"
+TENANT = "tenant"
+UNPRICED = "unpriced"  # what ``stopped_by`` returns when a budgeted scope's spend is unknown
+WARN_PERCENT = 80
+CENTS = Decimal("0.01")
+MAX_AMOUNT = Decimal("9999999999.99")
+DEFAULT_TTL_SECONDS = 60
+AGENT_KINDS = (LLM,)  # the cost types an agent budget counts
+
+_AMOUNT = re.compile(r"\d{1,10}(\.\d{1,2})?")
+_BAD_AMOUNT = (
+    "a budget must be a positive amount in US dollars, with at most two decimals "
+    f"and no more than {MAX_AMOUNT:,}"
+)
+
+
+def stop_text(agent_name: str) -> str:
+    return f"{agent_name} has reached its monthly budget. An admin can raise it in the console."
+
+
+def unpriced_stop_text(agent_name: str) -> str:
+    return (
+        f"{agent_name}'s spending can't be measured this month, so it is paused. "
+        "An admin can check prices in the console."
+    )
+
+
+class BudgetError(ValueError):
+    """The change names a budget that cannot be set or does not exist."""
+
+
+class InvalidBudget(BudgetError):
+    """The amount is not a positive sum of dollars and cents."""
+
+
+class BudgetNotFound(BudgetError):
+    """No budget is set for that scope."""
+
+
+def parse_amount(value: Any) -> Decimal:
+    """A budget amount from a form or a JSON body. Anything unclear is refused, never rounded."""
+    if isinstance(value, bool) or not isinstance(value, str | int | Decimal):
+        raise InvalidBudget(_BAD_AMOUNT)
+    if isinstance(value, str):
+        text = value.strip()
+        if not _AMOUNT.fullmatch(text):
+            raise InvalidBudget(_BAD_AMOUNT)
+        value = Decimal(text)
+    try:
+        amount = Decimal(value)
+        if not amount.is_finite() or amount != amount.quantize(CENTS):
+            raise InvalidBudget(_BAD_AMOUNT)
+    except InvalidOperation as err:
+        raise InvalidBudget(_BAD_AMOUNT) from err
+    amount = amount.quantize(CENTS)
+    if not 0 < amount <= MAX_AMOUNT:
+        raise InvalidBudget(_BAD_AMOUNT)
+    return amount
+
+
+# --- rows -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Budget:
+    tenant_id: str
+    agent_id: str | None  # None is the tenant-wide budget
+    amount: Decimal
+    updated_by: str
+    updated_at: datetime | None = None
+
+
+class BudgetStore(Protocol):
+    async def list(self, tenant_id: str) -> list[Budget]:
+        """Every budget of the tenant."""
+        ...
+
+    async def set_budget(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
+    ) -> Budget:
+        """Set or replace the budget of one scope (an agent, or the tenant when None).
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``), here and below.
+        """
+        ...
+
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
+        """Remove a budget, which lifts the limit. ``BudgetNotFound`` when none is set."""
+        ...
+
+
+class InMemoryBudgetStore:
+    def __init__(self) -> None:
+        self._rows: dict[tuple[str, str | None], Budget] = {}
+
+    def snapshot(self) -> dict[tuple[str, str | None], Budget]:
+        """The rows as they are now, for ``InMemoryUnitOfWork``."""
+        return dict(self._rows)
+
+    def restore(self, state: dict[tuple[str, str | None], Budget]) -> None:
+        self._rows = dict(state)
+
+    async def list(self, tenant_id: str) -> list[Budget]:
+        return sorted(
+            (b for (t, _), b in self._rows.items() if t == tenant_id),
+            key=lambda b: (b.agent_id is not None, b.agent_id or ""),
+        )
+
+    async def set_budget(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
+    ) -> Budget:
+        row = Budget(tenant_id, agent_id, amount, updated_by, utcnow())
+        self._rows[(tenant_id, agent_id)] = row
+        return row
+
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
+        if self._rows.pop((tenant_id, agent_id), None) is None:
+            raise _not_found(agent_id)
+
+
+def _not_found(agent_id: str | None) -> BudgetNotFound:
+    scope = "the organisation" if agent_id is None else f"agent '{agent_id}'"
+    return BudgetNotFound(f"no budget is set for {scope}")
+
+
+_COLUMNS = "tenant_id, agent_id, amount_usd, updated_by, updated_at"
+
+
+class PostgresBudgetStore:
+    def __init__(self, pool: AsyncConnectionPool):
+        self._pool = pool
+
+    async def list(self, tenant_id: str) -> list[Budget]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                f"SELECT {_COLUMNS} FROM budgets WHERE tenant_id = %s", (tenant_id,)
+            )
+            return [Budget(*row) for row in await cur.fetchall()]
+
+    async def set_budget(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        amount: Decimal,
+        updated_by: str,
+        conn: Any = None,
+    ) -> Budget:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
+                f"""
+                INSERT INTO budgets (tenant_id, agent_id, amount_usd, updated_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (tenant_id, scope) DO UPDATE
+                SET amount_usd = EXCLUDED.amount_usd,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                RETURNING {_COLUMNS}
+                """,
+                (tenant_id, agent_id, amount, updated_by),
+            )
+            row = await cur.fetchone()
+        return Budget(*row)
+
+    async def remove_budget(self, tenant_id: str, agent_id: str | None, conn: Any = None) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
+                """
+                DELETE FROM budgets
+                WHERE tenant_id = %s AND scope = %s
+                RETURNING tenant_id
+                """,
+                (tenant_id, agent_id or ""),
+            )
+            if await cur.fetchone() is None:
+                raise _not_found(agent_id)
+
+
+# --- spend and levels -----------------------------------------------------------------
+
+
+@dataclass
+class KindSpend:
+    """One cost type's part of a scope's spend."""
+
+    kind: str
+    cost: Decimal = Decimal(0)
+    unpriced_calls: int = 0
+
+    @property
+    def label(self) -> str:
+        return usage_module.KIND_LABELS.get(self.kind, self.kind)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "label": self.label,
+            "spend": format(self.cost.normalize(), "f"),
+            "unpriced_calls": self.unpriced_calls,
+        }
+
+
+@dataclass
+class Spend:
+    """What was spent in a scope: the priced rows' dollars, and how many rows had no price."""
+
+    cost: Decimal = Decimal(0)
+    unpriced_calls: int = 0
+    by_kind: dict[str, KindSpend] = field(default_factory=dict)
+
+    def add(self, group: UsageGroup) -> None:
+        self.cost += group.cost
+        self.unpriced_calls += group.unpriced_calls
+        part = self.by_kind.setdefault(group.kind, KindSpend(group.kind))
+        part.cost += group.cost
+        part.unpriced_calls += group.unpriced_calls
+
+    def kinds(self, only: tuple[str, ...] | None = None) -> list[KindSpend]:
+        """The split by cost type, in the order of ``usage.KIND_LABELS``, then any other kind seen.
+
+        ``only`` limits it to the cost types the scope counts (an agent counts model calls only).
+        """
+        order = list(usage_module.KIND_LABELS) + [
+            k for k in self.by_kind if k not in usage_module.KIND_LABELS
+        ]
+        return [
+            KindSpend(
+                k,
+                self.by_kind[k].cost if k in self.by_kind else Decimal(0),
+                self.by_kind[k].unpriced_calls if k in self.by_kind else 0,
+            )
+            for k in order
+            if only is None or k in only
+        ]
+
+
+@dataclass
+class MonthSpend:
+    tenant: Spend = field(default_factory=Spend)  # every model call and every embedding
+    agents: dict[str, Spend] = field(default_factory=dict)  # model calls, all versions
+
+    def of(self, agent_id: str) -> Spend:
+        return self.agents.get(agent_id, Spend())
+
+    def add(self, group: UsageGroup) -> None:
+        self.tenant.add(group)
+        if group.kind in AGENT_KINDS and group.agent_id is not None:
+            self.agents.setdefault(group.agent_id, Spend()).add(group)
+
+
+def month_spend(groups: list[UsageGroup]) -> MonthSpend:
+    spend = MonthSpend()
+    for g in groups:
+        spend.add(g)
+    return spend
+
+
+NONE, OK, WARNING, STOPPED = "none", "ok", "warning", "stopped"
+
+
+def level_of(spend: Decimal, amount: Decimal | None) -> tuple[int | None, str]:
+    """The whole percent of the budget spent, and the level: warning from 80%, stopped at 100%."""
+    if amount is None:
+        return None, NONE
+    percent = int(spend * 100 // amount)
+    if spend >= amount:
+        return percent, STOPPED
+    if spend * 100 >= amount * WARN_PERCENT:
+        return percent, WARNING
+    return percent, OK
+
+
+@dataclass
+class BudgetLine:
+    """One scope's budget against this month's spend. ``agent_id`` None is the tenant."""
+
+    agent_id: str | None
+    amount: Decimal | None
+    spend: Decimal
+    unpriced_calls: int
+    percent: int | None
+    level: str
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+    kinds: list[KindSpend] = field(default_factory=list)  # spend and unpriced calls by cost type
+
+    @classmethod
+    def of(
+        cls,
+        agent_id: str | None,
+        budget: Budget | None,
+        spend: Spend,
+        kinds: tuple[str, ...] | None = None,
+    ) -> BudgetLine:
+        """``kinds`` limits the split to the cost types the scope counts; None means all."""
+        amount = None if budget is None else budget.amount
+        percent, level = level_of(spend.cost, amount)
+        return cls(
+            agent_id,
+            amount,
+            spend.cost,
+            spend.unpriced_calls,
+            percent,
+            level,
+            None if budget is None else budget.updated_by,
+            None if budget is None else budget.updated_at,
+            spend.kinds(kinds),
+        )
+
+    @property
+    def cannot_see_unpriced(self) -> bool:
+        """A budget is set and some of the month's calls have no price, so the scope is stopped."""
+        return self.amount is not None and self.unpriced_calls > 0
+
+    @property
+    def stop_reason(self) -> str | None:
+        """Why the scope is stopped by its budget: the limit is reached, or spend is unknown."""
+        if self.level == STOPPED:
+            return STOP_REASON
+        return SPEND_UNKNOWN if self.cannot_see_unpriced else None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "amount": None if self.amount is None else format(self.amount, "f"),
+            "spend": format(self.spend.normalize(), "f"),
+            "percent": self.percent,
+            "level": self.level,
+            "stop_reason": self.stop_reason,
+            "unpriced_calls": self.unpriced_calls,
+            "kinds": [k.as_dict() for k in self.kinds],
+            "updated_by": self.updated_by,
+            "updated_at": None if self.updated_at is None else self.updated_at.isoformat(),
+        }
+
+
+@dataclass
+class BudgetsView:
+    month: str
+    tenant: BudgetLine | None  # admins only
+    agents: list[BudgetLine]
+
+    def line_of(self, agent_id: str) -> BudgetLine | None:
+        return next((x for x in self.agents if x.agent_id == agent_id), None)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "month": self.month,
+            "tenant": None if self.tenant is None else self.tenant.as_dict(),
+            "agents": [x.as_dict() for x in self.agents],
+        }
+
+
+# --- the stop -------------------------------------------------------------------------
+
+
+@dataclass
+class _Cached:
+    fetched_at: datetime
+    month_start: datetime
+    budgets: dict[str | None, Decimal]
+    spend: MonthSpend
+
+
+class BudgetGuard:
+    """Says whether an agent's turn must stop before a model call. See the module text."""
+
+    def __init__(
+        self,
+        budgets: BudgetStore,
+        usage: UsageStore,
+        clock: Callable[[], datetime] = utcnow,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ):
+        self.budgets = budgets
+        self.usage = usage
+        self.clock = clock
+        self.ttl_seconds = ttl_seconds
+        self._cache: dict[str, _Cached] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        # (tenant, agent or None for the tenant) -> until when a call of it went unmetered
+        self._unmetered: dict[tuple[str, str | None], datetime] = {}
+
+    def forget(self) -> None:
+        self._cache.clear()
+        self._unmetered.clear()
+
+    def note_recorded(self, event: UsageEvent, stored: bool) -> None:
+        """Follow a recorded call: add its cost to the cached figure now, or mark the scope.
+
+        A row that could not be stored makes its agent's and its tenant's spend unknown for
+        one cache window (in this process only): the checks stop a budgeted scope until then.
+        """
+        now = self.clock()
+        if not stored:
+            until = now + timedelta(seconds=self.ttl_seconds)
+            self._unmetered[(event.tenant_id, None)] = until
+            if event.agent_id is not None:
+                self._unmetered[(event.tenant_id, event.agent_id)] = until
+            return
+        cached = self._cache.get(event.tenant_id)
+        if cached is None or cached.month_start != month_bounds(None, now)[0]:
+            return
+        cached.spend.add(
+            UsageGroup(
+                event.kind,
+                event.agent_id,
+                event.agent_version,
+                event.model,
+                calls=1,
+                cost=event.cost or Decimal(0),
+                unpriced_calls=1 if event.cost is None else 0,
+            )
+        )
+
+    def _unknown(self, tenant_id: str, agent_id: str | None, cached: _Cached) -> bool:
+        """True when the scope's spend cannot be measured: unpriced rows, or an unmetered call."""
+        spend = cached.spend.tenant if agent_id is None else cached.spend.of(agent_id)
+        until = self._unmetered.get((tenant_id, agent_id))
+        return spend.unpriced_calls > 0 or (until is not None and self.clock() < until)
+
+    async def stopped_by(self, tenant_id: str, agent_id: str) -> str | None:
+        """``"agent"`` or ``"tenant"`` when that budget is reached, ``"unpriced"`` when a
+        budgeted scope's spend cannot be measured, else None.
+
+        The agent's budget is named first when both are reached; a reached budget before an
+        unknown spend.
+        """
+        cached = await self._read(tenant_id)
+        agent_limit = cached.budgets.get(agent_id)
+        tenant_limit = cached.budgets.get(None)
+        if agent_limit is not None and cached.spend.of(agent_id).cost >= agent_limit:
+            return AGENT
+        if tenant_limit is not None and cached.spend.tenant.cost >= tenant_limit:
+            return TENANT
+        if agent_limit is not None and self._unknown(tenant_id, agent_id, cached):
+            return UNPRICED
+        if tenant_limit is not None and self._unknown(tenant_id, None, cached):
+            return UNPRICED
+        return None
+
+    async def tenant_stopped(self, tenant_id: str) -> bool:
+        """True when the tenant-wide budget is reached or its spend is unknown.
+
+        Agent budgets never count here.
+        """
+        cached = await self._read(tenant_id)
+        limit = cached.budgets.get(None)
+        return limit is not None and (
+            cached.spend.tenant.cost >= limit or self._unknown(tenant_id, None, cached)
+        )
+
+    async def stop_response(
+        self, tenant_id: str, agent_id: str, agent_name: str
+    ) -> LLMResponse | None:
+        """The fixed answer when a budget is reached or spend is unknown, else None. Logs ids only."""
+        reached = await self.stopped_by(tenant_id, agent_id)
+        if reached is None:
+            return None
+        log.info(
+            "turn stopped by budget tenant_id=%s agent_id=%s budget=%s",
+            tenant_id,
+            agent_id,
+            reached,
+        )
+        if reached == UNPRICED:
+            return LLMResponse(
+                text=unpriced_stop_text(agent_name), tool_calls=[], stop_reason=SPEND_UNKNOWN
+            )
+        return LLMResponse(text=stop_text(agent_name), tool_calls=[], stop_reason=STOP_REASON)
+
+    def _fresh(self, tenant_id: str, now: datetime, month_start: datetime) -> _Cached | None:
+        cached = self._cache.get(tenant_id)
+        if (
+            cached is not None
+            and cached.month_start == month_start
+            and 0 <= (now - cached.fetched_at).total_seconds() < self.ttl_seconds
+        ):
+            return cached
+        return None
+
+    async def _read(self, tenant_id: str) -> _Cached:
+        now = self.clock()
+        start, _, _ = month_bounds(None, now)
+        cached = self._fresh(tenant_id, now, start)
+        if cached is not None:
+            return cached
+        # One rollup read per tenant at a time: a check that finds the cache expired while
+        # another is reading waits, then uses what that read stored.
+        async with self._locks.setdefault(tenant_id, asyncio.Lock()):
+            now = self.clock()
+            start, _, _ = month_bounds(None, now)
+            cached = self._fresh(tenant_id, now, start)
+            if cached is not None:
+                return cached
+            limits = {b.agent_id: b.amount for b in await self.budgets.list(tenant_id)}
+            spend = MonthSpend()
+            if limits:
+                spend = month_spend(await self.usage.month_totals(tenant_id, start))
+            cached = self._cache[tenant_id] = _Cached(now, start, limits, spend)
+            return cached

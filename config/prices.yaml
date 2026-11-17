@@ -1,0 +1,49 @@
+# Model prices, in US dollars per million tokens. The usage page costs every model
+# call with the entry in effect on the day the call was recorded, and stores that cost
+# on the row, so changing a price later never rewrites past months. A model with no
+# entry is recorded with its tokens and no cost, and the page shows "no price".
+#
+# Add one entry per model and per price change. All four prices are required: write 0
+# for a kind the model does not bill (an embedding model has no output or cache).
+# `model` is the name the provider reports back, which is what the usage page groups
+# by. `effective_from` is a UTC date; an entry applies from that day until the next
+# entry of the same model starts. Restart the worker after editing this file.
+#
+# A provider may report a dated or alternate name for a model. An entry matches, in this
+# order: the exact `model` name; then any name in its optional `aliases:` list (exact
+# names, each belonging to one model); then the longest `model` that the reported name
+# starts with, followed by `-` (`qwen3.7-plus` matches `qwen3.7-plus-2026-11-01`). A
+# call that matches nothing is recorded with no cost, and a budget then pauses its scope
+# because the spend cannot be measured. The worker refuses to start with no price for the
+# configured chat model or embedder. To price rows already recorded without a price, fix
+# this file and run `python -m agentos.usage reprice` (see the README).
+#
+# Copy prices from your provider's pricing page, and note where and when you copied
+# them. Only the models listed below are priced.
+#
+# prices:
+#   - model: example-model-name
+#     effective_from: 2026-01-01
+#     input: 3.00
+#     output: 15.00
+#     cache_read: 0.30
+#     cache_write: 3.75
+#     aliases: [example-model-latest]   # optional
+prices:
+  # Qwen Cloud, region ap-southeast-1, list prices copied 2026-11-15 from
+  # qwencloud.com/models/qwen3.7-plus (input up to 256k tokens; a 20% discount was
+  # also shown, not used here). cache_read is the implicit-cache input price, the
+  # cache that applies automatically; cache_write is explicit cache creation.
+  - model: qwen3.7-plus
+    effective_from: 2026-11-01
+    input: 0.40
+    output: 1.60
+    cache_read: 0.08
+    cache_write: 0.50
+  # Local embeddings through the Ollama app cost nothing.
+  - model: bge-m3
+    effective_from: 2026-11-01
+    input: 0
+    output: 0
+    cache_read: 0
+    cache_write: 0

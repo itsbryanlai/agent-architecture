@@ -4,22 +4,38 @@ The JSON API and the web pages both turn a ``ControlPlane`` refusal into a
 status and show its message, so the mapping lives here once.
 """
 
+from agentos.access_diff import WideningNotAcknowledged
 from agentos.agent_store import AgentNotFound, AgentStoreError
+from agentos.audience import AudienceCheckUnavailable, AudienceError
+from agentos.audience_pauses import NotPaused
+from agentos.budgets import BudgetError, BudgetNotFound, InvalidBudget
 from agentos.config import ConfigError
 from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
+from agentos.grant_picks import GrantNotPicked
 from agentos.members import InvalidMember, MemberError, MemberNotFound
+from agentos.switches import InvalidSwitch, SwitchError
 
 STATUS_BY_ERROR: dict[type[Exception], int] = {
     Forbidden: 403,
     AgentNotFound: 404,
     MemberNotFound: 404,
     InvalidMember: 422,
+    InvalidBudget: 422,
+    BudgetNotFound: 404,
+    BudgetError: 409,
+    InvalidSwitch: 422,
+    SwitchError: 409,
     AgentStoreError: 409,
     MemberError: 409,
     ConfigError: 422,
     GrantProblems: 409,
     GrantCheckUnavailable: 502,
+    AudienceError: 409,
+    AudienceCheckUnavailable: 502,
+    NotPaused: 409,
+    WideningNotAcknowledged: 409,
+    GrantNotPicked: 409,
 }
 
 REFUSALS = tuple(STATUS_BY_ERROR)

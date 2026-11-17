@@ -30,10 +30,9 @@ import yaml
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
-# The app connects as agentos_app, which cannot bypass row-level security. The
-# password is a local development value, like the Compose one.
-DEFAULT_DATABASE_URL = "postgresql://agentos_app:agentos_app@localhost:55432/agentos"
 DEFAULT_CONFIG_PATH = "config/agents.yaml"
+# Model prices in US dollars per million tokens, used to cost each model call.
+DEFAULT_PRICES_PATH = "config/prices.yaml"
 # The directory where the gateway writes each tenant's Notion verification token.
 DEFAULT_NOTION_TOKEN_DIR = "~/.agentos"
 # The directory of per-tenant payload encryption key files, <tenant_id>.key.
@@ -44,8 +43,26 @@ DEFAULT_SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
 DEFAULT_NOTION_TOKEN_ENV = "NOTION_TOKEN"
 DEFAULT_NOTION_WEBHOOK_TOKEN_ENV = "NOTION_WEBHOOK_VERIFICATION_TOKEN"
 DEFAULT_EMBED_MODEL = "text-embedding-v4"
+DEFAULT_DB_POOL_MIN = 2
+DEFAULT_DB_POOL_MAX = 32
+DEFAULT_MAX_CONCURRENT_ACTIVITIES = 32
 # Must match the vector(1024) column in the knowledge_chunks table.
 EMBED_DIMENSIONS = 1024
+# The farthest a chunk may be from the question (cosine distance: 0 identical, 1 unrelated,
+# 2 opposite) and still be shown to the model, per embedding model. A model not listed has
+# no cut-off, because its distances have not been looked at. ``bge-m3`` is the local model
+# the maintainer runs: published scores put related text mostly above 0.5 similarity and
+# unrelated text below 0.4, so a distance of 0.6 cuts the unrelated and keeps the related.
+# The value is a starting point from those scores, not measured on this deployment's pages;
+# ``AGENTOS_EMBED_MAX_DISTANCE`` overrides it. ``fake-embed`` is the test embedder, whose
+# unrelated texts are at distance 1.
+EMBED_MAX_DISTANCE: dict[str, float] = {"bge-m3": 0.6, "fake-embed": 0.9}
+
+
+def embed_max_distance(model: str, override: float | None = None) -> float | None:
+    """The cut-off for chunks of ``model``, or None when there is none."""
+    return override if override is not None else EMBED_MAX_DISTANCE.get(model)
+
 
 TASK_QUEUE = "agentos-main"
 
@@ -69,6 +86,10 @@ class ConfigError(ValueError):
     """The agents file or a setting is malformed or incomplete."""
 
 
+# Settings whose variable is not the upper-cased field name.
+_ENV_NAMES = {"database_url": "AGENTOS_DATABASE_URL"}
+
+
 @dataclass(frozen=True)
 class Settings:
     # Secret values are excluded from repr so that logging a Settings object
@@ -84,6 +105,10 @@ class Settings:
     # Where each tenant's payload encryption key file lives. A leading "~" is
     # expanded when the key is read. Holds a directory name, never a key.
     key_dir: str = DEFAULT_KEY_DIR
+    # Lets the payload codec read payloads that were never encrypted (a history
+    # from before encryption). Off by default: with Temporal reachable, a
+    # plaintext payload would otherwise be accepted as genuine.
+    allow_plaintext_payloads: bool = False
     anthropic_api_key: str | None = field(default=None, repr=False)
     qwen_api_key: str | None = field(default=None, repr=False)
     llm_provider: str = DEFAULT_LLM_PROVIDER
@@ -99,15 +124,40 @@ class Settings:
     # Ollama). Unset means the Qwen settings are used.
     embed_base_url: str | None = None
     embed_api_key: str | None = field(default=None, repr=False)
+    # Overrides the cut-off in ``EMBED_MAX_DISTANCE`` for the configured embedding model.
+    embed_max_distance: float | None = None
     temporal_address: str = DEFAULT_TEMPORAL_ADDRESS
-    database_url: str = field(default=DEFAULT_DATABASE_URL, repr=False)
+    # The app connects as agentos_app, which cannot bypass row-level security. There is no
+    # default: the URL holds the role's password, which the operator exports and no file
+    # in the repository carries.
+    database_url: str | None = field(default=None, repr=False)
     config_path: str = DEFAULT_CONFIG_PATH
+    prices_path: str = DEFAULT_PRICES_PATH
     # Sign in with Slack for the web console: the Slack app's client ID and secret,
     # and the public base URL the browser reaches the console at. The console is
     # configured only when all three are set (see ``slack_signin``).
     slack_client_id: str | None = None
     slack_client_secret: str | None = field(default=None, repr=False)
     console_url: str | None = None
+    # The Notion public integration behind "Choose from Notion" (see ``notion_picker``), and
+    # whether a new grant must have been chosen there before a version can be submitted.
+    notion_oauth_client_id: str | None = None
+    notion_oauth_client_secret: str | None = field(default=None, repr=False)
+    require_grant_picker: bool = False
+    # Database connections per process (min and max of the pool) and how many activities the
+    # worker runs at once. An activity holds a connection only while it runs a query, and a
+    # model call makes about six, so a pool smaller than the activity count makes activities
+    # queue for a connection. The worker therefore refuses to start with a pool max below
+    # ``max_concurrent_activities`` (see ``validate_worker_capacity``). The defaults suit one
+    # worker next to the gateway and the console on Postgres's default 100 connections:
+    # 32 + 32 + 32 stays under it. Raise both together, and the server's limit with them.
+    db_pool_min: int = DEFAULT_DB_POOL_MIN
+    db_pool_max: int = DEFAULT_DB_POOL_MAX
+    max_concurrent_activities: int = DEFAULT_MAX_CONCURRENT_ACTIVITIES
+
+    def pool_args(self) -> dict[str, int]:
+        """Keyword arguments for ``AsyncConnectionPool``: its minimum and maximum size."""
+        return {"min_size": self.db_pool_min, "max_size": self.db_pool_max}
 
     def require(self, name: str) -> str:
         """Return a required setting, or fail with a message naming the variable.
@@ -116,7 +166,7 @@ class Settings:
         """
         value = getattr(self, name)
         if not value:
-            env_name = name.upper()
+            env_name = _ENV_NAMES.get(name, name.upper())
             raise RuntimeError(
                 f"{env_name} is not set. Export it in the shell that runs this process."
             )
@@ -136,6 +186,48 @@ def _parse_flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in _TRUE_VALUES
 
 
+def _parse_distance(raw: str | None) -> float | None:
+    if not raw or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0 < value <= 2:
+        raise ConfigError(
+            f"AGENTOS_EMBED_MAX_DISTANCE must be a number above 0 up to 2; got {raw!r}"
+        )
+    return value
+
+
+def _parse_positive_int(env: Any, name: str, default: int) -> int:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ConfigError(f"{name} must be a whole number of at least 1; got {raw!r}")
+    return value
+
+
+def validate_worker_capacity(settings: Settings) -> None:
+    """Refuse a connection pool that cannot serve the activities the worker runs at once."""
+    if settings.db_pool_max < settings.db_pool_min:
+        raise ConfigError(
+            f"AGENTOS_DB_POOL_MAX ({settings.db_pool_max}) is below "
+            f"AGENTOS_DB_POOL_MIN ({settings.db_pool_min})"
+        )
+    if settings.db_pool_max < settings.max_concurrent_activities:
+        raise ConfigError(
+            f"AGENTOS_DB_POOL_MAX ({settings.db_pool_max}) is below "
+            f"AGENTOS_MAX_CONCURRENT_ACTIVITIES ({settings.max_concurrent_activities}): "
+            "activities would wait for a connection. Raise the pool or lower the activities."
+        )
+
+
 def load_settings() -> Settings:
     env = os.environ
     provider = _parse_provider(env.get("AGENTOS_LLM_PROVIDER"))
@@ -143,6 +235,7 @@ def load_settings() -> Settings:
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token_dir=env.get("AGENTOS_NOTION_TOKEN_DIR") or DEFAULT_NOTION_TOKEN_DIR,
         key_dir=env.get("AGENTOS_KEY_DIR") or DEFAULT_KEY_DIR,
+        allow_plaintext_payloads=_parse_flag(env.get("AGENTOS_ALLOW_PLAINTEXT_PAYLOADS")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         qwen_api_key=env.get("QWEN_API_KEY"),
         llm_provider=provider,
@@ -152,12 +245,22 @@ def load_settings() -> Settings:
         embed_model=env.get("AGENTOS_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
         embed_base_url=env.get("AGENTOS_EMBED_BASE_URL") or None,
         embed_api_key=env.get("EMBED_API_KEY") or None,
+        embed_max_distance=_parse_distance(env.get("AGENTOS_EMBED_MAX_DISTANCE")),
         temporal_address=env.get("AGENTOS_TEMPORAL_ADDRESS") or DEFAULT_TEMPORAL_ADDRESS,
-        database_url=env.get("AGENTOS_DATABASE_URL") or DEFAULT_DATABASE_URL,
+        database_url=env.get("AGENTOS_DATABASE_URL") or None,
         config_path=env.get("AGENTOS_CONFIG") or DEFAULT_CONFIG_PATH,
+        prices_path=env.get("AGENTOS_PRICES") or DEFAULT_PRICES_PATH,
         slack_client_id=env.get("SLACK_CLIENT_ID") or None,
         slack_client_secret=env.get("SLACK_CLIENT_SECRET") or None,
         console_url=env.get("AGENTOS_CONSOLE_URL") or None,
+        notion_oauth_client_id=env.get("NOTION_OAUTH_CLIENT_ID") or None,
+        notion_oauth_client_secret=env.get("NOTION_OAUTH_CLIENT_SECRET") or None,
+        require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
+        db_pool_min=_parse_positive_int(env, "AGENTOS_DB_POOL_MIN", DEFAULT_DB_POOL_MIN),
+        db_pool_max=_parse_positive_int(env, "AGENTOS_DB_POOL_MAX", DEFAULT_DB_POOL_MAX),
+        max_concurrent_activities=_parse_positive_int(
+            env, "AGENTOS_MAX_CONCURRENT_ACTIVITIES", DEFAULT_MAX_CONCURRENT_ACTIVITIES
+        ),
     )
 
 
@@ -230,6 +333,12 @@ class Grants:
     notion_pages: list[NotionPageGrant] = field(default_factory=list)
 
 
+# The most an agent definition may ask for. A task lives at most one approval window plus one
+# watch, so these bound how long a row a live task reads must be kept (see ``agentos.retention``).
+MAX_APPROVAL_EXPIRES_HOURS = 168
+MAX_WATCH_DAYS = 60
+
+
 @dataclass
 class FollowUpPolicy:
     poll_interval_minutes: int = 15
@@ -241,6 +350,32 @@ class FollowUpPolicy:
 class ApprovalPolicy:
     expires_after_hours: int = 72
     reminder_after_hours: int = 24
+
+
+DEFAULT_MAX_WRITES_PER_TURN = 2
+MAX_WRITES_PER_TURN_RANGE = (1, 10)
+
+# Slack IDs: C for a public channel, G for a private one, S for a user group.
+_CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
+_USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
+
+
+@dataclass
+class Audience:
+    """Who may use an agent and where, as the creator wrote it.
+
+    An agent answers in the listed channels, and in a direct message to everyone
+    (``dm_everyone``) or to members of the listed user groups. A guest (single or
+    multi-channel) is never let in unless ``guests`` is set, and a person from
+    another Slack workspace (Slack Connect) never is. A direct message is
+    allowed to nobody when neither ``dm_everyone`` nor a user group is set.
+    Only IDs, taken from the Slack event, are ever compared with these.
+    """
+
+    channels: list[str] = field(default_factory=list)
+    dm_everyone: bool = False
+    dm_user_groups: list[str] = field(default_factory=list)
+    guests: bool = False
 
 
 @dataclass
@@ -258,6 +393,15 @@ class AgentVersion:
     # Agents this one may hand a thread to. An agent with specialists is a
     # front door.
     specialists: list[str] = field(default_factory=list)
+    # None means the definition sets no audience: the legacy default applies (see
+    # ``agentos.audience.effective_audience``). Published versions never change,
+    # so an agent published before audiences existed keeps this.
+    audience: Audience | None = None
+    # An optional label the usage page groups cost by. Empty means no team.
+    team: str = ""
+    # How many writes (each an approval card) one model reply may start; the rest of its
+    # write calls get an error result.
+    max_writes_per_turn: int = DEFAULT_MAX_WRITES_PER_TURN
 
 
 @dataclass
@@ -314,26 +458,124 @@ _PROPERTY_ID_FIELDS = {
 }
 
 
+AGENT_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{1,39}")
+
+
+def check_agent_id(agent_id: object) -> str:
+    """The agent ID, or ``ConfigError``.
+
+    Lower-case ASCII letters, digits and ``-``, starting with a letter, 2 to 40 characters.
+    A look-alike letter, a ``/`` that the console cannot route, or a ``:`` that makes an
+    audit key ambiguous cannot get in.
+    """
+    if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+        raise ConfigError(
+            f"agent ID {agent_id!r} is invalid: use 2 to 40 lowercase ASCII letters, digits "
+            "and hyphens, starting with a letter"
+        )
+    return agent_id
+
+
+# What an agent definition may contain, at each level. A key that is not listed is an
+# error, so a misspelt ``audiance`` is refused instead of reading as "no audience".
+_AGENT_KEYS = frozenset(
+    {
+        "version",
+        "name",
+        "description",
+        "system_prompt",
+        "max_steps",
+        "max_writes_per_turn",
+        "grants",
+        "follow_up",
+        "approval",
+        "specialists",
+        "audience",
+        "team",
+    }
+)
+_GRANT_KEYS = frozenset({"notion"})
+_NOTION_KEYS = frozenset({"databases", "pages"})
+_DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
+_PAGE_KEYS = frozenset({"id", "name"})
+
+# Inclusive bounds on the numbers a definition sets.
+MAX_STEPS_RANGE = (1, 50)
+_FOLLOW_UP_RANGES = {
+    "poll_interval_minutes": (1, 1440),
+    "stale_after_days": (1, 365),
+    "max_watch_days": (1, MAX_WATCH_DAYS),
+}
+_APPROVAL_RANGES = {
+    "expires_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
+    "reminder_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
+}
+
+
+def _mapping(where: str, raw: Any, allowed: frozenset[str]) -> dict[str, Any]:
+    """``raw`` as a mapping with only the allowed keys; None is an empty mapping."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: expected a mapping")
+    for key in raw:
+        if key not in allowed:
+            raise ConfigError(f"{where}: unknown field '{key}'")
+    return raw
+
+
+def _text(where: str, key: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: '{key}' must be non-empty text")
+    return value
+
+
+def _whole(where: str, key: str, value: Any, low: int, high: int) -> int:
+    """An int (a bool is not one) within the bounds."""
+    if type(value) is not int or not low <= value <= high:
+        raise ConfigError(f"{where}: '{key}' must be a whole number from {low} to {high}")
+    return value
+
+
 def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     if not isinstance(mapping, dict) or key not in mapping or mapping[key] in (None, ""):
         raise ConfigError(f"{where}: missing required field '{key}'")
     return mapping[key]
 
 
-def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseGrant:
-    where = f"agent '{agent_id}' notion database grant"
-    db_id = str(_require(raw, "id", where))
-    name = str(_require(raw, "name", where))
+def _list_of(where: str, raw: Any) -> list[Any]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: expected a list")
+    return raw
+
+
+def _parse_database_grant(
+    agent_id: str, raw: dict[str, Any], index: int = 0
+) -> NotionDatabaseGrant:
+    where = f"agent '{agent_id}' grants.notion.databases[{index}]"
+    _mapping(where, raw, _DATABASE_KEYS)
+    db_id = _text(where, "id", _require(raw, "id", where))
+    name = _text(where, "name", _require(raw, "name", where))
     props = raw.get("properties")
     if not isinstance(props, dict):
         raise ConfigError(f"agent '{agent_id}' grant '{name}': missing required field 'properties'")
+    pwhere = f"agent '{agent_id}' grant '{name}' properties"
+    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS))
     values: dict[str, Any] = {}
     for key, attr in _PROPERTY_FIELDS.items():
         if key not in props or props[key] in (None, "", []):
             raise ConfigError(
                 f"agent '{agent_id}' grant '{name}': missing property mapping 'properties.{key}'"
             )
-        values[attr] = props[key]
+        if key == "done_values":
+            done = props[key]
+            if not isinstance(done, list) or not all(isinstance(v, str) and v for v in done):
+                raise ConfigError(f"{pwhere}: 'done_values' must be a list of status names")
+            values[attr] = done
+        else:
+            values[attr] = _text(pwhere, key, props[key])
     ids_raw = raw.get("property_ids")
     if ids_raw is None:
         ids_raw = {}
@@ -348,27 +590,33 @@ def _parse_database_grant(agent_id: str, raw: dict[str, Any]) -> NotionDatabaseG
                 f"agent '{agent_id}' grant '{name}': unknown key 'property_ids.{key}'"
             )
         if value not in (None, ""):
-            id_values[_PROPERTY_ID_FIELDS[key]] = str(value)
-    done_values = values["done_values"]
-    if not isinstance(done_values, list):
-        done_values = [done_values]
+            id_values[_PROPERTY_ID_FIELDS[key]] = _text(
+                f"agent '{agent_id}' grant '{name}' property_ids", key, value
+            )
     return NotionDatabaseGrant(
         id=db_id,
         name=name,
-        title_prop=str(values["title_prop"]),
-        status_prop=str(values["status_prop"]),
-        done_values=[str(v) for v in done_values],
-        requested_by_prop=str(values["requested_by_prop"]),
-        request_id_prop=str(values["request_id_prop"]),
+        title_prop=values["title_prop"],
+        status_prop=values["status_prop"],
+        done_values=list(values["done_values"]),
+        requested_by_prop=values["requested_by_prop"],
+        request_id_prop=values["request_id_prop"],
         **id_values,
     )
 
 
-def _parse_page_grant(agent_id: str, raw: dict[str, Any]) -> NotionPageGrant:
-    where = f"agent '{agent_id}' notion page grant"
+def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> NotionPageGrant:
+    where = f"agent '{agent_id}' grants.notion.pages[{index}]"
+    _mapping(where, raw, _PAGE_KEYS)
     return NotionPageGrant(
-        id=str(_require(raw, "id", where)), name=str(_require(raw, "name", where))
+        id=_text(where, "id", _require(raw, "id", where)),
+        name=_text(where, "name", _require(raw, "name", where)),
     )
+
+
+def _parse_policy(where: str, raw: Any, ranges: dict[str, tuple[int, int]], cls: type) -> Any:
+    block = _mapping(where, raw, frozenset(ranges))
+    return cls(**{k: _whole(where, k, v, *ranges[k]) for k, v in block.items()})
 
 
 def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
@@ -377,26 +625,46 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
     Both sources go through this function, so an agent loaded from the
     database is checked exactly like one read from YAML. ``version`` overrides
     the block's own ``version`` field: the database assigns version numbers, so
-    a stored definition has none.
+    a stored definition has none. A key the definition may not have, a value of the
+    wrong type and a number out of range are each an error that names where.
     """
+    check_agent_id(agent_id)
     where = f"agent '{agent_id}'"
-    grants_raw = raw.get("grants") or {}
-    notion = grants_raw.get("notion") or {}
-    databases = [_parse_database_grant(agent_id, db) for db in notion.get("databases") or []]
-    pages = [_parse_page_grant(agent_id, pg) for pg in notion.get("pages") or []]
-    follow = raw.get("follow_up") or {}
-    approval = raw.get("approval") or {}
+    raw = _mapping(where, raw, _AGENT_KEYS)
+    grants_raw = _mapping(f"{where} grants", raw.get("grants"), _GRANT_KEYS)
+    notion = _mapping(f"{where} grants.notion", grants_raw.get("notion"), _NOTION_KEYS)
+    databases = [
+        _parse_database_grant(agent_id, db, i)
+        for i, db in enumerate(
+            _list_of(f"{where} grants.notion.databases", notion.get("databases"))
+        )
+    ]
+    pages = [
+        _parse_page_grant(agent_id, pg, i)
+        for i, pg in enumerate(_list_of(f"{where} grants.notion.pages", notion.get("pages")))
+    ]
+    description = raw.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ConfigError(f"{where}: 'description' must be text")
+    given_version = version if version is not None else _require(raw, "version", where)
     return AgentVersion(
         agent_id=agent_id,
-        version=int(version if version is not None else _require(raw, "version", where)),
-        name=str(_require(raw, "name", where)),
-        system_prompt=str(_require(raw, "system_prompt", where)),
-        max_steps=int(_require(raw, "max_steps", where)),
+        version=_whole(where, "version", given_version, 1, 2**31 - 1),
+        name=_text(where, "name", _require(raw, "name", where)),
+        system_prompt=_text(where, "system_prompt", _require(raw, "system_prompt", where)),
+        max_steps=_whole(where, "max_steps", _require(raw, "max_steps", where), *MAX_STEPS_RANGE),
         grants=Grants(notion_databases=databases, notion_pages=pages),
-        follow_up=FollowUpPolicy(**{k: int(v) for k, v in follow.items()}),
-        approval=ApprovalPolicy(**{k: int(v) for k, v in approval.items()}),
-        description=str(raw.get("description") or "").strip(),
+        follow_up=_parse_policy(
+            f"{where} follow_up", raw.get("follow_up"), _FOLLOW_UP_RANGES, FollowUpPolicy
+        ),
+        approval=_parse_policy(
+            f"{where} approval", raw.get("approval"), _APPROVAL_RANGES, ApprovalPolicy
+        ),
+        description=(description or "").strip(),
         specialists=_parse_specialists(where, raw.get("specialists")),
+        audience=_parse_audience(where, raw.get("audience")),
+        team=_parse_team(where, raw.get("team")),
+        max_writes_per_turn=_parse_max_writes(where, raw.get("max_writes_per_turn")),
     )
 
 
@@ -427,7 +695,10 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         if property_ids:
             entry["property_ids"] = property_ids
         databases.append(entry)
-    return {
+    optional: dict[str, Any] = {"team": agent.team} if agent.team else {}
+    if agent.max_writes_per_turn != DEFAULT_MAX_WRITES_PER_TURN:
+        optional["max_writes_per_turn"] = agent.max_writes_per_turn
+    definition: dict[str, Any] = {
         "name": agent.name,
         "description": agent.description,
         "system_prompt": agent.system_prompt,
@@ -441,7 +712,128 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         "follow_up": dataclasses.asdict(agent.follow_up),
         "approval": dataclasses.asdict(agent.approval),
         "specialists": list(agent.specialists),
+        **optional,
     }
+    if agent.audience is not None:
+        definition["audience"] = _audience_definition(agent.audience)
+    return definition
+
+
+def _audience_definition(audience: Audience) -> dict[str, Any]:
+    block: dict[str, Any] = {"channels": list(audience.channels)}
+    if audience.dm_everyone:
+        block["dm"] = "everyone"
+    elif audience.dm_user_groups:
+        block["dm"] = {"user_groups": list(audience.dm_user_groups)}
+    block["guests"] = audience.guests
+    return block
+
+
+def _id_list(where: str, key: str, raw: Any, pattern: re.Pattern[str], what: str) -> list[str]:
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: '{key}' must be a list of {what}s")
+    for item in raw:
+        if not isinstance(item, str) or not pattern.fullmatch(item):
+            raise ConfigError(f"{where}: {item!r} is not a {what}")
+    if len(set(raw)) != len(raw):
+        raise ConfigError(f"{where}: '{key}' lists an ID more than once")
+    return list(raw)
+
+
+def _parse_audience(agent_where: str, raw: Any) -> Audience | None:
+    """The ``audience`` block, or None when the definition has none."""
+    if raw is None:
+        return None
+    where = f"{agent_where} audience"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: expected a mapping with 'channels', 'dm' and 'guests'")
+    unknown = set(raw) - {"channels", "dm", "guests"}
+    if unknown:
+        raise ConfigError(f"{where}: unknown field '{min(unknown)}'")
+    channels = _id_list(
+        f"{where}", "channels", raw.get("channels", []), _CHANNEL_ID, "Slack channel ID"
+    )
+    dm = raw.get("dm")
+    dm_everyone = False
+    groups: list[str] = []
+    if dm == "everyone":
+        dm_everyone = True
+    elif isinstance(dm, dict):
+        extra = set(dm) - {"user_groups"}
+        if extra:
+            raise ConfigError(f"{where}: unknown field 'dm.{min(extra)}'")
+        groups = _id_list(
+            f"{where} dm",
+            "user_groups",
+            dm.get("user_groups"),
+            _USER_GROUP_ID,
+            "Slack user group ID",
+        )
+        if not groups:
+            raise ConfigError(f"{where}: dm 'user_groups' must list at least one user group")
+    elif dm is not None:
+        raise ConfigError(f"{where}: 'dm' must be 'everyone' or a mapping with 'user_groups'")
+    guests = raw.get("guests", False)
+    if not isinstance(guests, bool):
+        raise ConfigError(f"{where}: 'guests' must be true or false")
+    if not channels and not dm_everyone and not groups:
+        raise ConfigError(f"{where}: reaches nobody; list 'channels' or set 'dm'")
+    return Audience(channels, dm_everyone, groups, guests)
+
+
+def channel_audience_problems(
+    channels: dict[str, str], agents: dict[str, AgentVersion]
+) -> list[str]:
+    """Channels mapped to an agent whose audience leaves them out.
+
+    The tenant file routes a channel to an agent. If that agent's audience does not
+    list the channel, every mention there would be refused, so the set is refused
+    instead. An agent without an audience has the legacy default and is never listed.
+    """
+    problems = []
+    for channel, agent_id in channels.items():
+        agent = agents.get(agent_id)
+        if (
+            agent is not None
+            and agent.audience is not None
+            and channel not in agent.audience.channels
+        ):
+            problems.append(
+                f"channel '{channel}' is mapped to agent '{agent_id}', whose audience does "
+                "not include that channel"
+            )
+    return problems
+
+
+MAX_TEAM_LENGTH = 64
+
+
+def _parse_max_writes(where: str, raw: Any) -> int:
+    """The ``max_writes_per_turn`` limit: a whole number from 1 to 10, or absent for the default."""
+    if raw is None:
+        return DEFAULT_MAX_WRITES_PER_TURN
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"{where}: 'max_writes_per_turn' must be a whole number")
+    if not MAX_WRITES_PER_TURN_RANGE[0] <= raw <= MAX_WRITES_PER_TURN_RANGE[1]:
+        low, high = MAX_WRITES_PER_TURN_RANGE
+        raise ConfigError(f"{where}: 'max_writes_per_turn' must be from {low} to {high}")
+    return raw
+
+
+def _parse_team(where: str, raw: Any) -> str:
+    """The ``team`` label: a short single-line string, or absent."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ConfigError(f"{where}: 'team' must be a text label such as IT")
+    team = raw.strip()
+    if not team:
+        raise ConfigError(f"{where}: 'team' must not be empty; leave it out for no team")
+    if len(team) > MAX_TEAM_LENGTH:
+        raise ConfigError(f"{where}: 'team' must be at most {MAX_TEAM_LENGTH} characters")
+    if not team.isprintable():
+        raise ConfigError(f"{where}: 'team' must be one line of printable characters")
+    return team
 
 
 def _parse_specialists(where: str, raw: Any) -> list[str]:
@@ -509,6 +901,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
     if not isinstance(raw, dict):
         raise ConfigError("agents config: expected a mapping at the top level")
     agents_raw = _require(raw, "agents", "agents config")
+    if not isinstance(agents_raw, dict):
+        raise ConfigError("agents config: 'agents' must map each agent ID to its definition")
     agents = {aid: parse_agent(aid, a or {}) for aid, a in agents_raw.items()}
     default_agent = str(_require(raw, "default_agent", "agents config"))
     if default_agent not in agents:
@@ -521,6 +915,8 @@ def parse_agents_config(raw: dict[str, Any]) -> AgentsConfig:
         )
     check_front_doors(agents)
     channels = _parse_channels(raw.get("channels"), agents)
+    if problems := channel_audience_problems(channels, agents):
+        raise ConfigError(f"agents config: {problems[0]}")
     workspace = raw.get("notion_workspace_id")
     return AgentsConfig(
         tenant_id=tenant_id,

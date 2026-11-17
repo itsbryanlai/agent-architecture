@@ -5,3 +5,45 @@
   <button type="submit">{{ label }}</button>
 </form>
 {%- endmacro %}
+{% macro kind_split(line) -%}
+{% for k in line.kinds %}{{ k.label }} {{ k.cost | usd }}{{ ", " if not loop.last }}{% endfor %}
+{%- endmacro %}
+{% macro budget_alerts(line, name) -%}
+{% if line and line.level == "warning" %}<p class="warn">{{ name }} has used {{ line.percent }}% of its monthly budget ({{ line.spend | usd }} of {{ line.amount | usd2 }}: {{ kind_split(line) }}).</p>{% endif %}
+{% if line and line.level == "stopped" %}{% if line.agent_id is none %}<p class="error">{{ name }} has reached its monthly budget. No agent is answering and indexing is paused. An admin can raise it.</p>{% else %}<p class="error">{{ name }} has reached its monthly budget and is not answering. An admin can raise it.</p>{% endif %}{% endif %}
+{% if line and line.amount is not none %}{% for k in line.kinds if k.unpriced_calls %}<p class="error">{{ k.unpriced_calls }} {{ k.label | lower }} call{{ "" if k.unpriced_calls == 1 else "s" }} {{ "has" if k.unpriced_calls == 1 else "have" }} no price this month, so the budget for {{ name }} cannot count {{ "it" if k.unpriced_calls == 1 else "them" }}. {% if line.agent_id is none %}No agent is answering and indexing is paused{% else %}{{ name }} is paused{% endif %} until the price is added to <code>config/prices.yaml</code> and the month is repriced (see the README).</p>{% endfor %}{% endif %}
+{%- endmacro %}
+
+{% macro paused_channels(paused, resume_base, csrf) -%}
+{% if paused %}
+<h2>Paused channels</h2>
+<p class="muted">This agent does not answer in these channels until its owner or an admin confirms who can see them. Direct messages and other channels are not affected.</p>
+<table>
+  <tr><th>Channel</th><th>Why</th><th>Since</th><th>People in it now</th><th></th></tr>
+  {% for v in paused %}
+  <tr>
+    <td><code>{{ v.pause.channel }}</code></td>
+    <td>{{ pause_reason(v.pause.reason) }}</td>
+    <td>{{ v.pause.paused_at | stamp }}</td>
+    <td>
+      {% if v.summary %}<strong>{{ v.summary.total }} people</strong>: {{ v.summary.guests }} guest{{ "" if v.summary.guests == 1 else "s" }}, {{ v.summary.external }} from another workspace
+      {% elif v.problem %}<span class="error">Could not count: {{ v.problem }}</span>
+      {% else %}not counted{% endif %}
+    </td>
+    <td>
+      <form method="post" action="{{ resume_base }}/{{ v.pause.channel | urlencode }}/resume">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        {% if v.summary %}
+        <input type="hidden" name="total" value="{{ v.summary.total }}">
+        <input type="hidden" name="guests" value="{{ v.summary.guests }}">
+        <input type="hidden" name="external" value="{{ v.summary.external }}">
+        <label><input type="checkbox" name="confirm" value="yes"> I confirm these people may see what this agent says here</label>
+        {% endif %}
+        <button type="submit">Resume</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{%- endmacro %}

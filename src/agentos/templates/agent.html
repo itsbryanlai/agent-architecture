@@ -1,9 +1,18 @@
 {% extends "base.html" %}
-{% from "macros.html" import post_button %}
+{% from "macros.html" import post_button, budget_alerts, kind_split, paused_channels %}
 {% block title %}{{ agent_id }}{% endblock %}
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a></p>
 <h1>{{ agent_id }}</h1>
+{% if stopped_by == "agent" %}<p class="error">This agent is turned off by an admin and is not answering.</p>
+{% elif stopped_by == "all_agents" %}<p class="error">All agents are turned off by an admin, so this agent is not answering.</p>{% endif %}
+{% if writes_off %}<p class="warn">Writes are turned off by an admin: this agent can draft, but nothing it drafts can be submitted.</p>{% endif %}
+{% if ctx.is_admin %}<p class="muted"><a href="{{ base }}/switches">Switches</a></p>{% endif %}
+{{ budget_alerts(budget, agent_id) }}
+{% if budget and budget.amount is not none %}
+<p class="muted">Monthly budget: {{ budget.spend | usd }} of {{ budget.amount | usd2 }} ({{ budget.percent }}%). {{ kind_split(budget) }}.</p>
+{% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
 <table>
   <tr><th>Version</th><th>Status</th><th>Created by</th><th>Submitted by</th><th>Approved by</th><th>Published</th></tr>
   {% for v in versions %}
@@ -17,9 +26,10 @@
   </tr>
   {% endfor %}
 </table>
+{{ paused_channels(paused, agent_url ~ "/channels", ctx.csrf) }}
 {% if can_edit %}
 <div class="actions">
-  {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version") }}
+  {{ post_button(base ~ "/agents/" ~ (agent_id | urlencode) ~ "/drafts", ctx.csrf, "New draft from the published version", {"request_id": new_token()}) }}
 </div>
 {% endif %}
 {% endblock %}

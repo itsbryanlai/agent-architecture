@@ -1,16 +1,21 @@
-# Notion connector manifest.
+# Notion connector manifest. The runtime reads it (see agentos.connectors.manifest).
 #
-# risk: read | write_reversible | write_irreversible. Writes always need the
-#   requester's approval before they run.
+# risk: read | write_reversible | write_irreversible. A read tool runs at once. A tool whose
+#   risk is a write is never run by the conversation: it becomes a task that asks the
+#   requester to approve before anything is sent, whatever the tool is called.
 # requester_scoped: the input field that names the person. The runtime fills it
 #   in from the requester's Slack identity and removes it from the schema the
 #   LLM sees, so the LLM can never choose whose records are read.
-# idempotency: how a retried write avoids creating a duplicate. marker_property
-#   means the item carries a hidden text property holding the idempotency key,
-#   and the connector queries for it before creating.
-# marker_text means the comment ends with a short ref and the connector looks
-#   for it in the page's comments before posting.
-# offer_to_llm: false keeps a tool for runtime use only.
+# idempotency: how a retried write avoids creating a duplicate, and which task carries the
+#   write out. marker_property means the item carries a hidden text property holding the
+#   idempotency key, and the connector queries for it before creating: the call becomes a
+#   create-item task. marker_text means the comment ends with a short ref and the connector
+#   looks for it in the page's comments before posting: the call becomes a comment task. A
+#   write with any other method is refused, and a write activity stops when no write in the
+#   manifests declares the method it implements.
+# input_schema: the model's input is checked against it before anything runs; a missing,
+#   unexpected or wrongly typed field becomes an error the model reads and can correct.
+# offer_to_llm: false keeps a tool for runtime use only; the model cannot call it.
 connector: notion
 tools:
   search_items:

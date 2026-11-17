@@ -3,6 +3,12 @@
 Calling a tool is generic; what makes a tool safe for an agent that does work
 is its risk class, whether it is scoped to the requester, and how a write
 avoids duplicates. That metadata lives in a YAML manifest per connector.
+
+The runtime reads it. ``screen`` classifies a call the model made: a read tool runs at
+once, a tool whose ``risk`` is a write becomes a task that needs the requester's approval
+(its ``idempotency`` method says which kind of task carries it out), and input that does
+not fit the tool's schema is refused with a message for the model. ``TOOLS`` holds every
+manifest's tools by name.
 """
 
 from __future__ import annotations
@@ -14,7 +20,13 @@ from pathlib import Path
 
 import yaml
 
+from agentos.models import READ_KIND
+
 MANIFEST_DIR = Path(__file__).parent / "manifests"
+
+# The kind of task that carries out a write, by the idempotency method its manifest declares:
+# an item carrying a marker property is created, a comment ending in a marker is posted.
+WRITE_KINDS = {"marker_property": "create_item", "marker_text": "add_comment"}
 
 
 class RiskClass(str, Enum):
@@ -32,6 +44,10 @@ class ToolSpec:
     requester_scoped: str | None = None  # name of the hidden person field
     idempotency: str | None = None  # idempotency method, e.g. "marker_property"
     offer_to_llm: bool = True
+
+    @property
+    def is_write(self) -> bool:
+        return self.risk is not RiskClass.READ
 
     def llm_definition(self) -> dict:
         """The Anthropic tool definition, with the requester field removed.
@@ -71,3 +87,85 @@ def load_manifest(path: str | Path) -> Manifest:
             offer_to_llm=bool(spec.get("offer_to_llm", True)),
         )
     return Manifest(connector=str(raw["connector"]), tools=tools)
+
+
+def _load_all() -> dict[str, ToolSpec]:
+    tools: dict[str, ToolSpec] = {}
+    for path in sorted(MANIFEST_DIR.glob("*.yaml")):
+        for name, spec in load_manifest(path).tools.items():
+            if name in tools:
+                raise ValueError(f"tool '{name}' is declared in more than one manifest")
+            tools[name] = spec
+    return tools
+
+
+TOOLS: dict[str, ToolSpec] = _load_all()
+
+_JSON_TYPES = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _is_type(value: object, kind: str) -> bool:
+    if kind in ("integer", "number") and isinstance(value, bool):
+        return False
+    return isinstance(value, _JSON_TYPES[kind])
+
+
+def check_input(schema: dict, value: object) -> str | None:
+    """Why ``value`` does not fit the object ``schema``, or None.
+
+    Covers what the manifests use: an object with named properties of a JSON type (and an
+    optional ``enum``), a ``required`` list, and no properties beyond the named ones.
+    """
+    if not isinstance(value, dict):
+        return "the input must be an object"
+    properties = schema.get("properties", {})
+    for name in schema.get("required", []):
+        if name not in value:
+            return f"missing required field '{name}'"
+    for name, item in value.items():
+        if name not in properties:
+            return f"unexpected field '{name}'"
+        kind = properties[name].get("type")
+        if kind in _JSON_TYPES and not _is_type(item, kind):
+            return f"'{name}' must be {'an' if kind[0] in 'aeiou' else 'a'} {kind}"
+        if "enum" in properties[name] and item not in properties[name]["enum"]:
+            return f"'{name}' is not one of the allowed values"
+    return None
+
+
+def screen(name: str, tool_input: object) -> tuple[str, str]:
+    """What the manifests say about a call the model made, as ``(kind, problem)``.
+
+    ``kind`` is ``READ_KIND``, or the kind of task a write becomes (see ``WRITE_KINDS``), or ""
+    for a name no manifest offers to the model. ``problem`` is why the input does not fit
+    the tool's schema ("" when it does), worded for the model. A write whose idempotency
+    method no task implements is not run: its kind is "".
+    """
+    spec = TOOLS.get(name)
+    if spec is None or not spec.offer_to_llm:
+        return "", ""
+    kind = READ_KIND
+    if spec.is_write:
+        kind = WRITE_KINDS.get(spec.idempotency or "", "")
+        if not kind:
+            return "", ""
+    problem = check_input(spec.llm_definition()["input_schema"], tool_input)
+    return kind, "" if problem is None else f"Invalid input for {name}: {problem}."
+
+
+def require_idempotency(method: str) -> None:
+    """Raise unless some write in the manifests declares ``method``.
+
+    A write activity names the idempotency method it implements. When no manifest declares
+    that method for a write, the manifests describe writes this code does not make (or this
+    one is no longer declared), so it stops before anything is sent.
+    """
+    if not any(spec.is_write and spec.idempotency == method for spec in TOOLS.values()):
+        raise ValueError(f"no write in the connector manifests declares idempotency '{method}'")

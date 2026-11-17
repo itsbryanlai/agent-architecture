@@ -1,9 +1,16 @@
 """Data types shared by the gateway, the workflows and the activities.
 
 Everything here is passed through Temporal, so each type is a plain dataclass
-of primitives, lists, dicts and other dataclasses. Workflows carry only
-references and small values: chat history lives in Postgres, never in these
-objects.
+of primitives, lists, dicts and other dataclasses. A signal, a workflow argument
+or an activity argument carries IDs and small values, never chat or document
+content: the text a person wrote, the model's reply, a tool call's input and a
+task's payload are kept in Postgres (``agentos.content_store``, chat history)
+and read there by the activities that need them.
+
+Two classes keep fields that held content before that change (``InboundMessage.text``,
+``TaskSpec.payload``, ``EditRequest.fields``) because histories recorded then still
+replay on them. A message, task or edit made now leaves them empty and sets the field
+that names the stored content (``text_stored``, ``draft_ref``, ``edit_id``).
 """
 
 from __future__ import annotations
@@ -19,16 +26,21 @@ from agentos.slack_format import escape_slack
 OUT_OF_STEPS = "I couldn't finish that. Try rephrasing."
 TURN_FAILED = "Sorry, something went wrong and I couldn't answer that. Please try again."
 HAND_OFF_ANNOUNCEMENT = "{agent} here, picking this up."
+NO_ANSWER = "Sorry, I couldn't come up with an answer to that."
+CUT_SHORT = "\n\n(reply cut short)"
 
 
 @dataclass
 class InboundMessage:
     event_id: str  # Slack event_id, used to drop duplicates
     user_id: str  # Slack user ID of the sender
-    text: str
+    text: str  # empty when ``text_stored``: the text is in ``inbound_events`` under the event ID
     channel: str
     thread_ts: str  # thread root ts (event.thread_ts or event.ts)
     channel_kind: str  # "im" or "channel"
+    # True when the gateway kept the text in ``inbound_events`` and the signal carries none.
+    # A signal recorded before that has the text inline and is handled as it was.
+    text_stored: bool = False
 
 
 @dataclass
@@ -69,11 +81,40 @@ class TurnContext:
     channel_kind: str
 
 
+# ``ToolCall.kind`` of a tool that only reads. A write's kind is the task that carries it out,
+# one of the keys of ``EDITABLE_FIELDS``.
+READ_KIND = "read"
+
+
 @dataclass
 class ToolCall:
     id: str
     name: str
     input: dict
+    # What the connector manifests say about this call, set by the ``call_llm`` activity and
+    # never by the model: ``kind`` is "read", the kind of task a write becomes
+    # ("create_item", "add_comment"), or "" for a tool no manifest offers; ``problem`` is why
+    # the input does not fit the tool's schema, worded for the model. Both are empty on a call
+    # recorded before they existed.
+    kind: str = ""
+    problem: str = ""
+
+
+def assistant_blocks(resp: LLMResponse) -> list[dict]:
+    """The assistant turn to store: the model's own blocks when available.
+
+    A tool call the blocks lack is added, so every call has its ``tool_use`` block.
+    """
+    blocks = [dict(b) for b in resp.content]
+    if not blocks and resp.text:
+        blocks.append({"type": "text", "text": resp.text})
+    listed = {b.get("id") for b in blocks if b.get("type") == "tool_use"}
+    for call in resp.tool_calls:
+        if call.id not in listed:
+            blocks.append(
+                {"type": "tool_use", "id": call.id, "name": call.name, "input": call.input}
+            )
+    return blocks
 
 
 @dataclass
@@ -103,6 +144,66 @@ class ToolResult:
 
 
 @dataclass
+class Usage:
+    """What one model call used, as the provider reported it.
+
+    ``input_tokens`` excludes the tokens served from or written to the prompt
+    cache, which are counted separately because they are priced differently.
+    ``model`` is the name the provider reported; None when it reported none.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    model: str | None = None
+
+
+@dataclass
+class ToolCallRef:
+    """A tool call as the workflow sees it: what it is, never what the model put in it.
+
+    The input is stored by tool-use ID (``tool_inputs``) and read by the activity that runs
+    the call. ``input_sha256`` lets the workflow tell two identical calls apart without
+    reading either; ``target`` is the specialist a ``hand_off`` names, when it is a
+    well-formed agent ID, else empty.
+    """
+
+    id: str
+    name: str
+    kind: str = ""
+    problem: str = ""
+    input_sha256: str = ""
+    target: str = ""
+
+
+@dataclass
+class StepResult:
+    """What one model step decided, with the content left in Postgres.
+
+    The assistant message is stored under the step key by the ``call_model`` activity. A
+    final reply (no ``tool_calls``) waits in ``model_steps`` until the activity that shows it
+    stores it in history.
+    """
+
+    stop_reason: str
+    tool_calls: list[ToolCallRef] = field(default_factory=list)
+    has_text: bool = False
+
+
+@dataclass
+class DraftOutcome:
+    """What drafting a task stored: the revision, or why the model's input cannot be a task.
+
+    ``error`` is worded for the model and holds no content (a missing field, a length).
+    """
+
+    error: str = ""
+    revision: int = 0
+    database_id: str = ""
+
+
+@dataclass
 class LLMResponse:
     text: str | None
     tool_calls: list[ToolCall]
@@ -112,16 +213,43 @@ class LLMResponse:
     # unchanged. Empty when the client has no raw blocks (the scripted fake);
     # history is then rebuilt from ``text`` and ``tool_calls``.
     content: list[dict] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+
+
+@dataclass
+class WatchState:
+    """What a watching task carries into its next run: IDs, a status value, times and flags.
+
+    Never a title, a comment or a link: those are read from Postgres when a line is posted.
+    """
+
+    page_id: str
+    last_status: str | None
+    last_change: datetime
+    stale_sent: bool
+    # When the watch ends, whatever the number of runs it takes.
+    deadline: datetime
+    # A poke arrived and has not been answered by a poll yet.
+    poked: bool = False
 
 
 @dataclass
 class TaskSpec:
     ctx: TurnContext
     tool_name: str
-    # The frozen, validated item to create. What the requester approves is
-    # exactly what runs; nothing changes this after the card is posted.
+    # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
+    # ``revision``). A task recorded before that carries its frozen payload here.
     payload: dict
     approval_nonce: str
+    # The task ID the draft revisions are stored under; empty on a task that carries its payload.
+    draft_ref: str = ""
+    # The revision the card shows and the approval names. An edit stores the next revision and
+    # a new nonce, so an approval always binds to one (revision, nonce).
+    revision: int = 0
+    # The Notion database the task writes to (a reference). Empty until a comment's page is resolved.
+    database_id: str = ""
+    # Set on a continue-as-new: the task is already past approval and only watches.
+    resume: WatchState | None = None
 
 
 @dataclass
@@ -137,9 +265,10 @@ class NotionItem:
 # item; the approval card shows a field in a section field (2000) or a section's
 # text (3000) behind a bold label, with ``&``, ``<`` and ``>`` encoded.
 NOTION_TEXT_MAX = 2000
-# What a comment's signature ("— <agent name>, ref <8 hex>") may add.
+# What a comment's signature ("— <agent name>, ref <64 hex>") may add: 4 characters
+# before the name, 6 between name and ref, 64 for the ref, so 100 leaves 26 for the name.
 COMMENT_SIGNATURE_MAX = 100
-SIGNATURE_NAME_MAX = 60
+SIGNATURE_NAME_MAX = 26
 
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's
@@ -158,21 +287,36 @@ _CARD_ROOM = {
 }
 
 
-def check_field(tool_name: str, name: str, value: str) -> str | None:
-    """Why ``value`` may not be this field of ``tool_name``, or None if it fits."""
+def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:
+    """Why ``value`` does not fit, and what the model should do about it."""
     limit = EDITABLE_FIELDS[tool_name][name]
     if len(value) > limit:
         return (
-            f"'{name}' is {len(value)} characters; the limit is {limit}. "
-            "Shorten it and call the tool again."
+            f"'{name}' is {len(value)} characters; the limit is {limit}.",
+            "Shorten it and call the tool again.",
         )
     if len(escape_slack(value)) > _CARD_ROOM[name]:
-        return (
+        what = (
             f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "
-            f"approval card and the result is over its {_CARD_ROOM[name]}-character room. "
-            "Shorten it or use fewer of them, and call the tool again."
+            f"approval card and the result is over its {_CARD_ROOM[name]}-character room."
         )
+        return what, "Shorten it or use fewer of them, and call the tool again."
     return None
+
+
+def check_field(tool_name: str, name: str, value: str) -> str | None:
+    """Why ``value`` may not be this field of ``tool_name``, or None if it fits.
+
+    The message is written for the model, which is told to call the tool again.
+    """
+    problem = _field_problem(tool_name, name, value)
+    return " ".join(problem) if problem else None
+
+
+def field_error(tool_name: str, name: str, value: str) -> str | None:
+    """The same check as :func:`check_field`, worded for a person editing the field."""
+    problem = _field_problem(tool_name, name, value)
+    return problem[0] if problem else None
 
 
 @dataclass
@@ -181,18 +325,25 @@ class EditRequest:
 
     nonce: str  # the nonce of the draft being edited
     user_id: str  # Slack user ID of whoever submitted the form
-    fields: dict  # str -> str; keys are the tool's editable fields
+    fields: dict  # str -> str; keys are the tool's editable fields. Empty when ``edit_id`` is set
+    # The ``inbound_events`` row that holds the saved values; empty on an edit recorded with them inline.
+    edit_id: str = ""
 
 
 @dataclass
 class DraftView:
-    """What the task's "draft" query returns: the current draft and its nonce."""
+    """What the task's "draft" query returns: which draft is current, and its nonce.
+
+    A task made now returns no field values: ``revision`` names the row of ``task_drafts``
+    that holds them. ``fields`` is filled only for a task that carries its payload.
+    """
 
     tool_name: str
-    fields: dict  # current editable values
+    fields: dict  # current editable values; empty when ``revision`` is set
     nonce: str
     requester_user_id: str
     editable: bool  # True only while awaiting approval and under the edit limit
+    revision: int = 0
 
 
 AGENT_AUDIT_KINDS = (
@@ -206,10 +357,32 @@ AGENT_AUDIT_KINDS = (
     "agent_publish",
 )
 MEMBER_AUDIT_KINDS = ("member_add", "member_remove", "member_role")
+AUDIENCE_AUDIT_KINDS = (
+    "audience_refused",
+    "audience_confirm",
+    "audience_pause",
+    "audience_resume",
+)
+# A budget belongs to an agent or to the whole tenant, not to a version of an agent.
+BUDGET_AUDIT_KINDS = ("budget_set",)
+# A kill switch belongs to an agent or to the whole tenant, not to a version of an agent.
+SWITCH_AUDIT_KINDS = ("switch_off", "switch_on")
+# A reprice of a month's unpriced usage belongs to the tenant, run by an owner from the command line.
+USAGE_AUDIT_KINDS = ("usage_repriced",)
+# A tenant's retention limits, set by an owner from the command line, belong to the tenant.
+RETENTION_AUDIT_KINDS = ("retention_set",)
+# Choosing grants from Notion, and an approver accepting that a version widens access.
+ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 AUDIT_KINDS = (
     ("answer", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
     + MEMBER_AUDIT_KINDS
+    + AUDIENCE_AUDIT_KINDS
+    + BUDGET_AUDIT_KINDS
+    + SWITCH_AUDIT_KINDS
+    + USAGE_AUDIT_KINDS
+    + RETENTION_AUDIT_KINDS
+    + ACCESS_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -227,7 +400,9 @@ class AuditEvent:
     tenant_id: str
     event_key: str  # unique per tenant: a retried activity records once
     kind: str
-    agent_id: str | None  # None only for a membership event
+    agent_id: (
+        str | None
+    )  # None only for a membership event, a tenant-wide budget or a tenant-wide switch
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -249,12 +424,26 @@ class AuditEvent:
             raise ValueError("an audit event needs a tenant_id and an event_key")
         if self.kind not in AUDIT_KINDS:
             raise ValueError(f"invalid audit kind {self.kind!r}")
-        if self.kind not in MEMBER_AUDIT_KINDS and (
-            not self.agent_id or self.agent_version is None
-        ):
+        tenant_wide = (
+            MEMBER_AUDIT_KINDS
+            + BUDGET_AUDIT_KINDS
+            + SWITCH_AUDIT_KINDS
+            + USAGE_AUDIT_KINDS
+            + RETENTION_AUDIT_KINDS
+        )
+        if self.kind not in tenant_wide and (not self.agent_id or self.agent_version is None):
             raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")
         if self.outcome not in AUDIT_OUTCOMES:
             raise ValueError(f"invalid audit outcome {self.outcome!r}")
         for digest in (self.input_sha256, self.output_sha256):
             if digest is not None and not _SHA256_HEX.fullmatch(digest):
                 raise ValueError("audit hashes must be 64 lowercase hex characters")
+
+
+@dataclass
+class AudienceEvent:
+    """A channel being shared with another organisation. Travels through Temporal: IDs only."""
+
+    tenant_id: str
+    event_id: str
+    channel: str

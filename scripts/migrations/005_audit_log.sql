@@ -49,7 +49,7 @@ CREATE TRIGGER audit_events_no_truncate
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_app') THEN
-    CREATE ROLE agentos_app LOGIN PASSWORD 'agentos_app' NOSUPERUSER NOBYPASSRLS;
+    CREATE ROLE agentos_app LOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END
 $$;

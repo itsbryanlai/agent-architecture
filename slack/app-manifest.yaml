@@ -13,10 +13,16 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      - channels:history
+      - channels:read
       - chat:write
+      - groups:history
+      - groups:read
       - im:history
       - im:read
       - im:write
+      - mpim:history
+      - usergroups:read
       - users:read
       - users:read.email
 settings:
@@ -24,6 +30,7 @@ settings:
     request_url: https://REPLACE_ME/slack/events
     bot_events:
       - app_mention
+      - channel_shared
       - message.im
   interactivity:
     is_enabled: true

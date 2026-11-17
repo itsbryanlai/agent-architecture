@@ -1,0 +1,133 @@
+{
+  "recorded": {
+    "commit": "01ba72c+uncommitted",
+    "date": "2026-11-16",
+    "converter": "tenant payload codec (encrypting), fixed test key",
+    "scenario": "conversation_hop_inline",
+    "suggested_at": 8
+  },
+  "workflow_id": "acme:conv:C_GENERAL:1700000000.000061",
+  "workflow_type": "ConversationWorkflow",
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-16T15:19:23.355Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "ConversationWorkflow"
+        },
+        "taskQueue": {
+          "name": "agentos-main"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L2VuY3J5cHRlZA==",
+                "nonce": "QtWY/Nio0EMiritP",
+                "encryption-key-id": "YWNtZS92MQ=="
+              },
+              "data": "+cXVdjzBmUA9/d4xCmfJb+4GhmsCjHI3EY0FrINu4TAcG4C6afQButHPKWny0RlYwTV3wAktWlc0vGImBCFb3uUZbiDGeKTy8jnmPetRyJe1kbq3qWXbCPiWLy/1uHT7Aue49oEzH0ypr7Rw26LeKQBOloutQLB7OsxX7KKjO4IKSGuh/EkSQKAt8w=="
+            },
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L2VuY3J5cHRlZA==",
+                "nonce": "XYVf8Y1KvKsJ6Pi1",
+                "encryption-key-id": "YWNtZS92MQ=="
+              },
+              "data": "MB4JZbPNKTQoDzWbW1CQuTju8GlQBzu0k35PI06fWq7cohfWWPPWLQqH+KI="
+            },
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L2VuY3J5cHRlZA==",
+                "nonce": "yFFl7392z2d560pq",
+                "encryption-key-id": "YWNtZS92MQ=="
+              },
+              "data": "xuSX1Di4YRPeebp64fGKHnwu/qtzFp0KsWDvTRae5AjgZ4gQU8orgt4VHem8E1Bnt3R5MtLVHcgLZ5y2xphvp3RGOHcgoQbEDqabfBF3fFsg3QM4RKa8E1ufCA=="
+            },
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L2VuY3J5cHRlZA==",
+                "nonce": "MD++an5EDdE7aDED",
+                "encryption-key-id": "YWNtZS92MQ=="
+              },
+              "data": "e7xRU3WV9mzx5akvtOFAj2TpWjSG3zYpYSdZfoDjpgPhw38B0821Rg+/Eg=="
+            },
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L2VuY3J5cHRlZA==",
+                "nonce": "KEZNeNRRdWs5Rvon",
+                "encryption-key-id": "YWNtZS92MQ=="
+              },
+              "data": "qZ2vw+ZxMZVWL640hRI1MlzGsYgD2KLJ867ek6lZA9pZwdykVPXqLE6vvfw="
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "315360000s",
+        "workflowRunTimeout": "315360000s",
+        "workflowTaskTimeout": "10s",
+        "continuedExecutionRunId": "3563d4f8-98f0-451e-bfce-fd9e4730a876",
+        "lastCompletionResult": {},
+        "originalExecutionRunId": "b9241912-70de-4f84-acc6-172a3968da28",
+        "identity": "85550@Bryans-MacBook-Pro-3.local",
+        "firstExecutionRunId": "702bc203-8c76-44c5-9ed0-819cf04081a6",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-16T15:19:23.355Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "agentos-main"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-16T15:19:23.355Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "85550@Bryans-MacBook-Pro-3.local",
+        "historySizeBytes": "1085"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-16T15:19:23.363Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "85550@Bryans-MacBook-Pro-3.local",
+        "binaryChecksum": "b09d5121ff1fb8329fc6ab8526085973",
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            4,
+            1,
+            2,
+            3
+          ],
+          "sdkName": "temporal-python",
+          "sdkVersion": "1.35.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-16T15:19:23.363Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "timerStartedEventAttributes": {
+        "timerId": "1",
+        "startToFireTimeout": "604800s",
+        "workflowTaskCompletedEventId": "3"
+      }
+    }
+  ]
+}

@@ -13,8 +13,10 @@ Rules kept here:
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 
 from agentos import ids
 from agentos.config import (
@@ -24,8 +26,11 @@ from agentos.config import (
     TenantsConfig,
     read_secret,
 )
-from agentos.connectors.notion import NotionAPI, normalize_id
+from agentos.connectors.notion import NotionAPI, NotionUserCache, normalize_id
 from agentos.slack_client import SlackPoster
+from agentos.tenant_store import TenantSource
+
+log = logging.getLogger("agentos.tenants")
 
 
 class UnknownTenant(Exception):
@@ -36,14 +41,17 @@ class UnknownTenant(Exception):
 class TenantRuntime:
     """One tenant's settings and the clients that act for it, and only it.
 
-    ``config.agents`` is the YAML section, the source of the one-time import.
-    The agents a turn runs are the published versions in the agent store.
+    ``config.agents`` is empty when the settings come from the tenants table: the
+    agents a turn runs are the published versions in the agent store.
     """
 
     config: AgentsConfig
     # The clients hold tokens, so they stay out of repr.
     slack: SlackPoster = field(repr=False)
     notion_api: NotionAPI = field(repr=False)
+    # What this tenant's Notion workspace says about people. Shared by every connector built
+    # for the tenant, so a requester is looked up once per cache lifetime, not once per call.
+    notion_users: NotionUserCache = field(default_factory=NotionUserCache, repr=False)
 
 
 def runtime_for(config: AgentsConfig, slack: SlackPoster, notion_api: NotionAPI) -> TenantRuntime:
@@ -66,11 +74,92 @@ class TenantRegistry:
     def tenants(self) -> list[str]:
         return list(self._runtimes)
 
+    def set(self, tenant_id: str, runtime: TenantRuntime) -> None:
+        self._runtimes[tenant_id] = runtime
+
+    def remove(self, tenant_id: str) -> None:
+        self._runtimes.pop(tenant_id, None)
+
     def only_tenant(self) -> str | None:
         """The tenant ID when exactly one tenant is configured, else None."""
         if len(self._runtimes) == 1:
             return next(iter(self._runtimes))
         return None
+
+
+class RegistrySync:
+    """Keeps a worker's ``TenantRegistry`` equal to the directory's enabled tenants.
+
+    ``sync`` adds a tenant added to the database (building its clients from the
+    variables its settings name), swaps in changed settings, and drops a tenant that
+    was disabled or removed, so the worker serves a tenant without a restart. A new
+    tenant that cannot be admitted (a secret variable is unset, or ``admit`` returns a
+    reason) is left out and reported once per reason; the next ``sync`` tries again.
+    """
+
+    def __init__(
+        self,
+        directory: TenantSource,
+        registry: TenantRegistry,
+        slack_factory: Callable[[str], SlackPoster],
+        notion_factory: Callable[[str], NotionAPI],
+        admit: Callable[[AgentsConfig], Awaitable[str | None]] | None = None,
+    ):
+        self._directory = directory
+        self._registry = registry
+        self._slack_factory = slack_factory
+        self._notion_factory = notion_factory
+        self._admit = admit
+        self._reported: set[tuple[str, str]] = set()
+
+    def _report(self, tenant_id: str, reason: str) -> None:
+        if (tenant_id, reason) not in self._reported:
+            self._reported.add((tenant_id, reason))
+            log.error("tenant_id=%s not served yet: %s", tenant_id, reason)
+
+    async def sync(self) -> list[str]:
+        """Bring the registry up to date; the IDs of tenants added by this call."""
+        wanted = (await self._directory.snapshot()).tenants
+        for tenant_id in self._registry.tenants():
+            if tenant_id not in wanted:
+                self._registry.remove(tenant_id)
+                log.info("tenant_id=%s no longer served (disabled or removed)", tenant_id)
+        added = []
+        for tenant_id, config in wanted.items():
+            try:
+                current = self._registry.get(tenant_id)
+            except UnknownTenant:
+                current = None
+            if current is not None and current.config == config:
+                continue
+            if current is not None and current.config.secrets == config.secrets:
+                self._registry.set(tenant_id, replace(current, config=config))
+                continue
+            try:
+                if current is None and self._admit is not None:
+                    failure = await self._admit(config)
+                    if failure:
+                        self._report(tenant_id, failure)
+                        continue
+                slack = self._slack_factory(require_tenant_secret(config, "slack_bot_token_env"))
+                notion = self._notion_factory(require_tenant_secret(config, "notion_token_env"))
+            except ConfigError as err:
+                self._report(tenant_id, str(err))
+                continue
+            self._registry.set(tenant_id, runtime_for(config, slack, notion))
+            if current is None:
+                added.append(tenant_id)
+                log.info("tenant_id=%s now served", tenant_id)
+        return added
+
+    async def run(self, interval_seconds: float) -> None:
+        """Sync forever, every ``interval_seconds``. A failed pass is logged, not fatal."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.sync()
+            except Exception as err:  # noqa: BLE001 - the loop must outlive one failed read
+                log.error("tenant sync failed: %s", type(err).__name__)
 
 
 def require_tenant_secret(config: AgentsConfig, field_name: str) -> str:

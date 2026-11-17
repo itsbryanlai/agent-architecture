@@ -7,17 +7,31 @@ services:
     image: pgvector/pgvector:0.8.1-pg16
     environment:
       POSTGRES_USER: agentos
-      POSTGRES_PASSWORD: agentos
+      # Both passwords come from the shell that runs Compose; no file here carries one.
+      # The owner password is used on the first start of an empty data directory only.
+      POSTGRES_PASSWORD: ${AGENTOS_OWNER_DB_PASSWORD:?export AGENTOS_OWNER_DB_PASSWORD}
+      AGENTOS_APP_DB_PASSWORD: ${AGENTOS_APP_DB_PASSWORD:?export AGENTOS_APP_DB_PASSWORD}
       POSTGRES_DB: agentos
     ports:
       # Host port 55432, not 5432: a native Postgres often already holds 5432.
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+      # Run in file-name order on the first start: the app role with its password, then the schema.
+      - ./scripts/docker-initdb/00_app_role.sh:/docker-entrypoint-initdb.d/00_app_role.sh:ro
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/10_init_db.sql:ro
 
   temporal:
     image: temporalio/temporal:1.9.1
-    command: ["server", "start-dev", "--ip", "0.0.0.0"]
+    # Listens on all interfaces inside the container so the published ports work;
+    # the ports below are bound to this machine only. --db-filename keeps pending
+    # workflows across a container restart.
+    command:
+      ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/home/temporal/temporal.db"]
     ports:
-      - "7233:7233"
-      - "8233:8233"
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
+    volumes:
+      - temporal-data:/home/temporal
+
+volumes:
+  temporal-data:

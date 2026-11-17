@@ -4,6 +4,8 @@
     uv run python -m agentos.index_knowledge --wait      # ... and wait for each summary
     uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
     uv run python -m agentos.index_knowledge --tenant acme  # only one tenant
+    uv run python -m agentos.index_knowledge --confirm-gone # delete the index of a root page
+                                                            # that is gone, without waiting
 
 Needs a running worker (``uv run python -m agentos.worker``), which does the
 reading and embedding with its own Notion token and Qwen key. This command
@@ -16,6 +18,10 @@ One run starts per distinct granted scope of each tenant: two agents of the
 same tenant granted the same root page share one run. A run that is already
 going is not started twice. Schedules are planned and deleted per tenant, by
 that tenant's ID prefix, so one tenant's command never touches another's.
+
+A scope whose root page is gone or unshared is not deleted by one run: the owner is told, and
+the index is deleted when three nightly runs in a row find the root gone. ``--confirm-gone``
+is the admin's way to delete it now. It changes nothing for a scope whose root page is back.
 """
 
 from __future__ import annotations
@@ -48,30 +54,40 @@ from agentos.config import (
     AgentsConfig,
     Settings,
     load_settings,
-    load_tenants_config,
 )
 from agentos.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from agentos.temporal_client import build_temporal_client
+from agentos.tenant_store import load_stored_tenants
 from agentos.tenants import granted_roots
 from agentos.workflows.indexing import IndexingWorkflow
 
 __all__ = ["apply_schedules", "granted_roots", "plan_schedules", "start_indexing"]
 
 
-async def start_indexing(client: Client, agents: AgentsConfig) -> list[tuple[str, WorkflowHandle]]:
-    """Start one IndexingWorkflow per distinct scope; reuse a run already going."""
+async def start_indexing(
+    client: Client, agents: AgentsConfig, confirm_gone: bool = False
+) -> list[tuple[str, WorkflowHandle]]:
+    """Start one IndexingWorkflow per distinct scope; reuse a run already going.
+
+    With ``confirm_gone``, a run that finds its scope's root page gone deletes the scope's
+    index at once instead of waiting for repeated runs. A run already going is reused as it is.
+    """
     started = []
     for scope, root in granted_roots(agents).items():
         workflow_id = ids.index_workflow_id(agents.tenant_id, scope)
         handle = await client.start_workflow(
             IndexingWorkflow.run,
-            args=[agents.tenant_id, scope, root],
+            args=[agents.tenant_id, scope, root, *_FRESH_RUN, confirm_gone],
             id=workflow_id,
             task_queue=TASK_QUEUE,
             id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         )
         started.append((workflow_id, handle))
     return started
+
+
+# The walk state of a run that has only begun: nothing seen, no start time, no parents.
+_FRESH_RUN = (None, None, None, 0, 0, None, None, 0)
 
 
 @dataclass
@@ -150,7 +166,7 @@ async def apply_schedules(
 @asynccontextmanager
 async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
     """The knowledge store, over the same database the worker uses."""
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         yield PostgresKnowledgeStore(pool)
@@ -161,7 +177,7 @@ async def open_store(settings: Settings) -> AsyncIterator[KnowledgeStore]:
 @asynccontextmanager
 async def open_agent_store(settings: Settings) -> AsyncIterator[AgentStore]:
     """The agent store, over the same database the worker uses."""
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
         yield PostgresAgentStore(pool)
@@ -169,9 +185,11 @@ async def open_agent_store(settings: Settings) -> AsyncIterator[AgentStore]:
         await pool.close()
 
 
-async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
+async def run(
+    wait: bool, schedule: bool, tenant: str | None = None, confirm_gone: bool = False
+) -> None:
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
+    tenants = await load_stored_tenants(settings.require("database_url"))
     if tenant is not None and tenant not in tenants.tenants:
         raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
     selected = [tenants.tenants[tenant]] if tenant else list(tenants.tenants.values())
@@ -207,7 +225,7 @@ async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
         return
     started = []
     for agents in selected:
-        started += await start_indexing(client, agents)
+        started += await start_indexing(client, agents, confirm_gone)
     for workflow_id, _ in started:
         print(f"started {workflow_id}")
     if wait:
@@ -215,7 +233,8 @@ async def run(wait: bool, schedule: bool, tenant: str | None = None) -> None:
             summary = await handle.result()
             print(
                 f"{workflow_id}: pages={summary.pages} changed={summary.changed} "
-                f"skipped={summary.skipped} pruned={summary.pruned}"
+                f"skipped={summary.skipped} failed={summary.failed} pruned={summary.pruned}"
+                + (" root-gone" if summary.root_gone else "")
             )
 
 
@@ -233,8 +252,16 @@ def main() -> None:
         help="create or update one nightly (03:00 UTC) schedule per scope and delete stale ones",
     )
     parser.add_argument("--tenant", help="only this tenant (default: every configured tenant)")
+    parser.add_argument(
+        "--confirm-gone",
+        action="store_true",
+        help=(
+            "start runs that delete the index of a scope whose root page is gone, "
+            "without waiting for three nightly runs"
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.wait, args.schedule, args.tenant))
+    asyncio.run(run(args.wait, args.schedule, args.tenant, args.confirm_gone))
 
 
 if __name__ == "__main__":

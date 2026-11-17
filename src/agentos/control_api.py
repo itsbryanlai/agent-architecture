@@ -1,4 +1,4 @@
-"""The control-plane API: agents, versions, members and the audit log, as JSON.
+"""The control-plane API: agents, versions, members, usage, budgets, switches and the audit log, as JSON.
 
 This is a separate app and process from the gateway. The gateway is reachable
 from the internet; this API is not, and must not be. Without sign-in with Slack
@@ -32,6 +32,7 @@ import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlsplit
 
@@ -39,13 +40,21 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from psycopg import ProgrammingError
+from psycopg.conninfo import conninfo_to_dict
 from pydantic import BaseModel, ConfigDict
 
 from agentos.agent_store import AgentNotFound
-from agentos.config import ConfigError, Settings, TenantsConfig, load_settings, load_tenants_config
+from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
 from agentos.control import ControlPlane
 from agentos.control_errors import STATUS_BY_ERROR
 from agentos.grant_checker import GrantProblems
+from agentos.notion_picker import (
+    NOTION_CALLBACK_PATH,
+    HttpNotionOAuth,
+    Picker,
+    picker_from_settings,
+)
 from agentos.sessions import SessionStore
 from agentos.slack_signin import (
     CALLBACK_PATH,
@@ -54,6 +63,7 @@ from agentos.slack_signin import (
     SlackSession,
     sign_in_from_settings,
 )
+from agentos.tenant_store import TenantSource, as_source
 from agentos.tenants import notion_key_failure
 from agentos.web_ui import CONSOLE_FORM_PREFIXES, install_web_ui
 
@@ -122,6 +132,30 @@ def check_bind_host(host: str, sign_in_configured: bool = False) -> None:
         )
 
 
+# Passwords that ship in the repository for local development.
+DEVELOPMENT_DATABASE_PASSWORDS = frozenset({"agentos_app", "agentos"})
+
+
+def check_database_for_bind(host: str, database_url: str) -> None:
+    """Refuse a non-loopback bind while the database password is empty or a development default.
+
+    A console reachable beyond this machine must not sit in front of a database
+    that anyone who has read the repository can open.
+    """
+    if host in LOOPBACK_HOSTS:
+        return
+    try:
+        password = conninfo_to_dict(database_url).get("password") or ""
+    except ProgrammingError:
+        password = ""
+    if not password or password in DEVELOPMENT_DATABASE_PASSWORDS:
+        raise SystemExit(
+            f"refusing to listen on '{host}': the database password in AGENTOS_DATABASE_URL "
+            "is empty or a development default. Set a password of your own in "
+            "AGENTOS_DATABASE_URL before listening beyond loopback."
+        )
+
+
 # --- bodies -------------------------------------------------------------------------
 
 
@@ -140,6 +174,34 @@ class NewDraft(_Body):
 
 class Definition(_Body):
     definition: dict[str, Any]
+
+
+class AudienceCounts(_Body):
+    total: int
+    guests: int
+    external: int
+
+
+class Publish(BaseModel):
+    """The publish body. ``definition_sha256`` is the hash of the version the approver was
+    shown (the ``definition_sha256`` of the version record they read); a publish without
+    it is refused, because it would publish whatever is pending when the request lands.
+    Other fields it does not know are ignored, and who acts never comes from a body. A
+    misspelt ``confirm_audience`` is therefore not a confirmation, and the publish is
+    refused."""
+
+    model_config = ConfigDict(extra="ignore")
+    definition_sha256: str
+    confirm_audience: AudienceCounts | None = None
+    # The approver has seen that the version widens access (see ``access_diff``).
+    acknowledge_widening: bool = False
+    # The published version number the approver's diff was computed against, or "none"
+    # (``published`` in the review). A publish without it is refused.
+    reviewed_published: str
+
+
+class BudgetAmount(_Body):
+    amount: Decimal
 
 
 class NewMember(_Body):
@@ -161,26 +223,28 @@ def _error(status: int, message: str, **extra: Any) -> JSONResponse:
 @dataclass
 class ControlDeps:
     plane: ControlPlane | None
-    tenants: TenantsConfig | None
+    tenants: TenantSource | None
     sessions: SessionStore | None = None
     console: Console | None = None
+    picker: Picker | None = None
 
 
 def create_app(
     plane: ControlPlane | None,
-    tenants: TenantsConfig | None,
+    tenants: TenantsConfig | TenantSource | None,
     identity: IdentityProvider,
     lifespan: Any = None,
     port: int = DEFAULT_PORT,
     sessions: SessionStore | None = None,
     console: Console | None = None,
+    picker: Picker | None = None,
 ) -> FastAPI:
     """Build the API. Tests pass fakes; the real process fills ``deps`` on startup.
 
     With a ``console`` the app also serves the web pages, and ``identity`` should be
     ``SlackSession()``. The Host and Origin allowlists then include the console URL.
     """
-    deps = ControlDeps(plane, tenants, sessions, console)
+    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
@@ -239,7 +303,10 @@ def create_app(
             return _error(403, "origin not allowed")
         # Slack sends the browser back to the callback from another site; the callback
         # is protected by its state cookie instead.
-        arrives_from_slack = console is not None and request.url.path == CALLBACK_PATH
+        arrives_from_slack = console is not None and request.url.path in (
+            CALLBACK_PATH,
+            NOTION_CALLBACK_PATH,
+        )
         if (
             headers.get("sec-fetch-site") in ("cross-site", "same-site")
             and not arrives_from_slack
@@ -293,17 +360,19 @@ def create_app(
         log.error("control API error: %s", type(err).__name__)
         return _error(500, "internal error")
 
-    def known_tenant(tenant_id: str) -> str:
-        if deps.tenants is None or deps.tenants.get(tenant_id) is None:
+    async def acting(request: Request) -> str:
+        """Who is asking. Runs before anything about the path's tenant is looked up, so a
+        caller with no session cannot tell a real tenant from an unknown one."""
+        return await identity.actor(request)
+
+    Actor = Annotated[str, Depends(acting)]
+
+    async def known_tenant(tenant_id: str, actor: Actor) -> str:
+        if deps.tenants is None or await deps.tenants.get(tenant_id) is None:
             raise HTTPException(404, f"unknown tenant '{tenant_id}'")
         return tenant_id
 
     Tenant = Annotated[str, Depends(known_tenant)]
-
-    async def acting(request: Request, tenant_id: Tenant) -> str:
-        return await identity.actor(request)
-
-    Actor = Annotated[str, Depends(acting)]
 
     async def request_id(
         request: Request,
@@ -403,16 +472,59 @@ def create_app(
 
     @app.post("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/publish")
     async def publish(
-        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str, version: int
+        tenant_id: Tenant,
+        actor: Actor,
+        rid: RequestId,
+        agent_id: str,
+        version: int,
+        body: Publish,
     ) -> JSONResponse:
-        return out(await deps.plane.publish_version(tenant_id, actor, agent_id, version, rid))
+        confirm = body.confirm_audience
+        return out(
+            await deps.plane.publish_version(
+                tenant_id,
+                actor,
+                agent_id,
+                version,
+                rid,
+                None if confirm is None else confirm.model_dump(),
+                reviewed_sha256=body.definition_sha256,
+                acknowledge_widening=body.acknowledge_widening is True,
+                reviewed_published=body.reviewed_published,
+            )
+        )
 
     @app.post("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/check-grants")
     async def check_grants(
         tenant_id: Tenant, actor: Actor, agent_id: str, version: int
     ) -> JSONResponse:
         reports = await deps.plane.check_version_grants(tenant_id, actor, agent_id, version)
-        return out({"ok": not any(r.problems for r in reports), "grants": reports})
+        return out({"ok": all(r.ok for r in reports), "grants": [r.as_dict() for r in reports]})
+
+    @app.get("/tenants/{tenant_id}/agents/{agent_id}/versions/{version}/review")
+    async def review(tenant_id: Tenant, actor: Actor, agent_id: str, version: int) -> JSONResponse:
+        """What a draft or pending version changes about access, for its editor or an admin.
+
+        Only an admin gets the grants with their live titles and parents; the diff and the
+        picks (who chose which object from their own Notion) go to either."""
+        found = await deps.plane.version_review(tenant_id, actor, agent_id, version)
+        return out(
+            {
+                "grants": None if found.reports is None else [r.as_dict() for r in found.reports],
+                "live_problem": found.live_problem,
+                "widens": None if found.diff is None else found.diff.widens,
+                "published": None if found.diff is None else found.diff.published,
+                "changes": None
+                if found.diff is None
+                else [
+                    {"kind": c.kind, "what": c.what, "widens": c.widens} for c in found.diff.changes
+                ],
+                "picks": {
+                    nid: {"picked_by": p.picked_by, "picked_at": p.picked_at}
+                    for nid, p in found.picks.items()
+                },
+            }
+        )
 
     # --- members ---
 
@@ -440,6 +552,94 @@ def create_app(
     ) -> JSONResponse:
         await deps.plane.drop_member(tenant_id, actor, user_id, rid)
         return out({"user_id": user_id, "removed": True})
+
+    # --- usage ---
+
+    @app.get("/tenants/{tenant_id}/usage")
+    async def usage(
+        tenant_id: Tenant, actor: Actor, month: Annotated[str | None, Query()] = None
+    ) -> JSONResponse:
+        """Usage and cost for ``month`` (YYYY-MM, default the current UTC month)."""
+        return out((await deps.plane.usage_report(tenant_id, actor, month)).as_dict())
+
+    # --- budgets ---
+
+    @app.get("/tenants/{tenant_id}/budgets")
+    async def budgets(tenant_id: Tenant, actor: Actor) -> JSONResponse:
+        """Budgets against the current UTC month's spend: the tenant line (admins) and agents."""
+        return out((await deps.plane.budgets(tenant_id, actor)).as_dict())
+
+    @app.put("/tenants/{tenant_id}/budget")
+    async def set_tenant_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, body: BudgetAmount
+    ) -> JSONResponse:
+        row = await deps.plane.set_budget(tenant_id, actor, None, body.amount, rid)
+        return out({"agent_id": None, "amount": format(row.amount, "f")})
+
+    @app.delete("/tenants/{tenant_id}/budget")
+    async def remove_tenant_budget(tenant_id: Tenant, actor: Actor, rid: RequestId) -> JSONResponse:
+        await deps.plane.remove_budget(tenant_id, actor, None, rid)
+        return out({"agent_id": None, "removed": True})
+
+    @app.put("/tenants/{tenant_id}/agents/{agent_id}/budget")
+    async def set_agent_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str, body: BudgetAmount
+    ) -> JSONResponse:
+        row = await deps.plane.set_budget(tenant_id, actor, agent_id, body.amount, rid)
+        return out({"agent_id": agent_id, "amount": format(row.amount, "f")})
+
+    @app.delete("/tenants/{tenant_id}/agents/{agent_id}/budget")
+    async def remove_agent_budget(
+        tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str
+    ) -> JSONResponse:
+        await deps.plane.remove_budget(tenant_id, actor, agent_id, rid)
+        return out({"agent_id": agent_id, "removed": True})
+
+    # --- kill switches ---
+
+    @app.get("/tenants/{tenant_id}/switches")
+    async def switches(tenant_id: Tenant, actor: Actor) -> JSONResponse:
+        """Every switch and its state: all of them for an admin, a creator's agents only."""
+        return out((await deps.plane.switches(tenant_id, actor)).as_dict())
+
+    async def change_switch(
+        tenant_id: str, actor: str, rid: str | None, scope: str, target: str | None, off: bool
+    ) -> JSONResponse:
+        change = deps.plane.turn_off if off else deps.plane.turn_on
+        changed = await change(tenant_id, actor, scope, target, rid)
+        return out({"scope": scope, "target": target, "off": off, "changed": changed})
+
+    @app.put("/tenants/{tenant_id}/switches/all-agents")
+    async def turn_off_all_agents(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "all_agents", None, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/all-agents")
+    async def turn_on_all_agents(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "all_agents", None, False)
+
+    @app.put("/tenants/{tenant_id}/switches/writes")
+    async def turn_off_writes(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "writes", None, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/writes")
+    async def turn_on_writes(tenant_id: Tenant, actor: Actor, rid: RequestId):
+        return await change_switch(tenant_id, actor, rid, "writes", None, False)
+
+    @app.put("/tenants/{tenant_id}/switches/agents/{agent_id}")
+    async def turn_off_agent(tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str):
+        return await change_switch(tenant_id, actor, rid, "agent", agent_id, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/agents/{agent_id}")
+    async def turn_on_agent(tenant_id: Tenant, actor: Actor, rid: RequestId, agent_id: str):
+        return await change_switch(tenant_id, actor, rid, "agent", agent_id, False)
+
+    @app.put("/tenants/{tenant_id}/switches/connectors/{connector}")
+    async def turn_off_connector(tenant_id: Tenant, actor: Actor, rid: RequestId, connector: str):
+        return await change_switch(tenant_id, actor, rid, "connector", connector, True)
+
+    @app.delete("/tenants/{tenant_id}/switches/connectors/{connector}")
+    async def turn_on_connector(tenant_id: Tenant, actor: Actor, rid: RequestId, connector: str):
+        return await change_switch(tenant_id, actor, rid, "connector", connector, False)
 
     # --- audit ---
 
@@ -471,36 +671,72 @@ async def _real_lifespan(app: FastAPI):
     from psycopg_pool import AsyncConnectionPool
 
     from agentos.agent_store import PostgresAgentStore
+    from agentos.audience import SlackAudienceInspector
+    from agentos.audience_pauses import PostgresPauseStore
     from agentos.audit import PostgresAuditStore
+    from agentos.budgets import PostgresBudgetStore
     from agentos.connectors.notion import RealNotionAPI
     from agentos.grant_checker import NotionGrantChecker
+    from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
+    from agentos.schema_version import require_current_schema
     from agentos.sessions import PostgresSessionStore
+    from agentos.slack_client import RealSlackPoster
+    from agentos.switches import PostgresSwitchStore
+    from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
     from agentos.tenants import require_tenant_secret
+    from agentos.unit_of_work import PostgresUnitOfWork
+    from agentos.usage import PostgresUsageStore
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
-    tenants = load_tenants_config(settings.config_path)
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
+        await require_current_schema(pool)
+        directory = TenantDirectory(PostgresTenantStore(pool))
+        if failure := notion_key_failure(await startup_tenants(directory)):
+            raise SystemExit(failure)
         apis: dict[str, RealNotionAPI] = {}
 
         def notion_for(tenant_id: str) -> RealNotionAPI:
             if tenant_id not in apis:
-                config = tenants.get(tenant_id)
+                config = directory.latest().get(tenant_id)
                 apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
             return apis[tenant_id]
+
+        slack_clients: dict[str, RealSlackPoster] = {}
+
+        def slack_for(tenant_id: str) -> RealSlackPoster:
+            # Built on first use, so a tenant whose Slack variable is unset fails its
+            # own publish with a message naming the variable, not the whole console.
+            if tenant_id not in slack_clients:
+                config = directory.latest().get(tenant_id)
+                slack_clients[tenant_id] = RealSlackPoster(
+                    require_tenant_secret(config, "slack_bot_token_env"), tenant_id=tenant_id
+                )
+            return slack_clients[tenant_id]
+
+        def team_for(tenant_id: str) -> str:
+            return directory.latest().get(tenant_id).slack_team_id
 
         app.state.deps.sessions = PostgresSessionStore(pool)
         app.state.deps.plane = ControlPlane(
             PostgresAgentStore(pool),
             PostgresMemberStore(pool),
             PostgresAuditStore(pool),
-            tenants,
+            directory,
             NotionGrantChecker(notion_for),
+            SlackAudienceInspector(slack_for, team_for),
+            usage=PostgresUsageStore(pool),
+            budgets=PostgresBudgetStore(pool),
+            pauses=PostgresPauseStore(pool),
+            switches=PostgresSwitchStore(pool),
+            unit_of_work=PostgresUnitOfWork(pool),
+            grant_picks=PostgresGrantPickStore(pool),
+            require_grant_picker=settings.require_grant_picker,
         )
-        app.state.deps.tenants = tenants
+        app.state.deps.tenants = directory
         yield
     finally:
         await pool.close()
@@ -520,10 +756,25 @@ def build_process_app(
     except ConfigError as err:
         raise SystemExit(str(err)) from err
     check_bind_host(host, sign_in_configured=sign_in is not None)
+    check_database_for_bind(host, settings.database_url)
     if sign_in is None:
         operator = operator_from_environment(environ)
         return create_app(None, None, operator, lifespan=_real_lifespan, port=port)
     slack = HttpSlackOidc(sign_in.client_id, sign_in.client_secret)
+    try:
+        picker_config = picker_from_settings(
+            settings.notion_oauth_client_id, settings.notion_oauth_client_secret
+        )
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
+    if settings.require_grant_picker and picker_config is None:
+        raise SystemExit(
+            "AGENTOS_REQUIRE_GRANT_PICKER is set but the picker is not configured: set "
+            "NOTION_OAUTH_CLIENT_ID and NOTION_OAUTH_CLIENT_SECRET"
+        )
+    picker = (
+        None if picker_config is None else Picker(picker_config, HttpNotionOAuth(picker_config))
+    )
     return create_app(
         None,
         None,
@@ -531,6 +782,7 @@ def build_process_app(
         lifespan=_real_lifespan,
         port=port,
         console=Console(sign_in, slack),
+        picker=picker,
     )
 
 
@@ -547,12 +799,6 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     settings = load_settings()
-    try:
-        failure = notion_key_failure(load_tenants_config(settings.config_path))
-    except ConfigError as err:
-        raise SystemExit(str(err)) from err
-    if failure:
-        raise SystemExit(failure)
     app = build_process_app(args.host, args.port, settings, os.environ)
     uvicorn.run(app, host=args.host, port=args.port)
 

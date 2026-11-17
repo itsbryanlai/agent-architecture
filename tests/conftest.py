@@ -8,14 +8,15 @@ import copy
 from dataclasses import dataclass, field
 
 import pytest
+import pytest_asyncio
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
 from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore
+from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import (
-    TASK_QUEUE,
     AgentsConfig,
     Settings,
     TenantsConfig,
@@ -28,16 +29,25 @@ from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
 from agentos.slack_client import FakeSlack
 from agentos.stores import (
+    InMemoryExternalWriteStore,
     InMemoryHistoryStore,
     InMemoryIdempotencyStore,
     InMemoryTaskLinkStore,
     InMemoryToolOutputStore,
 )
+from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
+from agentos.usage import InMemoryUsageStore
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
+from tests.helpers.temporal import (
+    TemporalScope,
+    current_server,
+    replace_server_if_stuck,
+    set_server,
+)
 
 TENANT = "acme"
 TEAM = "T0TEST"
@@ -140,7 +150,7 @@ def title_prop(title: str) -> dict:
 
 @dataclass
 class Harness:
-    wf_env: WorkflowEnvironment
+    wf_env: TemporalScope
     agents: AgentsConfig
     llm: ScriptedLLMClient
     slack: FakeSlack
@@ -151,15 +161,37 @@ class Harness:
     tool_outputs: InMemoryToolOutputStore
     audit: InMemoryAuditStore = field(default_factory=InMemoryAuditStore)
     agent_store: InMemoryAgentStore = field(default_factory=InMemoryAgentStore)
+    switches: InMemorySwitchStore = field(default_factory=InMemorySwitchStore)
+    external_writes: InMemoryExternalWriteStore = field(default_factory=InMemoryExternalWriteStore)
+    acts: AgentActivities = None  # type: ignore[assignment]
 
     @property
     def client(self):
         return self.wf_env.client
 
 
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def temporal_server():
+    """The one Temporal time-skipping server of the session."""
+    set_server(await WorkflowEnvironment.start_time_skipping())
+    yield
+    server = current_server()
+    set_server(None)
+    await server.shutdown()
+
+
 @pytest.fixture
-async def harness(agents):
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+async def temporal_scope(temporal_server):
+    """The shared server with this test's own task queue; its workflows end with the test."""
+    scope = TemporalScope(current_server())
+    yield scope
+    await scope.finish()
+    await replace_server_if_stuck()
+
+
+@pytest.fixture
+async def harness(agents, temporal_scope):
+    wf_env = temporal_scope
     h = Harness(
         wf_env=wf_env,
         agents=agents,
@@ -182,16 +214,21 @@ async def harness(agents):
         tool_outputs=h.tool_outputs,
         audit=h.audit,
         agents=h.agent_store,
+        switches=h.switches,
+        external_writes=h.external_writes,
     )
+    h.acts = acts
+    # The tests wait for no real seconds: a take-over looks again at once.
+    acts.visibility_interval = 0
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow],
         activities=acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
 
 
 async def eventually(check, timeout: float = 10.0, interval: float = 0.05):
@@ -225,6 +262,9 @@ def knowledge_agents_dict() -> dict:
     hr["name"] = "HR helper"
     plain = copy.deepcopy(base)
     plain["name"] = "Plain helper"
+    # Not the default agent and not routed to any channel, so without its own audience
+    # the audience check would refuse it in the channel the knowledge tests talk in.
+    plain["audience"] = {"channels": ["C_GENERAL"], "dm": "everyone"}
     base["grants"]["notion"]["pages"] = [{"id": ROOT_A, "name": "IT wiki"}]
     hr["grants"]["notion"]["pages"] = [{"id": ROOT_B, "name": "HR wiki"}]
     raw["agents"]["hr-helper"] = hr
@@ -276,12 +316,14 @@ class KnowledgeHarness(Harness):
     knowledge: InMemoryKnowledgeStore = None  # type: ignore[assignment]
     embedder: FakeEmbedder = None  # type: ignore[assignment]
     acts: AgentActivities = None  # type: ignore[assignment]
+    budgets: InMemoryBudgetStore = None  # type: ignore[assignment]
+    usage_store: InMemoryUsageStore = None  # type: ignore[assignment]
 
 
 @pytest.fixture
-async def kharness():
+async def kharness(temporal_scope):
     cfg = parse_agents_config(knowledge_agents_dict())
-    wf_env = await WorkflowEnvironment.start_time_skipping()
+    wf_env = temporal_scope
     notion = make_fake_notion()
     notion.add_page_tree(ROOT_A, a_tree())
     notion.add_page_tree(ROOT_B, b_tree())
@@ -298,6 +340,8 @@ async def kharness():
         knowledge=InMemoryKnowledgeStore(),
         embedder=FakeEmbedder(),
         agent_store=seeded_agent_store(cfg),
+        budgets=InMemoryBudgetStore(),
+        usage_store=InMemoryUsageStore(),
     )
     registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, notion)})
     h.acts = AgentActivities(
@@ -312,17 +356,25 @@ async def kharness():
         agents=h.agent_store,
         knowledge=h.knowledge,
         embedder=h.embedder,
+        switches=h.switches,
     )
-    index_acts = IndexActivities(registry, h.knowledge, h.embedder, h.agent_store)
+    index_acts = IndexActivities(
+        registry,
+        h.knowledge,
+        h.embedder,
+        h.agent_store,
+        switches=h.switches,
+        budgets=BudgetGuard(h.budgets, h.usage_store, ttl_seconds=0),
+    )
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
         activities=h.acts.all() + index_acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
 
 
 # --- Two tenants in one deployment, each with its own Slack and Notion fakes.
@@ -356,7 +408,7 @@ def two_tenant_dicts() -> tuple[dict, dict]:
 
 @dataclass
 class TwoTenantHarness:
-    wf_env: WorkflowEnvironment
+    wf_env: TemporalScope
     tenants: TenantsConfig
     registry: TenantRegistry
     llm: ScriptedLLMClient
@@ -370,11 +422,15 @@ class TwoTenantHarness:
 
 
 @pytest.fixture
-async def two_tenants():
+async def two_tenants(temporal_scope):
     acme_raw, globex_raw = two_tenant_dicts()
     tenants = TenantsConfig.of(parse_agents_config(acme_raw), parse_agents_config(globex_raw))
-    wf_env = await WorkflowEnvironment.start_time_skipping()
-    slacks = {t: FakeSlack(emails={ALICE: "alice@example.com"}) for t in tenants.tenants}
+    wf_env = temporal_scope
+    # Each tenant's Slack client answers for its own workspace, as the real one does.
+    slacks = {
+        t: FakeSlack(emails={ALICE: "alice@example.com"}, team_id=cfg.slack_team_id)
+        for t, cfg in tenants.tenants.items()
+    }
     notions = {t: make_fake_notion() for t in tenants.tenants}
     registry = TenantRegistry(
         {t: runtime_for(cfg, slacks[t], notions[t]) for t, cfg in tenants.tenants.items()}
@@ -401,10 +457,28 @@ async def two_tenants():
     )
     worker = Worker(
         wf_env.client,
-        task_queue=TASK_QUEUE,
+        task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow],
         activities=acts.all(),
+        interceptors=[wf_env.children],
     )
     async with worker:
         yield h
-    await wf_env.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _publish_acknowledges_widening(request, monkeypatch):
+    """Most tests are about something else, and a first publish widens access, so a direct
+    ``ControlPlane.publish_version`` call acknowledges it unless the test says otherwise.
+    ``test_grant_review`` exercises the acknowledgement itself and gets the real behaviour."""
+    if request.module.__name__.endswith("test_grant_review"):
+        return
+    from agentos.control import ControlPlane
+
+    real = ControlPlane.publish_version
+
+    async def publish(self, *args, **kwargs):
+        kwargs.setdefault("acknowledge_widening", True)
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ControlPlane, "publish_version", publish)

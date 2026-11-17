@@ -11,6 +11,16 @@ Moves a version may make: draft to pending, pending to draft (withdrawn or
 rejected), pending to published, published to superseded. The database
 enforces them with a trigger for every role; the in-memory store mirrors them.
 
+A version is approved by its content, not by its number. Submit stores the SHA-256 of
+the canonical JSON of the definition as ``definition_sha256`` (withdraw clears it), and
+a publish names the hash the approver was shown: when the version now carries another
+(it was withdrawn, edited and submitted again under the same number) the publish is
+refused with ``VersionChanged``. Submit, withdraw, edit and publish take the tenant's
+lock, so none of them lands between another one's read and update.
+
+Each write method takes an optional ``conn``. The control plane passes the connection of
+its unit of work (``unit_of_work.py``) so the change and its audit event commit together.
+
 ``definition`` is one agent block in the YAML shape, without ``version`` (the
 store assigns it as the agent's highest number plus one). It is parsed by
 ``config.parse_agent``, the same function that reads the YAML file, and the
@@ -24,10 +34,12 @@ refuse a publish of a version lower than the one already published, so no
 caller can roll an agent back by publishing an old version. A rollback is a new
 draft copied from the old version, then submitted and published.
 
-Tenant settings (``default_agent``, ``channels``, workspace, secrets) stay in
-the YAML file. The YAML ``agents`` section is only the source of a one-time
-import::
+Tenant settings (``default_agent``, ``channels``, workspace, the names of the
+secret variables) live in the ``tenants`` table (``agentos.tenant_store``). The
+YAML file is only the source of two one-time imports, its tenant section and its
+``agents`` section::
 
+    uv run python -m agentos.tenant_store import
     uv run python -m agentos.agent_store import
 """
 
@@ -52,11 +64,13 @@ from agentos.config import (
     ConfigError,
     TenantsConfig,
     agent_definition,
+    channel_audience_problems,
+    check_agent_id,
     check_front_doors,
     parse_agent,
 )
 from agentos.models import AuditEvent
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 
 IMPORT_USER = "import:yaml"
 
@@ -82,6 +96,10 @@ class AgentNotFound(AgentStoreError):
     """The change names an agent or a version that does not exist."""
 
 
+class VersionChanged(AgentStoreError):
+    """The version is not the one the approver was shown: its content changed since."""
+
+
 @dataclass(frozen=True)
 class AgentVersionRecord:
     """One stored version of an agent, with its lifecycle."""
@@ -97,6 +115,7 @@ class AgentVersionRecord:
     submitted_at: datetime | None = None
     approved_by: str | None = None
     published_at: datetime | None = None
+    definition_sha256: str | None = None  # set by submit; None while a draft
 
     def agent(self) -> AgentVersion:
         """The definition parsed and validated like a YAML agent block."""
@@ -131,7 +150,7 @@ class AgentStore(Protocol):
         ...
 
     async def get_version(
-        self, tenant_id: str, agent_id: str, version: int
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
     ) -> AgentVersionRecord | None: ...
 
     async def versions(self, tenant_id: str, agent_id: str) -> list[AgentVersionRecord]:
@@ -147,41 +166,67 @@ class AgentStore(Protocol):
     # --- writes --------------------------------------------------------------
 
     async def create_agent(
-        self, tenant_id: str, agent_id: str, definition: dict[str, Any], created_by: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        definition: dict[str, Any],
+        created_by: str,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         """Create the agent with version 1 as a draft."""
         ...
 
     async def create_draft(
-        self, tenant_id: str, agent_id: str, created_by: str, from_version: int | None = None
+        self,
+        tenant_id: str,
+        agent_id: str,
+        created_by: str,
+        from_version: int | None = None,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         """A new draft copied from ``from_version``, or from the published version."""
         ...
 
     async def replace_draft(
-        self, tenant_id: str, agent_id: str, version: int, definition: dict[str, Any]
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        definition: dict[str, Any],
+        conn: Any = None,
     ) -> AgentVersionRecord:
         """Replace a draft's definition. Any other status is refused."""
         ...
 
     async def submit(
-        self, tenant_id: str, agent_id: str, version: int, submitted_by: str
+        self, tenant_id: str, agent_id: str, version: int, submitted_by: str, conn: Any = None
     ) -> AgentVersionRecord:
-        """Draft to pending."""
+        """Draft to pending, storing the hash of the definition submitted."""
         ...
 
-    async def withdraw(self, tenant_id: str, agent_id: str, version: int) -> AgentVersionRecord:
+    async def withdraw(
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
+    ) -> AgentVersionRecord:
         """Pending back to draft: the submitter withdraws it or an approver rejects it."""
         ...
 
     async def publish(
-        self, tenant_id: str, agent_id: str, version: int, approved_by: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        approved_by: str,
+        reviewed_sha256: str | None = None,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         """Pending to published; the agent's previous published version becomes superseded.
 
-        Refused with ``AgentStoreError`` when a higher version is already
-        published, and with ``ConfigError`` when the tenant's published set
-        would break the front-door rules.
+        ``reviewed_sha256`` is the hash the approver was shown; the publish is refused with
+        ``VersionChanged`` when the version carries another. Without it the version that is
+        pending now is published (a caller that showed nobody a page, like a script).
+        Refused with ``AgentStoreError`` when a higher version is already published, and
+        with ``ConfigError`` when the tenant's published set would break the front-door
+        rules.
         """
         ...
 
@@ -256,6 +301,13 @@ def _no_such(agent_id: str, version: int) -> AgentNotFound:
     return AgentNotFound(f"agent '{agent_id}' has no version {version}")
 
 
+def version_changed(agent_id: str, version: int) -> VersionChanged:
+    return VersionChanged(
+        f"agent '{agent_id}' version {version} changed since you opened it; "
+        "reload the page and review it again"
+    )
+
+
 def _wrong_status(agent_id: str, version: int, status: str, wanted: str) -> AgentStoreError:
     return AgentStoreError(
         f"agent '{agent_id}' version {version} is {status}; this change needs {wanted}"
@@ -266,7 +318,7 @@ def _wrong_status(agent_id: str, version: int, status: str, wanted: str) -> Agen
 
 _COLUMNS = (
     "tenant_id, agent_id, version, status, definition, created_by, created_at, "
-    "submitted_by, submitted_at, approved_by, published_at"
+    "submitted_by, submitted_at, approved_by, published_at, definition_sha256"
 )
 _COLUMN_NAMES = [c.strip() for c in _COLUMNS.split(",")]
 _AGENT_COLUMNS = "tenant_id, agent_id, created_by, created_at"
@@ -309,10 +361,10 @@ class PostgresAgentStore:
         return {agent.agent_id: agent for agent in agents}
 
     async def get_version(
-        self, tenant_id: str, agent_id: str, version: int
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
     ) -> AgentVersionRecord | None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            return await self._get(conn, tenant_id, agent_id, version)
+        async with joined_transaction(self._pool, tenant_id, conn) as joined:
+            return await self._get(joined, tenant_id, agent_id, version)
 
     async def _get(
         self, conn, tenant_id: str, agent_id: str, version: int
@@ -357,11 +409,16 @@ class PostgresAgentStore:
             return [AgentRecord(*row) for row in await cur.fetchall()]
 
     async def create_agent(
-        self, tenant_id: str, agent_id: str, definition: dict[str, Any], created_by: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        definition: dict[str, Any],
+        created_by: str,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         stored = _validated(agent_id, definition)
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 """
                 INSERT INTO agents (tenant_id, agent_id, created_by) VALUES (%s, %s, %s)
                 ON CONFLICT (tenant_id, agent_id) DO NOTHING
@@ -371,7 +428,7 @@ class PostgresAgentStore:
             )
             if await cur.fetchone() is None:
                 raise AgentStoreError(f"agent '{agent_id}' already exists")
-            cur = await conn.execute(
+            cur = await db.execute(
                 f"""
                 INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition,
                                             created_by)
@@ -383,11 +440,16 @@ class PostgresAgentStore:
             return _record(await cur.fetchone())
 
     async def create_draft(
-        self, tenant_id: str, agent_id: str, created_by: str, from_version: int | None = None
+        self,
+        tenant_id: str,
+        agent_id: str,
+        created_by: str,
+        from_version: int | None = None,
+        conn: Any = None,
     ) -> AgentVersionRecord:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            await self._lock(conn, tenant_id)
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            cur = await db.execute(
                 f"""
                 INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition,
                                             created_by)
@@ -421,11 +483,17 @@ class PostgresAgentStore:
             return _record(row)
 
     async def replace_draft(
-        self, tenant_id: str, agent_id: str, version: int, definition: dict[str, Any]
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        definition: dict[str, Any],
+        conn: Any = None,
     ) -> AgentVersionRecord:
         stored = _validated(agent_id, definition)
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            cur = await db.execute(
                 f"""
                 UPDATE agent_versions SET definition = %s
                 WHERE tenant_id = %s AND agent_id = %s AND version = %s AND status = 'draft'
@@ -433,46 +501,72 @@ class PostgresAgentStore:
                 """,
                 (Jsonb(stored), tenant_id, agent_id, version),
             )
-            return await self._moved(conn, cur, tenant_id, agent_id, version, DRAFT)
+            return await self._moved(db, cur, tenant_id, agent_id, version, DRAFT)
 
     async def submit(
-        self, tenant_id: str, agent_id: str, version: int, submitted_by: str
+        self, tenant_id: str, agent_id: str, version: int, submitted_by: str, conn: Any = None
     ) -> AgentVersionRecord:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            target = await self._get(db, tenant_id, agent_id, version)
+            if target is None:
+                raise _no_such(agent_id, version)
+            if target.status != DRAFT:
+                raise _wrong_status(agent_id, version, target.status, DRAFT)
+            cur = await db.execute(
                 f"""
                 UPDATE agent_versions
-                SET status = 'pending', submitted_by = %s, submitted_at = now()
+                SET status = 'pending', submitted_by = %s, submitted_at = now(),
+                    definition_sha256 = %s
                 WHERE tenant_id = %s AND agent_id = %s AND version = %s AND status = 'draft'
+                  AND definition = %s
                 RETURNING {_COLUMNS}
                 """,
-                (submitted_by, tenant_id, agent_id, version),
+                (
+                    submitted_by,
+                    canonical_sha256(target.definition),
+                    tenant_id,
+                    agent_id,
+                    version,
+                    Jsonb(target.definition),
+                ),
             )
-            return await self._moved(conn, cur, tenant_id, agent_id, version, DRAFT)
+            return await self._moved(db, cur, tenant_id, agent_id, version, DRAFT)
 
-    async def withdraw(self, tenant_id: str, agent_id: str, version: int) -> AgentVersionRecord:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+    async def withdraw(
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
+    ) -> AgentVersionRecord:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            cur = await db.execute(
                 f"""
-                UPDATE agent_versions SET status = 'draft'
+                UPDATE agent_versions SET status = 'draft', definition_sha256 = NULL
                 WHERE tenant_id = %s AND agent_id = %s AND version = %s AND status = 'pending'
                 RETURNING {_COLUMNS}
                 """,
                 (tenant_id, agent_id, version),
             )
-            return await self._moved(conn, cur, tenant_id, agent_id, version, PENDING)
+            return await self._moved(db, cur, tenant_id, agent_id, version, PENDING)
 
     async def publish(
-        self, tenant_id: str, agent_id: str, version: int, approved_by: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        approved_by: str,
+        reviewed_sha256: str | None = None,
+        conn: Any = None,
     ) -> AgentVersionRecord:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            await self._lock(conn, tenant_id)
-            target = await self._get(conn, tenant_id, agent_id, version)
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            target = await self._get(db, tenant_id, agent_id, version)
             if target is None:
                 raise _no_such(agent_id, version)
             if target.status != PENDING:
                 raise _wrong_status(agent_id, version, target.status, PENDING)
-            cur = await conn.execute(
+            if reviewed_sha256 is not None and target.definition_sha256 != reviewed_sha256:
+                raise version_changed(agent_id, version)
+            cur = await db.execute(
                 f"""
                 SELECT {_COLUMNS} FROM agent_versions
                 WHERE tenant_id = %s AND agent_id = %s AND status = 'published'
@@ -482,29 +576,36 @@ class PostgresAgentStore:
             current = await cur.fetchone()
             if current is not None and version < _record(current).version:
                 raise _stale(agent_id, version, _record(current).version)
-            check_publish(await self._published_set(conn, tenant_id), target.agent())
-            await conn.execute(
+            check_publish(await self._published_set(db, tenant_id), target.agent())
+            await db.execute(
                 """
                 UPDATE agent_versions SET status = 'superseded'
                 WHERE tenant_id = %s AND agent_id = %s AND status = 'published'
                 """,
                 (tenant_id, agent_id),
             )
-            cur = await conn.execute(
+            cur = await db.execute(
                 f"""
                 UPDATE agent_versions
                 SET status = 'published', approved_by = %s, published_at = now()
                 WHERE tenant_id = %s AND agent_id = %s AND version = %s AND status = 'pending'
+                  AND definition_sha256 = %s
                 RETURNING {_COLUMNS}
                 """,
-                (approved_by, tenant_id, agent_id, version),
+                (approved_by, tenant_id, agent_id, version, target.definition_sha256),
             )
-            return _record(await cur.fetchone())
+            row = await cur.fetchone()
+            if row is None:
+                # Cannot happen under the tenant lock; refuse rather than assume.
+                raise version_changed(agent_id, version)
+            return _record(row)
 
     async def import_agents(
         self, tenant_id: str, agents: dict[str, AgentVersion], imported_by: str = IMPORT_USER
     ) -> ImportResult:
         result = ImportResult()
+        for agent_id in agents:
+            check_agent_id(agent_id)
         async with tenant_transaction(self._pool, tenant_id) as conn:
             await self._lock(conn, tenant_id)
             cur = await conn.execute(
@@ -524,10 +625,18 @@ class PostgresAgentStore:
                 await conn.execute(
                     """
                     INSERT INTO agent_versions (tenant_id, agent_id, version, status, definition,
-                                                created_by, approved_by, published_at)
-                    VALUES (%s, %s, 1, 'published', %s, %s, %s, now())
+                                                created_by, approved_by, published_at,
+                                                definition_sha256)
+                    VALUES (%s, %s, 1, 'published', %s, %s, %s, now(), %s)
                     """,
-                    (tenant_id, agent_id, Jsonb(definition), imported_by, imported_by),
+                    (
+                        tenant_id,
+                        agent_id,
+                        Jsonb(definition),
+                        imported_by,
+                        imported_by,
+                        canonical_sha256(definition),
+                    ),
                 )
                 # In the same transaction: an agent is never imported without its record.
                 await insert_event(conn, import_event(tenant_id, agent_id, definition, imported_by))
@@ -587,9 +696,17 @@ class InMemoryAgentStore:
                         created_at=now,
                         approved_by=by,
                         published_at=now,
+                        definition_sha256=canonical_sha256(agent_definition(agent)),
                     )
                 ]
         return store
+
+    def snapshot(self) -> dict[tuple[str, str], list[AgentVersionRecord]]:
+        """The rows as they are now, for ``InMemoryUnitOfWork`` (records are immutable)."""
+        return {key: list(rows) for key, rows in self._agents.items()}
+
+    def restore(self, state: dict[tuple[str, str], list[AgentVersionRecord]]) -> None:
+        self._agents = {key: list(rows) for key, rows in state.items()}
 
     # Test hooks. They skip the lifecycle and the front-door check on purpose.
 
@@ -603,7 +720,10 @@ class InMemoryAgentStore:
                 if definition is None:
                     rows[i] = replace(row, status=SUPERSEDED)
                 else:
-                    rows[i] = replace(row, definition=_without_version(definition))
+                    stored = _without_version(definition)
+                    rows[i] = replace(
+                        row, definition=stored, definition_sha256=canonical_sha256(stored)
+                    )
                 return
         if definition is not None:
             now = datetime.now(UTC)
@@ -618,6 +738,7 @@ class InMemoryAgentStore:
                     now,
                     approved_by=IMPORT_USER,
                     published_at=now,
+                    definition_sha256=canonical_sha256(_without_version(definition)),
                 )
             )
 
@@ -638,6 +759,13 @@ class InMemoryAgentStore:
             only_status = set(changes) == {"status"}
             if not (only_status and (row.status, changes["status"]) in ALLOWED_MOVES):
                 raise AgentStoreError(f"a {row.status} version is immutable")
+        if "definition_sha256" in changes and (row.status, changes.get("status")) not in (
+            (DRAFT, PENDING),
+            (PENDING, DRAFT),
+        ):
+            raise AgentStoreError(
+                "the definition hash changes only when a version is submitted or withdrawn"
+            )
         if "status" in changes and (row.status, changes["status"]) not in ALLOWED_MOVES:
             raise AgentStoreError(f"{row.status} -> {changes['status']} is not allowed")
         if "definition" in changes and row.status != DRAFT:
@@ -663,7 +791,7 @@ class InMemoryAgentStore:
         return found
 
     async def get_version(
-        self, tenant_id: str, agent_id: str, version: int
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
     ) -> AgentVersionRecord | None:
         try:
             return self._find(tenant_id, agent_id, version)
@@ -704,7 +832,12 @@ class InMemoryAgentStore:
         return row
 
     async def create_agent(
-        self, tenant_id: str, agent_id: str, definition: dict[str, Any], created_by: str
+        self,
+        tenant_id: str,
+        agent_id: str,
+        definition: dict[str, Any],
+        created_by: str,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         stored = _validated(agent_id, definition)
         if (tenant_id, agent_id) in self._agents:
@@ -713,7 +846,12 @@ class InMemoryAgentStore:
         return self._add(tenant_id, agent_id, stored, created_by)
 
     async def create_draft(
-        self, tenant_id: str, agent_id: str, created_by: str, from_version: int | None = None
+        self,
+        tenant_id: str,
+        agent_id: str,
+        created_by: str,
+        from_version: int | None = None,
+        conn: Any = None,
     ) -> AgentVersionRecord:
         if from_version is not None:
             source = self._find(tenant_id, agent_id, from_version)
@@ -725,7 +863,12 @@ class InMemoryAgentStore:
         return self._add(tenant_id, agent_id, source.definition, created_by)
 
     async def replace_draft(
-        self, tenant_id: str, agent_id: str, version: int, definition: dict[str, Any]
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        definition: dict[str, Any],
+        conn: Any = None,
     ) -> AgentVersionRecord:
         stored = _validated(agent_id, definition)
         row = self._find(tenant_id, agent_id, version)
@@ -734,27 +877,41 @@ class InMemoryAgentStore:
         return self._set(row, definition=stored)
 
     async def submit(
-        self, tenant_id: str, agent_id: str, version: int, submitted_by: str
+        self, tenant_id: str, agent_id: str, version: int, submitted_by: str, conn: Any = None
     ) -> AgentVersionRecord:
         row = self._find(tenant_id, agent_id, version)
         if row.status != DRAFT:
             raise _wrong_status(agent_id, version, row.status, DRAFT)
         return self._set(
-            row, status=PENDING, submitted_by=submitted_by, submitted_at=datetime.now(UTC)
+            row,
+            status=PENDING,
+            submitted_by=submitted_by,
+            submitted_at=datetime.now(UTC),
+            definition_sha256=canonical_sha256(row.definition),
         )
 
-    async def withdraw(self, tenant_id: str, agent_id: str, version: int) -> AgentVersionRecord:
-        row = self._find(tenant_id, agent_id, version)
-        if row.status != PENDING:
-            raise _wrong_status(agent_id, version, row.status, PENDING)
-        return self._set(row, status=DRAFT)
-
-    async def publish(
-        self, tenant_id: str, agent_id: str, version: int, approved_by: str
+    async def withdraw(
+        self, tenant_id: str, agent_id: str, version: int, conn: Any = None
     ) -> AgentVersionRecord:
         row = self._find(tenant_id, agent_id, version)
         if row.status != PENDING:
             raise _wrong_status(agent_id, version, row.status, PENDING)
+        return self._set(row, status=DRAFT, definition_sha256=None)
+
+    async def publish(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        approved_by: str,
+        reviewed_sha256: str | None = None,
+        conn: Any = None,
+    ) -> AgentVersionRecord:
+        row = self._find(tenant_id, agent_id, version)
+        if row.status != PENDING:
+            raise _wrong_status(agent_id, version, row.status, PENDING)
+        if reviewed_sha256 is not None and row.definition_sha256 != reviewed_sha256:
+            raise version_changed(agent_id, version)
         for other in self._rows(tenant_id, agent_id):
             if other.status == PUBLISHED and row.version < other.version:
                 raise _stale(agent_id, row.version, other.version)
@@ -773,6 +930,8 @@ class InMemoryAgentStore:
         self, tenant_id: str, agents: dict[str, AgentVersion], imported_by: str = IMPORT_USER
     ) -> ImportResult:
         result = ImportResult()
+        for agent_id in agents:
+            check_agent_id(agent_id)
         new = {aid: a for aid, a in agents.items() if (tenant_id, aid) not in self._agents}
         result.skipped = [aid for aid in agents if aid not in new]
         check_front_doors({**await self.published_all(tenant_id), **new})
@@ -790,6 +949,7 @@ class InMemoryAgentStore:
                     now,
                     approved_by=imported_by,
                     published_at=now,
+                    definition_sha256=canonical_sha256(definition),
                 )
             ]
             if self._audit is not None:
@@ -809,7 +969,7 @@ def seeded_agent_store(*configs: AgentsConfig) -> InMemoryAgentStore:
 async def with_published_agents(store: AgentStore, config: AgentsConfig) -> AgentsConfig:
     """The tenant's config with ``agents`` replaced by its published set.
 
-    The tenant's settings stay as the YAML file has them. Code that walks a
+    The tenant's settings stay as the tenants table has them. Code that walks a
     tenant's agents (grant checks, index schedules, the embedder check) reads
     this view, so none of it reads the YAML ``agents`` section.
     """
@@ -824,11 +984,13 @@ async def published_tenants(store: AgentStore, tenants: TenantsConfig) -> Tenant
 
 
 async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> str | None:
-    """A message when a tenant's default agent or a channel's agent has no published version.
+    """A message when a tenant's routing names an agent that cannot answer there.
 
-    ``default_agent`` and ``channels`` stay in the YAML file and name agents,
+    ``default_agent`` and ``channels`` live in the tenants table and name agents,
     so a process that would route a message to an unpublished agent must not
-    start. The message names the tenant and the agent.
+    start. Neither may it start when a channel is mapped to an agent whose published
+    audience leaves that channel out, because every mention there would be refused.
+    The message names the tenant and the agent.
     """
     problems = []
     for tenant_id, config in tenants.tenants.items():
@@ -842,6 +1004,10 @@ async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> st
                     "published version. Run `uv run python -m agentos.agent_store import` "
                     "or publish it."
                 )
+        problems += [
+            f"tenant '{tenant_id}': {problem}"
+            for problem in channel_audience_problems(config.channels, published)
+        ]
     return "\n".join(problems) or None
 
 
@@ -853,7 +1019,7 @@ async def run_import() -> int:
 
     settings = load_settings()
     tenants = load_tenants_config(settings.config_path)
-    pool = AsyncConnectionPool(settings.database_url, open=False)
+    pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     failed = False
     try:

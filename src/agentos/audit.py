@@ -8,8 +8,9 @@ without keeping it.
 
 Events are written by the activities that do the work, under an event key
 built in ``ids.py``, so an activity that retries records its event once. The
-database refuses UPDATE and DELETE on the table for every role; retention is
-not enforced yet.
+database refuses UPDATE and DELETE on the table for every role, and the
+retention job never purges it: audit rows are kept. Every kind is described in
+``docs/audit-events.md``.
 
 List a tenant's events, newest first, with::
 

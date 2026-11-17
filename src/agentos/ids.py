@@ -4,6 +4,8 @@ Every ID starts with the tenant ID, so workflows from different tenants can
 never collide and every ID says whose data it belongs to.
 """
 
+import hashlib
+
 from agentos.connectors.notion import normalize_id
 
 
@@ -150,3 +152,17 @@ def scope_gone_notice_key(tenant: str, scope: str, recipient: str, first_seen: s
 def edit_event_id(unique: str) -> str:
     """The ``inbound_events`` row that holds one saved Edit form (not a Slack event)."""
     return f"edit:{unique}"
+
+
+# Slack posts. Slack has no idempotency key, so a post carries an opaque marker in its message
+# metadata, and a retry that may have posted already looks the marker up before posting again.
+
+
+def slack_post_marker(tenant: str, idem_key: str) -> str:
+    """The opaque marker one Slack post carries: a hash of the tenant and the post's key, never content."""
+    return hashlib.sha256(f"{tenant}:{idem_key}".encode()).hexdigest()[:32]
+
+
+def slack_post_write_key(idem_key: str) -> str:
+    """The ``external_writes`` key that makes one Slack post happen once."""
+    return f"{idem_key}:slack-post"

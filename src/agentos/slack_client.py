@@ -27,6 +27,11 @@ INTERACTIVE_RATE_LIMIT_RETRIES = 2
 BULK_RATE_LIMIT_RETRIES = 20
 # A Retry-After above this is treated as this long.
 MAX_RETRY_AFTER_SECONDS = 600.0
+# Pages of history or replies one post lookup reads before giving up: it is a short window.
+POST_LOOKUP_PAGES = 10
+# Slack's answers to a history read that mean this app cannot see the channel: a missing scope,
+# or a channel the bot is not a member of (it can post to a public one without joining).
+HISTORY_REFUSED = {"missing_scope", "not_in_channel"}
 # A bulk read logs its progress every this many pages.
 PROGRESS_EVERY_PAGES = 10
 
@@ -42,6 +47,36 @@ class SlackLookupError(Exception):
         self.code = code
         self.transient = transient
         self.retry_after = retry_after
+
+
+class SlackHistoryUnavailable(Exception):
+    """Slack refused to show a channel's messages, so a post cannot be looked up.
+
+    ``scope`` is the OAuth scope the app lacks, when Slack named one; ``code`` is Slack's
+    error code (``missing_scope``, ``not_in_channel``). Neither carries a token or content.
+    """
+
+    def __init__(self, code: str, scope: str | None = None):
+        super().__init__(f"Slack history unavailable: {code}")
+        self.code = code
+        self.scope = scope
+
+
+# The message metadata event type that marks a post of this system.
+POST_EVENT_TYPE = "agentos_post"
+
+
+def post_metadata(marker: str) -> dict:
+    """The message metadata that carries a post's marker (see ``ids.slack_post_marker``)."""
+    return {"event_type": POST_EVENT_TYPE, "event_payload": {"key": marker}}
+
+
+def _carries_marker(message: dict, marker: str) -> bool:
+    meta = message.get("metadata") or {}
+    return (
+        meta.get("event_type") == POST_EVENT_TYPE
+        and (meta.get("event_payload") or {}).get("key") == marker
+    )
 
 
 @dataclass(frozen=True)
@@ -68,8 +103,20 @@ class SlackPoster(Protocol):
         text: str,
         thread_ts: str | None = None,
         blocks: list[dict] | None = None,
+        metadata: dict | None = None,
     ) -> str:
-        """Post a message and return its ts."""
+        """Post a message and return its ts. ``metadata`` is Slack message metadata."""
+        ...
+
+    async def find_post(
+        self, channel: str, thread_ts: str | None, marker: str, since: float
+    ) -> str | None:
+        """The ts of this app's post that carries ``marker`` (``post_metadata``), or None.
+
+        Reads the thread's replies when ``thread_ts`` is set, otherwise the channel's history
+        from ``since`` (epoch seconds). Needs the history scopes; raises
+        ``SlackHistoryUnavailable`` when Slack refuses them.
+        """
         ...
 
     async def update_message(
@@ -143,14 +190,49 @@ class RealSlackPoster:
             **extra,
         )
 
-    async def post_message(self, channel, text, thread_ts=None, blocks=None) -> str:
+    async def post_message(self, channel, text, thread_ts=None, blocks=None, metadata=None) -> str:
         kwargs: dict = {"channel": channel, "text": text}
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
         if blocks is not None:
             kwargs["blocks"] = blocks
+        if metadata is not None:
+            kwargs["metadata"] = metadata
         resp = await self._client.chat_postMessage(**kwargs)
         return resp["ts"]
+
+    async def find_post(self, channel, thread_ts, marker, since) -> str | None:
+        cursor = None
+        try:
+            for _ in range(POST_LOOKUP_PAGES):
+                if thread_ts:
+                    resp = await self._lookup_client.conversations_replies(
+                        channel=channel,
+                        ts=thread_ts,
+                        include_all_metadata=True,
+                        limit=PAGE_SIZE,
+                        cursor=cursor,
+                    )
+                else:
+                    resp = await self._lookup_client.conversations_history(
+                        channel=channel,
+                        oldest=f"{since:.6f}",
+                        include_all_metadata=True,
+                        limit=PAGE_SIZE,
+                        cursor=cursor,
+                    )
+                for message in resp.get("messages") or []:
+                    if _carries_marker(message, marker):
+                        return message["ts"]
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+                if not cursor:
+                    return None
+        except Exception as err:
+            error = _lookup_error(err)
+            if error.code in HISTORY_REFUSED:
+                raise SlackHistoryUnavailable(error.code, _needed_scope(err)) from err
+            raise error from err
+        raise SlackLookupError("too_many_pages")
 
     async def update_message(self, channel, ts, text, blocks=None) -> None:
         # An empty blocks list removes the old blocks (e.g. the buttons).
@@ -225,6 +307,14 @@ class RealSlackPoster:
         except Exception as err:
             raise _lookup_error(err) from err
         raise SlackLookupError("too_many_pages")
+
+
+def _needed_scope(err: Exception) -> str | None:
+    """The scope Slack says a refused call needed, if the error response names one."""
+    try:
+        return str(err.response.get("needed") or "") or None  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - an odd response just names no scope
+        return None
 
 
 def _user_from(raw: dict) -> SlackUser:
@@ -308,6 +398,8 @@ class FakeSlack:
         self._lookup_error: Exception | None = None
         self._lookup_failures_left: int | None = None
         self._ts = 0
+        self.messages: list[dict] = []
+        self._history_refusal: SlackHistoryUnavailable | None = None
         self._fail_next_update: Exception | None = None
 
     def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
@@ -323,21 +415,36 @@ class FakeSlack:
         self._ts += 1
         return f"1700000000.{self._ts:06d}"
 
-    async def post_message(self, channel, text, thread_ts=None, blocks=None) -> str:
+    def refuse_history(self, error: SlackHistoryUnavailable | None) -> None:
+        """Make ``find_post`` raise ``error``, as when the app lacks a history scope."""
+        self._history_refusal = error
+
+    async def post_message(self, channel, text, thread_ts=None, blocks=None, metadata=None) -> str:
         ts = self._next_ts()
-        self.calls.append(
-            (
-                "post_message",
-                {
-                    "channel": channel,
-                    "text": text,
-                    "thread_ts": thread_ts,
-                    "blocks": blocks,
-                    "ts": ts,
-                },
-            )
-        )
+        sent = {
+            "channel": channel,
+            "text": text,
+            "thread_ts": thread_ts,
+            "blocks": blocks,
+            "metadata": metadata,
+            "ts": ts,
+        }
+        self.calls.append(("post_message", sent))
+        self.messages.append(sent)
         return ts
+
+    async def find_post(self, channel, thread_ts, marker, since) -> str | None:
+        """The fake keeps every post, so ``since`` (a real-clock window) is not applied."""
+        self.calls.append(
+            ("find_post", {"channel": channel, "thread_ts": thread_ts, "marker": marker})
+        )
+        if self._history_refusal is not None:
+            raise self._history_refusal
+        for sent in self.messages:
+            here = sent["channel"] == channel and (not thread_ts or sent["thread_ts"] == thread_ts)
+            if here and _carries_marker(sent, marker):
+                return sent["ts"]
+        return None
 
     async def update_message(self, channel, ts, text, blocks=None) -> None:
         if self._fail_next_update is not None:

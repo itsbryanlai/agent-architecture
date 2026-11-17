@@ -123,7 +123,7 @@ from agentos.models import (
     assistant_blocks,
     check_field,
 )
-from agentos.slack_client import SlackLookupError
+from agentos.slack_client import SlackHistoryUnavailable, SlackLookupError, post_metadata
 from agentos.slack_format import escape_slack, to_slack_mrkdwn
 from agentos.stores import (
     ExternalWriteStore,
@@ -153,7 +153,7 @@ from agentos.threads import (
     ThreadStore,
 )
 from agentos.usage import UsageRecorder
-from agentos.workflows import WRITE_LEASE_SECONDS
+from agentos.workflows import ACTIVITY_TIMEOUT, WRITE_LEASE_SECONDS
 
 log = logging.getLogger("agentos.activities")
 
@@ -167,11 +167,21 @@ VERSION_CACHE_SIZE = 256
 # this many times, this far apart, before it writes again. Notion's search can lag.
 VISIBILITY_TRIES = 4
 VISIBILITY_INTERVAL = 2.5
+# A post that may have been sent is looked up in the channel's history from this long before
+# the lookup; a thread post is looked up in the thread, whatever its age.
+POST_LOOKUP_WINDOW_SECONDS = 3600.0
+# A post's lease outlasts the activity timeout, so a live attempt always holds it, but ends
+# soon enough that the retries after a crashed worker (the activity timeout, then backoff) get it.
+POST_LEASE_SECONDS = ACTIVITY_TIMEOUT.total_seconds() + 5
 # A retryable failure: another attempt holds the lease for this write.
 WRITE_IN_PROGRESS = "WriteInProgress"
 REQUESTER_NAME_MAX = 80
 
 T = TypeVar("T")
+
+
+class _StopLooking(Exception):
+    """Raised by a ``find`` that cannot look: ``_write_once`` then writes without more tries."""
 
 
 def _beat() -> None:
@@ -294,6 +304,7 @@ class AgentActivities:
         self.writes = external_writes or InMemoryExternalWriteStore()
         self.visibility_tries = VISIBILITY_TRIES
         self.visibility_interval = VISIBILITY_INTERVAL
+        self._history_refusals_logged: set[tuple[str, str]] = set()
         self.switches = switches or InMemorySwitchStore()
         self.usage = usage
         self.budgets = budgets
@@ -550,6 +561,9 @@ class AgentActivities:
         write: Callable[[], Awaitable[T]],
         to_ref: Callable[[T], str],
         from_ref: Callable[[str], T],
+        lease_seconds: float = WRITE_LEASE_SECONDS,
+        issued: bool = False,
+        look_first: bool = True,
     ) -> T:
         """Make one external write happen once, however many attempts run it.
 
@@ -570,25 +584,35 @@ class AgentActivities:
         ``RECONCILE_INTERVAL``). A target whose search lags a write by longer than that
         window gets a second item from the retry: that residual risk is accepted, and
         widening the window is the way to narrow it.
+
+        ``issued`` says the caller knows an earlier attempt may have sent the write, though
+        the store has no mark of it (a record from before the store was used for it). A
+        ``find`` that raises ``_StopLooking`` has no way to look: the write is made at once. A fresh claim looks once
+        before writing unless ``look_first`` is False (a write the target is known not to hold,
+        where a look is a wasted call).
         """
-        claim = await self.writes.claim(tenant_id, idem_key, WRITE_LEASE_SECONDS)
+        claim = await self.writes.claim(tenant_id, idem_key, lease_seconds)
         if claim.status == "done":
             return from_ref(claim.result_ref)
         if claim.status == "busy":
             raise self._in_progress()
         try:
             made = None
-            for look in range(self.visibility_tries if claim.issued else 1):
+            tries = self.visibility_tries if claim.issued or issued else int(look_first)
+            for look in range(tries):
                 if look:
                     _beat()
                     await asyncio.sleep(self.visibility_interval)
-                made = await find()
+                try:
+                    made = await find()
+                except _StopLooking:
+                    break
                 if made is not None:
                     break
             if made is None:
                 _beat()
                 if not await self.writes.mark_issued(
-                    tenant_id, idem_key, claim.token, WRITE_LEASE_SECONDS
+                    tenant_id, idem_key, claim.token, lease_seconds
                 ):
                     raise self._in_progress()
                 made = await write()
@@ -699,24 +723,71 @@ class AgentActivities:
     ) -> str:
         """Post once per ``idem_key`` and return the message ts.
 
-        Delivery is at least once. A crash between Slack accepting the post and
-        the ts being recorded can repeat the post, because Slack has no
-        idempotency key. A "pending" marker is written before posting, so a
-        call that finds the marker without a ts logs a possible duplicate.
+        Slack has no idempotency key, so the post is made once the way a Notion write is
+        (``_write_once``): one lease per post, so overlapping attempts never both post, and
+        the ts stored as the result. Every post carries a marker in its message metadata (a
+        hash of the tenant and the key, never content). An attempt that follows one that got
+        as far as sending first looks the post up by that marker, in the thread's replies or
+        in the channel's recent history, and uses its ts if Slack has it. Only when nothing
+        is found does it post.
+
+        The lookup needs the history scopes. When Slack refuses it (a missing scope, or a
+        channel the bot has not joined) the post is made again and a possible duplicate is
+        logged with the tenant and key; the scope is named once per tenant.
+
+        A ts already stored under ``idem_key`` is returned without a call. A ``:pending``
+        marker written by an earlier version, with no ts, counts as an attempt that sent.
         """
         existing = await self.idem.get(tenant_id, idem_key)
         if existing is not None:
             return existing["ts"]
-        pending_key = f"{idem_key}:pending"
-        if await self.idem.get(tenant_id, pending_key) is not None:
-            log.warning(
-                "possible duplicate Slack post tenant_id=%s idem_key=%s", tenant_id, idem_key
-            )
-        await self.idem.put_if_absent(tenant_id, pending_key, {"channel": channel})
+        sent_before = await self.idem.get(tenant_id, f"{idem_key}:pending") is not None
         slack = self._runtime(tenant_id).slack
-        ts = await slack.post_message(channel, text, thread_ts=thread_ts, blocks=blocks)
+        marker = ids.slack_post_marker(tenant_id, idem_key)
+        since = self.clock().timestamp() - POST_LOOKUP_WINDOW_SECONDS
+
+        async def find() -> str | None:
+            try:
+                return await slack.find_post(channel, thread_ts or None, marker, since)
+            except SlackHistoryUnavailable as refused:
+                self._note_history_refused(tenant_id, refused)
+                log.warning(
+                    "possible duplicate Slack post tenant_id=%s idem_key=%s", tenant_id, idem_key
+                )
+                raise _StopLooking from refused
+
+        ts = await self._write_once(
+            tenant_id,
+            ids.slack_post_write_key(idem_key),
+            find=find,
+            write=lambda: slack.post_message(
+                channel,
+                text,
+                thread_ts=thread_ts,
+                blocks=blocks,
+                metadata=post_metadata(marker),
+            ),
+            to_ref=lambda ts: ts,
+            from_ref=lambda ref: ref,
+            lease_seconds=POST_LEASE_SECONDS,
+            issued=sent_before,
+            look_first=False,
+        )
         stored = await self.idem.put_if_absent(tenant_id, idem_key, {"channel": channel, "ts": ts})
         return stored["ts"]
+
+    def _note_history_refused(self, tenant_id: str, refused: SlackHistoryUnavailable) -> None:
+        """Say once per tenant that Slack refused to show history, and what it lacks."""
+        what = refused.scope or refused.code
+        if (tenant_id, what) in self._history_refusals_logged:
+            return
+        self._history_refusals_logged.add((tenant_id, what))
+        log.warning(
+            "Slack refused to read history, so a retried post cannot be looked up "
+            "tenant_id=%s missing=%s",
+            tenant_id,
+            what,
+        )
 
     # --- conversation ------------------------------------------------------------
 

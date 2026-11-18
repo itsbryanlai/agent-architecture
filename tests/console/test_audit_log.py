@@ -207,18 +207,27 @@ async def test_comment_write_records_approval_and_write(harness):
     assert write.event_key == ids.audit_write_key(f"{task_id}:comment", "ok")
 
 
-async def test_cancelled_task_records_nothing(harness):
+async def test_cancelled_task_records_only_approval_closed(harness):
+    """Fails if a declined task records an approval or write, or skips its approval_closed row."""
     h = harness
     spec = TaskSpec(
         ctx(), "create_item", {"title": TITLE, "details": DETAILS, "database_id": DB_ID}, NONCE
     )
+    task_id = ids.task_id(TENANT, "t1")
     handle = await h.client.start_workflow(
-        TaskWorkflow.run, spec, id=ids.task_id(TENANT, "t1"), task_queue=TASK_QUEUE
+        TaskWorkflow.run, spec, id=task_id, task_queue=TASK_QUEUE
     )
     await eventually(lambda: h.slack.posts())
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, False))
     assert await handle.result() == "cancelled"
-    assert await events(h) == []
+
+    [closed] = await events(h, "approval_closed")
+    assert closed.tool == "declined"
+    assert closed.approver_user_id == ALICE
+    assert closed.input_sha256 == canonical_sha256(spec.payload)
+    assert closed.event_key == ids.audit_approval_closed_key(task_id, NONCE)
+    assert await events(h, "approval") == []
+    assert await events(h, "write") == []
 
 
 async def test_failed_write_records_error_outcome(harness):

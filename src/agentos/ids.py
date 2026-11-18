@@ -73,6 +73,11 @@ def audit_approval_key(task: str, nonce: str) -> str:
     return f"{task}:audit:approval:{nonce}"
 
 
+def audit_approval_closed_key(task: str, nonce: str) -> str:
+    """An approval that closed without a write: the requester declined it, or it expired."""
+    return f"{task}:audit:approval-closed:{nonce}"
+
+
 def audit_write_key(idem_key: str, outcome: str) -> str:
     """``idem_key`` is the write's idempotency key, ``{task_id}:create`` or ``:comment``."""
     return f"{idem_key}:audit:write:{outcome}"

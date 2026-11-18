@@ -289,6 +289,64 @@ async def test_a_pre_write_check_that_cannot_finish_fails_closed_and_clears_the_
     assert all(b["type"] == "section" for b in last["blocks"])
 
 
+# --- a draft_ref refusal replaces the card in place ---------------------------------------------
+
+
+async def start_draft_task(h):
+    task_id = ids.task_id(TENANT, str(uuid.uuid4()))
+    payload = {"title": "New monitor", "details": "Mine flickers.", "database_id": DB_ID}
+    await h.acts.content.put_draft(TENANT, task_id, 1, payload)
+    handle = await h.client.start_workflow(
+        TaskWorkflow.run,
+        TaskSpec(ctx(), "create_item", {}, NONCE, draft_ref=task_id, revision=1),
+        id=task_id,
+        task_queue=TASK_QUEUE,
+    )
+
+    async def waiting():
+        return await handle.query(TaskWorkflow.state) == "awaiting_approval"
+
+    await eventually(waiting, timeout=20)
+    return handle
+
+
+def assert_card_replaced_in_place(h, text: str):
+    [card] = [p for p in h.slack.posts() if p["blocks"]]
+    last = h.slack.updates()[-1]
+    assert (last["channel"], last["ts"], last["text"]) == (card["channel"], card["ts"], text)
+    assert all(b["type"] == "section" for b in last["blocks"])
+    assert [p for p in h.slack.posts() if p["channel"] == card["channel"]] == [card]
+
+
+async def test_a_draft_ref_task_refused_for_agent_off_replaces_the_card_with_no_buttons(harness):
+    """Fails if a draft_ref refusal for agent-off keeps the card's buttons or posts under the card."""
+    h = harness
+    handle = await start_draft_task(h)
+    await turn_off(h)
+
+    await submit(handle)
+
+    assert await handle.result() == "cancelled"
+    nothing_written(h)
+    assert_card_replaced_in_place(h, OFF_ON_CARD)
+
+
+@pytest.mark.parametrize("change", [pause_channel, deactivate_requester])
+async def test_a_draft_ref_task_refused_for_a_pause_or_lost_audience_replaces_the_card(
+    harness, change
+):
+    """Fails if a draft_ref refusal for a pause or lost audience keeps the buttons or posts under the card."""
+    h = harness
+    handle = await start_draft_task(h)
+    await change(h)
+
+    await submit(handle)
+
+    assert await handle.result() == "cancelled"
+    nothing_written(h)
+    assert_card_replaced_in_place(h, REFUSED_ON_CARD)
+
+
 # --- which switches stop which effect -----------------------------------------------------------
 
 

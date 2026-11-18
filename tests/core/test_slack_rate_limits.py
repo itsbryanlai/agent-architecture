@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 
 import pytest
@@ -199,3 +200,63 @@ async def test_a_history_read_refused_for_a_missing_scope_names_the_scope(serve)
         await poster.find_post("C1", None, "m1", since=1700000000.0)
 
     assert (refused.value.code, refused.value.scope) == ("missing_scope", "channels:history")
+
+
+def wire_blocks(sent: dict) -> list:
+    blocks = sent["blocks"]
+    return json.loads(blocks) if isinstance(blocks, str) else blocks
+
+
+async def test_update_carries_the_cards_channel_ts_and_section_only_blocks_over_the_wire(serve):
+    """Fails if chat.update misses the card's channel/ts or sends blocks that still hold actions."""
+    server, url = await serve(
+        [
+            (200, None, {"ok": True, "channel": "D1", "ts": "1.2", "text": "New monitor"}),
+            (200, None, {"ok": True, "channel": "D1", "ts": "1.2", "text": "turned off"}),
+        ]
+    )
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+    card_blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "New monitor"}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Submit"},
+                    "action_id": "submit",
+                    "value": "nonce-1",
+                }
+            ],
+        },
+    ]
+    ts = await poster.post_message("D1", "New monitor", blocks=card_blocks)
+    refusal_blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "IT helper is turned off by an admin. Nothing was changed.",
+            },
+        }
+    ]
+
+    await poster.update_message("D1", ts, "turned off", blocks=refusal_blocks)
+
+    assert server.requests == ["chat.postMessage", "chat.update"]
+    sent = server.sent[1]
+    assert (sent["channel"], sent["ts"]) == ("D1", "1.2")
+    assert wire_blocks(sent) == refusal_blocks
+
+
+async def test_update_with_no_blocks_sends_an_empty_list_over_the_wire(serve):
+    """Fails if update_message(blocks=None) omits blocks, leaving the old buttons on the card."""
+    server, url = await serve(
+        [(200, None, {"ok": True, "channel": "D1", "ts": "1.2", "text": "Cancelled"})]
+    )
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    await poster.update_message("D1", "1.2", "Cancelled", blocks=None)
+
+    assert server.requests == ["chat.update"]
+    assert wire_blocks(server.sent[0]) == []

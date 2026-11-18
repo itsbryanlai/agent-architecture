@@ -100,7 +100,7 @@ member's Slack user ID. Key as for the agent lifecycle.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `budget_set` | An admin sets or lifts a monthly budget. | admin / `user:<admin>` | The agent, or empty for the tenant-wide budget; never a version | `set` or `remove` | The amount (`0` for `remove`) | `ok` | Control key. Lifting a budget that is not set still writes the event |
+| `budget_set` | An admin sets or lifts a monthly budget. | admin / `user:<admin>` | The agent, or empty for the tenant-wide budget; never a version | `set` or `remove` | The amount (`0` for `remove`) | `ok` | Control key. Records only on a real change: a remove with no budget and a set of an unchanged amount record nothing |
 | `usage_repriced` | An owner runs `python -m agentos.usage reprice --yes` and at least one row was priced. A dry run, or a run with nothing to price, writes nothing. | `operator:<OS login>` for both | none | `reprice` | `<YYYY-MM> rows=<count>` | `ok` | `<tenant>:audit:control:usage_repriced:<month>:<random>`: a repeat run records again |
 
 ## Switches

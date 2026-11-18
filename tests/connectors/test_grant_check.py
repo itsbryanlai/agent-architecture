@@ -258,6 +258,29 @@ async def test_a_database_notion_will_not_show_is_a_grant_problem(agents, code):
     assert "Status" in report.problems[0]
 
 
+@pytest.mark.parametrize(
+    ("label", "live_title", "warns"),
+    [
+        ("IT Helpdesk Guidebook", "Acme Corp IT Helpdesk Guidebook", False),
+        ("Acme Corp IT Helpdesk Guidebook", "IT Helpdesk Guidebook", False),
+        ("Acme Corp — IT Helpdesk", "acme corp it helpdesk", False),
+        ("IT Helpdesk Guidebook", "HR Policy Handbook", True),
+    ],
+)
+async def test_a_label_contained_in_the_live_title_is_not_flagged(agents, label, live_title, warns):
+    """Fails if a label contained in the live title is flagged, or a real mismatch stops warning."""
+    api = make_fake_notion()
+    api.set_database_info(DB_ID, live_title)
+    agent = agents.agents["it-helper"]
+    grant = replace(agent.grants.notion_databases[0], name=label)
+    version = replace(agent, grants=replace(agent.grants, notion_databases=[grant]))
+
+    [report] = await NotionGrantChecker(lambda t: api).check(TENANT, version)
+
+    assert report.label_differs is warns
+    assert report.live_title == live_title
+
+
 async def test_the_check_command_reads_published_definitions_from_the_database_not_the_yaml(
     agents, capsys
 ):

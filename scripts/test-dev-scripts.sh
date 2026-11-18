@@ -228,5 +228,108 @@ check "dev-up --watch restarts a dead gateway tunnel" contains "$OUT" "THE GATEW
 check "it announces the new URL" bash -c "grep -q 'NEW gateway URL: https://stub-' '$OUT' && [[ \$(cat '$T/repo/.dev/urls/gateway') != '$gw_old' ]]"
 (cd / && bash "$DOWN") >/dev/null 2>&1
 
+# --- dev-env.sh: ask for each variable, then hand the values to dev-up ------------
+# A second temp repo whose dev-up.sh is a stub. The stub compares each variable inside its
+# own process against a checksum the test wrote outside the repo, so no value is stored.
+
+mkdir -p "$T/repo2/scripts" "$T/expect"
+cp "$SRC"/dev-lib.sh "$SRC"/dev-env.sh "$T/repo2/scripts/"
+cat >"$T/repo2/scripts/dev-up.sh" <<STUB
+#!/usr/bin/env bash
+{
+  echo "args: \$*"
+  for n in AGENTOS_OWNER_DB_PASSWORD AGENTOS_APP_DB_PASSWORD SLACK_BOT_TOKEN SLACK_SIGNING_SECRET SLACK_CLIENT_ID \\
+    SLACK_CLIENT_SECRET NOTION_TOKEN AGENTOS_LLM_PROVIDER QWEN_API_KEY QWEN_BASE_URL ANTHROPIC_API_KEY AGENTOS_MODEL; do
+    if [[ -f "$T/expect/\$n" ]]; then
+      if [[ "\$(printf %s "\${!n:-}" | cksum)" == "\$(cat "$T/expect/\$n")" ]]; then echo "\$n ok"; else echo "\$n WRONG"; fi
+    else
+      if [[ -z "\${!n:-}" ]]; then echo "\$n unset-ok"; else echo "\$n SHOULD-BE-UNSET"; fi
+    fi
+  done
+  if ps -ww -o args= -p \$\$ | grep -q "Sentin[e]l"; then echo "ps LEAK"; else echo "ps ok"; fi
+} >"$T/up-result"
+STUB
+cat >"$T/bin/fakeshell" <<STUB
+#!/usr/bin/env bash
+echo "shell args: \$*" >"$T/shell-result"
+echo "token: \$([[ "\$SLACK_BOT_TOKEN" == xoxb-SentinelShell ]] && echo ok || echo WRONG)" >>"$T/shell-result"
+STUB
+chmod +x "$T/repo2/scripts/dev-up.sh" "$T/bin/fakeshell"
+
+ENV_SCRIPT="$T/repo2/scripts/dev-env.sh"
+LIVE_VARS="AGENTOS_OWNER_DB_PASSWORD AGENTOS_APP_DB_PASSWORD SLACK_BOT_TOKEN SLACK_SIGNING_SECRET SLACK_CLIENT_ID SLACK_CLIENT_SECRET NOTION_TOKEN AGENTOS_LLM_PROVIDER QWEN_API_KEY QWEN_BASE_URL ANTHROPIC_API_KEY AGENTOS_MODEL AGENTOS_DATABASE_URL"
+clear_vars() { local n; for n in $LIVE_VARS; do unset "$n"; done; rm -f "$T/expect"/* "$T/up-result" "$T/shell-result"; }
+expect() { printf %s "$2" | cksum >"$T/expect/$1"; }
+# feed STDIN [args...]: give the lines to dev-env.sh (stdin is not a terminal) from another directory.
+feed() { local input="$1"; shift; (cd / && printf '%b' "$input" | bash "$ENV_SCRIPT" "$@") >"$OUT" 2>&1; }
+all_ok() { ! grep -qE 'WRONG|LEAK|SHOULD-BE' "$T/up-result" && grep -q '^ps ok' "$T/up-result"; }
+
+COMMON_EXPECT() {
+  expect AGENTOS_OWNER_DB_PASSWORD OwnerSentinel1; expect AGENTOS_APP_DB_PASSWORD AppSentinel2
+  expect SLACK_BOT_TOKEN xoxb-SentinelBotToken3; expect SLACK_SIGNING_SECRET SigSentinel4
+  expect SLACK_CLIENT_ID ClientId6; expect SLACK_CLIENT_SECRET ClientSecretSentinel7
+  expect NOTION_TOKEN NotionSentinel5
+}
+BASE_IN='OwnerSentinel1\nAppSentinel2\nxoxb-SentinelBotToken3\nSigSentinel4\nClientId6\nClientSecretSentinel7\nNotionSentinel5\n'
+QWEN_IN="${BASE_IN}"'\nQwenSentinel9\nhttps://qwen.example/v1\n\n'
+set_qwen_expect() { COMMON_EXPECT; expect AGENTOS_LLM_PROVIDER qwen; expect QWEN_API_KEY QwenSentinel9; expect QWEN_BASE_URL https://qwen.example/v1; }
+
+clear_vars; set_qwen_expect
+feed "$QWEN_IN" --watch; rc=$?
+check "dev-env hands every typed value to dev-up's environment, with its options" \
+  bash -c "[[ $rc -eq 0 ]] && grep -q '^args: --watch' '$T/up-result' && [[ \$(grep -c ' ok\$' '$T/up-result') -ge 10 ]]"
+check "no typed value was wrong, and none was on dev-up's command line" all_ok
+
+clear_vars; set_qwen_expect
+feed 'OwnerSentinel1\np@ss\nAppSentinel2\nxoxb-SentinelBotToken3xoxb-SentinelBotToken3\nxoxb-SentinelBotToken3\nSigSentinel4\nClientId6\nClientSecretSentinel7\nNotionSentinel5\n\nQwenSentinel9\nhttps://qwen.example/v1\n\n'; rc=$?
+check "a rejected value is re-asked and the second one is used" \
+  bash -c "[[ $rc -eq 0 ]] && grep -q 'breaks a database URL' '$OUT' && grep -q 'more than once' '$OUT'"
+check "after the re-ask dev-up got the second values" all_ok
+
+# Enter keeps a variable that is already set; --reset asks for it regardless.
+clear_vars; set_qwen_expect
+export SLACK_BOT_TOKEN=xoxb-SentinelKept
+expect SLACK_BOT_TOKEN xoxb-SentinelKept
+feed 'OwnerSentinel1\nAppSentinel2\n\nSigSentinel4\nClientId6\nClientSecretSentinel7\nNotionSentinel5\n\nQwenSentinel9\nhttps://qwen.example/v1\n\n'
+check "an already-set variable is kept on Enter" bash -c "grep -q 'SLACK_BOT_TOKEN already set, keeping it' '$OUT'"
+check "the kept value is what dev-up got" all_ok
+clear_vars; set_qwen_expect
+export SLACK_BOT_TOKEN=xoxb-SentinelKept
+feed "$QWEN_IN" --reset
+check "--reset replaces an already-set variable with the typed one" all_ok
+
+# The provider decides which key is asked for.
+for provider in qwen anthropic; do
+  clear_vars; COMMON_EXPECT; expect AGENTOS_LLM_PROVIDER "$provider"
+  if [[ "$provider" == anthropic ]]; then
+    expect ANTHROPIC_API_KEY AnthropicSentinel8
+    tail_in='AnthropicSentinel8\n\n'; asked=ANTHROPIC_API_KEY; not_asked=QWEN_API_KEY
+  else
+    expect QWEN_API_KEY QwenSentinel9; expect QWEN_BASE_URL https://qwen.example/v1
+    tail_in='QwenSentinel9\nhttps://qwen.example/v1\n\n'; asked=QWEN_API_KEY; not_asked=ANTHROPIC_API_KEY
+  fi
+  feed "${BASE_IN}${provider}\n${tail_in}"
+  check "provider $provider asks for $asked and not $not_asked" \
+    bash -c "grep -q '^$asked>' '$OUT' && ! grep -q '^$not_asked>' '$OUT'"
+  check "provider $provider reaches dev-up with only its own key set" all_ok
+done
+
+# No secret in the output or in any file of the temp repo (the stub checks the command line).
+clear_vars; set_qwen_expect
+feed "$QWEN_IN"
+check "dev-env prints no secret value" no_secret_in "$OUT"
+check "dev-env writes no secret value to any file in its repo" bash -c "! grep -rqE 'Sentinel' '$T/repo2'"
+
+# --shell opens the user's shell with the values.
+clear_vars
+SHELL="$T/bin/fakeshell" feed 'OwnerSentinel1\nAppSentinel2\nxoxb-SentinelShell\nSigSentinel4\nClientId6\nClientSecretSentinel7\nNotionSentinel5\nanthropic\nAnthropicSentinel8\n\n' --shell
+check "--shell says what it is and opens the shell with the values" \
+  bash -c "grep -q 'a shell with the variables; type exit to leave it' '$OUT' && grep -q 'shell args: -i' '$T/shell-result' && grep -q 'token: ok' '$T/shell-result'"
+
+# Three bad tries name the variable and stop.
+clear_vars
+feed 'OwnerSentinel1\np@a\np@b\np@c\n'; rc=$?
+check "three rejected tries exit non-zero naming the variable" bash -c "[[ $rc -ne 0 ]] && grep -q 'AGENTOS_APP_DB_PASSWORD: three tries failed' '$OUT'"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

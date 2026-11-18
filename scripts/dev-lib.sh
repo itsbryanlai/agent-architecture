@@ -35,6 +35,76 @@ dev_prepare_dirs() {
   [[ -f "$DEV_DIR/.gitignore" ]] || printf '*\n' >"$DEV_DIR/.gitignore"
 }
 
+# --- value checks, shared by dev-up.sh and dev-env.sh ---------------------------
+# Each prints nothing about the value itself; only the variable name and the rule.
+
+# How a message tells the user to try again (dev-env.sh says "Paste it again").
+DEV_REENTER="${DEV_REENTER:-Export it again}"
+
+DEV_BASE_VARS="AGENTOS_OWNER_DB_PASSWORD AGENTOS_APP_DB_PASSWORD SLACK_BOT_TOKEN SLACK_SIGNING_SECRET SLACK_CLIENT_ID SLACK_CLIENT_SECRET NOTION_TOKEN"
+DEV_CHECKED_VARS="SLACK_BOT_TOKEN SLACK_SIGNING_SECRET NOTION_TOKEN SLACK_CLIENT_SECRET QWEN_API_KEY ANTHROPIC_API_KEY AGENTOS_APP_DB_PASSWORD AGENTOS_OWNER_DB_PASSWORD"
+
+# required_vars: the variables every provider needs, one per line.
+required_vars() { printf '%s\n' $DEV_BASE_VARS; }
+
+# provider_vars PROVIDER: the variables that provider needs; non-zero for an unknown one.
+provider_vars() {
+  case "$1" in
+    qwen) printf '%s\n' QWEN_API_KEY QWEN_BASE_URL ;;
+    anthropic) printf '%s\n' ANTHROPIC_API_KEY ;;
+    *) return 1 ;;
+  esac
+}
+
+# is_doubled VAR: the value is the same text twice in a row (a paste made twice).
+is_doubled() {
+  local v="${!1}" n half
+  n=${#v}
+  half=$((n / 2))
+  ((n >= 8 && n % 2 == 0)) && [[ "${v:0:half}" == "${v:half}" ]]
+}
+
+# has_special VAR: the value has a character that breaks a database URL.
+has_special() {
+  local special='[@:/#%?& ]'
+  [[ "${!1}" == *$special* ]]
+}
+
+# value_problems VAR: print one line per rule the value of VAR breaks; return 0 if any.
+value_problems() {
+  local v="$1" found=1 stripped
+  case "$v" in
+    AGENTOS_APP_DB_PASSWORD | AGENTOS_OWNER_DB_PASSWORD)
+      if has_special "$v"; then
+        say "$v contains a character that breaks a database URL (one of @ : / # % ? & or a space). Choose a password without them."
+        found=0
+      fi ;;
+    SLACK_BOT_TOKEN)
+      if [[ "${!v}" != xoxb-* ]]; then
+        say "$v must start with xoxb- (the Bot User OAuth Token, not the user token)."
+        found=0
+      else
+        stripped="${!v//xoxb-/}"
+        if (((${#SLACK_BOT_TOKEN} - ${#stripped}) != 5)); then
+          say "$v contains xoxb- more than once: it was pasted twice. $DEV_REENTER, once."
+          found=0
+        fi
+      fi ;;
+  esac
+  case " $DEV_CHECKED_VARS " in
+    *" $v "*)
+      if is_doubled "$v"; then
+        say "$v is the same text twice in a row: it was probably pasted twice. $DEV_REENTER, once."
+        found=0
+      fi
+      if [[ "${!v}" =~ [[:space:]] ]]; then
+        say "$v contains a space or a newline. $DEV_REENTER without one."
+        found=0
+      fi ;;
+  esac
+  return "$found"
+}
+
 # --- processes ---------------------------------------------------------------
 
 pid_file() { printf '%s/%s.pid' "$DEV_PIDS" "$1"; }

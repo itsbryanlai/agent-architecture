@@ -43,53 +43,20 @@ need() {
   if [[ -z "${!1:-}" ]]; then fail "$1 is not set. Export it once in this shell (see docs/local-run.md)."; fi
 }
 
-# is_doubled VAR: the value is the same text twice in a row (a paste made twice).
-is_doubled() {
-  local v="${!1}" n half
-  n=${#v}
-  half=$((n / 2))
-  ((n >= 8 && n % 2 == 0)) && [[ "${v:0:half}" == "${v:half}" ]]
-}
-
-need AGENTOS_OWNER_DB_PASSWORD
-need AGENTOS_APP_DB_PASSWORD
-need SLACK_BOT_TOKEN
-need SLACK_SIGNING_SECRET
-need NOTION_TOKEN
-need SLACK_CLIENT_ID
-need SLACK_CLIENT_SECRET
+for v in $(required_vars); do need "$v"; done
 
 PROVIDER="$(printf '%s' "${AGENTOS_LLM_PROVIDER:-anthropic}" | tr '[:upper:]' '[:lower:]')"
-case "$PROVIDER" in
-  qwen) need QWEN_API_KEY; need QWEN_BASE_URL ;;
-  anthropic) need ANTHROPIC_API_KEY ;;
-  *) fail "AGENTOS_LLM_PROVIDER must be anthropic or qwen." ;;
-esac
-
-# URL-special characters would break the database URL (the driver reads the rest as the host).
-SPECIAL='[@:/#%?& ]'
-for v in AGENTOS_APP_DB_PASSWORD AGENTOS_OWNER_DB_PASSWORD; do
-  if [[ -n "${!v:-}" && "${!v}" == *$SPECIAL* ]]; then
-    fail "$v contains a character that breaks a database URL (one of @ : / # % ? & or a space). Choose a password without them."
-  fi
-done
-
-# A pasted-twice secret: the Slack bot token must start with xoxb- and contain it once.
-if [[ -n "${SLACK_BOT_TOKEN:-}" ]]; then
-  if [[ "$SLACK_BOT_TOKEN" != xoxb-* ]]; then
-    fail "SLACK_BOT_TOKEN must start with xoxb- (the Bot User OAuth Token, not the user token)."
-  else
-    stripped="${SLACK_BOT_TOKEN//xoxb-/}"
-    if (((${#SLACK_BOT_TOKEN} - ${#stripped}) != 5)); then
-      fail "SLACK_BOT_TOKEN contains xoxb- more than once: it was pasted twice. Export it again, once."
-    fi
-  fi
+if provider_vars "$PROVIDER" >/dev/null; then
+  for v in $(provider_vars "$PROVIDER"); do need "$v"; done
+else
+  fail "AGENTOS_LLM_PROVIDER must be anthropic or qwen."
 fi
-for v in SLACK_BOT_TOKEN SLACK_SIGNING_SECRET NOTION_TOKEN SLACK_CLIENT_SECRET QWEN_API_KEY ANTHROPIC_API_KEY \
-  AGENTOS_APP_DB_PASSWORD AGENTOS_OWNER_DB_PASSWORD; do
+
+# Shape checks shared with dev-env.sh (scripts/dev-lib.sh): URL-special characters, a bot
+# token pasted twice, a secret that is the same text twice, whitespace.
+for v in $DEV_CHECKED_VARS; do
   [[ -n "${!v:-}" ]] || continue
-  if is_doubled "$v"; then fail "$v is the same text twice in a row: it was probably pasted twice. Export it again, once."; fi
-  if [[ "${!v}" =~ [[:space:]] ]]; then fail "$v contains a space or a newline. Export it again without one."; fi
+  while IFS= read -r line; do [[ -n "$line" ]] && fail "$line"; done < <(value_problems "$v" || true)
 done
 
 # The database URLs: build them from the passwords, and refuse one that disagrees.

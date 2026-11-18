@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 from temporalio.client import WorkflowExecutionStatus
 
+from agentos import ids
+from agentos.audit import canonical_sha256
 from agentos.config import ConfigError, Settings, TenantsConfig, parse_agents_config
 from agentos.gateway.app import create_app
 from agentos.models import ToolCall
@@ -185,6 +187,24 @@ async def test_hand_off_specialist_answers_same_message(fd):
     assert result["content"] == "Handed to it-helper. They will answer now."
 
 
+async def test_hand_off_announcement_records_a_notice_event(fd):
+    """Fails if a hand-off announcement is shown without an audit row."""
+    h = fd
+    h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("Report it to IT."))
+
+    await converse(h, "concierge", message("Ev1"))
+    await eventually(lambda: len(h.slack.updates()) >= 2)
+    await stored_history(h, CONV_ID)
+
+    [notice] = [e for e in h.audit.events if e.kind == "notice"]
+    assert notice.tool == "hand_off"
+    assert notice.agent_id == "concierge"
+    assert notice.agent_version == 1
+    assert notice.conversation_id == CONV_ID
+    assert notice.output_sha256 == canonical_sha256(ANNOUNCEMENT)
+    assert notice.event_key == ids.audit_notice_key(CONV_ID, "hand_off", h.slack.updates()[0]["ts"])
+
+
 async def test_next_message_goes_to_specialist(fd):
     h = fd
     h.llm.queue(tool_turn(hand_off_to("it-helper")), answer("First."), answer("Second."))
@@ -351,7 +371,7 @@ async def test_specialist_failure_recovers_as_specialist(fd, caplog):
     assert [u["text"] for u in h.slack.updates()] == [ANNOUNCEMENT, TURN_FAILED]
     assert h.slack.updates()[1]["ts"] == placeholder[1]["ts"]
     finalized = [
-        r.getMessage() for r in caplog.records if "activity=finalize_reply" in r.getMessage()
+        r.getMessage() for r in caplog.records if "activity=finalize_notice" in r.getMessage()
     ]
     # The first finalize is the announcement, by the front door; the failure
     # notice is the second, and it is sent as the specialist.

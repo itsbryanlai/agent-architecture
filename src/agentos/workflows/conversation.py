@@ -136,6 +136,7 @@ PATCH_THREAD_AGENT = "thread-agent-row"
 PATCH_CONTENT_REFS = "content-refs"
 PATCH_DISCARD_INBOUND = "discard-unconsumed-inbound"
 PATCH_CONTIGUOUS_MARKERS = "contiguous-citation-markers"
+PATCH_NOTICE_AUDIT = "notice-audit"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
@@ -316,12 +317,20 @@ class ConversationWorkflow:
             channel_kind=m.channel_kind,
         )
         try:
-            await workflow.execute_activity_method(
-                AgentActivities.post_in_thread,
-                args=[ctx, TURN_FAILED, f"{m.event_id}:err"],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
-            )
+            if workflow.patched(PATCH_NOTICE_AUDIT):
+                await workflow.execute_activity_method(
+                    AgentActivities.post_notice_in_thread,
+                    args=[ctx, TURN_FAILED, f"{m.event_id}:err", "failure"],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+            else:
+                await workflow.execute_activity_method(
+                    AgentActivities.post_in_thread,
+                    args=[ctx, TURN_FAILED, f"{m.event_id}:err"],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
         except ActivityError as err:
             self._log_failure(ref, err, "failure notice")
 
@@ -375,12 +384,20 @@ class ConversationWorkflow:
             except ActivityError as err:
                 self._log_failure(ref, err, "recovery")
         try:
-            await workflow.execute_activity_method(
-                AgentActivities.finalize_reply,
-                args=[ctx, placeholder_ts, TURN_FAILED, [], False],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
-            )
+            if workflow.patched(PATCH_NOTICE_AUDIT):
+                await workflow.execute_activity_method(
+                    AgentActivities.finalize_notice,
+                    args=[ctx, placeholder_ts, TURN_FAILED, "failure"],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+            else:
+                await workflow.execute_activity_method(
+                    AgentActivities.finalize_reply,
+                    args=[ctx, placeholder_ts, TURN_FAILED, [], False],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
         except ActivityError as err:
             self._log_failure(ref, err, "recovery")
 
@@ -611,12 +628,20 @@ class ConversationWorkflow:
             state.pending_tool_ids = []
             step += 1
 
-        await workflow.execute_activity_method(
-            AgentActivities.finalize_reply,
-            args=[ctx, placeholder_ts, OUT_OF_STEPS, [], False],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
+        if workflow.patched(PATCH_NOTICE_AUDIT):
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_notice,
+                args=[ctx, placeholder_ts, OUT_OF_STEPS, "step_limit"],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        else:
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_reply,
+                args=[ctx, placeholder_ts, OUT_OF_STEPS, [], False],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
 
     async def _reply(
         self,
@@ -640,24 +665,41 @@ class ConversationWorkflow:
         if not (state.refs or workflow.patched(PATCH_STORE_AFTER_SHOWN)):
             await self._append(ctx, conv_id, step_key, "assistant", content)
             state.reply_stored = True
-        await workflow.execute_activity_method(
-            AgentActivities.finalize_reply,
-            args=[ctx, placeholder_ts, shown, citations, model_answer],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
+        if not model_answer and workflow.patched(PATCH_NOTICE_AUDIT):
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_notice,
+                args=[ctx, placeholder_ts, shown, "step_limit"],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        else:
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_reply,
+                args=[ctx, placeholder_ts, shown, citations, model_answer],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
         if not state.reply_stored:
             await self._append(ctx, conv_id, step_key, "assistant", content)
             state.reply_stored = True
 
     async def _reply_empty_message(self, ctx: TurnContext, m: InboundMessage) -> None:
         """Answer a message with no text: ask what the person wants. Nothing is stored."""
-        await workflow.execute_activity_method(
-            AgentActivities.post_in_thread,
-            args=[ctx, EMPTY_MESSAGE_REPLY, ids.empty_message_key(m.event_id, ctx.agent_id)],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
+        key = ids.empty_message_key(m.event_id, ctx.agent_id)
+        if workflow.patched(PATCH_NOTICE_AUDIT):
+            await workflow.execute_activity_method(
+                AgentActivities.post_notice_in_thread,
+                args=[ctx, EMPTY_MESSAGE_REPLY, key, "empty_message"],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        else:
+            await workflow.execute_activity_method(
+                AgentActivities.post_in_thread,
+                args=[ctx, EMPTY_MESSAGE_REPLY, key],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
 
     async def _reply_stored(
         self,
@@ -847,18 +889,21 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
-        await workflow.execute_activity_method(
-            AgentActivities.finalize_reply,
-            args=[
-                state.ctx,
-                state.placeholder_ts,
-                HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name),
-                [],
-                False,
-            ],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
+        announcement = HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name)
+        if workflow.patched(PATCH_NOTICE_AUDIT):
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_notice,
+                args=[state.ctx, state.placeholder_ts, announcement, "hand_off"],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+        else:
+            await workflow.execute_activity_method(
+                AgentActivities.finalize_reply,
+                args=[state.ctx, state.placeholder_ts, announcement, [], False],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
         placeholder_ts: str = await workflow.execute_activity_method(
             AgentActivities.post_placeholder,
             args=[ctx, f"{m.event_id}:{HAND_OFF_PREFIX}ph"],

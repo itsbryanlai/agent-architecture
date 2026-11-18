@@ -376,7 +376,7 @@ RETENTION_AUDIT_KINDS = ("retention_set",)
 # Choosing grants from Notion, and an approver accepting that a version widens access.
 ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 AUDIT_KINDS = (
-    ("answer", "tool_call", "hand_off", "approval", "write")
+    ("answer", "notice", "tool_call", "hand_off", "approval", "write")
     + AGENT_AUDIT_KINDS
     + MEMBER_AUDIT_KINDS
     + AUDIENCE_AUDIT_KINDS

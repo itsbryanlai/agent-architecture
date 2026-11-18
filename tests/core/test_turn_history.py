@@ -3,6 +3,7 @@
 import pytest
 
 from agentos import ids
+from agentos.audit import canonical_sha256
 from agentos.history_view import HISTORY_BUDGET_CHARS, prepare_for_model
 from agentos.models import LLMResponse
 from agentos.workflows.conversation import EMPTY_MESSAGE_REPLY, ConversationWorkflow
@@ -164,6 +165,26 @@ async def test_message_without_text_gets_a_fixed_reply_and_poisons_nothing(harne
     assert [m["content"][0]["text"] for m in h.llm.calls[0]["messages"]] == ["a real question"]
     stored = await stored_history(h, CONV_ID)
     assert all(b["text"].strip() for m in stored for b in m["content"])
+
+
+async def test_empty_message_prompt_records_a_notice_event(harness):
+    """Fails if the empty-message prompt is shown without an audit row."""
+    h = harness
+    h.llm.queue(LLMResponse(text="Real answer", tool_calls=[], stop_reason="end_turn"))
+    handle = await start_conversation(h, inbound("Ev1", ""))
+    await eventually(lambda: [p for p in h.slack.posts() if p["text"] == EMPTY_MESSAGE_REPLY])
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2", "a real question"))
+    await eventually(lambda: h.slack.updates())
+
+    [notice] = [e for e in h.audit.events if e.kind == "notice"]
+    assert notice.tool == "empty_message"
+    assert notice.agent_id == "it-helper"
+    assert notice.agent_version == 1
+    assert notice.conversation_id == CONV_ID
+    assert notice.output_sha256 == canonical_sha256(EMPTY_MESSAGE_REPLY)
+    assert notice.event_key == ids.audit_notice_key(
+        CONV_ID, "empty_message", ids.empty_message_key("Ev1", "it-helper")
+    )
 
 
 async def test_empty_text_block_already_stored_is_not_sent(harness):

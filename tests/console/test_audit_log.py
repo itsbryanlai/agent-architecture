@@ -22,10 +22,10 @@ from agentos.models import (
     ToolCall,
     TurnContext,
 )
-from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.conversation import EMPTY_MESSAGE_REPLY, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, DB_ID, TENANT, eventually, title_prop
-from tests.helpers.front_door import front_door_dict, running
+from tests.helpers.front_door import ANNOUNCEMENT, front_door_dict, running
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -263,7 +263,11 @@ async def test_hand_off_records_one_event_then_the_specialists_answer():
         [answer_event] = await events(h, "answer")
         assert_actor(answer_event, "it-helper")
         assert answer_event.output_sha256 == canonical_sha256(ANSWER)
-        assert len(await events(h)) == 2
+        [notice] = await events(h, "notice")
+        assert_actor(notice, "concierge")
+        assert notice.tool == "hand_off"
+        assert notice.output_sha256 == canonical_sha256(ANNOUNCEMENT)
+        assert len(await events(h)) == 3
 
 
 # --- retries -------------------------------------------------------------------
@@ -291,6 +295,25 @@ async def test_an_audit_outage_fails_the_activity_instead_of_skipping_the_event(
     await eventually(lambda: events(h, "answer"), timeout=30)
 
     assert len(await events(h, "answer")) == 1
+
+
+async def test_notice_retry_records_once(harness):
+    """Fails if a retried notice post records a second notice row."""
+    h = harness
+    h.llm.queue(answer("Real answer"))
+    h.audit.fail_next_records(1)
+
+    handle = await converse(h, "it-helper", inbound("Ev1", ""))
+    await eventually(lambda: events(h, "notice"), timeout=30)
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2"))
+    await eventually(lambda: h.slack.updates(), timeout=30)
+
+    [notice] = await events(h, "notice")
+    assert notice.tool == "empty_message"
+    assert notice.event_key == ids.audit_notice_key(
+        CONV_ID, "empty_message", ids.empty_message_key("Ev1", "it-helper")
+    )
+    assert len([p for p in h.slack.posts() if p["text"] == EMPTY_MESSAGE_REPLY]) == 1
 
 
 # --- no content ------------------------------------------------------------------

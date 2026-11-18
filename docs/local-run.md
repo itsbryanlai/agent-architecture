@@ -2,7 +2,7 @@
 
 How to run the whole stack on one machine with one command, and what to do when it breaks. Every other setting is in [operations.md](operations.md); what the system does is in [architecture.md](architecture.md).
 
-Contents: [What runs](#what-runs) · [One-time setup](#one-time-setup) · [The exports](#the-exports-paste-once) · [Which process needs what](#which-process-needs-what) · [Start, check, stop](#start-check-stop) · [The manual way](#the-manual-way-several-terminals) · [Troubleshooting](#troubleshooting)
+Contents: [What runs](#what-runs) · [One-time setup](#one-time-setup) · [The variables](#the-variables-a-prompt-or-paste-once) · [Which process needs what](#which-process-needs-what) · [Start, check, stop](#start-check-stop) · [The manual way](#the-manual-way-several-terminals) · [Troubleshooting](#troubleshooting)
 
 ## What runs
 
@@ -39,9 +39,18 @@ Slack reaches the gateway through the first tunnel. Your browser and Slack sign-
    The worker, the gateway and the console refuse to start without a tenant, a published default agent and a key. See [operations.md](operations.md#tenants-in-the-database).
 6. **Invite the bot to each channel it should answer in**, private ones included (`/invite @<bot>`). A private channel the bot is not in fails with `channel_not_found`.
 
-## The exports: paste once
+## The variables: a prompt, or paste once
 
-Export these once, in the one shell you will run the scripts from. Fill the placeholders by hand; never write them to a file, and paste each line once.
+The easiest way is to let a script ask for each value in turn:
+
+```bash
+scripts/dev-env.sh            # asks for each value, then runs scripts/dev-up.sh (it accepts dev-up's options, e.g. --watch)
+scripts/dev-env.sh --shell    # asks, then opens a shell with the same values (for dev-status, dev-down, CLI commands)
+```
+
+Run it, do not `source` it. Each prompt says where to find the value; secrets are not echoed and the script prints only `set (<n> characters)`. A value is checked as you enter it (no URL-special character in a database password, `xoxb-` once in the bot token, no text pasted twice, no whitespace) and asked again on a mistake, three tries at most. A variable already set in your shell is kept when you press Enter; `--reset` asks for every one. Nothing is written to a file or put on a command line: the values are exported and the next program inherits them.
+
+The alternative is to export them yourself, once, in the one shell you will run the scripts from. Fill the placeholders by hand; never write them to a file, and paste each line once.
 
 ```bash
 # Database. Letters and digits only: @ : / # % ? & or a space would break the database URL.
@@ -98,6 +107,8 @@ The scripts do not check the optional rows. `docker compose` needs both password
 ## Start, check, stop
 
 ```bash
+scripts/dev-env.sh           # ask for each variable, then run dev-up.sh (takes dev-up's options)
+scripts/dev-env.sh --shell   # ask for each variable, then open a shell that has them
 scripts/dev-up.sh            # preflight, Docker, migrations, tunnels, worker, gateway, console
 scripts/dev-up.sh --watch    # the same, then stay and restart a tunnel that dies
 scripts/dev-status.sh        # one line per component, and the Slack addresses

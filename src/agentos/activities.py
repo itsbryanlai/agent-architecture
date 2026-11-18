@@ -123,8 +123,18 @@ from agentos.models import (
     assistant_blocks,
     check_field,
 )
-from agentos.slack_client import SlackHistoryUnavailable, SlackLookupError, post_metadata
-from agentos.slack_format import escape_slack, to_slack_mrkdwn
+from agentos.slack_client import (
+    SlackHistoryUnavailable,
+    SlackLookupError,
+    SlackPoster,
+    post_metadata,
+)
+from agentos.slack_format import (
+    escape_slack,
+    mentioned_user_ids,
+    render_mentions,
+    to_slack_mrkdwn,
+)
 from agentos.stores import (
     ExternalWriteStore,
     HistoryStore,
@@ -1071,7 +1081,8 @@ class AgentActivities:
         shown = text + CUT_SHORT if cut_short else text
         footer = await self._sources_footer(ctx, text, citations)
         slack = self._runtime(ctx.tenant_id).slack
-        await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(shown) + footer)
+        rendered = await self._rendered_reply(ctx, slack, shown)
+        await slack.update_message(ctx.channel, placeholder_ts, rendered + footer)
         await self._record(
             ctx,
             "answer",
@@ -1117,7 +1128,8 @@ class AgentActivities:
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
         footer = await self._sources_footer(ctx, text, citations or [])
         slack = self._runtime(ctx.tenant_id).slack
-        await slack.update_message(ctx.channel, placeholder_ts, to_slack_mrkdwn(text) + footer)
+        rendered = await self._rendered_reply(ctx, slack, text)
+        await slack.update_message(ctx.channel, placeholder_ts, rendered + footer)
         if audit_answer:
             conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
             await self._record(
@@ -1127,6 +1139,19 @@ class AgentActivities:
                 conversation_id=conversation_id,
                 output_sha256=canonical_sha256(text),
             )
+
+    async def _rendered_reply(self, ctx: TurnContext, slack: SlackPoster, text: str) -> str:
+        """The model's text as posted mrkdwn: only the requester's own mention pings."""
+        converted = to_slack_mrkdwn(text)
+        names: dict[str, str] = {}
+        for user_id in mentioned_user_ids(converted):
+            if user_id == ctx.requester_user_id:
+                continue
+            try:
+                names[user_id] = (await slack.user_info(user_id)).display_name
+            except SlackLookupError:
+                names[user_id] = "someone"
+        return render_mentions(converted, ctx.requester_user_id, names)
 
     async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
         if not citations or self.knowledge is None:

@@ -363,6 +363,8 @@ AUDIENCE_AUDIT_KINDS = (
     "audience_pause",
     "audience_resume",
 )
+# A resume may close a pause after the agent's published version is gone: the agent, no version.
+AGENT_NO_VERSION_AUDIT_KINDS = ("audience_resume",)
 # A budget belongs to an agent or to the whole tenant, not to a version of an agent.
 BUDGET_AUDIT_KINDS = ("budget_set",)
 # A kill switch belongs to an agent or to the whole tenant, not to a version of an agent.
@@ -431,7 +433,10 @@ class AuditEvent:
             + USAGE_AUDIT_KINDS
             + RETENTION_AUDIT_KINDS
         )
-        if self.kind not in tenant_wide and (not self.agent_id or self.agent_version is None):
+        if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
+            if not self.agent_id:
+                raise ValueError(f"audit kind {self.kind!r} needs an agent_id")
+        elif self.kind not in tenant_wide and (not self.agent_id or self.agent_version is None):
             raise ValueError(f"audit kind {self.kind!r} needs an agent_id and an agent_version")
         if self.outcome not in AUDIT_OUTCOMES:
             raise ValueError(f"invalid audit outcome {self.outcome!r}")

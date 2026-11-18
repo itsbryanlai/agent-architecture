@@ -649,18 +649,18 @@ class ControlPlane:
             )
             if closed is None:
                 raise NotPaused(f"agent '{agent_id}' is not paused in channel '{channel}'")
-            if version is not None:
-                await self._record(
-                    "audience_resume",
-                    tenant_id,
-                    actor,
-                    version=version,
-                    approver=actor,
-                    target=f"{channel}{counts}",
-                    tool=pause.reason,
-                    request_id=request_id,
-                    conn=conn,
-                )
+            await self._record(
+                "audience_resume",
+                tenant_id,
+                actor,
+                version=version,
+                agent_id=agent_id,
+                approver=actor,
+                target=f"{channel}{counts}",
+                tool=pause.reason,
+                request_id=request_id,
+                conn=conn,
+            )
         return closed
 
     async def _confirmed_channel(

@@ -21,7 +21,8 @@ columns hold for each kind:
   conversation), `user:<Slack user ID>` (a person using the console or API),
   `operator:<OS login>` (a host command), or `system:audience-watch` (the shared-channel watch).
 - **agent / version**: `agent_id` and `agent_version`. A version is always present when an agent is,
-  except for a budget or switch on an agent, which belong to the agent and not to one of its versions.
+  except for a budget or switch on an agent, which belong to the agent and not to one of its versions,
+  and an `audience_resume` for an agent that no longer has a published version.
 - **tool / target / approver / in / out**: `tool`, `target`, `approver_user_id`,
   `input_sha256`, `output_sha256`. A dash means the column is empty.
 
@@ -93,7 +94,7 @@ member's Slack user ID. Key as for the agent lifecycle.
 | `audience_refused` | A turn is refused because the asker is not in the agent's audience, or a hand-off to a specialist is refused for the same reason. | Slack user who asked / `agent:<agent id>` | The agent that was asked (for a refused hand-off, the front door) | reason code: `channel`, `dm`, `guest`, `external`, `deactivated`, `unavailable`, `off`, `paused` | the specialist's ID for a refused hand-off, else - | - | `error` when the lookup failed (`unavailable`), else `ok` | `<tenant>:audit:audience-refused:<event id>:<agent id>:<specialist or empty>` |
 | `audience_confirm` | An admin publishes a version after confirming the counted audience (total, guests, other workspaces). Written only when the plane counts audiences. | submitter / `user:<admin>` | Published version | - | `total=N guests=N external=N` | the admin | `ok` | Control key |
 | `audience_pause` | The watch finds a channel an agent answers in has been shared with another organisation, and pauses the agent there. One row per agent paused. | `system:audience-watch` for both | The agent's published version | why: `channel_shared` | the channel ID | - | `ok` | `<tenant>:audit:audience-pause:<agent id>:<channel>:<paused at>` (once per pause) |
-| `audience_resume` | An editor or admin ends a pause after confirming the channel's people. | actor / `user:<actor>` | The published version | the pause's reason | `<channel> total=N guests=N external=N` | the actor | `ok` | Control key |
+| `audience_resume` | An editor or admin ends a pause after confirming the channel's people. | actor / `user:<actor>` | The published version; the agent with an empty version when it has no published version | the pause's reason | `<channel> total=N guests=N external=N` | the actor | `ok` | Control key |
 
 ## Budgets and usage
 

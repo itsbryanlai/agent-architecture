@@ -64,6 +64,7 @@ async def reprice(
     identity: str,
     now: datetime | None = None,
     uow: UnitOfWork | None = None,
+    request_id: str | None = None,
 ) -> RepriceResult:
     """Work out the adjustments for the month's unpriced rows; store them only when ``write``.
 
@@ -97,7 +98,7 @@ async def reprice(
             AuditEvent(
                 tenant_id=tenant_id,
                 event_key=ids.audit_control_key(
-                    tenant_id, AUDIT_KIND, f"{label}:{uuid.uuid4().hex}"
+                    tenant_id, AUDIT_KIND, f"{label}:{request_id or uuid.uuid4().hex}"
                 ),
                 kind=AUDIT_KIND,
                 agent_id=None,
@@ -185,6 +186,7 @@ async def run(args: argparse.Namespace) -> int:
             write=args.yes,
             identity=operator_identity(),
             uow=PostgresUnitOfWork(pool),
+            request_id=uuid.uuid4().hex,
         )
     finally:
         await pool.close()

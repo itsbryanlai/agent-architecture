@@ -455,6 +455,7 @@ async def execute(
     audit: AuditStore,
     agents: AgentStore,
     uow: UnitOfWork | None = None,
+    request_id: str | None = None,
 ) -> int:
     """Run one parsed command against the given stores. Reads no tenant list.
 
@@ -473,6 +474,7 @@ async def execute(
                 print("nothing is turned off")
             return 0
         identity = operator_identity()
+        invocation = request_id or uuid.uuid4().hex
         for scope, target in _targets(args):
             changed = await set_switch(
                 store,
@@ -485,6 +487,7 @@ async def execute(
                 actor=identity,
                 identity=identity,
                 uow=uow,
+                request_id=f"{scope}:{target or '-'}:{invocation}",
             )
             word = "turned " + args.command if changed else f"already {args.command}"
             print(f"{scope} {target or '-'}: {word}")

@@ -14,6 +14,7 @@
     <td>
       <form class="inline" method="post" action="{{ base }}/members/{{ m.user_id | urlencode }}/role">
         <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
         <select name="role">
           {% for r in roles %}<option value="{{ r }}"{% if r == m.role %} selected{% endif %}>{{ r }}</option>{% endfor %}
         </select>
@@ -22,7 +23,7 @@
     </td>
     <td>{{ m.added_by }}</td>
     <td>{{ m.added_at | stamp }}</td>
-    <td>{{ post_button(base ~ "/members/" ~ (m.user_id | urlencode) ~ "/remove", ctx.csrf, "Remove") }}</td>
+    <td>{{ post_button(base ~ "/members/" ~ (m.user_id | urlencode) ~ "/remove", ctx.csrf, "Remove", {"request_id": new_token()}) }}</td>
   </tr>
   {% endfor %}
 </table>
@@ -30,6 +31,7 @@
 <h2>Add a member</h2>
 <form method="post" action="{{ base }}/members">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
   <label for="user_id">Slack user ID</label>
   <input type="text" id="user_id" name="user_id" required>
   <label for="role">Role</label>

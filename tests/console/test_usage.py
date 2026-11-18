@@ -1114,6 +1114,34 @@ async def test_reprice_leaves_other_tenants_and_months_alone():
     assert store.adjustments == {}
 
 
+async def test_a_retried_reprice_records_one_event_and_a_new_invocation_records_again():
+    """Fails if a reprice retried with the same request ID records a second event, or a new ID does not record again."""
+    store, audit = await unpriced_store(), InMemoryAuditStore()
+    prices = Prices([price("m", i="3")])
+
+    async def run(request_id):
+        return await reprice(
+            store,
+            audit,
+            prices,
+            TENANT,
+            "2026-11",
+            write=True,
+            identity="o",
+            now=NOV,
+            request_id=request_id,
+        )
+
+    first = await run("inv-1")
+    await store.record(event("u3", "a1", model="m", cost=None, tokens=(1_000_000, 0, 0, 0)))
+    retry = await run("inv-1")
+    await store.record(event("u4", "a1", model="m", cost=None, tokens=(1_000_000, 0, 0, 0)))
+    fresh = await run("inv-2")
+
+    assert (first.stored, retry.stored, fresh.stored) == (1, 1, 1)
+    assert [e.kind for e in audit.events] == ["usage_repriced", "usage_repriced"]
+
+
 def test_the_reprice_command_names_the_variable_it_needs(monkeypatch, capsys):
     """Fails if the command runs without an owner URL, or prints anything but the variable name."""
     from agentos.usage_reprice import main

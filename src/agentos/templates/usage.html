@@ -44,11 +44,12 @@
     <td>
       <form class="inline" method="post" action="{{ base }}/budgets">
         <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
         <input type="hidden" name="agent_id" value="{{ agent_id }}">
         <input type="text" name="amount" size="10" inputmode="decimal" aria-label="Monthly budget in US dollars for {{ label }}" placeholder="dollars" value="{% if line.amount is not none %}{{ line.amount }}{% endif %}">
         <button type="submit">{{ "Change" if line.amount is not none else "Set" }}</button>
       </form>
-      {% if line.amount is not none %}{{ post_button(base ~ "/budgets/remove", ctx.csrf, "Remove", {"agent_id": agent_id}) }}{% endif %}
+      {% if line.amount is not none %}{{ post_button(base ~ "/budgets/remove", ctx.csrf, "Remove", {"agent_id": agent_id, "request_id": new_token()}) }}{% endif %}
     </td>
     {% endif %}
   </tr>

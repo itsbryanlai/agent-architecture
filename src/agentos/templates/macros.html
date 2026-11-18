@@ -33,6 +33,7 @@
     <td>
       <form method="post" action="{{ resume_base }}/{{ v.pause.channel | urlencode }}/resume">
         <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
         {% if v.summary %}
         <input type="hidden" name="total" value="{{ v.summary.total }}">
         <input type="hidden" name="guests" value="{{ v.summary.guests }}">

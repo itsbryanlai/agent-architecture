@@ -78,11 +78,12 @@ async def admin_page(h, path):
 
 
 async def test_the_agents_page_links_the_admin_pages_and_offers_a_new_agent(h):
-    """Fails if an admin's agent list leaves out the agent, the members and audit links, or New agent."""
+    """Fails if an admin's agent list leaves out the agent, the members and audit links, or New agent, or the new-agent form carries no request token."""
     page = await admin_page(h, f"{UI}/agents")
     assert page.status_code == 200 and "it-helper" in page.text
     assert f'href="{UI}/members"' in page.text and f'href="{UI}/audit"' in page.text
     assert "New agent" in page.text
+    assert 'name="request_id"' in page.text
 
 
 async def test_the_agent_page_lists_its_pending_version_and_its_creator(h):
@@ -93,21 +94,25 @@ async def test_the_agent_page_lists_its_pending_version_and_its_creator(h):
 
 
 async def test_the_version_page_offers_an_admin_the_controls_of_a_pending_version(h):
-    """Fails if a pending version's page lacks reject, publish, check-grants or withdraw, offers submit, or hides the definition."""
+    """Fails if a pending version's page lacks reject, publish, check-grants or withdraw, offers submit, hides the definition, or a mutating control carries no request token."""
     page = await admin_page(h, VERSION)
     assert page.status_code == 200
     for control in ("/reject", "/publish", "/check-grants", "/withdraw"):
         assert f'action="{VERSION}{control}"' in page.text, control
+    for control in ("/reject", "/publish", "/withdraw"):
+        form = re.search(rf'<form[^>]*action="{VERSION}{control}".*?</form>', page.text, re.DOTALL)
+        assert form and 'name="request_id"' in form.group(0), control
     assert "/submit" not in page.text  # it is already pending
     assert "system_prompt" in page.text and "<pre>" in page.text
 
 
 async def test_the_members_page_lists_members_and_their_source(h):
-    """Fails if the members page does not show the tenant-file admin as such, the creator, or the add form."""
+    """Fails if the members page does not show the tenant-file admin as such, the creator, or the add form, or a form carries no request token."""
     page = await admin_page(h, f"{UI}/members")
     assert page.status_code == 200
     assert ROOT in page.text and "set in the tenant file" in page.text
     assert OWNER in page.text and "Add a member" in page.text
+    assert 'name="request_id"' in page.text
 
 
 async def test_the_audit_page_lists_events_with_shortened_hashes(h):
@@ -131,6 +136,11 @@ async def test_a_creator_sees_their_own_agent_with_editing_controls_only(h):
         assert f'action="{VERSION}/submit"' in draft.text
         assert f'action="{VERSION}/check-grants"' in draft.text
         assert "<textarea" in draft.text and f'action="{VERSION}/edit"' in draft.text
+        for control in ("/submit", "/edit"):
+            form = re.search(
+                rf'<form[^>]*action="{VERSION}{control}".*?</form>', draft.text, re.DOTALL
+            )
+            assert form and 'name="request_id"' in form.group(0), control
         for admin_only in ("/publish", "/reject"):
             assert admin_only not in draft.text
 

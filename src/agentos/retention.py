@@ -137,7 +137,11 @@ def check_new_limits(changes: dict[str, int]) -> dict[str, int]:
 
 
 async def set_limits(
-    pool: AsyncConnectionPool, tenant_id: str, changes: dict[str, int], identity: str
+    pool: AsyncConnectionPool,
+    tenant_id: str,
+    changes: dict[str, int],
+    identity: str,
+    request_id: str | None = None,
 ) -> None:
     """Store limits on the tenant and audit it, in one transaction."""
     from agentos.audit import PostgresAuditStore
@@ -156,7 +160,9 @@ async def set_limits(
         await audit.record(
             AuditEvent(
                 tenant_id=tenant_id,
-                event_key=ids.audit_control_key(tenant_id, AUDIT_KIND, uuid.uuid4().hex),
+                event_key=ids.audit_control_key(
+                    tenant_id, AUDIT_KIND, request_id or uuid.uuid4().hex
+                ),
                 kind=AUDIT_KIND,
                 agent_id=None,
                 agent_version=None,
@@ -501,7 +507,7 @@ async def run_set(args: argparse.Namespace) -> int:
     pool = AsyncConnectionPool(url, open=False, **load_settings().pool_args())
     await pool.open()
     try:
-        await set_limits(pool, args.tenant, changes, operator_identity())
+        await set_limits(pool, args.tenant, changes, operator_identity(), uuid.uuid4().hex)
     except ConfigError as err:
         print(f"refused: {err}")
         return 2

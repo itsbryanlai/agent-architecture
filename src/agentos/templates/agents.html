@@ -21,6 +21,7 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <form method="post" action="{{ base }}/agents">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
   <label for="agent_id">Agent ID</label>
   <input type="text" id="agent_id" name="agent_id" value="{{ new_id }}" required>
   <label for="definition">Definition (YAML)</label>

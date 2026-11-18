@@ -554,6 +554,7 @@ async def test_the_agent_page_shows_the_paused_channel_the_reason_and_fresh_coun
     assert "shared with another organisation" in page
     assert "2 people" in page and "1 guest" in page
     assert 'name="confirm"' in page and f"{AGENT_URL}/channels/{CHAN}/resume" in page
+    assert 'name="request_id"' in page
 
 
 async def test_the_version_page_shows_the_paused_channels_too():

@@ -207,6 +207,14 @@ def csrf_in(html: str) -> str:
     return match.group(1)
 
 
+def request_id_in(html: str, action: str) -> str:
+    form = re.search(rf'<form[^>]*action="{re.escape(action)}".*?</form>', html, re.DOTALL)
+    assert form, f"no form posts to {action}"
+    token = re.search(r'name="request_id" value="([^"]+)"', form.group(0))
+    assert token, f"the form at {action} carries no one-time request token"
+    return token.group(1)
+
+
 async def csrf_token(client: httpx.AsyncClient, tenant: str = TENANT) -> str:
     return csrf_in((await client.get(f"/ui/{tenant}/agents")).text)
 

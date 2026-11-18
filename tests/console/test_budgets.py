@@ -42,6 +42,7 @@ from agentos.usage import InMemoryUsageStore, Prices, UsageRecorder
 from tests.conftest import ALICE, ROOT_A, TENANT, a_tree, make_fake_notion
 from tests.helpers.budgets import NOV, D, usage_row
 from tests.helpers.console_harness import (
+    ADMIN2,
     OTHER,
     OWNER,
     ROOT,
@@ -411,6 +412,16 @@ async def test_raising_a_budget_replaces_the_row_rather_than_adding_one(h):
     assert only.amount == D("60.00")
 
 
+async def test_setting_an_unchanged_amount_records_nothing_and_writes_nothing(h):
+    """Fails if a set of the amount already in force writes a budget_set event or a new row."""
+    first = await h.plane.set_budget(TENANT, ROOT, "mine", D("50"))
+    again = await h.plane.set_budget(TENANT, ADMIN2, "mine", D("50"))
+    await h.plane.set_budget(TENANT, ROOT, "mine", D("60"))
+
+    assert again == first
+    assert [(e.target, e.tool) for e in h.audit.events] == [("50.00", "set"), ("60.00", "set")]
+
+
 async def test_a_creator_and_a_stranger_may_not_set_or_remove_a_budget(h):
     await h.plane.set_budget(TENANT, ROOT, "mine", D("50"))
     h.audit.events.clear()
@@ -731,14 +742,14 @@ async def test_a_double_posted_budget_form_records_one_event_and_a_new_form_reco
             f"{UI}/budgets",
             token,
             agent_id="",
-            amount="300",
+            amount="350",
             request_id=request_id_in(fresh.text, f"{UI}/budgets"),
         )
 
     assert (first.status_code, second.status_code, third.status_code) == (303, 303, 303)
     assert kinds(h) == ["budget_set", "budget_set"]
     [budget] = await h.budgets.list(TENANT)
-    assert (budget.agent_id, budget.amount) == (None, D("300.00"))
+    assert (budget.agent_id, budget.amount) == (None, D("350.00"))
 
 
 async def test_a_budget_form_without_a_one_time_token_still_works_and_each_post_records(h):
@@ -746,7 +757,7 @@ async def test_a_budget_form_without_a_one_time_token_still_works_and_each_post_
     async with using(await h.signed_in(ROOT)) as client:
         token = await csrf_token(client)
         first = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="12.5")
-        second = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="12.5")
+        second = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="15")
 
     assert (first.status_code, second.status_code) == (303, 303)
     assert kinds(h) == ["budget_set", "budget_set"]

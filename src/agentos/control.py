@@ -1037,12 +1037,18 @@ class ControlPlane:
         """Set or raise the monthly budget of an agent, or of the tenant when ``agent_id`` is None.
 
         Only an admin. The amount is dollars and cents, refused rather than rounded.
+        Setting the amount already in force changes nothing and records nothing.
         """
         await self._require_role(tenant_id, actor, ADMIN)
         amount = parse_amount(amount)
         if agent_id is not None and await self._agents.get_agent(tenant_id, agent_id) is None:
             raise AgentNotFound(f"agent '{agent_id}' does not exist")
         async with self._uow.begin(tenant_id) as conn:
+            existing = next(
+                (b for b in await self._budgets.list(tenant_id) if b.agent_id == agent_id), None
+            )
+            if existing is not None and existing.amount == amount:
+                return existing
             budget = await self._budgets.set_budget(tenant_id, agent_id, amount, actor, conn=conn)
             await self._record(
                 "budget_set",

@@ -36,7 +36,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos.access_diff import WideningNotAcknowledged
-from agentos.agent_store import PENDING, AgentNotFound
+from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
@@ -111,6 +111,12 @@ NOTICES = {
     "budget-removed": "Budget removed.",
     "switch-off": "Turned off. It takes effect on the next step.",
     "switch-on": "Turned back on.",
+}
+
+# What the version page shows after a refused publish. Like NOTICES, the redirect
+# carries a fixed key, never the error text.
+REFUSED = {
+    "version-changed": "The version changed since you opened it; review it again and publish.",
 }
 
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -415,6 +421,9 @@ class WebUI:
     def notice(self, request: Request) -> str | None:
         return NOTICES.get(request.query_params.get("done", ""))
 
+    def refusal(self, request: Request) -> str | None:
+        return REFUSED.get(request.query_params.get("refused", ""))
+
     # --- sign-in ----------------------------------------------------------------------
 
     async def index(self, request: Request) -> Response:
@@ -621,7 +630,14 @@ class WebUI:
         return _redirect(self.version_url(ctx, agent_id, record.version, "draft"))
 
     async def version(self, request: Request, ctx: Ctx, agent_id: str, version: int) -> Response:
-        return await self.version_page(request, ctx, agent_id, version, notice=self.notice(request))
+        return await self.version_page(
+            request,
+            ctx,
+            agent_id,
+            version,
+            notice=self.notice(request),
+            error=self.refusal(request),
+        )
 
     async def version_page(
         self,
@@ -829,6 +845,8 @@ class WebUI:
             )
         except GrantCheckUnavailable:
             return await self.notion_down(request, ctx, agent_id, version)
+        except VersionChanged:
+            return _redirect(self.version_url(ctx, agent_id, version) + "?refused=version-changed")
         return _redirect(self.version_url(ctx, agent_id, version, done))
 
     async def members(self, request: Request, ctx: Ctx) -> Response:

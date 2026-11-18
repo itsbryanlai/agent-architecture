@@ -117,7 +117,17 @@ async def test_publish_names_the_version_the_admin_saw(h, surface):
 
     stale = await publish_through(surface, h, shown)
 
-    assert stale.status_code == 409 and "changed since you opened it" in stale.text
+    if surface == "console":
+        assert stale.status_code == 303
+        assert stale.headers["location"] == f"{VERSION}?refused=version-changed"
+        c = await h.signed_in(ROOT)
+        async with using(c):
+            page = await c.get(stale.headers["location"])
+        assert page.status_code == 200
+        assert "changed since you opened it" in page.text
+    else:
+        assert stale.status_code == 409
+        assert "changed since you opened it" in stale.text
     assert await status_of(h) == "pending"
     assert "agent_publish" not in [e.kind for e in h.audit.events]
 
@@ -139,7 +149,10 @@ async def test_a_publish_that_names_no_hash_publishes_nothing(h, surface):
 
     response = await publish_through(surface, h, None)
 
-    assert response.status_code in (409, 422)
+    if surface == "console":
+        assert response.status_code == 303
+    else:
+        assert response.status_code in (409, 422)
     assert await status_of(h) == "pending"
 
 

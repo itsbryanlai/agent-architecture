@@ -492,6 +492,23 @@ async def test_a_refused_publish_shows_the_grant_problems_and_changes_nothing(h)
     assert await status_of_version(h) == "published"
 
 
+async def test_a_stale_hash_publish_redirects_to_the_version_page_with_the_error(h):
+    """Fails if a stale-hash publish renders a page at the POST URL instead of redirecting to the version page."""
+    await make_pending(h)
+    admin = await h.signed_in(ADMIN2)
+    fields = await shown(h, "publish")
+    fields["definition_sha256"] = "0" * 64
+    async with using(admin):
+        refused = await post(admin, f"{VERSION}/publish", await csrf_token(admin), **fields)
+        assert refused.status_code == 303
+        location = refused.headers["location"]
+        assert location == f"{VERSION}?refused=version-changed"
+        page = await admin.get(location)
+    assert page.status_code == 200
+    assert "changed since you opened it" in page.text
+    assert await status_of_version(h) == "pending"
+
+
 NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
 
 

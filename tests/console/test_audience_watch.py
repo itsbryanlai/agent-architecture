@@ -53,6 +53,7 @@ from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, TEAM, TENANT, agents_dict, eventually, make_fake_notion
+from tests.helpers.agents import helper_block
 from tests.helpers.audience import CHAN, OWNER, THREAD, converse
 from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
 from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
@@ -452,6 +453,25 @@ async def test_the_owner_or_an_admin_resumes_with_the_fresh_counts(who):
     assert (event.agent_id, event.agent_version, event.approver_user_id) == ("it-helper", 1, who)
     assert event.target == f"{CHAN} total=2 guests=1 external=0"
     assert event.requester_user_id == who
+
+
+async def test_a_resume_with_no_published_version_still_records_the_resume():
+    """Fails if a resume with no published version closes the pause without an audit row."""
+    w = World()
+    await w.seed_members()
+    await w.plane.add_agent(TENANT, OWNER, "draft-helper", helper_block())
+    await w.pauses.open_pause(TENANT, "draft-helper", CHAN, CHANNEL_SHARED, datetime.now(UTC))
+    record = await w.plane.resume_channel(TENANT, OWNER, "draft-helper", CHAN, COUNTS)
+    assert (record.resumed_by, record.resumed_at is not None) == (OWNER, True)
+    assert await w.paused() == []
+    (event,) = [e for e in w.audit.events if e.kind == "audience_resume"]
+    assert (event.agent_id, event.agent_version, event.approver_user_id) == (
+        "draft-helper",
+        None,
+        OWNER,
+    )
+    assert event.target == f"{CHAN} total=2 guests=1 external=0"
+    assert event.tool == CHANNEL_SHARED
 
 
 async def test_another_creator_and_a_stranger_cannot_resume():

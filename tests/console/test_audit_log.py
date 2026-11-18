@@ -333,6 +333,10 @@ BAD_EVENTS = [
         {"kind": "agent_publish", "agent_id": None, "agent_version": None}, id="publish, no agent"
     ),
     pytest.param({"kind": "answer", "agent_version": None}, id="answer, no version"),
+    pytest.param(
+        {"kind": "audience_resume", "agent_id": None, "agent_version": None},
+        id="resume, no agent",
+    ),
 ]
 
 
@@ -349,6 +353,12 @@ def test_a_membership_budget_or_switch_event_may_name_no_agent(kind):
     """Fails if an event about the organisation, not an agent, must name an agent."""
     event = AuditEvent(TENANT, "k", kind, None, None, ALICE, f"user:{ALICE}", target="x")
     assert (event.agent_id, event.agent_version) == (None, None)
+
+
+def test_a_resume_may_name_an_agent_with_no_published_version():
+    """Fails if audience_resume refuses an agent whose published version is gone."""
+    event = AuditEvent(TENANT, "k", "audience_resume", "a", None, ALICE, f"user:{ALICE}")
+    assert (event.agent_id, event.agent_version) == ("a", None)
 
 
 def test_canonical_hash_ignores_key_order_and_spacing():

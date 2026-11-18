@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -437,6 +438,36 @@ async def knowledge_answer(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def knowledge_two_searches(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(24 if stored else 23)
+    scope = ids.knowledge_scope(ROOT_A)
+    await r.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, scope, ROOT_A.replace("-", "")],
+        id=ids.index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    r.llm.queue(
+        tool_turn(
+            ToolCall("tu_s1", "search_knowledge", {"query": "reset your vpn password"}),
+            ToolCall("tu_s2", "search_knowledge", {"query": "laptops replaced"}),
+        ),
+        answer("The portal [1] and the laptop policy [2]."),
+    )
+    await start_conversation(r, "it-helper", thread, "vpn reset and laptop policy?", stored=stored)
+    await replies(r, 1)
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    outputs = await r.acts.tool_outputs.get_many(TENANT, conv, ["tu_s1", "tu_s2"])
+    markers = [
+        {int(n) for n in re.findall(r'<source n="(\d+)"', outputs[t][0])}
+        for t in ("tu_s1", "tu_s2")
+    ]
+    assert all(markers) and markers[0].isdisjoint(markers[1])
+    union = markers[0] | markers[1]
+    assert union == set(range(1, len(union) + 1))
+    return [await current(r, "", conv)]
+
+
 async def audience_refusal(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(32 if stored else 31)
     await start_conversation(r, "unlisted", thread, "hello", stored=stored)
@@ -633,6 +664,7 @@ for _name, _fn in {
     "dm_answer": dm_answer,
     "hand_off": hand_off,
     "knowledge_answer": knowledge_answer,
+    "knowledge_two_searches": knowledge_two_searches,
     "audience_refusal": audience_refusal,
     "failed_turn": failed_turn,
     "budget_stop": budget_stop,

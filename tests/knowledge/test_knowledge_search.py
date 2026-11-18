@@ -9,7 +9,7 @@ from agentos import ids
 from agentos.config import parse_agents_config
 from agentos.connectors.notion import text_block
 from agentos.index_knowledge import apply_schedules
-from agentos.knowledge.search import KNOWLEDGE_RULES, SEARCH_RESULTS, sources_footer
+from agentos.knowledge.search import KNOWLEDGE_RULES, sources_footer
 from agentos.models import (
     Citation,
     InboundMessage,
@@ -214,12 +214,13 @@ async def test_uncited_or_unknown_markers_add_no_footer(kharness):
     assert texts == ["No numbers here.", "See [9] for details."]
 
 
-async def test_markers_unique_across_parallel_searches(kharness):
+async def test_markers_contiguous_across_searches_in_one_reply(kharness):
+    """Fails if searches in one reply leave gaps in the citation numbers."""
     h = kharness
     await index_both(h)
     h.llm.queue(
         tool_turn(call("tu_1", "reset your vpn password"), call("tu_2", "laptops replaced")),
-        answer("Done [1] [7]."),
+        answer("Done [1] [2]."),
     )
 
     await converse(h, "it-helper", "1700000000.000400")
@@ -230,12 +231,21 @@ async def test_markers_unique_across_parallel_searches(kharness):
     markers = [{int(n) for n in re.findall(r'<source n="(\d+)"', b["content"])} for b in blocks]
     assert len(markers) == 2 and all(markers)
     assert markers[0].isdisjoint(markers[1])
-    assert max(markers[0]) < 1 + SEARCH_RESULTS <= min(markers[1])
-    # Both pages' links are cited by number: [1] and [7] map to stored pages.
-    assert "Sources: [1] <" in h.slack.updates()[0]["text"]
+    union = markers[0] | markers[1]
+    assert union == set(range(1, len(union) + 1))
+    assert max(markers[0]) + 1 == min(markers[1])
+    # Both pages' links are cited by number: [1] and [2] map to stored pages.
+    meta = await h.knowledge.page_meta(TENANT, [SCOPE_A], [plain(ROOT_A), plain(PAGE_A1)])
+    root_title, root_url = meta[plain(ROOT_A)]
+    laptops_title, laptops_url = meta[plain(PAGE_A1)]
+    assert h.slack.updates()[0]["text"] == (
+        f"Done [1] [2].\n\nSources: [1] <{root_url}|{root_title}>"
+        f" · [2] <{laptops_url}|{laptops_title}>"
+    )
 
 
 async def test_markers_continue_across_turns(kharness):
+    """Fails if a later turn's citation numbers skip the unused reservations of an earlier turn."""
     h = kharness
     await index_both(h)
     h.llm.queue(
@@ -263,7 +273,7 @@ async def test_markers_continue_across_turns(kharness):
         if b.get("type") == "tool_result"
     ]
     assert len(results) == 2 and all(results)
-    assert min(results[1]) > max(results[0])
+    assert min(results[1]) == max(results[0]) + 1
 
 
 async def test_earlier_turn_citation_resolves(kharness):

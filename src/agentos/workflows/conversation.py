@@ -135,6 +135,7 @@ PATCH_THREAD_AGENT = "thread-agent-row"
 # A turn whose message text is in ``inbound_events``: the content-free commands (see the module doc).
 PATCH_CONTENT_REFS = "content-refs"
 PATCH_DISCARD_INBOUND = "discard-unconsumed-inbound"
+PATCH_CONTIGUOUS_MARKERS = "contiguous-citation-markers"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
@@ -164,10 +165,11 @@ class ConversationWorkflow:
         self.seen: deque[str] = deque(maxlen=SEEN_LIMIT)
         # Citation numbers are unique for the life of the thread, so a number
         # the model cites from an earlier turn still means the same page. Each
-        # search_knowledge call gets its own block of SEARCH_RESULTS numbers
-        # before any call starts, so parallel searches never collide. Only
-        # references are kept (number, scope, page ID), the latest
-        # MAX_CITATIONS of them.
+        # search numbers its kept passages from the next free marker, so the
+        # numbers run 1..n with no gaps (PATCH_CONTIGUOUS_MARKERS); histories
+        # recorded before that patch reserved a block of SEARCH_RESULTS per
+        # search instead. Only references are kept (number, scope, page ID),
+        # the latest MAX_CITATIONS of them.
         self.next_marker = 1
         self.citations: list[Citation] = []
         # The thread's agent. It starts as the agent the workflow was started
@@ -554,21 +556,24 @@ class ConversationWorkflow:
                 key_prefix = HAND_OFF_PREFIX
                 step = 0
                 continue
-            first_markers: list[int] = []
-            for call in calls:
-                first_markers.append(self.next_marker)
-                if call.name == "search_knowledge":
-                    self.next_marker += SEARCH_RESULTS
             refused = self._refused_calls(agent, calls)
-            outcomes = await asyncio.gather(
-                *[
-                    self._dispatch(ctx, agent, conv_id, call, first_marker, unavailable)
-                    if i not in refused
-                    else _resolved(refused[i])
-                    for i, (call, first_marker) in enumerate(zip(calls, first_markers))
-                ],
-                return_exceptions=True,
-            )
+            if workflow.patched(PATCH_CONTIGUOUS_MARKERS):
+                outcomes = await self._run_calls(ctx, agent, conv_id, calls, refused, unavailable)
+            else:
+                first_markers: list[int] = []
+                for call in calls:
+                    first_markers.append(self.next_marker)
+                    if call.name == "search_knowledge":
+                        self.next_marker += SEARCH_RESULTS
+                outcomes = await asyncio.gather(
+                    *[
+                        self._dispatch(ctx, agent, conv_id, call, first_marker, unavailable)
+                        if i not in refused
+                        else _resolved(refused[i])
+                        for i, (call, first_marker) in enumerate(zip(calls, first_markers))
+                    ],
+                    return_exceptions=True,
+                )
             failed = [o for o in outcomes if isinstance(o, BaseException)]
             if failed:
                 if refs or workflow.patched(PATCH_PARTIAL_TOOL_RESULTS):
@@ -887,6 +892,49 @@ class ConversationWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
+
+    async def _run_calls(
+        self,
+        ctx: TurnContext,
+        agent: AgentVersion,
+        conv_id: str,
+        calls: list[ToolCall] | list[ToolCallRef],
+        refused: dict[int, ToolResult],
+        unavailable: ToolResult | None,
+    ) -> list[ToolResult | BaseException]:
+        """The calls' outcomes in call order, with searches numbered by what they keep.
+
+        Searches run one at a time in call order, each numbered from the thread's next
+        free marker, which advances by the citations the search kept. The other calls
+        run in parallel. A failed call is an exception in its own position, as
+        ``asyncio.gather(return_exceptions=True)`` returns it.
+        """
+        outcomes: dict[int, ToolResult | BaseException] = {}
+        parallel: list[int] = []
+        for i, call in enumerate(calls):
+            if i in refused:
+                outcomes[i] = refused[i]
+            elif call.name == "search_knowledge":
+                outcome = (
+                    await asyncio.gather(
+                        self._dispatch(ctx, agent, conv_id, call, self.next_marker, unavailable),
+                        return_exceptions=True,
+                    )
+                )[0]
+                outcomes[i] = outcome
+                if isinstance(outcome, ToolResult):
+                    self.next_marker += len(outcome.citations)
+            else:
+                parallel.append(i)
+        rest = await asyncio.gather(
+            *[
+                self._dispatch(ctx, agent, conv_id, calls[i], self.next_marker, unavailable)
+                for i in parallel
+            ],
+            return_exceptions=True,
+        )
+        outcomes.update(zip(parallel, rest))
+        return [outcomes[i] for i in range(len(calls))]
 
     async def _dispatch(
         self,

@@ -109,6 +109,74 @@ def to_slack_mrkdwn(text: str) -> str:
     return "\n".join(out)
 
 
+_MENTION = re.compile(r"&lt;([@!])([^<>]*?)&gt;")
+_USER_ID = re.compile(r"[UW][A-Z0-9]+")
+
+
+def _mention_pieces(text: str) -> list[tuple[str, str]]:
+    """Cut converted mrkdwn into ``(kind, text)`` pieces; fences and code are kind ``code``."""
+    pieces: list[tuple[str, str]] = []
+    in_fence = False
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if in_fence:
+            in_fence = not line.startswith("```")
+            pieces.append(("code", line))
+        elif line.startswith("```"):
+            in_fence = "```" not in line[3:]
+            pieces.append(("code", line))
+        else:
+            pieces.extend(_segments(line))
+        if index < len(lines) - 1:
+            pieces.append(("plain", "\n"))
+    return pieces
+
+
+def mentioned_user_ids(text: str) -> list[str]:
+    """The Slack user IDs mentioned outside code in converted mrkdwn, first-seen order."""
+    found: list[str] = []
+    for kind, piece in _mention_pieces(text):
+        if kind != "plain":
+            continue
+        for match in _MENTION.finditer(piece):
+            user_id = match.group(2)
+            if match.group(1) == "@" and _USER_ID.fullmatch(user_id) and user_id not in found:
+                found.append(user_id)
+    return found
+
+
+def render_mentions(text: str, requester_id: str, names: dict[str, str]) -> str:
+    """Rewrite model-written mentions in converted mrkdwn so only the requester is pinged.
+
+    The requester's own ``<@ID>`` becomes a real mention; any other user ID becomes
+    that user's escaped display name from ``names`` ("someone" when absent or empty).
+    ``here``, ``channel`` and ``everyone`` become the plain word; a user group becomes
+    its already-escaped label ("a group" without one). Fenced blocks, inline code and
+    Markdown links are left as written, and every other token stays escaped, so no
+    model-written token can turn into a ping.
+    """
+
+    def render(match: re.Match[str]) -> str:
+        body = match.group(2)
+        if match.group(1) == "@":
+            if body == requester_id:
+                return f"<@{body}>"
+            if _USER_ID.fullmatch(body):
+                return escape_slack(names.get(body) or "someone")
+            return match.group(0)
+        if body in ("here", "channel", "everyone"):
+            return body
+        if body.startswith("subteam^"):
+            _, _, label = body.partition("|")
+            return label or "a group"
+        return match.group(0)
+
+    return "".join(
+        _MENTION.sub(render, piece) if kind == "plain" else piece
+        for kind, piece in _mention_pieces(text)
+    )
+
+
 class _Text:
     """Escaped text and a same-length mask that hides what a rule must not touch.
 

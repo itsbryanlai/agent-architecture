@@ -8,10 +8,11 @@
     <td class="muted">{% if line.off %}turned off by {{ line.switch.turned_off_by }}, {{ line.switch.turned_off_at | stamp }}{% else %}{{ what }}{% endif %}</td>
     <td>
       {% if line.off %}
-      {{ post_button(base ~ "/switches/on", ctx.csrf, "Turn on", {"scope": line.scope, "target": line.target}) }}
+      {{ post_button(base ~ "/switches/on", ctx.csrf, "Turn on", {"scope": line.scope, "target": line.target, "request_id": new_token()}) }}
       {% else %}
       <form class="inline" method="post" action="{{ base }}/switches/off">
         <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
         <input type="hidden" name="scope" value="{{ line.scope }}">
         <input type="hidden" name="target" value="{{ line.target }}">
         {% if line.scope in needs_confirm %}<label class="inline"><input type="checkbox" name="confirm" value="yes"> I confirm</label>{% endif %}
@@ -39,7 +40,7 @@
   <tr><th>Agent</th><th>State</th><th></th><th></th></tr>
   {% for line in view.agents %}
   {% if view.stopped_by.get(line.target) == "all_agents" and not line.off %}
-  <tr><td>{{ line.target }}</td><td><span class="error">Off</span></td><td class="muted">all agents are turned off</td><td>{{ post_button(base ~ "/switches/off", ctx.csrf, "Turn off", {"scope": line.scope, "target": line.target}) }}</td></tr>
+  <tr><td>{{ line.target }}</td><td><span class="error">Off</span></td><td class="muted">all agents are turned off</td><td>{{ post_button(base ~ "/switches/off", ctx.csrf, "Turn off", {"scope": line.scope, "target": line.target, "request_id": new_token()}) }}</td></tr>
   {% else %}{{ row(line, line.target, "Answering.") }}{% endif %}
   {% else %}
   <tr><td colspan="4" class="muted">No agents.</td></tr>

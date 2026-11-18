@@ -48,6 +48,7 @@ from tests.helpers.console_harness import (
     ConsoleHarness,
     csrf_token,
     post,
+    request_id_in,
     using,
 )
 from tests.helpers.control_api import JSON
@@ -710,6 +711,45 @@ async def test_an_admin_sets_and_removes_a_budget_from_the_page(h):
     ]
     [left] = await h.budgets.list(TENANT)
     assert left.agent_id is None
+
+
+async def test_a_double_posted_budget_form_records_one_event_and_a_new_form_records_again(h):
+    """Fails if a double-posted budget form records two events, or a freshly rendered form does not record again."""
+    async with using(await h.signed_in(ROOT)) as client:
+        token = await csrf_token(client)
+        shown = await client.get(f"{UI}/usage")
+        request_id = request_id_in(shown.text, f"{UI}/budgets")
+        first = await post(
+            client, f"{UI}/budgets", token, agent_id="", amount="300", request_id=request_id
+        )
+        second = await post(
+            client, f"{UI}/budgets", token, agent_id="", amount="300", request_id=request_id
+        )
+        fresh = await client.get(f"{UI}/usage")
+        third = await post(
+            client,
+            f"{UI}/budgets",
+            token,
+            agent_id="",
+            amount="300",
+            request_id=request_id_in(fresh.text, f"{UI}/budgets"),
+        )
+
+    assert (first.status_code, second.status_code, third.status_code) == (303, 303, 303)
+    assert kinds(h) == ["budget_set", "budget_set"]
+    [budget] = await h.budgets.list(TENANT)
+    assert (budget.agent_id, budget.amount) == (None, D("300.00"))
+
+
+async def test_a_budget_form_without_a_one_time_token_still_works_and_each_post_records(h):
+    """Fails if a form post without a request token is refused, or two such posts collapse into one event."""
+    async with using(await h.signed_in(ROOT)) as client:
+        token = await csrf_token(client)
+        first = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="12.5")
+        second = await post(client, f"{UI}/budgets", token, agent_id="mine", amount="12.5")
+
+    assert (first.status_code, second.status_code) == (303, 303)
+    assert kinds(h) == ["budget_set", "budget_set"]
 
 
 async def test_a_forged_budget_post_from_a_creator_is_refused_and_changes_nothing(h):

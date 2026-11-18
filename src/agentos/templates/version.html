@@ -14,12 +14,13 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
 <div class="actions">
-  {% if editor and is_draft %}{{ post_button(version_url ~ "/submit", ctx.csrf, "Submit for approval") }}{% endif %}
-  {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw") }}{% endif %}
+  {% if editor and is_draft %}{{ post_button(version_url ~ "/submit", ctx.csrf, "Submit for approval", {"request_id": new_token()}) }}{% endif %}
+  {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw", {"request_id": new_token()}) }}{% endif %}
   {% if ctx.is_admin and is_pending %}
-    {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject") }}
+    {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject", {"request_id": new_token()}) }}
     <form method="post" action="{{ version_url }}/publish">
       <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+      <input type="hidden" name="request_id" value="{{ new_token() }}">
       <input type="hidden" name="definition_sha256" value="{{ record.definition_sha256 }}">
       <input type="hidden" name="reviewed_published" value="{{ review.diff.published if review and review.diff else 'unknown' }}">
       {% if widens %}
@@ -123,6 +124,7 @@
 {% if editor and is_draft %}
 <form method="post" action="{{ version_url }}/edit">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
   <textarea name="definition" spellcheck="false">{{ definition }}</textarea>
   <p><button type="submit">Save draft</button></p>
 </form>

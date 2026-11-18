@@ -536,7 +536,11 @@ class WebUI:
         try:
             definition = parse_definition(ctx.get("definition"))
             record = await ctx.plane.add_agent(
-                ctx.tenant_id, ctx.user_id, ctx.get("agent_id").strip(), definition
+                ctx.tenant_id,
+                ctx.user_id,
+                ctx.get("agent_id").strip(),
+                definition,
+                request_id=_form_request_id(ctx),
             )
         except REFUSALS as err:
 
@@ -598,6 +602,7 @@ class WebUI:
                 agent_id,
                 channel,
                 confirm_audience=_audience_confirmation(ctx),
+                request_id=_form_request_id(ctx),
             )
         except REFUSALS as err:
 
@@ -696,7 +701,14 @@ class WebUI:
         text = ctx.get("definition")
         try:
             definition = parse_definition(text)
-            await ctx.plane.edit_draft(ctx.tenant_id, ctx.user_id, agent_id, version, definition)
+            await ctx.plane.edit_draft(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                definition,
+                request_id=_form_request_id(ctx),
+            )
         except REFUSALS as err:
 
             async def again(status: int, message: str) -> Response:
@@ -835,7 +847,14 @@ class WebUI:
             extra["acknowledge_widening"] = ctx.get("widening") == "yes"
             extra["reviewed_published"] = ctx.get("reviewed_published").strip() or "unknown"
         try:
-            await call(ctx.tenant_id, ctx.user_id, agent_id, version, **extra)
+            await call(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                request_id=_form_request_id(ctx),
+                **extra,
+            )
         except (AudienceError, WideningNotAcknowledged, GrantNotPicked) as err:
             status = page_status(status_of(err) or 409)
             return await self.version_page(request, ctx, agent_id, version, status, str(err))
@@ -862,16 +881,24 @@ class WebUI:
 
     async def add_member(self, request: Request, ctx: Ctx) -> Response:
         await ctx.plane.invite_member(
-            ctx.tenant_id, ctx.user_id, ctx.get("user_id").strip(), ctx.get("role")
+            ctx.tenant_id,
+            ctx.user_id,
+            ctx.get("user_id").strip(),
+            ctx.get("role"),
+            request_id=_form_request_id(ctx),
         )
         return _redirect(self.base(ctx) + "/members?done=member-added")
 
     async def change_role(self, request: Request, ctx: Ctx, user_id: str) -> Response:
-        await ctx.plane.change_role(ctx.tenant_id, ctx.user_id, user_id, ctx.get("role"))
+        await ctx.plane.change_role(
+            ctx.tenant_id, ctx.user_id, user_id, ctx.get("role"), request_id=_form_request_id(ctx)
+        )
         return _redirect(self.base(ctx) + "/members?done=member-role")
 
     async def drop_member(self, request: Request, ctx: Ctx, user_id: str) -> Response:
-        await ctx.plane.drop_member(ctx.tenant_id, ctx.user_id, user_id)
+        await ctx.plane.drop_member(
+            ctx.tenant_id, ctx.user_id, user_id, request_id=_form_request_id(ctx)
+        )
         return _redirect(self.base(ctx) + "/members?done=member-removed")
 
     async def audit(self, request: Request, ctx: Ctx) -> Response:
@@ -901,12 +928,20 @@ class WebUI:
     async def set_budget(self, request: Request, ctx: Ctx) -> Response:
         """An empty agent field is the tenant-wide budget."""
         agent_id = ctx.get("agent_id").strip() or None
-        await ctx.plane.set_budget(ctx.tenant_id, ctx.user_id, agent_id, ctx.get("amount"))
+        await ctx.plane.set_budget(
+            ctx.tenant_id,
+            ctx.user_id,
+            agent_id,
+            ctx.get("amount"),
+            request_id=_form_request_id(ctx),
+        )
         return _redirect(self.base(ctx) + "/usage?done=budget-set")
 
     async def remove_budget(self, request: Request, ctx: Ctx) -> Response:
         agent_id = ctx.get("agent_id").strip() or None
-        await ctx.plane.remove_budget(ctx.tenant_id, ctx.user_id, agent_id)
+        await ctx.plane.remove_budget(
+            ctx.tenant_id, ctx.user_id, agent_id, request_id=_form_request_id(ctx)
+        )
         return _redirect(self.base(ctx) + "/usage?done=budget-removed")
 
     async def switches(
@@ -937,12 +972,22 @@ class WebUI:
             return await self.switches(
                 request, ctx, 422, f"Tick the box to confirm: this stops {what}."
             )
-        await ctx.plane.turn_off(ctx.tenant_id, ctx.user_id, scope, ctx.get("target").strip())
+        await ctx.plane.turn_off(
+            ctx.tenant_id,
+            ctx.user_id,
+            scope,
+            ctx.get("target").strip(),
+            request_id=_form_request_id(ctx),
+        )
         return _redirect(self.base(ctx) + "/switches?done=switch-off")
 
     async def turn_on(self, request: Request, ctx: Ctx) -> Response:
         await ctx.plane.turn_on(
-            ctx.tenant_id, ctx.user_id, ctx.get("scope"), ctx.get("target").strip()
+            ctx.tenant_id,
+            ctx.user_id,
+            ctx.get("scope"),
+            ctx.get("target").strip(),
+            request_id=_form_request_id(ctx),
         )
         return _redirect(self.base(ctx) + "/switches?done=switch-on")
 

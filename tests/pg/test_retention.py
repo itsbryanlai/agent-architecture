@@ -254,6 +254,26 @@ async def test_set_stores_the_limit_and_audits_it_but_refuses_one_below_the_task
     assert events == [("retention_set", None, "operator:o", "messages_days=200,sessions_days=0")]
 
 
+async def test_a_retried_set_records_one_event_and_a_new_invocation_records_again(
+    db: TestDatabase, pool, tenant: str
+):
+    """Fails if a set retried with the same request ID records a second event, or a new ID does not record again."""
+    seed(db, tenant)
+
+    await set_limits(pool, tenant, {"messages_days": 200}, "operator:o", request_id="inv-1")
+    await set_limits(pool, tenant, {"sessions_days": 2}, "operator:o", request_id="inv-1")
+    await set_limits(pool, tenant, {"messages_days": 150}, "operator:o", request_id="inv-2")
+
+    policy = await PostgresRetentionStore(pool).policy(tenant)
+    assert (policy.messages_days, policy.sessions_days) == (150, 2)
+    with db.owner() as c:
+        events = c.execute(
+            "SELECT kind FROM audit_events WHERE tenant_id = %s AND kind = 'retention_set'",
+            (tenant,),
+        ).fetchall()
+    assert events == [("retention_set",), ("retention_set",)]
+
+
 async def test_the_set_command_refuses_a_low_limit_and_stores_a_valid_one(
     db: TestDatabase, tenant: str, monkeypatch, capsys
 ):

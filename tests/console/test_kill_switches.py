@@ -816,7 +816,7 @@ def text_of(response):
 
 
 async def test_an_admin_turns_switches_off_and_on_from_the_page(hs):
-    """Fails if the page does not show a switch as off after turning it off, or the on and off posts do not change the store and audit log."""
+    """Fails if the page does not show a switch as off after turning it off, the on and off posts do not change the store and audit log, or a switch form carries no request token."""
     async with using(await hs.signed_in(ROOT)) as client:
         token = await csrf_token(client)
         agent = await post(client, f"{UI}/switches/off", token, scope="agent", target="mine")
@@ -829,6 +829,7 @@ async def test_an_admin_turns_switches_off_and_on_from_the_page(hs):
     assert agent.status_code == 303 and connector.status_code == 303
     assert agent.headers["location"] == f"{UI}/switches?done=switch-off"
     assert on.headers["location"] == f"{UI}/switches?done=switch-on"
+    assert 'name="request_id"' in shown.text
     rows = re.findall(r"<tr>.*?</tr>", shown.text, re.DOTALL)
     (connector_row,) = [r for r in rows if "Connector: notion" in r]
     (agent_row,) = [r for r in rows if "<td>mine</td>" in r]
@@ -952,6 +953,23 @@ async def test_the_command_turns_a_switch_off_and_on_and_audits_a_runtime_operat
     }
     with pytest.raises(AgentNotFound):
         await run(True, AGENT, "ghost")
+
+
+async def test_a_retried_command_invocation_records_one_event_per_switch_and_a_new_one_records_again(
+    hs,
+):
+    """Fails if a retried invocation records a second event per switch, distinct switches collapse into one event, or a new invocation does not record again."""
+    off_args = build_parser().parse_args(["--tenant", TENANT, "off", "--everything"])
+    on_args = build_parser().parse_args(["--tenant", TENANT, "on", "--everything"])
+
+    assert await cli_execute(off_args, hs.switches, hs.audit, hs.agents, request_id="inv-1") == 0
+    assert await cli_execute(on_args, hs.switches, hs.audit, hs.agents) == 0
+    assert await cli_execute(off_args, hs.switches, hs.audit, hs.agents, request_id="inv-1") == 0
+    assert await cli_execute(on_args, hs.switches, hs.audit, hs.agents) == 0
+    assert await cli_execute(off_args, hs.switches, hs.audit, hs.agents, request_id="inv-2") == 0
+
+    kinds = [e.kind for e in hs.audit.events]
+    assert (kinds.count("switch_off"), kinds.count("switch_on")) == (6, 6)
 
 
 def test_the_operator_is_the_account_not_a_login_variable(monkeypatch):

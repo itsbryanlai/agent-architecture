@@ -137,6 +137,7 @@ PATCH_CONTENT_REFS = "content-refs"
 PATCH_DISCARD_INBOUND = "discard-unconsumed-inbound"
 PATCH_CONTIGUOUS_MARKERS = "contiguous-citation-markers"
 PATCH_NOTICE_AUDIT = "notice-audit"
+PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 
@@ -837,9 +838,13 @@ class ConversationWorkflow:
             decision = AudienceDecision(False, UNAVAILABLE)
         if decision.allowed:
             return None
+        if workflow.patched(PATCH_HANDOFF_REFUSAL_AGENT):
+            refusal_ctx, refusal_target = specialist_ctx, ctx.agent_id
+        else:
+            refusal_ctx, refusal_target = ctx, target
         await workflow.execute_activity_method(
             AgentActivities.record_audience_refusal,
-            args=[ctx, m.event_id, decision.reason, target],
+            args=[refusal_ctx, m.event_id, decision.reason, refusal_target],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

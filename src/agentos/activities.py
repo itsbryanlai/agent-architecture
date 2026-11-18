@@ -1939,10 +1939,13 @@ class AgentActivities:
     async def record_audience_refusal(
         self, ctx: TurnContext, event_id: str, reason: str, target: str | None = None
     ) -> None:
-        """Audit a turn, or a hand-off to ``target``, refused by an audience.
+        """Audit an audience refusal: a turn, or a hand-off between two agents.
 
-        ``ctx`` is the agent that was asked. The event holds IDs and the reason
-        code, never the message. A lookup failure is recorded as an error.
+        ``ctx`` is the agent the event names and ``target`` the other party: the
+        asked agent for a turn; for a refused hand-off the specialist and the
+        front door (pre-patch histories name them the other way round). The
+        event holds IDs and the reason code, never the message. A lookup
+        failure is recorded as an error.
         """
         self._log("record_audience_refusal", ctx.tenant_id, ctx.agent_id, reason=reason)
         await self._record(

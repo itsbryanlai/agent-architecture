@@ -711,6 +711,30 @@ async def task_with_edit(r: Rig, stored: bool) -> list[Recorded]:
     return out
 
 
+async def task_declined(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(162 if stored else 161)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce, approved=False)
+    assert await handle.result() == "cancelled"
+    return [await current(r, "", handle.id)]
+
+
+async def task_expired(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(172 if stored else 171)
+    if stored:
+        handle, _nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+    # Advance past the 72-hour expiry so the task closes; then result() returns at once.
+    await r.env.sleep(timedelta(hours=73))
+    assert await handle.result() == "expired"
+    return [await current(r, "", handle.id)]
+
+
 async def watch_done(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(92 if stored else 91)
     if stored:
@@ -767,6 +791,8 @@ for _name, _fn in {
     "conversation_hop": conversation_hop,
     "task_with_approval": task_with_approval,
     "task_with_edit": task_with_edit,
+    "task_declined": task_declined,
+    "task_expired": task_expired,
     "watch_done": watch_done,
     "task_hop": task_hop,
 }.items():

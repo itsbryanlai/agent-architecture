@@ -1,12 +1,16 @@
 import asyncio
+import dataclasses
 from datetime import timedelta
 
 import pytest
 from temporalio.client import WorkflowExecutionStatus
 
+from agentos import ids
+from agentos.audit import canonical_sha256
+from agentos.config import TASK_QUEUE
 from agentos.models import ApprovalDecision, EditRequest, ExternalUpdate, TaskSpec
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, BOB, DB_ID, eventually, title_prop
+from tests.conftest import ALICE, BOB, DB_ID, TENANT, eventually, title_prop
 from tests.helpers.tasks import NONCE, approve, spec, start_task, thread_posts, wait_state
 
 
@@ -80,6 +84,114 @@ async def test_expiry_with_reminder(harness):
     assert len(thread_posts(h, "expired without approval")) == 1
     assert [u["text"] for u in h.slack.updates()] == ["Expired: New monitor"]
     assert h.notion.count("create_page") == 0
+
+
+async def test_declined_approval_is_audited(harness):
+    """Fails if a declined approval closes without an audit row."""
+    h = harness
+    handle = await start_task(h)
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, False))
+    assert await handle.result() == "cancelled"
+
+    [event] = [e for e in h.audit.events if e.kind == "approval_closed"]
+    assert event.tool == "declined"
+    assert event.requester_user_id == ALICE
+    assert event.approver_user_id == ALICE
+    assert event.agent_id == "it-helper"
+    assert event.agent_version == 1
+    assert event.task_id == handle.id
+    assert event.input_sha256 == canonical_sha256(spec().payload)
+
+
+async def test_an_audit_outage_still_closes_the_card(harness):
+    """Fails if an audit outage stops the card from closing."""
+    h = harness
+    handle = await start_task(h)
+    # Down through the activity's whole retry ladder (RETRY.maximum_attempts).
+    h.audit.fail_next_records(5)
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, False))
+    assert await handle.result() == "cancelled"
+
+    assert h.slack.updates()[-1]["text"] == "Cancelled: New monitor"
+    assert [e for e in h.audit.events if e.kind == "approval_closed"] == []
+
+
+async def test_expired_approval_is_audited(harness):
+    """Fails if an expired approval closes without an audit row."""
+    h = harness
+    handle = await start_task(h)
+
+    assert await handle.result() == "expired"
+
+    [event] = [e for e in h.audit.events if e.kind == "approval_closed"]
+    assert event.tool == "expired"
+    assert event.requester_user_id == ALICE
+    assert event.approver_user_id is None
+    assert event.task_id == handle.id
+    assert event.input_sha256 == canonical_sha256(spec().payload)
+
+
+async def test_an_approved_write_records_approval_and_write_not_approval_closed(harness):
+    """Fails if an approved write loses its approval/write rows or gains a closed-approval row."""
+    h = harness
+    handle = await start_task(h)
+
+    await approve(h, handle)
+    await wait_state(handle, "watching")
+
+    kinds = [e.kind for e in h.audit.events]
+    assert "approval" in kinds
+    assert "write" in kinds
+    assert "approval_closed" not in kinds
+
+
+async def test_a_declined_stored_draft_hashes_the_revision_the_card_named(harness):
+    """Fails if a declined stored draft hashes the carried payload or the latest draft, not the named revision."""
+    h = harness
+    task_id = ids.task_id(TENANT, "stored-decline")
+    first = {"title": "Stored monitor", "details": "Flickers too.", "database_id": DB_ID}
+    await h.acts.content.put_draft(TENANT, task_id, 1, first)
+    stored = dataclasses.replace(
+        spec(), payload={}, draft_ref=task_id, revision=1, database_id=DB_ID
+    )
+    handle = await h.client.start_workflow(
+        TaskWorkflow.run, stored, id=task_id, task_queue=TASK_QUEUE
+    )
+    await wait_state(handle, "awaiting_approval")
+
+    # An edit stores revision 2 with a new nonce; the decline binds to that card.
+    await h.acts.content.put_inbound(
+        TENANT,
+        "edit:sd1",
+        {
+            "kind": "edit",
+            "task_id": task_id,
+            "fields": {"title": "Edited monitor", "details": "Edited details."},
+        },
+        delivered=True,
+    )
+    await handle.signal(TaskWorkflow.edit, EditRequest(NONCE, ALICE, {}, "edit:sd1"))
+
+    async def edited():
+        view = await handle.query(TaskWorkflow.draft)
+        return view if view.revision == 2 else None
+
+    nonce2 = (await eventually(edited)).nonce
+    # A later revision exists, but it is not the one the declined card named.
+    await h.acts.content.put_draft(
+        TENANT, task_id, 3, {"title": "Sneaked", "details": "x", "database_id": DB_ID}
+    )
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(nonce2, ALICE, False))
+    assert await handle.result() == "cancelled"
+
+    [event] = [e for e in h.audit.events if e.kind == "approval_closed"]
+    named = await h.acts.content.get_draft(TENANT, task_id, 2)
+    assert event.input_sha256 == canonical_sha256(named)
+    assert event.input_sha256 != canonical_sha256({})
+    assert event.event_key == ids.audit_approval_closed_key(task_id, nonce2)
 
 
 async def _approved_and_watching(h):

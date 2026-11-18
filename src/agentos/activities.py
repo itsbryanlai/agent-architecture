@@ -362,6 +362,7 @@ class AgentActivities:
             self.check_audience,
             self.check_before_write,
             self.record_audience_refusal,
+            self.record_approval_closed,
             self.thread_agent,
             self.remember_thread_agent,
             self.ingest_message,
@@ -1952,6 +1953,27 @@ class AgentActivities:
             conversation_id=ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts),
             tool=reason,
             target=target,
+        )
+
+    @activity.defn(name="record_approval_closed")
+    async def record_approval_closed(self, spec: TaskSpec, task_id: str, tool: str) -> None:
+        """Audit an approval that closed without a write: ``declined`` or ``expired``.
+
+        The event holds the hash of the proposed payload (the revision the card
+        named), never its text. The requester is the approver on a decline; an
+        expiry has no approver. A missing draft revision is non-retryable.
+        """
+        ctx = spec.ctx
+        self._log("record_approval_closed", ctx.tenant_id, ctx.agent_id, tool=tool)
+        payload = await self._spec_payload(spec)
+        await self._record(
+            ctx,
+            "approval_closed",
+            ids.audit_approval_closed_key(task_id, spec.approval_nonce),
+            task_id=task_id,
+            tool=tool,
+            input_sha256=canonical_sha256(payload),
+            approver_user_id=ctx.requester_user_id if tool == "declined" else None,
         )
 
 

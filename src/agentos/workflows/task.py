@@ -83,6 +83,8 @@ PRE_WRITE_PATCH = "pre-write-audience"
 DRAFT_REFS_PATCH = "draft-refs"
 # Histories recorded before it never continue as new and answer every poke at once.
 CONTINUE_AS_NEW_PATCH = "task-continue-as-new"
+# Histories recorded before a closed approval was audited close it with no audit row.
+PATCH_APPROVAL_CLOSED = "approval-closed-audit"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -302,6 +304,8 @@ class TaskWorkflow:
 
         spec = self._spec
         if self._decision is None:
+            if workflow.patched(PATCH_APPROVAL_CLOSED):
+                await self._try(AgentActivities.record_approval_closed, spec, task_id, "expired")
             await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Expired")
             await self._try(
                 AgentActivities.post_in_thread,
@@ -313,6 +317,8 @@ class TaskWorkflow:
             return self._state
 
         if not self._decision.approved:
+            if workflow.patched(PATCH_APPROVAL_CLOSED):
+                await self._try(AgentActivities.record_approval_closed, spec, task_id, "declined")
             await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
             self._state = "cancelled"
             return self._state

@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS audit_kinds (
 );
 
 INSERT INTO audit_kinds (kind) VALUES
-  ('answer'), ('notice'), ('tool_call'), ('hand_off'), ('approval'), ('write'),
+  ('answer'), ('notice'), ('tool_call'), ('hand_off'), ('approval'), ('approval_closed'), ('write'),
   ('agent_create'), ('agent_draft'), ('agent_edit'), ('agent_import'), ('agent_submit'),
   ('agent_withdraw'), ('agent_reject'), ('agent_publish'),
   ('member_add'), ('member_remove'), ('member_role'),
@@ -963,5 +963,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028')
 ON CONFLICT DO NOTHING;

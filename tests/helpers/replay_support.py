@@ -60,7 +60,12 @@ from agentos.switches import InMemorySwitchStore
 from agentos.temporal_client import tenant_data_converter
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, UsageEvent
-from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
+from agentos.workflows.conversation import (
+    EMPTY_MESSAGE_REPLY,
+    OUT_OF_STEPS,
+    TURN_FAILED,
+    ConversationWorkflow,
+)
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
@@ -77,6 +82,7 @@ from tests.conftest import (
     knowledge_agents_dict,
     make_fake_notion,
 )
+from tests.helpers.llm_errors import StatusError
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "replay"
 CONVERTER = "tenant payload codec (encrypting), fixed test key"
@@ -418,6 +424,21 @@ async def hand_off(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def hand_off_notice(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(132 if stored else 131)
+    r.llm.queue(
+        tool_turn(ToolCall("tu_h", "hand_off", {"agent": "it-helper"})),
+        answer("As the specialist."),
+    )
+    await start_conversation(r, "concierge", thread, "my laptop battery swells", stored=stored)
+    await replies(r, 2)
+    notices = await eventually(
+        lambda: [e for e in r.acts.audit.events if e.kind == "notice"], timeout=30
+    )
+    assert [e.tool for e in notices] == ["hand_off"]
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 async def knowledge_answer(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(22 if stored else 21)
     scope = ids.knowledge_scope(ROOT_A)
@@ -488,6 +509,76 @@ async def failed_turn(r: Rig, stored: bool) -> list[Recorded]:
             return row is not None and bool(row.get("consumed"))
 
         await eventually(consumed, timeout=30)
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
+async def step_limit_notice(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(122 if stored else 121)
+    r.llm.queue(
+        *[tool_turn(ToolCall(f"tu_{n}", "search_items", {"query": "laptop"})) for n in range(6)]
+    )
+    await start_conversation(r, "it-helper", thread, "keep looking", stored=stored)
+    await replies(r, 1)
+    assert OUT_OF_STEPS in said_text(r)
+    await eventually(lambda: [e for e in r.acts.audit.events if e.kind == "notice"], timeout=30)
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
+async def failure_notice(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(142 if stored else 141)
+    r.llm.queue(StatusError(401))
+    handle = await start_conversation(r, "it-helper", thread, "hello", stored=stored)
+    await replies(r, 1)
+    assert TURN_FAILED in said_text(r)
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    event_id = f"Ev-{thread}-2"
+    if stored:
+        await r.acts.content.put_inbound(
+            TENANT,
+            event_id,
+            {
+                "kind": "message",
+                "agent_id": "it-helper",
+                "user_id": ALICE,
+                "text": "",
+                "channel": "C_GENERAL",
+                "thread_ts": thread,
+                "channel_kind": "channel",
+            },
+        )
+    await handle.signal(
+        ConversationWorkflow.message,
+        InboundMessage(event_id, ALICE, "", "C_GENERAL", thread, "channel", text_stored=stored),
+    )
+    await eventually(
+        lambda: [p for p in r.slack.posts() if p["text"] == EMPTY_MESSAGE_REPLY], timeout=30
+    )
+
+    async def two_notices():
+        found = [e for e in r.acts.audit.events if e.kind == "notice"]
+        return found if len(found) == 2 else None
+
+    notices = await eventually(two_notices, timeout=30)
+    assert [e.tool for e in notices] == ["failure", "empty_message"]
+    return [await current(r, "", conv)]
+
+
+async def failed_turn_notice(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(152 if stored else 151)
+    await start_conversation(r, "gone", thread, "hello", stored=stored)
+    await answered(r)
+    assert TURN_FAILED in said_text(r)
+    if stored:
+
+        async def consumed() -> bool:
+            row = await r.acts.content.get_inbound(TENANT, f"Ev-{thread}")
+            return row is not None and bool(row.get("consumed"))
+
+        await eventually(consumed, timeout=30)
+    notices = await eventually(
+        lambda: [e for e in r.acts.audit.events if e.kind == "notice"], timeout=30
+    )
+    assert [e.tool for e in notices] == ["failure"]
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
@@ -663,10 +754,14 @@ SCENARIOS: dict[str, Scenario] = {}
 for _name, _fn in {
     "dm_answer": dm_answer,
     "hand_off": hand_off,
+    "hand_off_notice": hand_off_notice,
     "knowledge_answer": knowledge_answer,
     "knowledge_two_searches": knowledge_two_searches,
     "audience_refusal": audience_refusal,
     "failed_turn": failed_turn,
+    "step_limit_notice": step_limit_notice,
+    "failure_notice": failure_notice,
+    "failed_turn_notice": failed_turn_notice,
     "budget_stop": budget_stop,
     "switch_off": switch_off,
     "conversation_hop": conversation_hop,

@@ -37,7 +37,8 @@ is the Slack user who asked, agent and version are the ones the turn is pinned t
 
 | Kind | Written when | tool | target | approver | in / out | Refused or failed | Event key |
 |---|---|---|---|---|---|---|---|
-| `answer` | The model's final reply has been shown in Slack (a Sources line included). Hand-off announcements, audience refusals, step-limit and failure notices are not answers. | - | - | - | out: hash of the text shown; in: - | Not written if the reply was not shown; the activity retries | `<conversation>:audit:answer:<placeholder ts>` |
+| `answer` | The model's final reply has been shown in Slack (a Sources line included). The fixed stop texts the model call returns as the turn's reply (agent switched off, budget reached, spend unknown) and the no-answer text record as `answer` too. Hand-off announcements, step-limit, failure and empty-message notices are `notice`, not answers; audience refusals are `audience_refused`. | - | - | - | out: hash of the text shown; in: - | Not written if the reply was not shown; the activity retries | `<conversation>:audit:answer:<placeholder ts>` |
+| `notice` | A final text that is not a model answer was shown: the hand-off announcement, the step-limit notice, the failure notice or the empty-message prompt. A failure notice posted before an agent could be loaded records version 0. | why: `step_limit`, `hand_off`, `failure`, `empty_message` | - | - | out: hash of the text shown; in: - | Not written if the text was not shown; the activity retries | `<conversation>:audit:notice:<reason>:<placeholder ts or reply idempotency key>` |
 | `tool_call` | A read tool ran (`search_knowledge`, a Notion read) and its output was stored. | tool name | - | - | in: hash of the tool input; out: hash of the output text | Written with `error` when the tool failed, or when the agent or the connector was switched off (the model got the off message); nothing is read then | `<conversation>:audit:tool:<tool use id>` |
 | `hand_off` | A front door hands the thread to a specialist, before the announcement is shown. Agent and version are the front door's. | - | specialist's agent ID | - | - | A hand-off the specialist's audience refuses is `audience_refused`, not this | `<tenant>:audit:hand-off:<event id>` |
 
@@ -134,7 +135,7 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 ## What the log never holds
 
 - No message text and no document text. Where something is proved, it is a SHA-256 of canonical
-  JSON (sorted keys, no spaces): the answer shown, a tool's input and output, an approved payload,
+  JSON (sorted keys, no spaces): the answer or notice shown, a tool's input and output, an approved payload,
   an agent definition. The rest is IDs, scope names and small values (counts, amounts, role names).
 - Rows are append-only: the database refuses UPDATE and DELETE for every role.
 - Rows are exempt from retention and kept until someone removes them outside the app.
@@ -153,7 +154,7 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 - A DM question that searches the knowledge: `tool_call` (`search_knowledge`, `ok`), then `answer`.
 - A request that files a Notion item: `approval`, then `write` (`ok`, target the new page ID). If the
   agent was switched off between approval and write: `approval`, then `write` with `error`.
-- A front door that hands off: `hand_off` (front door as the agent, specialist as target), then the specialist's own `tool_call` and `answer` rows.
+- A front door that hands off: `hand_off` (front door as the agent, specialist as target), a `notice` (`hand_off`) for the announcement, then the specialist's own `tool_call` and `answer` rows.
 - Someone outside an agent's audience asks it: `audience_refused` (the reason in `tool`).
 - Publishing a version: `agent_publish`, then `widening_confirm` when it widens, then `audience_confirm`
   (all in one transaction, in that `seq` order).

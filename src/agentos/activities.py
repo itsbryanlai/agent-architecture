@@ -344,6 +344,7 @@ class AgentActivities:
             self.call_llm,
             self.post_placeholder,
             self.finalize_reply,
+            self.finalize_notice,
             self.run_read_tool,
             self.post_approval_card,
             self.update_card,
@@ -356,6 +357,7 @@ class AgentActivities:
             self.reconcile_notion_item,
             self.get_notion_item,
             self.post_in_thread,
+            self.post_notice_in_thread,
             self.record_hand_off,
             self.check_audience,
             self.check_before_write,
@@ -1140,6 +1142,30 @@ class AgentActivities:
                 output_sha256=canonical_sha256(text),
             )
 
+    @activity.defn(name="finalize_notice")
+    async def finalize_notice(
+        self, ctx: TurnContext, placeholder_ts: str, text: str, tool: str
+    ) -> None:
+        """Show a non-answer final text on the placeholder and audit it as a ``notice``.
+
+        Like ``finalize_reply`` for the fixed notices (step limit, hand-off announcement,
+        failure): no citations, the reason in ``tool``, the hash of the text shown. A retry
+        updates the same message and records once.
+        """
+        self._log("finalize_notice", ctx.tenant_id, ctx.agent_id, tool=tool)
+        slack = self._runtime(ctx.tenant_id).slack
+        rendered = await self._rendered_reply(ctx, slack, text)
+        await slack.update_message(ctx.channel, placeholder_ts, rendered)
+        conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+        await self._record(
+            ctx,
+            "notice",
+            ids.audit_notice_key(conversation_id, tool, placeholder_ts),
+            conversation_id=conversation_id,
+            tool=tool,
+            output_sha256=canonical_sha256(text),
+        )
+
     async def _rendered_reply(self, ctx: TurnContext, slack: SlackPoster, text: str) -> str:
         """The model's text as posted mrkdwn: only the requester's own mention pings."""
         converted = to_slack_mrkdwn(text)
@@ -1745,6 +1771,25 @@ class AgentActivities:
     async def post_in_thread(self, ctx: TurnContext, text: str, idem_key: str) -> str:
         self._log("post_in_thread", ctx.tenant_id, ctx.agent_id)
         return await self._post_once(ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts)
+
+    @activity.defn(name="post_notice_in_thread")
+    async def post_notice_in_thread(
+        self, ctx: TurnContext, text: str, idem_key: str, tool: str
+    ) -> str:
+        """Post a fixed notice in the thread and audit it as a ``notice``: the reason in
+        ``tool``, the hash of the text shown, a key stable per ``idem_key``."""
+        self._log("post_notice_in_thread", ctx.tenant_id, ctx.agent_id, tool=tool)
+        ts = await self._post_once(ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts)
+        conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+        await self._record(
+            ctx,
+            "notice",
+            ids.audit_notice_key(conversation_id, tool, idem_key),
+            conversation_id=conversation_id,
+            tool=tool,
+            output_sha256=canonical_sha256(text),
+        )
+        return ts
 
     @activity.defn(name="record_hand_off")
     async def record_hand_off(self, ctx: TurnContext, target_agent: str, event_id: str) -> None:

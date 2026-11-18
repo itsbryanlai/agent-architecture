@@ -3,9 +3,11 @@
 from temporalio.client import WorkflowExecutionStatus
 
 from agentos import ids
-from agentos.models import LLMResponse, ToolCall
+from agentos.audit import canonical_sha256
+from agentos.config import TASK_QUEUE
+from agentos.models import ConversationRef, LLMResponse, ToolCall
 from agentos.workflows.conversation import TOOL_NOT_COMPLETED, TURN_FAILED, ConversationWorkflow
-from tests.conftest import TENANT, eventually
+from tests.conftest import ALICE, TENANT, eventually
 from tests.helpers.conversation import (
     CHANNEL,
     THREAD,
@@ -111,3 +113,60 @@ async def test_failed_tool_call_closes_pending_tool_use(harness):
     assert h.slack.updates()[1]["text"] == "Recovered"
     next_call = h.llm.calls[-1]["messages"]
     assert tool_use_ids(next_call) == tool_result_ids(next_call) == ["tu_1"]
+
+
+async def test_failure_notice_records_a_notice_event(harness):
+    """Fails if a failure notice is shown without an audit row."""
+    h = harness
+    h.llm.queue(
+        StatusError(401),
+        LLMResponse(text="Recovered", tool_calls=[], stop_reason="end_turn"),
+    )
+
+    handle = await start_conversation(h, inbound("Ev1"))
+    await eventually(lambda: h.slack.updates())
+    assert h.slack.updates()[0]["text"] == TURN_FAILED
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2", "try again"))
+    await eventually(lambda: len(h.slack.updates()) >= 2)
+
+    conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
+    [notice] = [e for e in h.audit.events if e.kind == "notice"]
+    assert notice.tool == "failure"
+    assert notice.agent_id == "it-helper"
+    assert notice.agent_version == 1
+    assert notice.requester_user_id == ALICE
+    assert notice.conversation_id == conv_id
+    assert notice.output_sha256 == canonical_sha256(TURN_FAILED)
+    assert notice.event_key == ids.audit_notice_key(conv_id, "failure", placeholders(h)[0]["ts"])
+
+
+async def test_early_failure_notice_records_a_notice_event(harness):
+    """Fails if a failure notice posted without a placeholder records no audit row."""
+    h = harness
+    msg = inbound("Ev1")
+    handle = await h.client.start_workflow(
+        ConversationWorkflow.run,
+        ConversationRef(TENANT, "ghost-agent", CHANNEL, THREAD),
+        id=ids.conversation_id(TENANT, CHANNEL, THREAD),
+        task_queue=TASK_QUEUE,
+        start_signal="message",
+        start_signal_args=[msg],
+    )
+    await handle.signal(ConversationWorkflow.message, msg)
+    await handle.signal(ConversationWorkflow.message, inbound("Ev2-sentinel"))
+    await eventually(lambda: len(h.slack.posts()) >= 2)
+
+    async def two_notices():
+        found = [e for e in h.audit.events if e.kind == "notice"]
+        return found if len(found) == 2 else None
+
+    [first, second] = await eventually(two_notices)
+    conv_id = ids.conversation_id(TENANT, CHANNEL, THREAD)
+    assert first.event_key == ids.audit_notice_key(conv_id, "failure", "Ev1:err")
+    assert second.event_key == ids.audit_notice_key(conv_id, "failure", "Ev2-sentinel:err")
+    assert first.tool == "failure"
+    assert first.agent_id == "ghost-agent"
+    assert first.agent_version == 0
+    assert first.requester_user_id == ALICE
+    assert first.conversation_id == conv_id
+    assert first.output_sha256 == canonical_sha256(TURN_FAILED)

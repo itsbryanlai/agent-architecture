@@ -9,7 +9,7 @@ from temporalio.worker import Worker
 from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import seeded_agent_store
-from agentos.audit import InMemoryAuditStore
+from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
 from agentos.llm import ScriptedLLMClient
 from agentos.models import ConversationRef, LLMResponse, ToolCall
@@ -108,6 +108,33 @@ async def test_last_step_does_not_dispatch_tools(harness):
     assert tool_results(stored)["tu_last"]["is_error"] is True
     assert stored[-1] == {"role": "assistant", "content": [{"type": "text", "text": OUT_OF_STEPS}]}
     assert tool_use_ids(stored) == tool_result_ids(stored)
+
+
+async def test_step_limit_notice_records_a_notice_event(harness):
+    """Fails if a step-limit notice is shown without an audit row."""
+    h = harness
+    h.llm.queue(
+        *[
+            LLMResponse(text=None, tool_calls=[search_call(f"tu_{n}")], stop_reason="tool_use")
+            for n in range(6)
+        ]
+    )
+
+    await start_conversation(h, inbound("Ev1", "keep going"))
+    await eventually(lambda: h.slack.updates())
+    assert h.slack.updates()[0]["text"] == OUT_OF_STEPS
+    await stored_history(h, CONV_ID)
+
+    [notice] = [e for e in h.audit.events if e.kind == "notice"]
+    assert notice.tool == "step_limit"
+    assert notice.agent_id == "it-helper"
+    assert notice.agent_version == 1
+    assert notice.requester_user_id == ALICE
+    assert notice.conversation_id == CONV_ID
+    assert notice.output_sha256 == canonical_sha256(OUT_OF_STEPS)
+    assert notice.event_key == ids.audit_notice_key(
+        CONV_ID, "step_limit", h.slack.updates()[0]["ts"]
+    )
 
 
 async def test_agent_removed_from_config_still_gets_a_reply(harness):

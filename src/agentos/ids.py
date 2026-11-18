@@ -60,6 +60,11 @@ def audit_answer_key(conversation_id: str, placeholder_ts: str) -> str:
     return f"{conversation_id}:audit:answer:{placeholder_ts}"
 
 
+def audit_notice_key(conversation_id: str, tool: str, marker: str) -> str:
+    """A non-answer final text: ``marker`` is the placeholder ts or the reply's idempotency key."""
+    return f"{conversation_id}:audit:notice:{tool}:{marker}"
+
+
 def audit_hand_off_key(tenant: str, event_id: str) -> str:
     return f"{tenant}:audit:hand-off:{event_id}"
 

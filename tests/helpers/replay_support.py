@@ -82,6 +82,7 @@ from tests.conftest import (
     knowledge_agents_dict,
     make_fake_notion,
 )
+from tests.helpers.agents import republish
 from tests.helpers.llm_errors import StatusError
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "replay"
@@ -497,6 +498,26 @@ async def audience_refusal(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def hand_off_refused(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(182 if stored else 181)
+    specialist = await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda definition: definition.update(audience={"dm": "everyone"}),
+    )
+    r.llm.queue(
+        tool_turn(ToolCall("tu_h", "hand_off", {"agent": "it-helper"})),
+        answer("I'll handle it myself."),
+    )
+    await start_conversation(r, "concierge", thread, "my laptop battery swells", stored=stored)
+    await replies(r, 1)
+    refusals = [e for e in r.acts.audit.events if e.kind == "audience_refused"]
+    assert [(e.agent_id, e.agent_version, e.target) for e in refusals] == [
+        ("it-helper", specialist.version, "concierge")
+    ]
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 async def failed_turn(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(112 if stored else 111)
     await start_conversation(r, "gone", thread, "hello", stored=stored)
@@ -782,6 +803,7 @@ for _name, _fn in {
     "knowledge_answer": knowledge_answer,
     "knowledge_two_searches": knowledge_two_searches,
     "audience_refusal": audience_refusal,
+    "hand_off_refused": hand_off_refused,
     "failed_turn": failed_turn,
     "step_limit_notice": step_limit_notice,
     "failure_notice": failure_notice,

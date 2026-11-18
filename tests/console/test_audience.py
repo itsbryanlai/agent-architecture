@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from temporalio import workflow
 from temporalio.client import WorkflowHistory
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
@@ -52,7 +53,7 @@ from agentos.stores import (
     InMemoryToolOutputStore,
 )
 from agentos.tenants import TenantRegistry, runtime_for
-from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.conversation import PATCH_HANDOFF_REFUSAL_AGENT, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import (
     ALICE,
@@ -63,6 +64,7 @@ from tests.conftest import (
     eventually,
     make_fake_notion,
 )
+from tests.helpers.agents import republish
 from tests.helpers.audience import CHAN, THREAD, converse, running, say, tenant_dict
 from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
 from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
@@ -569,10 +571,14 @@ async def test_no_hand_off_tool_when_no_specialist_is_reachable():
 
 
 async def test_a_forged_hand_off_to_an_unreachable_specialist_is_refused_without_switching():
+    """Fails if a refused hand-off names the front door instead of the specialist."""
     raw = front_door_raw({"channels": [CHAN]})
     raw["channels"] = {}
     raw["agents"]["concierge"]["audience"] = {"dm": "everyone"}
     async with running(raw) as h:
+        specialist = await republish(
+            h.agent_store, "it-helper", lambda definition: definition.update(description="IT v2.")
+        )
         h.llm.queue(hand_off(), reply("I'll handle it myself"))
         handle = await converse(h, "concierge", say("Ev1", ALICE, "D1", "im"))
         await eventually(lambda: h.slack.updates())
@@ -583,12 +589,39 @@ async def test_a_forged_hand_off_to_an_unreachable_specialist_is_refused_without
         assert second["is_error"] is True and "not available" in second["content"]
         assert [e.kind for e in h.audit.events].count("hand_off") == 0
         (event,) = refusals(h)
-        assert (event.agent_id, event.target, event.tool) == ("concierge", "it-helper", "dm")
+        assert (event.agent_id, event.agent_version, event.target, event.tool) == (
+            "it-helper",
+            specialist.version,
+            "concierge",
+            "dm",
+        )
         # The thread stays with the front door for the next message too.
         h.llm.queue(reply("still me"))
         await handle.signal(ConversationWorkflow.message, say("Ev2", ALICE, "D1", "im"))
         await eventually(lambda: len(h.llm.calls) >= 3)
         assert h.llm.calls[2]["system"] == h.llm.calls[0]["system"]
+
+
+async def test_a_pre_patch_refused_hand_off_still_names_the_front_door(monkeypatch):
+    """Fails if the legacy refused hand-off stops naming the front door, target the specialist."""
+    raw = front_door_raw({"channels": [CHAN]})
+    raw["channels"] = {}
+    raw["agents"]["concierge"]["audience"] = {"dm": "everyone"}
+    real_patched = workflow.patched
+
+    def legacy_patched(patch_id: str) -> bool:
+        if patch_id == PATCH_HANDOFF_REFUSAL_AGENT:
+            return False
+        return real_patched(patch_id)
+
+    monkeypatch.setattr(workflow, "patched", legacy_patched)
+    async with running(raw) as h:
+        h.llm.queue(hand_off(), reply("I'll handle it myself"))
+        await converse(h, "concierge", say("Ev1", ALICE, "D1", "im"))
+        await eventually(lambda: h.slack.updates())
+
+        (event,) = refusals(h)
+        assert (event.agent_id, event.target, event.tool) == ("concierge", "it-helper", "dm")
 
 
 async def test_a_hand_off_to_a_reachable_specialist_still_switches():

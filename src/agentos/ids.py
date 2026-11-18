@@ -94,7 +94,9 @@ def audit_import_key(tenant: str, agent_id: str) -> str:
 
 
 def audit_audience_refused_key(tenant: str, event_id: str, agent_id: str, target: str = "") -> str:
-    """A turn refused by an agent's audience, or a hand-off to ``target`` refused: once each."""
+    """An audience refusal, once each. ``agent_id`` is the refused agent; ``target``, when set,
+    is the other party in a refused hand-off (the front door now, the specialist in pre-patch
+    histories)."""
     return f"{tenant}:audit:audience-refused:{event_id}:{agent_id}:{target}"
 
 

@@ -69,13 +69,14 @@ from datetime import datetime, timedelta
 from typing import TypeVar
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.converter import value_to_type
 from temporalio.exceptions import ActivityError, ChildWorkflowError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from agentos import ids
-    from agentos.activities import HAND_OFF_TOOL, AgentActivities
+    from agentos.activities import HAND_OFF_TOOL, MY_TASKS_TOOL, AgentActivities
     from agentos.audience import (
         UNAVAILABLE,
         AudienceDecision,
@@ -94,6 +95,7 @@ with workflow.unsafe.imports_passed_through():
         Citation,
         ConversationRef,
         DraftOutcome,
+        ExternalUpdate,
         InboundMessage,
         LLMResponse,
         StepResult,
@@ -105,9 +107,11 @@ with workflow.unsafe.imports_passed_through():
         check_field,
     )
     from agentos.slack_format import escape_slack
+    from agentos.tasks import REFRESH_WAIT, TaskRecord
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         LLM_TIMEOUT,
+        POKE_GAP,
         PROGRESS_RETRY,
         PROGRESS_TIMEOUT,
         RETRY,
@@ -159,6 +163,11 @@ PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
 PATCH_PROGRESS = "progress"
 PATCH_PROGRESS_DROPPED = "progress-dropped"
 PATCH_SEARCHED_FOOTER = "searched-footer"
+# The my_tasks tool and its in-thread poke: a call no older history ever made.
+PATCH_MY_TASKS = "my-tasks"
+# One refresh per turn, and no poke for a task that just reported: a my-tasks history
+# recorded before this patch pokes and waits on every call, even a second in the turn.
+PATCH_MY_TASKS_ONCE = "my-tasks-once-per-turn"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -174,6 +183,7 @@ SEARCHING_SOURCES = "Searching the knowledge sources…"
 READING_NOTION = "Reading Notion…"
 DRAFTING_REQUEST = "Drafting the request…"
 HANDING_OVER = "Handing over to {agent}…"
+CHECKING_REQUESTS = "Checking your requests…"
 
 
 def progress_label(
@@ -197,6 +207,8 @@ def progress_label(
         return SEARCHING_SOURCES
     if name == HAND_OFF_TOOL:
         return HANDING_OVER.format(agent=escape_slack(agent_name))
+    if name == MY_TASKS_TOOL:
+        return CHECKING_REQUESTS
     if kind == READ_KIND:
         return READING_NOTION
     if kind in EDITABLE_FIELDS:
@@ -229,6 +241,9 @@ class _TurnState:
         # The citations this turn's searches kept, so the reply can name the pages it
         # searched even when the answer cites none of them. References only, like citations.
         self.searched: list[Citation] = []
+        # True once this turn refreshed the thread's task, or found it fresh enough: a
+        # second my_tasks call lists the store without another poke and wait.
+        self.task_refreshed = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -1132,12 +1147,13 @@ class ConversationWorkflow:
             call.name, kind, source_titles=[g.name for g in agent.grants.notion_pages]
         )
         return await self._with_progress(
-            ctx, state, label, self._run_call(ctx, agent, conv_id, call, kind, first_marker)
+            ctx, state, label, self._run_call(ctx, state, agent, conv_id, call, kind, first_marker)
         )
 
     async def _run_call(
         self,
         ctx: TurnContext,
+        state: "_TurnState",
         agent: AgentVersion,
         conv_id: str,
         call: ToolCall | ToolCallRef,
@@ -1145,6 +1161,8 @@ class ConversationWorkflow:
         first_marker: int,
     ) -> ToolResult:
         if kind == READ_KIND:
+            if call.name == MY_TASKS_TOOL and workflow.patched(PATCH_MY_TASKS):
+                await self._refresh_thread_task(ctx, state)
             return await workflow.execute_activity_method(
                 AgentActivities.run_stored_read_tool
                 if isinstance(call, ToolCallRef)
@@ -1160,6 +1178,52 @@ class ConversationWorkflow:
             return await self._start_task(ctx, agent, call, kind)
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
+
+    async def _refresh_thread_task(self, ctx: TurnContext, state: "_TurnState") -> None:
+        """Poke the watch of the asker's task in this thread, then wait for its report.
+
+        The poke is the webhook's own ``external_update`` signal, so the watch answers
+        it at most once per ``POKE_GAP``: a question never forces a sooner poll. The
+        wait is bounded and best-effort; a task that does not report in time is listed
+        as it was last recorded. A task that closed between the lookup and the poke
+        already recorded its final state, so a failed signal changes nothing.
+
+        A turn refreshes at most once: a second my_tasks call lists the store as it is.
+        A task that reported within ``POKE_GAP`` is fresh already, so its poke and wait
+        are skipped. Histories recorded before the once-per-turn patch keep the original
+        poke and wait on every call.
+        """
+        once = workflow.patched(PATCH_MY_TASKS_ONCE)
+        if once and state.task_refreshed:
+            return
+        record: TaskRecord | None = await workflow.execute_activity_method(
+            AgentActivities.task_in_thread,
+            args=[ctx.tenant_id, ctx.channel, ctx.thread_ts, ctx.requester_user_id],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        if record is None or not record.page_id:
+            return
+        if once:
+            state.task_refreshed = True
+            if workflow.now() - record.updated_at < POKE_GAP:
+                return
+        try:
+            await workflow.get_external_workflow_handle(record.task_id).signal(
+                "external_update", ExternalUpdate(page_id=record.page_id, source="my_tasks")
+            )
+        except Exception as err:  # noqa: BLE001 - a closed task refuses the signal; its final state is recorded
+            self._log_failure(self._ref(), err, "task poke")
+            return
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.wait_task_refresh,
+                args=[ctx.tenant_id, record.task_id, record.updated_at],
+                start_to_close_timeout=REFRESH_WAIT + timedelta(seconds=15),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError as err:
+            self._log_failure(self._ref(), err, "task refresh wait")
 
     async def _with_progress(
         self,

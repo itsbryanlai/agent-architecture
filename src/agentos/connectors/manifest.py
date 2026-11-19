@@ -44,6 +44,7 @@ class ToolSpec:
     requester_scoped: str | None = None  # name of the hidden person field
     idempotency: str | None = None  # idempotency method, e.g. "marker_property"
     offer_to_llm: bool = True
+    connector: str = ""  # the manifest's connector; empty for a spec built outside one
 
     @property
     def is_write(self) -> bool:
@@ -75,6 +76,7 @@ class Manifest:
 def load_manifest(path: str | Path) -> Manifest:
     with open(path, encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
+    connector = str(raw["connector"])
     tools = {}
     for name, spec in (raw.get("tools") or {}).items():
         tools[name] = ToolSpec(
@@ -85,8 +87,9 @@ def load_manifest(path: str | Path) -> Manifest:
             requester_scoped=spec.get("requester_scoped"),
             idempotency=spec.get("idempotency"),
             offer_to_llm=bool(spec.get("offer_to_llm", True)),
+            connector=connector,
         )
-    return Manifest(connector=str(raw["connector"]), tools=tools)
+    return Manifest(connector=connector, tools=tools)
 
 
 def _load_all() -> dict[str, ToolSpec]:

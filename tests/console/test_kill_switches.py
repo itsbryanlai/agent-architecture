@@ -70,6 +70,7 @@ from agentos.switches import (
 from agentos.switches import _targets as cli_targets
 from agentos.switches import execute as cli_execute
 from agentos.switches import run as cli_run
+from agentos.tasks import TaskRecord
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore, Prices, UsageRecorder
 from agentos.workflows.conversation import ConversationWorkflow
@@ -364,17 +365,45 @@ def search_call(tool_id="tu_1") -> ToolCall:
     return ToolCall(tool_id, "search_knowledge", {"query": "reset VPN password"})
 
 
-async def test_a_connector_that_is_off_returns_an_error_for_a_tool_call_and_reads_nothing(kn):
+@pytest.mark.parametrize(
+    ("call", "refused"),
+    [
+        (ToolCall("tu_1", "search_items", {"query": "vpn"}), True),
+        (ToolCall("tu_1", "my_tasks", {}), False),
+    ],
+)
+async def test_the_notion_switch_stops_notion_tools_but_not_the_platforms_own(kn, call, refused):
+    """Fails if the Notion switch refuses the platform's my_tasks, or lets a Notion read through while off."""
+    await kn.acts.tasks.record(
+        TaskRecord(
+            tenant_id=TENANT,
+            task_id=ids.task_id(TENANT, "t-1"),
+            requester_user_id=ALICE,
+            agent_id="it-helper",
+            title="New monitor",
+            url="https://www.notion.so/monitor",
+            page_id="p-1",
+            state="watching",
+            last_status="To do",
+            updated_at=NOV,
+            channel="C1",
+            thread_ts="1.1",
+        )
+    )
     await off(kn.switches, CONNECTOR, NOTION)
     calls_before = len(kn.notion.calls)
 
-    text, is_error, result = await kn.read(ToolCall("tu_1", "search_items", {"query": "vpn"}))
+    text, is_error, result = await kn.read(call)
 
-    assert is_error and result.is_error and result.stored
-    assert text == "Notion is turned off by an admin, so this can't be done now."
+    assert is_error is refused and result.is_error is refused and result.stored
     assert len(kn.notion.calls) == calls_before
     [event] = kn.audit.events
-    assert event.kind == "tool_call" and event.outcome == "error"
+    assert event.kind == "tool_call"
+    assert event.outcome == ("error" if refused else "ok")
+    if refused:
+        assert text == "Notion is turned off by an admin, so this can't be done now."
+    else:
+        assert "New monitor" in text
 
 
 async def test_knowledge_search_refuses_while_the_connector_is_off_and_works_when_it_is_on(kn):

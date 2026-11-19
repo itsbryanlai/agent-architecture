@@ -92,7 +92,13 @@ from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import BudgetGuard
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors import notion_errors
-from agentos.connectors.manifest import MANIFEST_DIR, load_manifest, require_idempotency, screen
+from agentos.connectors.manifest import (
+    MANIFEST_DIR,
+    TOOLS,
+    load_manifest,
+    require_idempotency,
+    screen,
+)
 from agentos.connectors.notion import (
     ConnectorError,
     NotionConnector,
@@ -156,6 +162,7 @@ from agentos.stores import (
     ToolOutputStore,
 )
 from agentos.switches import (
+    NOTION,
     SWITCHED_OFF,
     AgentOff,
     Effect,
@@ -166,6 +173,14 @@ from agentos.switches import (
     connector_off_text,
     log_stop,
     read_state,
+)
+from agentos.tasks import (
+    REFRESH_WAIT,
+    InMemoryTaskStore,
+    TaskRecord,
+    TaskStore,
+    format_task_list,
+    listed_state,
 )
 from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
 from agentos.threads import (
@@ -181,6 +196,7 @@ log = logging.getLogger("agentos.activities")
 
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
+MY_TASKS_TOOL = "my_tasks"
 # Published versions are immutable, so one is kept per (tenant, agent, version). A worker
 # holds the versions its running turns use, and few of them.
 VERSION_CACHE_SIZE = 256
@@ -231,6 +247,16 @@ def _item_from_ref(ref: str) -> NotionItem:
 
 def _non_retryable(err: Exception) -> ApplicationError:
     return ApplicationError(str(err), type=type(err).__name__, non_retryable=True)
+
+
+def _tool_connector(name: str) -> str:
+    """The manifest connector of a tool, for the gate's connector scope.
+
+    A name no manifest declares answers to the Notion switch, as every read did before
+    the platform manifest existed; the call itself is refused as unknown either way.
+    """
+    spec = TOOLS.get(name)
+    return spec.connector if spec is not None and spec.connector else NOTION
 
 
 def _is_client_error(err: Exception) -> bool:
@@ -316,6 +342,7 @@ class AgentActivities:
         owner_pings: OwnerPingStore | None = None,
         content: ContentStore | None = None,
         health: HealthStore | None = None,
+        tasks: TaskStore | None = None,
     ):
         self.settings = settings
         self.content = content or InMemoryContentStore()
@@ -330,6 +357,9 @@ class AgentActivities:
         self._history_refusals_logged: set[tuple[str, str]] = set()
         self.switches = switches or InMemorySwitchStore()
         self.health = health or InMemoryAgentHealthStore()
+        self.tasks = tasks or InMemoryTaskStore()
+        # How long the in-thread wait for a poke-answered poll may take. Tests move it.
+        self.refresh_wait_seconds = REFRESH_WAIT.total_seconds()
         self.usage = usage
         self.budgets = budgets
         self.registry = registry
@@ -397,6 +427,9 @@ class AgentActivities:
             self.apply_edit,
             self.post_task_notice,
             self.watch_notion_item,
+            self.record_task_state,
+            self.task_in_thread,
+            self.wait_task_refresh,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -478,19 +511,20 @@ class AgentActivities:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
 
     async def _gate_refusal(
-        self, tenant_id: str, agent_id: str, effect: Effect
+        self, tenant_id: str, agent_id: str, effect: Effect, connector: str = NOTION
     ) -> Exception | None:
         """Why the agent may not do ``effect`` now, or None. The one place the gate is read.
 
         Every activity that acts for an agent calls this (or ``_gate``) first, so one read
         of the switches applies the agent, writes and connector scopes that matter to the
         effect, and one read of the agent's health stops an agent whose grant check failed.
-        An admin's switch is checked first; health covers every effect. Read from the stores
-        now, never cached. An unreadable switch or health row raises, so the step fails and
-        is retried rather than let through.
+        An admin's switch is checked first; health covers every effect. The connector scope
+        covers the tool's own connector (``_tool_connector``), Notion by default. Read from
+        the stores now, never cached. An unreadable switch or health row raises, so the step
+        fails and is retried rather than let through.
         """
         state = await read_state(self.switches, tenant_id)
-        refusal = state.refusal(agent_id, effect)
+        refusal = state.refusal(agent_id, effect, connector)
         if refusal is None:
             row = await self.health.get(tenant_id, agent_id)
             if row is not None and row.status == HEALTH_UNAVAILABLE:
@@ -953,6 +987,9 @@ class AgentActivities:
                 return stopped
         messages = prepare_for_model(await self.history.load_window(ctx.tenant_id, conversation_id))
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
+        if agent.grants.notion_databases:
+            # Only an agent with a write grant starts tasks, so only it has any to list.
+            tools = tools + [TOOLS[MY_TASKS_TOOL].llm_definition()]
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
         if agent.grants.notion_pages:
@@ -1436,7 +1473,9 @@ class AgentActivities:
         ``search_knowledge`` uses it, and it returns the citations it numbered.
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
-        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        refusal = await self._gate_refusal(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(call.name)
+        )
         return await self._run_read(ctx, conversation_id, call, first_marker, refusal)
 
     @activity.defn(name="run_stored_read_tool")
@@ -1445,7 +1484,9 @@ class AgentActivities:
     ) -> ToolResult:
         """``run_read_tool`` for a call whose input is stored by tool-use ID, not passed in."""
         self._log("run_stored_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
-        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        refusal = await self._gate_refusal(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(call.name)
+        )
         found, tool_input = await self.content.get_tool_input(
             ctx.tenant_id, conversation_id, call.id
         )
@@ -1474,10 +1515,12 @@ class AgentActivities:
             agent = await self._agent(ctx.tenant_id, ctx.agent_id)
             text, is_error = agent_unavailable_text(agent.name), True
         elif refusal is not None:
-            # Reading and searching Notion both go through the connector.
-            text, is_error = connector_off_text("notion"), True
+            # A connector switch: the refusal names the connector the tool reads through.
+            text, is_error = str(refusal), True
         elif call.name == "search_knowledge":
             text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
+        elif call.name == MY_TASKS_TOOL:
+            text, is_error = await self._my_tasks(ctx)
         else:
             text, is_error = await self._read_tool_output(ctx, call)
         await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
@@ -1560,6 +1603,21 @@ class AgentActivities:
             len(kept),
             pages,
         )
+
+    async def _my_tasks(self, ctx: TurnContext) -> tuple[str, bool]:
+        """The asker's tasks from the platform's store: no connector call, no Notion search.
+
+        The requester is the runtime's, never a model argument; the store filters by it.
+        The write grant is checked here too, not only where the tool is offered: a model
+        can invent a call it was never offered, and an agent that cannot start tasks has
+        none to list.
+        """
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if not agent.grants.notion_databases:
+            return "This agent has no write access, so it has no requests to list.", True
+        records = await self.tasks.list_for_requester(ctx.tenant_id, ctx.requester_user_id)
+        team_id = self._runtime(ctx.tenant_id).config.slack_team_id
+        return format_task_list(records, team_id=team_id), False
 
     async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""
@@ -2038,6 +2096,85 @@ class AgentActivities:
             if _is_client_error(err):
                 raise _non_retryable(err) from err
             _reraise(err)
+
+    @activity.defn(name="record_task_state")
+    async def record_task_state(
+        self, spec: TaskSpec, task_id: str, state: str, status: str, updated_at: datetime
+    ) -> None:
+        """Store the task's latest report in the ``tasks`` table, one row per task ID.
+
+        The workflow names its own state, the item's last status and the time of the
+        report; the title, link and page are read here from the write's stored result
+        or the stored draft, so they never pass through workflow history. A retry
+        stores the same row again.
+        """
+        ctx = spec.ctx
+        self._log("record_task_state", ctx.tenant_id, ctx.agent_id, state=state)
+        title, url, page_id = await self._task_item_meta(spec, task_id)
+        await self.tasks.record(
+            TaskRecord(
+                tenant_id=ctx.tenant_id,
+                task_id=task_id,
+                requester_user_id=ctx.requester_user_id,
+                agent_id=ctx.agent_id,
+                title=title,
+                url=url,
+                page_id=page_id,
+                state=listed_state(state),
+                last_status=status,
+                updated_at=updated_at,
+                channel=ctx.channel,
+                thread_ts=ctx.thread_ts,
+            )
+        )
+
+    async def _task_item_meta(self, spec: TaskSpec, task_id: str) -> tuple[str, str, str]:
+        """The item's title, link and page ID: the write's stored result once it exists,
+        else the stored draft (a comment's resolved item carries its own)."""
+        payload = await self._spec_payload(spec)
+        if spec.tool_name == "add_comment":
+            return (
+                payload.get("item_title", ""),
+                payload.get("item_url", ""),
+                payload.get("page_id", ""),
+            )
+        stored = await self.writes.result(spec.ctx.tenant_id, f"{task_id}:create")
+        if stored is not None:
+            item = _item_from_ref(stored)
+            return item.title, item.url, item.page_id
+        return payload.get("title", ""), "", ""
+
+    @activity.defn(name="task_in_thread")
+    async def task_in_thread(
+        self, tenant_id: str, channel: str, thread_ts: str, requester_user_id: str
+    ) -> TaskRecord | None:
+        """The asker's newest watching task in this thread, or None.
+
+        Only a watching task has a watch to poke. The row's page ID names the item the
+        ``external_update`` signal must carry, and its ``updated_at`` is the mark the
+        refresh wait watches.
+        """
+        self._log("task_in_thread", tenant_id, "-")
+        return await self.tasks.watching_in_thread(tenant_id, channel, thread_ts, requester_user_id)
+
+    @activity.defn(name="wait_task_refresh")
+    async def wait_task_refresh(self, tenant_id: str, task_id: str, before: datetime) -> bool:
+        """Wait until the task reports again after ``before``, or the budget runs out.
+
+        The poke went through the watch's own signal path, so the report lands within
+        ``POKE_GAP`` plus the poll's own time. The wait is real time inside the activity;
+        the marks it compares are the task's workflow time. Best-effort: a task that
+        never reports is listed as it was last recorded.
+        """
+        self._log("wait_task_refresh", tenant_id, "-", task_id=task_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.refresh_wait_seconds
+        while loop.time() < deadline:
+            await asyncio.sleep(0.5)
+            row = await self.tasks.get(tenant_id, task_id)
+            if row is None or row.updated_at > before:
+                return True
+        return False
 
     @activity.defn(name="post_in_thread")
     async def post_in_thread(self, ctx: TurnContext, text: str, idem_key: str) -> str:

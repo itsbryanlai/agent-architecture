@@ -90,6 +90,9 @@ PATCH_APPROVAL_CLOSED = "approval-closed-audit"
 # replay without its clean stop. A watch is not covered: an unavailable agent's poll
 # fails retryably, so the watch keeps polling with no workflow change.
 AGENT_UNAVAILABLE_PATCH = "agent-unavailable"
+# Histories recorded before the task store existed never record their state; they
+# replay without the record activity, and those tasks simply have no row.
+TASK_RECORD_PATCH = "task-record"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -223,9 +226,11 @@ class TaskWorkflow:
                     AgentActivities.post_in_thread, spec.ctx, _reason(err), f"{task_id}:failed"
                 )
                 self._state = "cancelled"
+                await self._record()
                 return self._state
             await self._notice(task_notices.CARRY_ON_FAILED, f"{task_id}:failed", task_id)
             self._state = "failed"
+            await self._record()
             return self._state
 
     async def _run(self, spec: TaskSpec) -> str:
@@ -259,6 +264,7 @@ class TaskWorkflow:
                         f"{task_id}:failed",
                     )
                     self._state = "cancelled"
+                    await self._record()
                     return self._state
                 if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
                     await self._act(
@@ -268,6 +274,7 @@ class TaskWorkflow:
                         f"{task_id}:failed",
                     )
                     self._state = "cancelled"
+                    await self._record()
                     return self._state
                 await self._act(
                     AgentActivities.post_in_thread,
@@ -277,6 +284,7 @@ class TaskWorkflow:
                     f"{task_id}:failed",
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
             if self._refs:
                 self._spec = dataclasses.replace(
@@ -286,6 +294,7 @@ class TaskWorkflow:
                 self._spec = dataclasses.replace(spec, payload=payload)
         card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
+        await self._record()
 
         # --- wait for a valid decision, with one reminder, until expiry ---------
         expires = timedelta(hours=agent.approval.expires_after_hours)
@@ -336,6 +345,7 @@ class TaskWorkflow:
                 f"{task_id}:expired",
             )
             self._state = "expired"
+            await self._record()
             return self._state
 
         if not self._decision.approved:
@@ -343,6 +353,7 @@ class TaskWorkflow:
                 await self._try(AgentActivities.record_approval_closed, spec, task_id, "declined")
             await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
             self._state = "cancelled"
+            await self._record()
             return self._state
 
         if workflow.patched(PRE_WRITE_PATCH):
@@ -356,6 +367,7 @@ class TaskWorkflow:
             if stopped is not None:
                 await self._try(AgentActivities.update_card_line, spec, task_id, card_ts, stopped)
                 self._state = "cancelled"
+                await self._record()
                 return self._state
 
         if spec.tool_name == "add_comment":
@@ -366,6 +378,7 @@ class TaskWorkflow:
 
         # --- execute exactly once ------------------------------------------------
         self._state = "executing"
+        await self._record()
         try:
             item: NotionItem = await self._act_write(
                 AgentActivities.create_notion_item, spec, task_id
@@ -390,6 +403,7 @@ class TaskWorkflow:
                         f"{task_id}:failed",
                     )
                     self._state = "failed"
+                    await self._record()
                     return self._state
             if found is None:
                 reason = _reason(err)
@@ -404,6 +418,7 @@ class TaskWorkflow:
                     reason=reason,
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
             item = found
 
@@ -438,6 +453,7 @@ class TaskWorkflow:
         """
         ctx = self._spec.ctx
         self._state = "watching"
+        await self._record(state.last_status or "")
         self._page_key = normalize_id(item.page_id)
         self._poked = state.poked
         done_values = _done_values(agent, database_id)
@@ -458,6 +474,7 @@ class TaskWorkflow:
                     task_notices.STOPPED_WATCH, f"{task_id}:stopped", task_id, subject=item.title
                 )
                 self._state = "done"
+                await self._record(last_status or "")
                 return self._state
             if hop and _hop_due():
                 # Signals that arrive after this point make Temporal refuse the hop and run
@@ -497,6 +514,7 @@ class TaskWorkflow:
                 if _is_agent_off(err):
                     # An admin turned the agent off: the watch ends here, with no post.
                     self._state = "cancelled"
+                    await self._record(last_status or "")
                     return self._state
                 if _is_permanent(err):
                     await self._notice(
@@ -506,6 +524,7 @@ class TaskWorkflow:
                         subject=item.title,
                     )
                     self._state = "done"
+                    await self._record(last_status or "")
                     return self._state
                 workflow.logger.warning("watch poll failed after retries; still watching")
                 continue
@@ -518,20 +537,27 @@ class TaskWorkflow:
                     status=current.status or "",
                 )
                 self._state = "done"
+                await self._record(current.status or "")
                 return self._state
             now = workflow.now()
             if current.status != last_status:
                 last_status = current.status
                 last_change = now
-            elif not stale_sent and now - last_change >= stale_after:
-                stale_sent = True
-                await self._notice(
-                    task_notices.STALE,
-                    f"{task_id}:stale",
-                    task_id,
-                    subject=current.title,
-                    days=agent.follow_up.stale_after_days,
-                )
+                await self._record(current.status or "")
+            else:
+                if woken_by_poke:
+                    # A poke asked for a fresh look: report the check even when nothing
+                    # moved, so a my_tasks wait in the thread sees the refresh land.
+                    await self._record(current.status or "")
+                if not stale_sent and now - last_change >= stale_after:
+                    stale_sent = True
+                    await self._notice(
+                        task_notices.STALE,
+                        f"{task_id}:stale",
+                        task_id,
+                        subject=current.title,
+                        days=agent.follow_up.stale_after_days,
+                    )
             item = NotionItem(
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
@@ -548,6 +574,7 @@ class TaskWorkflow:
             agent_off_card_text(agent_name),
         )
         self._state = "cancelled"
+        await self._record()
         return self._state
 
     async def _stop_for_agent_unavailable(
@@ -562,6 +589,7 @@ class TaskWorkflow:
             agent_unavailable_text(agent_name),
         )
         self._state = "cancelled"
+        await self._record()
         return self._state
 
     async def _run_comment(
@@ -569,6 +597,7 @@ class TaskWorkflow:
     ) -> str:
         """Post the approved comment once. There is nothing to watch afterwards."""
         self._state = "executing"
+        await self._record()
         payload = {} if self._refs else spec.payload
         title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
         try:
@@ -593,6 +622,7 @@ class TaskWorkflow:
                         url=item_url,
                     )
                     self._state = "failed"
+                    await self._record()
                     return self._state
             else:
                 reason = _reason(err)
@@ -607,6 +637,7 @@ class TaskWorkflow:
                     reason=reason,
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
         await self._notice(
@@ -617,6 +648,7 @@ class TaskWorkflow:
             url=item_url,
         )
         self._state = "done"
+        await self._record()
         return self._state
 
     async def _store_edit(self, e: EditRequest) -> None:
@@ -682,6 +714,25 @@ class TaskWorkflow:
             days=days,
         )
         await self._try(AgentActivities.post_in_thread, ctx, text, idem_key)
+
+    async def _record(self, status: str = "") -> None:
+        """Record the task's state in the platform's store, for the asker's ``my_tasks``.
+
+        Best-effort: a failed record never ends the task. The activity reads the item's
+        title and link from the stored draft or the write's result; the workflow carries
+        only its state, the status and the time. Histories recorded before the store
+        existed never record (the patch marker is absent).
+        """
+        if not workflow.patched(TASK_RECORD_PATCH):
+            return
+        await self._try(
+            AgentActivities.record_task_state,
+            self._spec,
+            workflow.info().workflow_id,
+            self._state,
+            status,
+            workflow.now(),
+        )
 
     async def _try(self, method, *args) -> None:
         """Run an activity whose failure must not end the task (a card redraw, a notice)."""

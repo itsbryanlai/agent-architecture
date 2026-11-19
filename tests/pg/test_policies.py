@@ -18,6 +18,8 @@ SEEDS = {
     "idempotency_records": "INSERT INTO idempotency_records (tenant_id, idem_key, value) "
     "VALUES (%(t)s, 'k', '{}')",
     "task_links": "INSERT INTO task_links (tenant_id, page_id, task_id) VALUES (%(t)s, 'p', 'k')",
+    "tasks": "INSERT INTO tasks (tenant_id, task_id, requester_user_id, agent_id, state, channel, "
+    "thread_ts) VALUES (%(t)s, 'k', 'u', 'aa', 'watching', 'C1', '1.1')",
     "tool_outputs": "INSERT INTO tool_outputs "
     "(tenant_id, conversation_id, tool_use_id, content, is_error) "
     "VALUES (%(t)s, 'c', 'u', 'x', false)",
@@ -98,6 +100,7 @@ PRIVILEGES = {
     "conversation_messages": "SELECT INSERT UPDATE DELETE",
     "idempotency_records": "SELECT INSERT UPDATE DELETE",
     "task_links": "SELECT INSERT UPDATE DELETE",
+    "tasks": "SELECT INSERT UPDATE",
     "tool_outputs": "SELECT INSERT UPDATE DELETE",
     "knowledge_pages": "SELECT INSERT UPDATE DELETE",
     "knowledge_chunks": "SELECT INSERT UPDATE DELETE",

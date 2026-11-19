@@ -72,6 +72,7 @@ from agentos.stores import (
     PostgresToolOutputStore,
 )
 from agentos.switches import PostgresSwitchStore
+from agentos.tasks import PostgresTaskStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, TenantSource, startup_tenants
 from agentos.tenants import RegistrySync, TenantRegistry, build_registry
@@ -342,6 +343,7 @@ async def main() -> None:
             owner_pings=PostgresOwnerPingStore(pool),
             content=PostgresContentStore(pool),
             health=health,
+            tasks=PostgresTaskStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

@@ -484,7 +484,9 @@ class DatabaseKeyStore:
                 f"create one with: uv run python -m agentos.tenant_keys create {tenant_id}"
             )
         if isinstance(entry, TenantKeyError):
-            raise entry
+            # A fresh error each time: re-raising one cached instance would grow its
+            # traceback with every caller's frames.
+            raise TenantKeyError(str(entry)) from None
         return entry
 
 
@@ -637,5 +639,6 @@ def startup_key_failure(keys: KeyStore, tenant_ids: Iterable[str]) -> str | None
         f"refusing to start: {len(problems)} tenant key problem(s): "
         + "; ".join(problems)
         + ". Create a missing key with: uv run python -m agentos.tenant_keys create <tenant_id>"
-        + " (key files) or value <tenant_id> (key variables)"
+        + " (key files, or the database with AGENTOS_KEY_SOURCE=db),"
+        + " or value <tenant_id> (key variables)"
     )

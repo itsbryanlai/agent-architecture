@@ -37,8 +37,8 @@ def test_prefixed_infra_vars_are_read(monkeypatch):
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(None, "files"), ("env", "env"), ("files", "files"), ("bogus", None)],
-    ids=["unset", "env", "files", "unknown"],
+    [(None, "files"), ("env", "env"), ("files", "files"), ("db", "db"), ("bogus", None)],
+    ids=["unset", "env", "files", "db", "unknown"],
 )
 def test_the_key_source_setting_is_read_and_an_unknown_source_is_refused(
     monkeypatch, raw, expected

@@ -880,6 +880,7 @@ async def _real_lifespan(app: FastAPI):
             await asyncio.gather(relay_task, return_exceptions=True)
         if key_refresh is not None:
             key_refresh.cancel()
+            await asyncio.gather(key_refresh, return_exceptions=True)
         await pool.close()
 
 

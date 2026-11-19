@@ -594,6 +594,9 @@ async def test_a_key_the_worker_has_not_loaded_retries_until_a_miss_refresh_find
             assert [u for u in slack.updates() if u["channel"] == CHANNEL] == []
             assert (await handle_a.describe()).status == WorkflowExecutionStatus.RUNNING
             source[(TENANT, 1)] = key_a  # no manual refresh: the codec's miss must trigger it
-            await eventually(lambda: [u for u in slack.updates() if u["channel"] == CHANNEL])
+            # The server's workflow-task retry backoff runs in real time, not skipped time.
+            await eventually(
+                lambda: [u for u in slack.updates() if u["channel"] == CHANNEL], timeout=30.0
+            )
     finally:
         await env.shutdown()

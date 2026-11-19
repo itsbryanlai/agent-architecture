@@ -138,7 +138,7 @@ async def test_the_db_key_command_audits_the_operator_without_key_material(
     ]
     store = DatabaseKeyStore(pool, masters)
     await store.refresh()
-    material = base64.b64encode(store.key(tenant, store.latest_version(tenant))).decode()
+    materials = [base64.b64encode(store.key(tenant, v)).decode() for v in store.versions(tenant)]
     captured = capsys.readouterr()
-    assert material not in captured.out + captured.err
-    assert all(material not in event_json(e) for e in events)
+    assert all(m not in captured.out + captured.err for m in materials)
+    assert all(m not in event_json(e) for m in materials for e in events)

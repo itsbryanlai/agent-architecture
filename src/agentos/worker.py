@@ -407,6 +407,7 @@ async def main() -> None:
             refresher.cancel()
             if key_refresh is not None:
                 key_refresh.cancel()
+                await asyncio.gather(key_refresh, return_exceptions=True)
     finally:
         await pool.close()
 

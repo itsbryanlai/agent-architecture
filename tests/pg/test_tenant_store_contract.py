@@ -60,6 +60,46 @@ async def test_a_stored_tenant_loads_with_its_settings_and_secret_names_only(
     assert "made-up-value-123" not in repr(row)
 
 
+async def test_routing_changes_load_back_and_move_the_change_time(store, tenant: str):
+    """Fails if a saved default agent or channel map does not load back, or the directory
+    cannot notice the change."""
+    await store.insert(tenant_config(tenant))
+    before = await store.load(tenant)
+
+    await store.set_routing(tenant, None, {"C2": "it-helper"})
+
+    after = await store.load(tenant)
+    assert (after.config.default_agent, after.config.channels) == (None, {"C2": "it-helper"})
+    assert after.updated_at > before.updated_at
+
+
+@pytest.mark.parametrize("clash", [False, True], ids=["own workspace", "another tenant's"])
+async def test_the_notion_workspace_is_stored_cleared_and_not_shared(
+    store, tenant: str, other_tenant: str, clash: bool
+):
+    """Fails if a connected workspace does not load back with its name, a clear leaves it
+    behind, or two tenants may share one Notion workspace."""
+    await store.insert(tenant_config(tenant))
+    await store.insert(tenant_config(other_tenant))
+
+    if clash:
+        with pytest.raises(ConfigError, match="already uses"):
+            await store.set_notion_workspace(tenant, f"w-{other_tenant}", "Other HQ")
+        assert (await store.load(tenant)).config.notion_workspace_id == f"w-{tenant}"
+        return
+
+    await store.set_notion_workspace(tenant, "w-new", "New HQ")
+    row = await store.load(tenant)
+    assert (row.config.notion_workspace_id, row.config.notion_workspace_name) == (
+        "w-new",
+        "New HQ",
+    )
+
+    await store.set_notion_workspace(tenant, None, None)
+    row = await store.load(tenant)
+    assert (row.config.notion_workspace_id, row.config.notion_workspace_name) == (None, None)
+
+
 async def test_disabling_a_tenant_is_seen_by_the_lookups_by_slack_team_and_by_list(
     store, tenant: str
 ):

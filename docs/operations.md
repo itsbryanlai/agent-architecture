@@ -103,8 +103,10 @@ signature it cannot check, so set it up in this order:
    token with the tenant's payload key and stores it in the database as
    **pending**, and logs that a token is pending (never the token). While a
    token is pending or active a second handshake gets 409 and changes nothing.
-3. Print the pending token once, paste it into the Notion integration to finish
-   subscribing, then confirm it:
+3. Show the pending token once, paste it into the Notion integration to finish
+   subscribing, then confirm it. In the console (an admin): **Settings → Notion
+   webhook verification → Reveal token**, Copy, paste into Notion's verify box,
+   then **Confirm**. The command line does the same:
 
    ```bash
    uv run python -m agentos.notion_webhook show --tenant <tenant_id>
@@ -112,13 +114,16 @@ signature it cannot check, so set it up in this order:
    ```
 
    Only a **confirmed** (active) token accepts events; a pending one never does.
-   Each command is audited as the operator (`operator:<OS login>`), and the
-   audit row never holds the token. `show` refuses once the token is confirmed.
-   The command reads the tenant's payload key from the same key source as the
-   gateway (`AGENTOS_KEY_SOURCE`), so run it where those keys are available.
+   Each step is audited — as the signed-in user (`user:<Slack ID>`) from the
+   console, as the operator (`operator:<OS login>`) from the command — and the
+   audit row never holds the token. `show` (Reveal) refuses once the token is
+   confirmed. The command reads the tenant's payload key from the same key
+   source as the gateway (`AGENTOS_KEY_SOURCE`), so run it where those keys are
+   available; the console uses its own.
 
 To re-subscribe (a new subscription sends a new token), clear the stored token
-first, then let the new handshake arrive:
+first (**Clear** on the settings page, or the command), then let the new
+handshake arrive:
 
 ```bash
 uv run python -m agentos.notion_webhook clear --tenant <tenant_id>
@@ -1231,10 +1236,12 @@ any write that is not `application/json`.
 it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
 unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
 also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
-as that user, and nothing in a request (header, query or body) can change it. It also
-needs each tenant's Notion key exported (`NOTION_TOKEN`, or the variable the tenant's
-`secrets.notion_token_env` names), because the grant check and publish read Notion
-with it; the process exits naming an unset variable. With
+as that user, and nothing in a request (header, query or body) can change it. The
+grant check and publish read Notion with each tenant's own token: the encrypted
+credential row once an admin has connected Notion in the console, else the variable
+the tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default). A tenant
+with neither fails its own check or publish with a message naming the variable; the
+process starts and serves the tenant Slack-only. With
 [sign-in configured](#web-console) the process may bind more widely and every
 request acts as the signed-in user instead. What the user may do comes from their role in the
 tenant named in the path (`/tenants/<tenant id>/...`), decided by
@@ -1369,13 +1376,14 @@ uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
 ```
 
 The grant check ("Check Notion grants", and inside every publish) reads Notion with
-the tenant's own Notion key, so the process needs it too. The variable is the one the
-tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
-`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. A tenant whose
-variable is unset is served Slack-only: the console starts, and that tenant's grant
-check fails at publish time with a message naming the variable, until Notion is
-connected. The console also serves the public "Add to Slack" page when the install is
-configured — see [Slack OAuth install](#slack-oauth-install-pilot).
+the tenant's own Notion token: the encrypted credential row once an admin has connected
+Notion on the settings page (below), else the variable the tenant's
+`secrets.notion_token_env` names (`NOTION_TOKEN` by default, `NOTION_TOKEN_GLOBEX` in the
+example above); export one per tenant as the fallback. A tenant with neither is served
+Slack-only: the console starts, and that tenant's grant check fails at publish time with
+a message naming the variable, until Notion is connected. The console also serves the
+public "Add to Slack" page when the install is configured — see
+[Slack OAuth install](#slack-oauth-install-pilot).
 
 **Choose from Notion (optional).** A creator may grant only what their own Notion account
 can see. With the picker on, "Choose from Notion" on a draft signs the creator in to
@@ -1401,6 +1409,33 @@ sees each grant's live title and parent, a warning when the creator's label and 
 title don't contain one another as whole words once normalised, and a diff against the published version,
 and must tick a box to publish a version that widens
 access. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
+
+**Tenant settings (admins).** `/ui/<tenant>/settings` (the **Settings** nav link) gathers
+the organisation's setup on one page. Every change is audited and picked up by every
+process on its next directory refresh, with no restart.
+
+- **Default agent and channel routing.** Choose the default agent among the published
+  agents, and map channels — picked from the channels the app is in — to agents. The same
+  rules as the tenant file apply: the default and every mapped agent need a published
+  version, and a mapped channel must be in its agent's audience. Audited as
+  `tenant_settings`. A tenant with no default agent sees a "not set up" banner with the
+  steps left (create an agent, publish it, choose it here).
+- **Connect Notion.** With the public integration configured (the same
+  `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET` as the picker), a Notion
+  workspace admin signs in and authorizes the integration for the workspace. The callback
+  validates the returned workspace bot token with one cheap API call and stores it
+  encrypted as the tenant's `notion` credential (migration `034`), with the workspace ID
+  and name on the tenant row. The page shows the workspace, who connected it and when.
+  **Reconnect** replaces the token; **Disconnect** removes it and the workspace. Both are
+  audited as `connector`; the token is never in the audit row. Processes resolve the
+  Notion token from the credential row first, the tenant's `notion_token_env` variable as
+  fallback — the same resolver shape as the Slack bot token. No new redirect URI: the flow
+  reuses `<AGENTOS_CONSOLE_URL>/auth/notion/callback`. A workspace another tenant already
+  uses is refused.
+- **Notion webhook verification.** Reveal the pending token once (with a Copy button),
+  paste it into the Notion integration, then **Confirm** or **Clear** — the same steps and
+  audit kind (`webhook_token`) as the command line, as the signed-in user. See
+  [Notion webhook](#notion-webhook-optional).
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or

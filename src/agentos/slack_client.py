@@ -43,13 +43,21 @@ class SlackLookupError(Exception):
     """A read of Slack's directory failed. ``transient`` says whether a retry may help.
 
     ``retry_after`` is the seconds Slack asked for in a ``Retry-After`` header, if it did.
+    ``scope`` is the OAuth scope Slack says the call needed, when it named one.
     """
 
-    def __init__(self, code: str, transient: bool = False, retry_after: float | None = None):
+    def __init__(
+        self,
+        code: str,
+        transient: bool = False,
+        retry_after: float | None = None,
+        scope: str | None = None,
+    ):
         super().__init__(f"Slack lookup failed: {code}")
         self.code = code
         self.transient = transient
         self.retry_after = retry_after
+        self.scope = scope
 
 
 class SlackHistoryUnavailable(Exception):
@@ -97,6 +105,14 @@ class SlackUser:
     @property
     def is_guest(self) -> bool:
         return self.is_restricted or self.is_ultra_restricted
+
+
+@dataclass(frozen=True)
+class SlackChannel:
+    """One channel the app is in, from ``conversations.list``: enough to pick it."""
+
+    id: str
+    name: str
 
 
 class SlackPoster(Protocol):
@@ -158,6 +174,12 @@ class SlackPoster(Protocol):
 
     async def list_users(self) -> list[SlackUser]:
         """Every user of the workspace, all pages (needs ``users:read``)."""
+        ...
+
+    async def list_channels(self) -> list[SlackChannel]:
+        """The non-archived channels the app is in, all pages (needs ``channels:read``
+        and ``groups:read``): public and private alike, but only ones the bot joined,
+        so it can answer there. The console's routing picker offers these."""
         ...
 
 
@@ -311,6 +333,36 @@ class RealSlackPoster:
             raise _lookup_error(err) from err
         raise SlackLookupError("too_many_pages")
 
+    async def list_channels(self) -> list[SlackChannel]:
+        channels: list[SlackChannel] = []
+        cursor = None
+        try:
+            for page in range(1, MAX_PAGES + 1):
+                resp = await self._bulk_client.conversations_list(
+                    types="public_channel,private_channel",
+                    exclude_archived=True,
+                    limit=PAGE_SIZE,
+                    cursor=cursor,
+                )
+                channels.extend(
+                    SlackChannel(id=raw.get("id", ""), name=raw.get("name", ""))
+                    for raw in resp.get("channels") or []
+                    if raw.get("is_member")
+                )
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+                if not cursor:
+                    return channels
+                if page % PROGRESS_EVERY_PAGES == 0:
+                    log.info(
+                        "slack conversations.list tenant_id=%s pages=%d channels=%d",
+                        self._tenant_id,
+                        page,
+                        len(channels),
+                    )
+        except Exception as err:
+            raise _lookup_error(err) from err
+        raise SlackLookupError("too_many_pages")
+
 
 def _needed_scope(err: Exception) -> str | None:
     """The scope Slack says a refused call needed, if the error response names one."""
@@ -375,7 +427,9 @@ def _lookup_error(err: Exception) -> SlackLookupError:
         or (isinstance(status, int) and (status == 429 or status >= 500))
         or not hasattr(err, "response")
     )
-    return SlackLookupError(code, transient=transient, retry_after=retry_after)
+    return SlackLookupError(
+        code, transient=transient, retry_after=retry_after, scope=_needed_scope(err)
+    )
 
 
 class FakeSlack:
@@ -391,12 +445,14 @@ class FakeSlack:
         groups: dict[str, list[str]] | None = None,
         channel_members: dict[str, list[str]] | None = None,
         team_id: str = "T0TEST",
+        channels: dict[str, str] | None = None,
     ):
         self.calls: list[tuple[str, dict]] = []
         self.emails = dict(emails or {})
         self.users = dict(users or {})
         self.groups = {g: list(m) for g, m in (groups or {}).items()}
         self.members_of = {c: list(m) for c, m in (channel_members or {}).items()}
+        self.channels = dict(channels or {})
         self.team_id = team_id
         self._lookup_error: Exception | None = None
         self._lookup_failures_left: int | None = None
@@ -529,9 +585,14 @@ class FakeSlack:
                 listed.setdefault(user_id, SlackUser(user_id, self.team_id))
         return list(listed.values())
 
+    async def list_channels(self) -> list[SlackChannel]:
+        self.calls.append(("list_channels", {}))
+        self._check_lookup()
+        return [SlackChannel(id=c, name=n) for c, n in self.channels.items()]
+
     def lookups(self) -> list[tuple[str, dict]]:
         """The directory reads made so far."""
-        names = {"user_info", "usergroup_members", "channel_members", "list_users"}
+        names = {"user_info", "usergroup_members", "channel_members", "list_users", "list_channels"}
         return [(name, kw) for name, kw in self.calls if name in names]
 
     def ephemerals(self) -> list[dict]:

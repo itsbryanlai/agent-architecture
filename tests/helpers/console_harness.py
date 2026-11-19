@@ -31,6 +31,7 @@ from agentos.slack_signin import (
     SlackSignInError,
 )
 from agentos.switches import InMemorySwitchStore
+from agentos.tenant_store import TenantDirectory
 from agentos.usage import InMemoryUsageStore
 from tests.conftest import (
     TEAM,
@@ -116,6 +117,11 @@ class ConsoleHarness:
         audience=None,
         picker=None,
         require_grant_picker: bool = False,
+        tenant_store=None,
+        credentials=None,
+        webhook_tokens=None,
+        slack_for=None,
+        directory_ttl: float = 0,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
@@ -134,11 +140,19 @@ class ConsoleHarness:
         if not single_tenant:
             configs.append(parse_agents_config(globex))
         self.tenants = TenantsConfig.of(*configs)
+        # With a tenant store the settings writes are live: the plane and the app read
+        # through a directory that re-reads the store on every ask (ttl 0), unless a
+        # test sets a real TTL to exercise the cache.
+        source = (
+            self.tenants
+            if tenant_store is None
+            else TenantDirectory(tenant_store, ttl_seconds=directory_ttl)
+        )
         self.plane = ControlPlane(
             self.agents,
             self.members,
             self.audit,
-            self.tenants,
+            source,
             NotionGrantChecker(lambda tenant_id: self.notion),
             audience,
             usage=self.usage,
@@ -147,12 +161,16 @@ class ConsoleHarness:
             pauses=self.pauses,
             switches=self.switches,
             require_grant_picker=require_grant_picker,
+            credentials=credentials,
+            tenant_store=tenant_store,
+            webhook_tokens=webhook_tokens,
+            slack_for=slack_for,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)
         self.app = create_app(
             self.plane,
-            self.tenants,
+            source,
             SlackSession(),
             sessions=self.sessions,
             console=self.console,

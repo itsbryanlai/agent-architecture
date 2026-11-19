@@ -413,7 +413,7 @@ DEFAULT_MAX_WRITES_PER_TURN = 2
 MAX_WRITES_PER_TURN_RANGE = (1, 10)
 
 # Slack IDs: C for a public channel, G for a private one, S for a user group.
-_CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
+CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
 _USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
 
 
@@ -492,6 +492,8 @@ class AgentsConfig:
     default_agent: str | None
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
+    # The connected workspace's name, for display; set by Connect Notion, not the YAML file.
+    notion_workspace_name: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
     # Slack channel ID to the agent that answers mentions there.
     channels: dict[str, str] = field(default_factory=dict)
@@ -810,7 +812,7 @@ def _parse_audience(agent_where: str, raw: Any) -> Audience | None:
     if unknown:
         raise ConfigError(f"{where}: unknown field '{min(unknown)}'")
     channels = _id_list(
-        f"{where}", "channels", raw.get("channels", []), _CHANNEL_ID, "Slack channel ID"
+        f"{where}", "channels", raw.get("channels", []), CHANNEL_ID, "Slack channel ID"
     )
     dm = raw.get("dm")
     dm_everyone = False

@@ -1,4 +1,4 @@
-"""The Slack bot token resolver: the credential row first, the env variable as fallback."""
+"""The credential resolvers: the credential row first, the env variable as fallback."""
 
 from __future__ import annotations
 
@@ -8,15 +8,13 @@ from dataclasses import replace
 import pytest
 
 from agentos.config import ConfigError, TenantSecrets, parse_agents_config
-from agentos.credentials import SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
 from agentos.payload_codec import encrypt_with_tenant_key
 from tests.conftest import TENANT, agents_dict
 from tests.helpers.keys import RefreshableKeyStore
 
-ROW_TOKEN = "xoxb-made-up-from-the-row"
-ENV_TOKEN = "xoxb-made-up-from-the-env"
 
-
+@pytest.mark.parametrize("resolver", ["slack", "notion"])
 @pytest.mark.parametrize(
     "case",
     [
@@ -29,21 +27,25 @@ ENV_TOKEN = "xoxb-made-up-from-the-env"
     ],
     ids=["row-wins", "env-fallback", "neither", "key-miss", "replaced", "undecryptable"],
 )
-async def test_the_resolver_reads_the_row_first_then_the_env(case, monkeypatch):
-    """Fails if the resolver prefers the env variable over a stored credential, serves a stale
-    or undecryptable row, or guesses a token when neither source exists."""
+async def test_the_resolver_reads_the_row_first_then_the_env(resolver, case, monkeypatch):
+    """Fails if either resolver prefers the env variable over a stored credential, serves a
+    stale or undecryptable row, or guesses a token when neither source exists (Notion then
+    returns None: the tenant is Slack-only)."""
+    kind = SLACK_BOT if resolver == "slack" else NOTION
+    env_field = "slack_bot_token_env" if resolver == "slack" else "notion_token_env"
+    prefix = "xoxb" if resolver == "slack" else "ntn"
+    row_token = f"{prefix}-made-up-from-the-row"
+    env_token = f"{prefix}-made-up-from-the-env"
     config = replace(
         parse_agents_config(agents_dict()),
-        secrets=TenantSecrets(slack_bot_token_env="MY_SLACK"),
+        secrets=TenantSecrets(**{env_field: "MY_SECRET"}),
     )
     key = token_source.token_bytes(32)
     store = InMemoryCredentialStore()
     keys = RefreshableKeyStore({(TENANT, 1): key})
-    monkeypatch.setenv("MY_SLACK", ENV_TOKEN)
+    monkeypatch.setenv("MY_SECRET", env_token)
     if case in ("row wins over env", "key miss reloads", "replaced row", "undecryptable row"):
-        await store.put(
-            TENANT, SLACK_BOT, encrypt_with_tenant_key(TENANT, key, ROW_TOKEN.encode()), 1
-        )
+        await store.put(TENANT, kind, encrypt_with_tenant_key(TENANT, key, row_token.encode()), 1)
     if case in ("row wins over env", "replaced row"):
         await keys.refresh()
     if case == "undecryptable row":
@@ -51,27 +53,29 @@ async def test_the_resolver_reads_the_row_first_then_the_env(case, monkeypatch):
         keys = RefreshableKeyStore({(TENANT, 1): token_source.token_bytes(32)})
         await keys.refresh()
     if case == "neither names the variable":
-        monkeypatch.delenv("MY_SLACK", raising=False)
+        monkeypatch.delenv("MY_SECRET", raising=False)
     credentials = TenantCredentials(store, keys)
+    resolve = credentials.slack_bot_token if resolver == "slack" else credentials.notion_token
 
     if case == "neither names the variable":
-        with pytest.raises(ConfigError) as err:
-            await credentials.slack_bot_token(config)
-        assert "MY_SLACK" in str(err.value) and TENANT in str(err.value)
-        assert ROW_TOKEN not in str(err.value)
+        if resolver == "slack":
+            with pytest.raises(ConfigError) as err:
+                await resolve(config)
+            assert "MY_SECRET" in str(err.value) and TENANT in str(err.value)
+            assert row_token not in str(err.value)
+        else:
+            assert await resolve(config) is None
         return
     if case == "undecryptable row":
         with pytest.raises(ConfigError) as err:
-            await credentials.slack_bot_token(config)
+            await resolve(config)
         assert TENANT in str(err.value) and "version 1" in str(err.value)
-        assert ROW_TOKEN not in str(err.value) and ENV_TOKEN not in str(err.value)
+        assert row_token not in str(err.value) and env_token not in str(err.value)
         return
 
-    expected = ENV_TOKEN if case == "no row falls back to env" else ROW_TOKEN
-    assert await credentials.slack_bot_token(config) == expected
+    expected = env_token if case == "no row falls back to env" else row_token
+    assert await resolve(config) == expected
     if case == "replaced row":
-        replaced = "xoxb-made-up-replacement"
-        await store.put(
-            TENANT, SLACK_BOT, encrypt_with_tenant_key(TENANT, key, replaced.encode()), 1
-        )
-        assert await credentials.slack_bot_token(config) == replaced
+        replaced = f"{prefix}-made-up-replacement"
+        await store.put(TENANT, kind, encrypt_with_tenant_key(TENANT, key, replaced.encode()), 1)
+        assert await resolve(config) == replaced

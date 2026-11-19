@@ -105,6 +105,32 @@ async def test_a_resume_is_recorded_for_an_agent_with_no_published_version(audit
     assert (event.kind, event.agent_id, event.agent_version) == ("audience_resume", "aa", None)
 
 
+async def test_the_latest_event_of_a_kind_and_tool_is_the_newest_match(
+    audit, tenant: str, other_tenant: str
+):
+    """Fails if the narrow newest-event read returns an older match, another kind or tool,
+    or another tenant's event."""
+    connect = {"kind": "connector", "tool": "connect", "agent_id": None, "agent_version": None}
+    await audit.record(audit_event(tenant, "c1", requester_user_id="U1", **connect))
+    await audit.record(
+        audit_event(
+            tenant,
+            "d1",
+            kind="connector",
+            tool="disconnect",
+            agent_id=None,
+            agent_version=None,
+        )
+    )
+    await audit.record(audit_event(tenant, "c2", requester_user_id="U2", **connect))
+    await audit.record(audit_event(other_tenant, "c3", requester_user_id="U3", **connect))
+
+    event = await audit.latest(tenant, "connector", "connect")
+
+    assert (event.event_key, event.requester_user_id) == ("c2", "U2")
+    assert await audit.latest(tenant, "connector", "no-such-tool") is None
+
+
 # --- usage -------------------------------------------------------------------------
 
 

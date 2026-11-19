@@ -37,7 +37,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Nightly re-check of creators' access, suspension, notification | target | none | |
 | Creators read only their own agents | built | `control.py` (`Principal`) | |
 | Console, Sign in with Slack, sessions, CSRF | built | `web_ui.py`, `slack_signin.py`, `sessions.py`, `control_api.py` | |
-| Console connectors page, tenant-settings page | target | none | The connectors page is in the v1 scope in product.md |
+| Console connectors page, tenant-settings page | partial | `web_ui.py`, `control.py`, `notion_picker.py`, `credentials.py`, migration 034 | The tenant-settings page is built (default agent, channel routing, Connect Notion by OAuth, webhook confirm); connector health status (last success, last error) is the follow-up. The connectors page is in the v1 scope in product.md |
 | Audit log, append-only | built | `audit.py`, migration 005 | |
 | Audit export | target | none | |
 | Usage and cost, CSV, repricing | built | `usage.py`, `usage_reprice.py` | |
@@ -49,7 +49,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Tenants in Postgres with live reload | built | `tenant_store.py` | |
 | Retention per tenant, nightly | built | `retention.py`, `workflows/retention.py` | Audit and usage rows exempt |
 | Temporal payload encryption | partial | `payload_codec.py`, `crypto_keys.py`, `tenant_keys.py` | Local versioned key files, host variables (`AGENTOS_KEY_SOURCE=env`), or database-stored keys wrapped by a master key (`db`) with rotation; no KMS. Patch marker records are outside the codec |
-| Credential vault, per-tenant key from a KMS, crypto-shredding | target | none | Secrets are environment variables named in the tenant's settings, except the Slack bot token and the Notion webhook token, stored encrypted per tenant in the database |
+| Credential vault, per-tenant key from a KMS, crypto-shredding | target | none | Secrets are environment variables named in the tenant's settings, except the Slack bot token, the Notion token and the Notion webhook token, stored encrypted per tenant in the database |
 | `tenant_id` search attribute | target | none | |
 | Per-tenant rate limits | partial | `connectors/notion_limiter.py` | Notion calls only, per tenant per worker process; none for Slack or the model |
 | Model allowlist, bring-your-own LLM key | target | none | |

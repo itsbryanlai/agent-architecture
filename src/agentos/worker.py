@@ -1,16 +1,18 @@
 """The Temporal worker: runs both workflows and every activity.
 
 Real clients are built here, at startup, one Slack client and one Notion
-client for each tenant. The Slack token is resolved from the tenant's encrypted
+client for each tenant. Both tokens are resolved from the tenant's encrypted
 credential row first, else the environment variable its config names; a missing
-one fails with a message naming the tenant and the variable (never its value).
-A tenant with no Notion token is served Slack-only.
+Slack token fails with a message naming the tenant and the variable (never its
+value). A tenant with no Notion token is served Slack-only. A token connected
+in the console while the worker runs reaches it on the next directory refresh.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -43,7 +45,7 @@ from agentos.config import (
     load_settings,
     validate_worker_capacity,
 )
-from agentos.connectors.notion import RealNotionAPI
+from agentos.connectors.notion import NotionAPI, RealNotionAPI
 from agentos.content_store import PostgresContentStore
 from agentos.credentials import PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import (
@@ -61,7 +63,7 @@ from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
 from agentos.retention import PostgresRetentionStore, RetentionActivities
 from agentos.schema_version import require_current_schema
-from agentos.slack_client import RealSlackPoster
+from agentos.slack_client import RealSlackPoster, SlackPoster
 from agentos.stores import (
     PostgresExternalWriteStore,
     PostgresHistoryStore,
@@ -71,8 +73,8 @@ from agentos.stores import (
 )
 from agentos.switches import PostgresSwitchStore
 from agentos.temporal_client import build_temporal_client
-from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
-from agentos.tenants import RegistrySync, build_registry
+from agentos.tenant_store import PostgresTenantStore, TenantDirectory, TenantSource, startup_tenants
+from agentos.tenants import RegistrySync, TenantRegistry, build_registry
 from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
 from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
@@ -195,6 +197,46 @@ async def admit_new_tenant(
     return None
 
 
+async def build_tenant_clients(
+    tenants: TenantsConfig,
+    directory: TenantSource,
+    settings: Settings,
+    credentials: TenantCredentials,
+    keys: KeyStore,
+    log: logging.Logger,
+    slack_factory: Callable[[str], SlackPoster] = RealSlackPoster,
+    notion_factory: Callable[[str], NotionAPI] = RealNotionAPI,
+) -> tuple[TenantRegistry, RegistrySync]:
+    """The worker's tenant clients at start-up, and the sync that keeps them current.
+
+    Both resolve each tenant's tokens through ``TenantCredentials``: the encrypted
+    credential row first, else the environment variable the tenant's settings name.
+    A tenant connected only in the console is served with no variable exported, and
+    a token connected or replaced while the worker runs rebuilds that tenant's
+    client on the next sync, as a Slack reinstall does. The health check reads its
+    Notion client from this registry, so it checks with the connected token too.
+    """
+    registry = await build_registry(
+        tenants,
+        settings,
+        slack_factory,
+        notion_factory,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+    )
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack_factory,
+        notion_factory,
+        admit=lambda config: admit_new_tenant(config, keys, log),
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+        on_drop=credentials.forget,
+    )
+    return registry, sync
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("agentos.worker")
@@ -232,8 +274,8 @@ async def main() -> None:
         )
         if price_failure:
             raise SystemExit(price_failure)
-        registry = await build_registry(
-            tenants, settings, RealSlackPoster, RealNotionAPI, credentials.slack_bot_token
+        registry, tenant_sync = await build_tenant_clients(
+            tenants, directory, settings, credentials, keys, log
         )
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
@@ -332,15 +374,6 @@ async def main() -> None:
                 idempotency,
             ).all()
         client = await build_temporal_client(settings, keys)
-        tenant_sync = RegistrySync(
-            directory,
-            registry,
-            RealSlackPoster,
-            RealNotionAPI,
-            admit=lambda config: admit_new_tenant(config, keys, log),
-            slack_token=credentials.slack_bot_token,
-            on_drop=credentials.forget,
-        )
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,

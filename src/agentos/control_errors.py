@@ -14,6 +14,7 @@ from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
 from agentos.members import InvalidMember, MemberError, MemberNotFound
+from agentos.notion_webhook import WebhookTokenError
 from agentos.switches import InvalidSwitch, SwitchError
 
 STATUS_BY_ERROR: dict[type[Exception], int] = {
@@ -34,6 +35,7 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     AudienceError: 409,
     AudienceCheckUnavailable: 502,
     NotPaused: 409,
+    WebhookTokenError: 409,
     WideningNotAcknowledged: 409,
     GrantNotPicked: 409,
 }

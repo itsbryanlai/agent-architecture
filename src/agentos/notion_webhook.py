@@ -17,6 +17,10 @@ removes it so a new handshake is accepted. Each is audited as
 and the audit row never holds the token. A pending token never accepts an
 event, and an unauthenticated POST can never replace an active one.
 
+The console's settings page offers the same three steps to a tenant admin
+(reveal, confirm, clear), through ``ControlPlane`` and the same
+``WebhookTokens`` state machine, audited as ``user:<Slack ID>`` instead.
+
 The gateway reads the active token afresh for every event and caches only the
 decryption, keyed by the exact ciphertext it decrypted: a cleared or replaced
 token is never served from the cache.
@@ -52,6 +56,11 @@ log = logging.getLogger("agentos.notion_webhook")
 
 PENDING = "pending"
 ACTIVE = "active"
+
+
+class WebhookTokenError(Exception):
+    """A show, confirm or clear found nothing in the state it needs. The message is for
+    the page or the command; it never holds a token."""
 
 
 @dataclass(frozen=True)
@@ -180,6 +189,37 @@ class WebhookTokens:
         self._store = store
         self._keys = keys
         self._cache: dict[str, tuple[tuple[int, bytes], str]] = {}
+
+    def snapshot(self) -> Any:
+        """The store's rows as they are now, for ``InMemoryUnitOfWork``."""
+        return self._store.snapshot()
+
+    def restore(self, state: Any) -> None:
+        self._store.restore(state)
+
+    async def state(self, tenant_id: str) -> str | None:
+        """The token's state (``pending`` or ``active``), or None. Reads no token value."""
+        row = await self._store.get(tenant_id)
+        return None if row is None else row.state
+
+    async def pending(self, tenant_id: str) -> str | None:
+        """The pending token, decrypted in memory, or None when there is none pending.
+
+        Raises ``InvalidTag`` or ``TenantKeyError`` when the row cannot be decrypted;
+        the caller refuses cleanly, as the command line does.
+        """
+        row = await self._store.get(tenant_id)
+        if row is None or row.state != PENDING:
+            return None
+        return await self._decrypt(tenant_id, row.ciphertext, row.key_version)
+
+    async def confirm(self, tenant_id: str, at: datetime, conn: Any = None) -> bool:
+        """Make the pending token active. False when there is no pending token."""
+        return await self._store.confirm(tenant_id, at, conn=conn)
+
+    async def clear(self, tenant_id: str, conn: Any = None) -> bool:
+        """Remove the token so a new handshake is accepted. False when there was none."""
+        return await self._store.clear(tenant_id, conn=conn)
 
     async def accept_handshake(self, tenant_id: str, token: str) -> bool:
         """Encrypt the token under the tenant's newest key and store it pending.

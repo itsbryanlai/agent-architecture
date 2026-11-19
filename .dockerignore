@@ -10,6 +10,7 @@
 !scripts/migrate.py
 !scripts/migrations/
 !scripts/init_db.sql
+!slack/app-manifest.yaml
 
 # Inside the allowed paths: caches, and local overrides or secrets.
 **/__pycache__/

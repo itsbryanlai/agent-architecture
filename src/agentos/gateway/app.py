@@ -45,7 +45,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -112,8 +112,9 @@ class GatewayDeps:
     links: TaskLinkStore
     verifier: Any  # slack_sdk.signature.SignatureVerifier or compatible
     # A tenant's own SlackPoster, used to open the Edit form in that tenant's
-    # workspace. Unset in tests that never open a form.
-    slack_for: Callable[[str], Any] | None = None
+    # workspace and to answer a tenant that is not set up yet. Unset in tests that
+    # never post. Async: the token is resolved from the tenant's credential row.
+    slack_for: Callable[[str], Awaitable[Any]] | None = None
     # The published agents. A Notion page event is acted on only when some
     # published agent of the tenant is granted pages. Unset in tests that never
     # send a page event.
@@ -127,6 +128,8 @@ class GatewayDeps:
     # The Notion webhook verification tokens, encrypted per tenant. None keeps the
     # local file flow for a gateway built without a database.
     webhook_tokens: WebhookTokens | None = None
+    # The app's name from the manifest, for the not-set-up reply; "This app" without one.
+    app_name: str = "This app"
 
 
 def create_app(
@@ -136,11 +139,12 @@ def create_app(
     links: TaskLinkStore | None,
     verifier: Any,
     lifespan: Any = None,
-    slack_for: Callable[[str], Any] | None = None,
+    slack_for: Callable[[str], Awaitable[Any]] | None = None,
     agents: AgentStore | None = None,
     switches: SwitchStore | None = None,
     content: ContentStore | None = None,
     webhook_tokens: WebhookTokens | None = None,
+    app_name: str = "This app",
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
@@ -156,6 +160,7 @@ def create_app(
             switches,
             content or InMemoryContentStore(),
             webhook_tokens=webhook_tokens,
+            app_name=app_name,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -224,19 +229,27 @@ def create_app(
             agent_id = config.channels.get(channel, agent_id)
         if d.content is None:
             raise RuntimeError("the gateway has no content store to keep inbound events in")
-        stored = await d.content.put_inbound(
-            tenant,
-            event_id,
-            {
-                "kind": "message",
-                "agent_id": agent_id,
-                "user_id": event["user"],
-                "text": from_slack_text(LEADING_MENTION.sub("", event.get("text") or "", count=1)),
-                "channel": channel,
-                "thread_ts": thread_ts,
-                "channel_kind": channel_kind,
-            },
-        )
+        inbound = {
+            "kind": "message",
+            "agent_id": agent_id,
+            "user_id": event["user"],
+            "text": from_slack_text(LEADING_MENTION.sub("", event.get("text") or "", count=1)),
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "channel_kind": channel_kind,
+        }
+        if agent_id is None:
+            # A tenant installed but not set up yet: one fixed reply, no model call and
+            # no Notion call. The event is stored already delivered, so a Slack retry
+            # posts nothing and the relay never hands it to a workflow.
+            stored = await d.content.put_inbound(tenant, event_id, inbound, delivered=True)
+            if stored:
+                await _tell_not_set_up(d, tenant, channel, thread_ts)
+            log.info(
+                "tenant_id=%s event_id=%s stored=%s not-set-up reply", tenant, event_id, stored
+            )
+            return Response(status_code=200)
+        stored = await d.content.put_inbound(tenant, event_id, inbound)
         if d.on_inbound is not None:
             d.on_inbound()
         log.info(
@@ -346,7 +359,8 @@ async def _tell_try_again(d: GatewayDeps, tenant: str, payload: dict, clicker: s
         return
     try:
         async with asyncio.timeout(NOTICE_TIMEOUT_SECONDS):
-            await d.slack_for(tenant).post_ephemeral(channel, clicker, TRY_AGAIN, thread_ts)
+            slack = await d.slack_for(tenant)
+            await slack.post_ephemeral(channel, clicker, TRY_AGAIN, thread_ts)
     except Exception as err:  # noqa: BLE001 - nothing more can be done for this click
         log.warning(
             "tenant_id=%s try-again notice not shown error_type=%s", tenant, type(err).__name__
@@ -637,9 +651,8 @@ async def _open_edit_form(
     if not fields:
         log.warning("tenant_id=%s workflow_id=%s edit form not opened: no draft", tenant, task_id)
         return
-    await d.slack_for(tenant).open_view(
-        payload.get("trigger_id", ""), _edit_view(task_id, draft, fields)
-    )
+    slack = await d.slack_for(tenant)
+    await slack.open_view(payload.get("trigger_id", ""), _edit_view(task_id, draft, fields))
 
 
 async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: DraftView) -> dict:
@@ -767,10 +780,38 @@ async def _tell_writes_off(d: GatewayDeps, tenant: str, payload: dict) -> None:
     if d.slack_for is None or not channel:
         return
     try:
-        await d.slack_for(tenant).post_message(channel, WRITES_OFF_TEXT, thread_ts=thread_ts)
+        slack = await d.slack_for(tenant)
+        await slack.post_message(channel, WRITES_OFF_TEXT, thread_ts=thread_ts)
     except Exception as err:  # noqa: BLE001 - the refusal stands even if the notice fails
         log.warning(
             "tenant_id=%s writes-off notice not posted error_type=%s", tenant, type(err).__name__
+        )
+
+
+def not_set_up_text(console_url: str | None, app_name: str = "This app") -> str:
+    """The fixed reply of a tenant that is installed but has no agent yet."""
+    if console_url:
+        return (
+            f"{app_name} is installed but not set up yet. "
+            f"An admin can finish setup at {console_url}."
+        )
+    return (
+        f"{app_name} is installed but not set up yet. An admin can finish setup in the web console."
+    )
+
+
+async def _tell_not_set_up(d: GatewayDeps, tenant: str, channel: str, thread_ts: str) -> None:
+    """Post the fixed not-set-up reply once per event; best effort, like the other notices."""
+    if d.slack_for is None:
+        return
+    try:
+        slack = await d.slack_for(tenant)
+        await slack.post_message(
+            channel, not_set_up_text(d.settings.console_url, d.app_name), thread_ts=thread_ts
+        )
+    except Exception as err:  # noqa: BLE001 - the event is already answered; the notice may fail
+        log.warning(
+            "tenant_id=%s not-set-up reply not posted error_type=%s", tenant, type(err).__name__
         )
 
 
@@ -798,6 +839,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings
     from agentos.content_store import PostgresContentStore
+    from agentos.credentials import PostgresCredentialStore, TenantCredentials
     from agentos.crypto_keys import (
         TenantKeyError,
         build_key_store,
@@ -808,11 +850,11 @@ async def _real_lifespan(app: FastAPI):
     from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
     from agentos.slack_client import RealSlackPoster
+    from agentos.slack_install import DEFAULT_MANIFEST_PATH, app_name_from_manifest
     from agentos.stores import PostgresTaskLinkStore
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
-    from agentos.tenants import require_tenant_secret
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -837,24 +879,27 @@ async def _real_lifespan(app: FastAPI):
         if agent_failure:
             raise SystemExit(agent_failure)
         client = await build_temporal_client(settings, keys)
-        slack_clients: dict[str, RealSlackPoster] = {}
+        credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
+        slack_clients: dict[str, tuple[str, RealSlackPoster]] = {}
 
-        def slack_for(tenant_id: str) -> RealSlackPoster:
-            # Built on first use from the tenant's current settings, so a tenant added
-            # while the gateway runs gets its own client; a tenant whose variable is
-            # unset fails its own form, not the gateway.
-            if tenant_id not in slack_clients:
-                config = directory.latest().get(tenant_id)
-                if config is None:
-                    raise KeyError(tenant_id)
-                slack_clients[tenant_id] = RealSlackPoster(
-                    require_tenant_secret(config, "slack_bot_token_env"), tenant_id=tenant_id
-                )
-            return slack_clients[tenant_id]
+        async def slack_for(tenant_id: str) -> RealSlackPoster:
+            # Built on first use from the tenant's resolved token and rebuilt when the
+            # credential changes, so a tenant added while the gateway runs gets its own
+            # client; a tenant whose token is unavailable fails its own form, not the
+            # gateway.
+            config = directory.latest().get(tenant_id)
+            if config is None:
+                raise KeyError(tenant_id)
+            token = await credentials.slack_bot_token(config)
+            entry = slack_clients.get(tenant_id)
+            if entry is None or entry[0] != token:
+                entry = (token, RealSlackPoster(token, tenant_id=tenant_id))
+                slack_clients[tenant_id] = entry
+            return entry[1]
 
-        # A tenant whose variable is unset is refused at start-up, as before.
+        # A tenant whose Slack token is unavailable is refused at start-up, as before.
         for config in tenants.tenants.values():
-            slack_for(config.tenant_id)
+            await slack_for(config.tenant_id)
         content = PostgresContentStore(pool)
         relay = InboundRelay(content, directory, client)
         app.state.deps = GatewayDeps(
@@ -869,6 +914,7 @@ async def _real_lifespan(app: FastAPI):
             content=content,
             on_inbound=relay.wake,
             webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
+            app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

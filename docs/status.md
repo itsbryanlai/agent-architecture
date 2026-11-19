@@ -1,6 +1,6 @@
 # Status: what is built
 
-Last updated 2026-11-16. One row per capability. `built` means the code does what [architecture.md](architecture.md) says; `partial` means part of it, with the gap named; `target` means designed and not in the code. A difference between this table and the code is a defect in this table.
+Last updated 2026-11-20. One row per capability. `built` means the code does what [architecture.md](architecture.md) says; `partial` means part of it, with the gap named; `target` means designed and not in the code. A difference between this table and the code is a defect in this table.
 
 The design is in [architecture.md](architecture.md), the reasons in [decisions.md](decisions.md), the product scope in [product.md](product.md), and a map of the code in [modules.md](modules.md). Nothing here changes the v1 scope or the roadmap: product scope items that are not in the code are listed as `target`.
 
@@ -48,12 +48,12 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Tenants in Postgres with live reload | built | `tenant_store.py` | |
 | Retention per tenant, nightly | built | `retention.py`, `workflows/retention.py` | Audit and usage rows exempt |
 | Temporal payload encryption | partial | `payload_codec.py`, `crypto_keys.py`, `tenant_keys.py` | Local versioned key files, host variables (`AGENTOS_KEY_SOURCE=env`), or database-stored keys wrapped by a master key (`db`) with rotation; no KMS. Patch marker records are outside the codec |
-| Credential vault, per-tenant key from a KMS, crypto-shredding | target | none | Secrets are environment variables named in the tenant's settings; the Notion webhook token is stored encrypted per tenant in the database |
+| Credential vault, per-tenant key from a KMS, crypto-shredding | target | none | Secrets are environment variables named in the tenant's settings, except the Slack bot token and the Notion webhook token, stored encrypted per tenant in the database |
 | `tenant_id` search attribute | target | none | |
 | Per-tenant rate limits | partial | `connectors/notion_limiter.py` | Notion calls only, per tenant per worker process; none for Slack or the model |
 | Model allowlist, bring-your-own LLM key | target | none | |
 | Qwen as a chat provider, local embeddings | built | `llm.py`, `knowledge/embedder.py` | |
-| Slack OAuth install, Marketplace listing | target | none | The app is installed by hand from `slack/app-manifest.yaml` |
+| Slack OAuth install, Marketplace listing | partial | `slack_install.py`, `credentials.py`, `web_ui.py`, migration 032 | "Add to Slack" creates the tenant, key, encrypted bot token and first admin (pilot allowlist); a not-set-up tenant gets a fixed reply; no Marketplace listing. Not yet run against a real workspace |
 | Progress updates on the placeholder | target | none | The placeholder stays "Thinking…" |
 | Token budget per turn, tenant or agent; cap on writes per task | target | none | Built: step limit, reply token limit, history window, `max_writes_per_turn` |
 | Nightly retention of the audit log | target | none | Audit rows are kept |

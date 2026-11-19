@@ -15,6 +15,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 COPY config ./config
+# The console reads the app's bot scopes from the manifest at start-up (the install).
+COPY slack ./slack
 COPY scripts/migrate.py ./scripts/migrate.py
 COPY scripts/migrations ./scripts/migrations
 COPY scripts/init_db.sql ./scripts/init_db.sql

@@ -2,6 +2,7 @@
 a tenant added, changed or disabled without a restart (gateway, worker, console)."""
 
 import logging
+import secrets as token_source
 from dataclasses import replace
 
 import httpx
@@ -9,7 +10,9 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
+from temporalio.exceptions import ApplicationError
 
+from agentos.activities import AgentActivities
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
 from agentos.config import (
@@ -22,15 +25,22 @@ from agentos.config import (
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
+from agentos.credentials import SLACK_BOT, InMemoryCredentialStore, TenantCredentials
 from agentos.gateway.app import create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
+from agentos.models import TurnContext
+from agentos.payload_codec import encrypt_with_tenant_key
 from agentos.slack_client import FakeSlack
 from agentos.slack_signin import SlackSession
-from agentos.stores import InMemoryTaskLinkStore
+from agentos.stores import (
+    InMemoryHistoryStore,
+    InMemoryIdempotencyStore,
+    InMemoryTaskLinkStore,
+    InMemoryToolOutputStore,
+)
 from agentos.tenant_store import (
-    IMPORT_COMMAND,
     UNKNOWN_TENANT_TTL_SECONDS,
     InMemoryTenantStore,
     StaticTenants,
@@ -38,8 +48,9 @@ from agentos.tenant_store import (
     import_tenant,
     startup_tenants,
 )
-from agentos.tenants import RegistrySync, UnknownTenant, build_registry
+from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry, runtime_for
 from tests.conftest import (
+    ALICE,
     GLOBEX,
     GLOBEX_TEAM,
     TEAM,
@@ -49,6 +60,7 @@ from tests.conftest import (
 from tests.helpers.console_harness import ROOT, ConsoleHarness, using
 from tests.helpers.control_api import BASE, JSON, StandIn
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
+from tests.helpers.keys import CountingKeyStore
 
 
 @pytest.fixture
@@ -224,19 +236,30 @@ async def test_two_stored_tenants_sharing_a_secret_variable_are_refused_at_start
         await startup_tenants(TenantDirectory(store))
 
 
-async def test_an_empty_table_refuses_start_up_and_names_the_import():
-    with pytest.raises(SystemExit) as err:
-        await startup_tenants(TenantDirectory(InMemoryTenantStore()))
+@pytest.mark.parametrize(
+    "case", ["an empty table", "every tenant disabled"], ids=["empty", "all-disabled"]
+)
+async def test_start_up_with_no_enabled_tenant_serves_none(case, secret, caplog):
+    """Fails if a process refuses to start with no enabled tenant, instead of serving none
+    until the next refresh picks one up."""
+    store = InMemoryTenantStore() if case == "an empty table" else InMemoryTenantStore(acme())
+    if case == "every tenant disabled":
+        await store.set_enabled(TENANT, False)
+    directory = TenantDirectory(store)
 
-    assert IMPORT_COMMAND in str(err.value)
+    with caplog.at_level(logging.INFO, logger="agentos.tenants"):
+        tenants = await startup_tenants(directory)
 
-
-async def test_a_table_where_every_tenant_is_disabled_refuses_start_up():
-    store = InMemoryTenantStore(acme())
-    await store.set_enabled(TENANT, False)
-
-    with pytest.raises(SystemExit, match="disabled"):
-        await startup_tenants(TenantDirectory(store))
+    assert tenants.tenants == {}
+    assert caplog.text.count("no enabled tenants") == 1
+    registry = await build_registry(
+        tenants, Settings(), lambda t: FakeSlack(), lambda t: FakeNotionAPI()
+    )
+    assert registry.tenants() == []
+    client, temporal = gateway(directory, secret)
+    assert post_event(client, secret, event_for(TEAM, "Ev1")).status_code == 200
+    assert await delivered(client) == 0
+    assert temporal.signal_with_starts == []
 
 
 async def test_start_up_returns_the_enabled_tenants():
@@ -352,7 +375,7 @@ async def start_worker_registry(monkeypatch, store, clock):
     set_secrets(monkeypatch, "ACME")
     directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
     built, slack, notion = fake_factories()
-    registry = build_registry(await startup_tenants(directory), Settings(), slack, notion)
+    registry = await build_registry(await startup_tenants(directory), Settings(), slack, notion)
     return registry, RegistrySync(directory, registry, slack, notion), built
 
 
@@ -386,6 +409,43 @@ async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):
     with pytest.raises(UnknownTenant):
         registry.get(GLOBEX)
     assert registry.tenants() == [TENANT]
+
+
+async def test_a_sync_that_drops_a_tenant_forgets_its_cached_token():
+    """Fails if a tenant the sync drops keeps its decrypted token in the resolver cache."""
+    store, clock = InMemoryTenantStore(globex()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = CountingKeyStore({(GLOBEX, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    await credential_store.put(
+        GLOBEX, SLACK_BOT, encrypt_with_tenant_key(GLOBEX, key, b"xoxb-made-up"), 1
+    )
+    credentials = TenantCredentials(credential_store, keys)
+    config = globex()
+    token = await credentials.slack_bot_token(config)
+    registry = TenantRegistry({GLOBEX: runtime_for(config, FakeSlack(), slack_token=token)})
+    _built, slack, notion = fake_factories()
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        on_drop=credentials.forget,
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert keys.reads == 1  # the sync's own resolve was served from the cache
+
+    await store.set_enabled(GLOBEX, False)
+    clock.advance(6)
+    await sync.sync()
+
+    assert registry.tenants() == []
+    assert await credentials.slack_bot_token(config) == token
+    assert keys.reads == 2  # forgotten: the still-stored row was decrypted again
 
 
 async def test_changed_settings_reach_the_worker_without_new_clients(monkeypatch):
@@ -441,6 +501,48 @@ async def test_a_new_tenant_the_start_up_check_refuses_is_not_served(monkeypatch
     assert seen == [GLOBEX]
     assert registry.tenants() == [TENANT]
     assert built["slack"] == []
+
+
+async def test_an_activity_for_a_tenant_that_appears_on_the_next_refresh_succeeds(monkeypatch):
+    """Fails if work for a tenant installed seconds ago fails for good, instead of waiting
+    for the directory refresh that admits it and then running."""
+    set_secrets(monkeypatch, "ACME")
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    _, slack, notion = fake_factories()
+    registry = await build_registry(await startup_tenants(directory), Settings(), slack, notion)
+    sync = RegistrySync(directory, registry, slack, notion)
+    acts = AgentActivities(
+        settings=Settings(),
+        registry=registry,
+        history=InMemoryHistoryStore(),
+        idem=InMemoryIdempotencyStore(),
+        links=InMemoryTaskLinkStore(),
+        llm=None,
+        tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=InMemoryAgentStore(),
+    )
+    ctx = TurnContext(
+        tenant_id=GLOBEX,
+        agent_id="it-helper",
+        agent_version=1,
+        requester_user_id=ALICE,
+        channel="C1",
+        thread_ts="1.1",
+        channel_kind="channel",
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        await acts.post_placeholder(ctx, "key")
+    assert caught.value.non_retryable is False
+
+    set_secrets(monkeypatch, "GLOBEX")
+    await import_tenant(store, globex())
+    clock.advance(6)
+    assert await sync.sync() == [GLOBEX]
+
+    assert await acts.post_placeholder(ctx, "key") == "1700000000.000001"
 
 
 # --- Console and control API ---------------------------------------------------

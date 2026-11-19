@@ -83,18 +83,25 @@ def tenant_from_workflow_id(workflow_id: str | None) -> str | None:
     return tenant if TENANT_ID_PATTERN.fullmatch(tenant) else None
 
 
-def encrypt_for_tenant(keys: KeyStore, tenant_id: str, plaintext: bytes) -> tuple[bytes, int]:
-    """A small value under the tenant's newest key: (nonce || ciphertext, key version).
+def encrypt_with_tenant_key(tenant_id: str, key: bytes, plaintext: bytes) -> bytes:
+    """A small value under a key already in hand: nonce || ciphertext.
 
     The same AES-256-GCM cipher the payloads use, with the tenant ID as the
     associated data, so a value stored for one tenant does not decrypt for
-    another. For a secret kept outside Temporal (the Notion webhook token);
-    the value never appears in a log or an error.
+    another. The value never appears in a log or an error.
+    """
+    nonce = os.urandom(NONCE_BYTES)
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, tenant_id.encode())
+
+
+def encrypt_for_tenant(keys: KeyStore, tenant_id: str, plaintext: bytes) -> tuple[bytes, int]:
+    """A small value under the tenant's newest key: (nonce || ciphertext, key version).
+
+    For a secret kept outside Temporal (the Notion webhook token, a connector
+    credential); the value never appears in a log or an error.
     """
     version = keys.latest_version(tenant_id)
-    nonce = os.urandom(NONCE_BYTES)
-    data = AESGCM(keys.key(tenant_id, version)).encrypt(nonce, plaintext, tenant_id.encode())
-    return nonce + data, version
+    return encrypt_with_tenant_key(tenant_id, keys.key(tenant_id, version), plaintext), version
 
 
 def decrypt_for_tenant(keys: KeyStore, tenant_id: str, blob: bytes, version: int) -> bytes:

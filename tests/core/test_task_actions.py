@@ -226,13 +226,17 @@ def gateway(agents, draft: DraftView):
     sec = secrets.token_hex(16)
     temporal = QueryableTemporal(draft)
     slack = FakeSlack()
+
+    async def slack_for(tenant):
+        return slack
+
     app = create_app(
         Settings(),
         TenantsConfig.of(agents),
         temporal,
         InMemoryTaskLinkStore(),
         SignatureVerifier(sec),
-        slack_for=lambda tenant: slack,
+        slack_for=slack_for,
     )
     return TestClient(app), sec, temporal, slack
 

@@ -1,9 +1,10 @@
 """The Temporal worker: runs both workflows and every activity.
 
 Real clients are built here, at startup, one Slack client and one Notion
-client for each tenant. Each one needs its secret from the environment
-variable the tenant's config names, and fails with a message naming the tenant
-and the missing variable (never its value) if it is not exported.
+client for each tenant. The Slack token is resolved from the tenant's encrypted
+credential row first, else the environment variable its config names; a missing
+one fails with a message naming the tenant and the variable (never its value).
+A tenant with no Notion token is served Slack-only.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from agentos.config import (
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
 from agentos.content_store import PostgresContentStore
+from agentos.credentials import PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import (
     KeyStore,
     TenantKeyError,
@@ -148,7 +150,7 @@ async def warn_pages_without_model(store, tenant_ids, logger) -> int:
 
 
 async def check_grants_at_startup(
-    api: NotionAPI, agents: AgentsConfig, log: logging.Logger
+    api: NotionAPI | None, agents: AgentsConfig, log: logging.Logger
 ) -> str | None:
     """Check every published agent's Notion grants against the live schemas.
 
@@ -160,8 +162,17 @@ async def check_grants_at_startup(
     Notion but still found by its ID, are logged as warnings. Only the
     granted databases' schemas are read, with the agent's own token, and the
     agent never changes a schema. Logs name the tenant, agent and grant, and
-    never a token or page content.
+    never a token or page content. A Slack-only tenant (``api`` None) passes
+    while none of its agents grants Notion objects.
     """
+    if api is None and any(
+        agent.grants.notion_databases or agent.grants.notion_pages
+        for agent in agents.agents.values()
+    ):
+        return (
+            f"tenant '{agents.tenant_id}': published agents grant Notion objects but the "
+            "tenant has no Notion token; connect Notion or remove the grants"
+        )
     failed = 0
     missing_ids = False
     for agent in agents.agents.values():
@@ -228,7 +239,7 @@ def startup_price_failure(
 
 
 # How often the worker re-reads the tenants table. Short, because an activity for a
-# tenant the worker does not know yet fails for good.
+# tenant the worker does not know yet retries until a pass picks the tenant up.
 TENANT_SYNC_SECONDS = 5.0
 
 
@@ -283,6 +294,7 @@ async def main() -> None:
         key_failure = startup_key_failure(keys, tenants.tenants)
         if key_failure:
             raise SystemExit(key_failure)
+        credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
         agent_store = PostgresAgentStore(pool)
         agent_failure = await startup_agent_failure(agent_store, tenants)
         if agent_failure:
@@ -296,7 +308,9 @@ async def main() -> None:
         )
         if price_failure:
             raise SystemExit(price_failure)
-        registry = build_registry(tenants, settings, RealSlackPoster, RealNotionAPI)
+        registry = await build_registry(
+            tenants, settings, RealSlackPoster, RealNotionAPI, credentials.slack_bot_token
+        )
         failures = []
         for tenant_id in registry.tenants():
             runtime = registry.get(tenant_id)
@@ -387,6 +401,8 @@ async def main() -> None:
             RealSlackPoster,
             RealNotionAPI,
             admit=lambda config: admit_new_tenant(config, keys, agent_store, log),
+            slack_token=credentials.slack_bot_token,
+            on_drop=credentials.forget,
         )
         worker = Worker(
             client,

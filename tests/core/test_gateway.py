@@ -1,5 +1,6 @@
 import json
 import secrets
+from dataclasses import replace
 from urllib.parse import urlencode
 
 import pytest
@@ -10,6 +11,8 @@ from agentos import ids
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
+from agentos.slack_client import FakeSlack
+from agentos.slack_install import installed_tenant_secrets
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import ALICE, TEAM, TENANT
 from tests.helpers.gateway import (
@@ -168,3 +171,52 @@ def test_oversized_webhook_body_is_refused_before_anything_else(client, route, c
     content = (b"x" * 65536 for _ in range(size // 65536 + 1)) if chunked else b"x" * size
     resp = client.post(route, content=content)
     assert resp.status_code == 413
+
+
+@pytest.mark.parametrize("app_name", ["This app", "Acme Helper"], ids=["fallback", "named"])
+async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(
+    agents, temporal, secret, app_name
+):
+    """Fails if a message in a tenant with no default agent starts a workflow, or is answered
+    with anything but the fixed not-set-up text naming the app, once per event."""
+    fresh = replace(
+        agents,
+        tenant_id="newco",
+        slack_team_id="T_NEWCO",
+        agents={},
+        default_agent=None,
+        channels={},
+        secrets=installed_tenant_secrets("newco"),
+    )
+    slack = FakeSlack()
+
+    async def slack_for(tenant_id):
+        return slack
+
+    app = create_app(
+        Settings(console_url="https://console.example.com"),
+        TenantsConfig.of(agents, fresh),
+        temporal,
+        InMemoryTaskLinkStore(),
+        SignatureVerifier(secret),
+        slack_for=slack_for,
+        app_name=app_name,
+    )
+    client = TestClient(app)
+    event = im_event()
+    event["team_id"], event["event_id"] = "T_NEWCO", "EvNew"
+    assert post_event(client, secret, event).status_code == 200
+    # A Slack retry of the same event posts nothing.
+    assert post_event(client, secret, event).status_code == 200
+    # The sentinel: a message in the set-up tenant still reaches its workflow.
+    assert post_event(client, secret, im_event()).status_code == 200
+    assert await deliver_inbound(app) == 1
+
+    assert len(slack.posts()) == 1
+    post = slack.posts()[0]
+    assert post["text"] == (
+        f"{app_name} is installed but not set up yet. "
+        "An admin can finish setup at https://console.example.com."
+    )
+    assert (post["channel"], post["thread_ts"]) == ("D123", "1700000000.000200")
+    assert [c["arg"].tenant_id for c in temporal.signal_with_starts] == [TENANT]

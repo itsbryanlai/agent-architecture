@@ -7,7 +7,7 @@ table by `scripts/init_db.sql` and the migrations. A kind that is not in both ca
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
 [Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
-[Retention](#retention) · [Webhook token](#webhook-token) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
+[Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
 [How to read it](#how-to-read-it) · [What you see in a live run](#what-you-see-in-a-live-run)
 
 ## Columns
@@ -146,6 +146,17 @@ as `operator:<OS login>` (which names the requester too). The key material is ne
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `payload_key` | The operator creates the tenant's key (idempotent) or adds its next version | `operator:<OS login>` for both | none | `create` or `rotate` | - | `ok` | `<tenant>:audit:control:payload_key:<command>:<random>`: a repeat run records again |
+
+## Install
+
+Written by the console's Slack OAuth install (`agentos.slack_install`), in the same
+transaction as the tenant row, the payload key and the encrypted bot token. The installer
+is the tenant's first admin. A refused install (state mismatch, a workspace off the pilot
+allowlist, a failed code exchange) writes nothing. The bot token is never in the row.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
 
 ## Access review
 

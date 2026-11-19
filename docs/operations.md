@@ -1356,15 +1356,26 @@ The row holds the item's title and link, its last known status, the listed state
 (awaiting approval, filed, watching, done, failed, cancelled), when the task last
 reported, and the thread it lives in — short metadata, never conversation text.
 
-The tool is offered only to an agent with a write grant (a Notion database), takes no
-input, and lists the asker's own tasks: the requester comes from the runtime, open
-tasks first, then newest, at most 10. A question asked in the task's own thread first
+The tool is offered only to an agent with a write grant (a Notion database), and the
+grant is checked again when the call runs: a call the model invents for an agent
+without one is a tool error and lists nothing. It takes no input and lists the asker's
+own tasks made through any agent in the workspace: the requester comes from the
+runtime, open tasks first, then newest, at most 10. A connector switch stops only that
+connector's tools, so turning Notion off does not refuse `my_tasks` (the platform's
+own read); an agent switch and agent health still stop it. A question asked in the
+task's own thread refreshes the task at most once per turn: the first `my_tasks` call
 pokes the watch through the webhook's `external_update` signal and waits for the fresh
-report; the watch answers a poke at most once per 60 seconds (`POKE_GAP`), so the
-question never forces a sooner poll, and the wait is bounded — a task that does not
-report in time is listed as it was last recorded. The thread link in the listing opens
-the channel the task's thread lives in (Slack's universal link); a thread permalink
-would need the workspace's domain, which the runtime does not store (D-37).
+report, and a second call in the same turn lists the store as it is. A task that
+reported within 60 seconds (`POKE_GAP`) of the question is fresh already, so the poke
+and wait are skipped; otherwise the watch answers the poke at most once per `POKE_GAP`,
+so the question never forces a sooner poll, and the wait is bounded — a task that does
+not report in time is listed as it was last recorded. A task that closed between the
+lookup and the poke already recorded its final state, so the turn still answers from
+the store. These two refresh rules sit behind the `my-tasks-once-per-turn` patch
+marker; conversations recorded before it keep the original poke and wait on every
+call. The thread link in the listing opens the channel the task's thread lives in
+(Slack's universal link); a thread permalink would need the workspace's domain, which
+the runtime does not store (D-37).
 
 Nothing deletes a task row yet: retention does not cover `tasks`. The worker's start-up
 wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level security and

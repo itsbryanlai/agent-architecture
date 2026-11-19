@@ -42,6 +42,9 @@ export default defineRailway(() => {
     env: {
       POSTGRES_USER: "agentos",
       POSTGRES_DB: "agentos",
+      // A Railway volume's root holds lost+found, and initdb refuses a non-empty
+      // directory: the cluster lives in a subdirectory of the mount.
+      PGDATA: "/var/lib/postgresql/data/pgdata",
       // The owner role's password; set it in the service's variables.
       POSTGRES_PASSWORD: "${{shared.AGENTOS_OWNER_DB_PASSWORD}}",
       PORT: "5432",

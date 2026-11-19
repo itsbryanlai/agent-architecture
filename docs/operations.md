@@ -804,6 +804,7 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `AGENTOS_OWNER_DB_PASSWORD` | worker (pre-deploy only) | secret: the owner role's password |
 | `POSTGRES_PASSWORD` | postgres | secret: the owner role's password, same as above |
 | `POSTGRES_USER`, `POSTGRES_DB` | postgres | `agentos`, `agentos` |
+| `PGDATA` | postgres | `/var/lib/postgresql/data/pgdata`: a subdirectory, because the volume's root holds `lost+found` and `initdb` refuses a non-empty directory |
 | `AGENTOS_TEMPORAL_ADDRESS` | worker, gateway | `temporal.railway.internal:7233` |
 | `AGENTOS_EMBED_BASE_URL` | worker | `http://ollama.railway.internal:11434/v1` |
 | `AGENTOS_EMBED_MODEL` | worker | `bge-m3` |

@@ -524,6 +524,37 @@ async def knowledge_uncited(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def knowledge_uncited_dropped(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(206 if stored else 205)
+    scope = ids.knowledge_scope(ROOT_A)
+    await r.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, scope, ROOT_A.replace("-", "")],
+        id=ids.index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    r.llm.queue(
+        tool_turn(
+            ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"}),
+        ),
+        answer("Try the steps in the guidebook."),
+    )
+    # The search runs long enough for a progress edit and both attempts of that edit are
+    # refused, so the uncited answer is posted as a new message that still names the page.
+    read_hang = r.notion.hang_next_read("retrieve_page")
+    r.slack.fail_next_update(ValueError("slack down"), times=2)
+    await start_conversation(r, "it-helper", thread, "how do I reset my vpn?", stored=stored)
+    await read_hang.reached.wait()
+    await r.env.sleep(PROGRESS_AFTER + timedelta(seconds=2))
+    read_hang.release()
+    await r.env.sleep(timedelta(seconds=1))
+    await eventually(
+        lambda: [p for p in r.slack.posts() if "Searched:" in p["text"]], timeout=30
+    )
+    assert not r.slack.updates()
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 async def audience_refusal(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(32 if stored else 31)
     await start_conversation(r, "unlisted", thread, "hello", stored=stored)
@@ -967,6 +998,7 @@ for _name, _fn in {
     "knowledge_uncited": knowledge_uncited,
     "progress": progress,
     "progress_dropped": progress_dropped,
+    "knowledge_uncited_dropped": knowledge_uncited_dropped,
     "audience_refusal": audience_refusal,
     "hand_off_refused": hand_off_refused,
     "failed_turn": failed_turn,

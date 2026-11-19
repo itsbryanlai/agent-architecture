@@ -1048,6 +1048,7 @@ class ConversationWorkflow:
         # The specialist's placeholder is new: no progress edit was dropped on it, so its
         # final text may edit it even if the front door's placeholder was left unsafe.
         state.progress_dropped = False
+        state.searched = []
         state.handed_off = True
         return specialist, ctx, placeholder_ts
 

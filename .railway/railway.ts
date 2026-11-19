@@ -16,8 +16,8 @@ import { defineRailway, github, preserve, project, service, volume } from "railw
 
 const REPO = "itsbryanlai/agent-architecture";
 // Services deploy only from this branch. Work merges into main; a release moves
-// deployment/prod forward to a main commit (docs/operations.md, Releases).
-const DEPLOY_BRANCH = "deployment/prod";
+// deploy/prod forward to a main commit (docs/operations.md, Releases).
+const DEPLOY_BRANCH = "deploy/prod";
 
 // The app role's URL; the password is the shared AGENTOS_APP_DB_PASSWORD.
 const APP_DATABASE_URL =

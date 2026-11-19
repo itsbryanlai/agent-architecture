@@ -732,14 +732,11 @@ that documents it.
    current plan; a larger size fails the whole apply with no message naming it.
 3. **Set the secret variables** the table below lists, once each, as project
    shared variables (dashboard: Project Settings → Shared Variables); the
-   services already reference them. For `acme`'s existing
-   payload key, the value to paste is the key file's content: the file already
-   holds the base64 of the 32 bytes. The maintainer prints it themselves —
-   `cat ~/.agentos/keys/acme.key` (the file under their `AGENTOS_KEY_DIR`) — and
-   pastes it as the shared variable `AGENTOS_PAYLOAD_KEY_ACME_V1`; no agent runs
-   that command. A new tenant's key comes from `python -m
-   agentos.tenant_keys value <tenant_id>` (see [Payload keys on a host without
-   files](#payload-keys-on-a-host-without-files)).
+   services already reference them. Payload keys need one variable,
+   `AGENTOS_MASTER_KEY_V1`: a value from `openssl rand -base64 32` (or `python -m
+   agentos.tenant_keys master-value`), made and pasted by the maintainer. Tenant
+   keys are created in the database (step 6), never pasted. Database passwords
+   go inside URLs, so make them URL-safe (`openssl rand -hex 24`).
 4. **Generate the public domains.** `railway domain --service gateway` and
    `railway domain --service console` each create a fixed `<name>.up.railway.app`
    domain ([domain](https://docs.railway.com/cli/domain)). The console's
@@ -753,10 +750,11 @@ that documents it.
    <name>` from the directory it builds from: the repository root for worker,
    gateway and console, `deploy/<name>` for the three infrastructure services
    ([up](https://docs.railway.com/cli/up)).
-6. **Import the tenants and agents once**, inside the worker service
-   ([ssh](https://docs.railway.com/cli/ssh)):
+6. **Create the tenant's key, then import the tenants and agents, once**,
+   inside the worker service ([ssh](https://docs.railway.com/cli/ssh)):
 
    ```bash
+   railway ssh --service worker -- python -m agentos.tenant_keys create acme
    railway ssh --service worker -- python -m agentos.tenant_store import
    railway ssh --service worker -- python -m agentos.agent_store import
    ```
@@ -809,8 +807,7 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `AGENTOS_TEMPORAL_ADDRESS` | worker, gateway | `temporal.railway.internal:7233` |
 | `AGENTOS_EMBED_BASE_URL` | worker | `http://ollama.railway.internal:11434/v1` |
 | `AGENTOS_EMBED_MODEL` | worker | `bge-m3` |
-| `AGENTOS_KEY_SOURCE` | worker, gateway | `env`: payload keys come from the service's variables |
-| `AGENTOS_PAYLOAD_KEY_ACME_V1` | worker, gateway | secret: tenant `acme`'s payload key; one `AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` per tenant and version, the same in both services |
+| `AGENTOS_KEY_SOURCE` | worker, gateway | `db`: tenant payload keys live in the database, wrapped by the master key |
 | `AGENTOS_MASTER_KEY_V1` | worker, gateway | secret: the master key that wraps the tenant payload keys when `AGENTOS_KEY_SOURCE=db`; one master variable instead of one per tenant, the same in both services |
 | `SLACK_SIGNING_SECRET` | gateway | secret |
 | `SLACK_BOT_TOKEN` | worker, gateway, console | secret (or the variable the tenant's `secrets` block names) |
@@ -826,11 +823,12 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `RAILWAY_RUN_UID` | temporal | `0`: the only service that runs as root (see below) |
 
 **Payload keys** follow [Payload keys on a host without files](#payload-keys-on-a-host-without-files):
-`AGENTOS_KEY_SOURCE=env` on the worker and the gateway, one
-`AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` variable per tenant key version, the same
-in both services. Create a tenant's key with `python -m agentos.tenant_keys
-value <tenant_id>` and paste the printed variable into both services; keep
-every older version when rotating. There is no key directory and no volume.
+`AGENTOS_KEY_SOURCE=db` on the worker and the gateway and one shared
+`AGENTOS_MASTER_KEY_V<n>` variable. Each tenant's key is a database row
+wrapped by the master key, made by `python -m agentos.tenant_keys create
+<tenant_id>` (or by the install, once it exists); rotation adds a row, and a
+new master version is a new variable with the old one kept. There is no key
+directory, no volume and no variable per tenant.
 
 **The Notion webhook token** lives in the database, encrypted with the
 tenant's payload key, so the gateway needs no token directory. Follow

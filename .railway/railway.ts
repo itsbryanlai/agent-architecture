@@ -110,10 +110,10 @@ export default defineRailway(() => {
       AGENTOS_TEMPORAL_ADDRESS: TEMPORAL_ADDRESS,
       AGENTOS_EMBED_BASE_URL: "http://ollama.railway.internal:11434/v1",
       AGENTOS_EMBED_MODEL: "bge-m3",
-      // Per-tenant payload keys come from variables, the same in the gateway
+      // Tenant payload keys live in the database, wrapped by the master key; the same in the gateway
       // (docs/operations.md, Payload keys on a host without files).
-      AGENTOS_KEY_SOURCE: "env",
-      AGENTOS_PAYLOAD_KEY_ACME_V1: "${{shared.AGENTOS_PAYLOAD_KEY_ACME_V1}}",
+      AGENTOS_KEY_SOURCE: "db",
+      AGENTOS_MASTER_KEY_V1: "${{shared.AGENTOS_MASTER_KEY_V1}}",
       // The hosted chat model is Qwen qwen3.7-plus; the model must have an
       // entry in config/prices.yaml or the worker refuses to start. Anthropic
       // is supported too: AGENTOS_LLM_PROVIDER=anthropic with ANTHROPIC_API_KEY.
@@ -145,8 +145,8 @@ export default defineRailway(() => {
       AGENTOS_TEMPORAL_ADDRESS: TEMPORAL_ADDRESS,
       // The same payload keys as the worker; the Notion webhook token is
       // encrypted with them in the database, so the gateway needs no volume.
-      AGENTOS_KEY_SOURCE: "env",
-      AGENTOS_PAYLOAD_KEY_ACME_V1: "${{shared.AGENTOS_PAYLOAD_KEY_ACME_V1}}",
+      AGENTOS_KEY_SOURCE: "db",
+      AGENTOS_MASTER_KEY_V1: "${{shared.AGENTOS_MASTER_KEY_V1}}",
       SLACK_SIGNING_SECRET: "${{shared.SLACK_SIGNING_SECRET}}",
       SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
       NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",

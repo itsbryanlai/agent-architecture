@@ -786,15 +786,24 @@ missing, or whose tenant has no Notion token is marked unavailable in
 changed." — with no model call and no Notion call, and a write waiting for
 approval is refused at Submit with the same reason. Every other agent and
 tenant keeps running. The agent's creator and the tenant's admins get one Slack
-DM per transition, and each transition is audited as `agent_health`.
+DM per transition, and each transition is audited as `agent_health`. The DM is
+best-effort: a crash or a Slack failure at the transition loses that one notice;
+the health state and the audit row are unaffected. A watch on an unavailable
+agent keeps polling and reports the status change once the agent recovers; a
+write whose agent becomes unavailable between the pre-write check and the write
+stops with the same fixed reply on the card — nothing changed, no failure line.
 
 Recovery needs no restart: an unavailable agent is re-checked at most once
 every five minutes, a newly published version is checked at once, and a passing
 check marks the agent available again (audited, and the creator is told). Fix
 the grant in Notion, or publish a corrected version. A transient Notion failure
 (a network error, rate limit or server error) changes no health; the next check
-tries again. An admin's kill switch is separate: it is checked first, and
-turning an agent off is not a health transition.
+tries again. A check that cannot run never stops the worker: a permanent
+connector problem (a granted database with no data source) marks its agent
+unavailable; any other unexpected error is logged and changes no health; one
+agent's or tenant's failed check never skips the rest. An admin's kill switch
+is separate: it is checked first, and turning an agent off is not a health
+transition.
 
 ## Railway (hosted)
 

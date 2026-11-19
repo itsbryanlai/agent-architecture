@@ -548,9 +548,7 @@ async def knowledge_uncited_dropped(r: Rig, stored: bool) -> list[Recorded]:
     await r.env.sleep(PROGRESS_AFTER + timedelta(seconds=2))
     read_hang.release()
     await r.env.sleep(timedelta(seconds=1))
-    await eventually(
-        lambda: [p for p in r.slack.posts() if "Searched:" in p["text"]], timeout=30
-    )
+    await eventually(lambda: [p for p in r.slack.posts() if "Searched:" in p["text"]], timeout=30)
     assert not r.slack.updates()
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 

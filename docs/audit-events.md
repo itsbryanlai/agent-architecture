@@ -49,13 +49,15 @@ is the Slack user who asked, agent and version are the ones the turn is pinned t
 Written by the gateway when a person clicks 👍 or 👎 on an answer — the user's action, not the
 agent's (D-38). The voter is the Slack user of the signed request; the agent and version are the
 ones the answer's button names. The optional reason a 👎 may carry lives in `answer_feedback`
-only, never here, and is purged with that row by retention. A repeated identical click records
-nothing; a changed vote records again. Submitting or dismissing the reason form records nothing
-new.
+only, never here, and is purged with that row by retention. Every click records its own event,
+because the key carries the vote's time: up → down → up records three events and an identical
+double click records twice (Slack does not retry clicks). The vote and its event commit in one
+transaction, so a failed audit insert leaves no vote behind. Submitting or dismissing the reason
+form records nothing new.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `feedback` | A person's vote on an answer is recorded: 👍 or 👎, a second click by the same person replacing it | the voter / `user:<voter>` | The agent and version that answered | `feedback` | the vote: `up` or `down` | `ok` | `<conversation>:audit:feedback:<answer ts>:<voter>:<vote>` |
+| `feedback` | A person's click on an answer is recorded: 👍 or 👎, a second click by the same person replacing it. Every click is its own event | the voter / `user:<voter>` | The agent and version that answered | `feedback` | the vote: `up` or `down` | `ok` | `<conversation>:audit:feedback:<answer ts>:<voter>:<vote>:<vote time>` |
 
 ## Writes
 

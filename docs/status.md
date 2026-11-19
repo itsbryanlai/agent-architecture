@@ -62,7 +62,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Worker Versioning | target | none | `workflow.patched` markers are used |
 | OpenTelemetry traces | target | none | |
 | Evals and agent test sets | target | none | |
-| Answer feedback: 👍/👎 on answers in Slack (C-3) | built | `feedback.py`, `gateway/app.py`, `activities.py`, migration 036 | One changeable vote per person per answer; a 👎 may carry an optional ≤300-character reason; audited as `feedback` (never the reason); purged with `tool_outputs_days`. No model or connector call (D-38) |
-| Creator feedback page (unanswered questions) | target | none | Named in product.md; reads the C-3 votes |
+| Answer feedback: 👍/👎 on answers in Slack | built | `feedback.py`, `gateway/app.py`, `activities.py`, migration 036 | One changeable vote per person per answer; a 👎 may carry an optional ≤300-character reason; every click audited as `feedback` (never the reason), the vote and its event in one transaction; purged with `tool_outputs_days`. No model or connector call (D-38) |
+| Creator feedback page (unanswered questions) | target | none | Named in product.md; reads the answer feedback votes |
 | Connector self-repair | target | none | Design in [design/self-repair.md](design/self-repair.md) |
 | Cells (a stack per group of tenants) | target | none | One deployment today |

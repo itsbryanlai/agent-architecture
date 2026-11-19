@@ -1395,11 +1395,15 @@ cards, the not-set-up reply and the fixed off / unavailable / budget replies car
 - A 👎 opens a small modal for an optional one-line reason (at most 300 characters). Submitting
   or dismissing keeps the vote; a reason attaches only while the vote is still a 👎.
 - The vote is acknowledged to the voter alone ("Thanks — noted.", an ephemeral message);
-  nothing is posted in the thread. Each vote is audited as `feedback` — the vote and the agent,
-  never the reason text.
+  nothing is posted in the thread. Every click is audited as its own `feedback` event — the vote
+  and the agent, never the reason text — and the vote and its event commit in one transaction, so
+  a failed audit write leaves no vote behind and the clicker is told to try again.
 - No model call and no connector call: the gateway records the vote in `answer_feedback`
   (migration 036) directly, without a workflow. Feedback is the user's action, not the agent's,
   so the kill-switch gate does not apply (D-38).
+- An answer posted as a new message (after a dropped progress edit) is posted first and edited
+  once more to add its buttons. That edit is best effort: if it fails, the answer stays as posted,
+  without buttons, and is still recorded.
 
 Votes follow the tenant's `tool_outputs_days` retention: the nightly purge deletes votes older
 than the limit, the reason text with them. The reason is the only free text the feature stores.

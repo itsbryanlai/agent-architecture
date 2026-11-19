@@ -831,6 +831,20 @@ come from the database. `config/agents.yaml` ships in the image (the default of
 `AGENTOS_CONFIG`) for the one-time imports, `python -m agentos.tenant_store
 import` and `python -m agentos.agent_store import`.
 
+### Releases
+
+Every service deploys from the `deployment/prod` branch, never from `main`, so
+merging work into `main` deploys nothing. A release moves `deployment/prod`
+forward to a commit already on `main` (a fast-forward), and each service then
+builds and deploys that commit. The maintainer does this, in their own terminal
+or on GitHub:
+
+```bash
+git push origin main:deployment/prod
+```
+
+Deploy the worker first when the release adds a migration (see step 5).
+
 ### Logs
 
 `railway logs --service <name> --lines 200` prints one service's recent runtime

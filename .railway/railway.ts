@@ -15,6 +15,9 @@
 import { defineRailway, github, preserve, project, service, volume } from "railway/iac";
 
 const REPO = "itsbryanlai/agent-architecture";
+// Services deploy only from this branch. Work merges into main; a release moves
+// deployment/prod forward to a main commit (docs/operations.md, Releases).
+const DEPLOY_BRANCH = "deployment/prod";
 
 // The app role's URL; the password is the shared AGENTOS_APP_DB_PASSWORD.
 const APP_DATABASE_URL =
@@ -30,7 +33,7 @@ export default defineRailway(() => {
   const ollamaModels = volume("ollama-models", { sizeMB: 5000, region: VOLUME_REGION });
 
   const postgres = service("postgres", {
-    source: github(REPO, { rootDirectory: "deploy/postgres" }),
+    source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/postgres" }),
     build: { builder: "DOCKERFILE" },
     deploy: {
       restartPolicyType: "ON_FAILURE",
@@ -47,7 +50,7 @@ export default defineRailway(() => {
   });
 
   const temporal = service("temporal", {
-    source: github(REPO, { rootDirectory: "deploy/temporal" }),
+    source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/temporal" }),
     build: { builder: "DOCKERFILE" },
     start: "temporal server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db",
     deploy: {
@@ -65,7 +68,7 @@ export default defineRailway(() => {
   });
 
   const ollama = service("ollama", {
-    source: github(REPO, { rootDirectory: "deploy/ollama" }),
+    source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/ollama" }),
     build: { builder: "DOCKERFILE" },
     // The entrypoint reads PORT and OLLAMA_MODELS from the environment.
     start: "/bin/sh /entrypoint.sh",
@@ -83,7 +86,7 @@ export default defineRailway(() => {
   });
 
   const worker = service("worker", {
-    source: github(REPO),
+    source: github(REPO, { branch: DEPLOY_BRANCH }),
     build: { builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
     start: "python -m agentos.worker",
     // The only service that migrates: one schema writer per deploy. It runs
@@ -125,7 +128,7 @@ export default defineRailway(() => {
   });
 
   const gateway = service("gateway", {
-    source: github(REPO),
+    source: github(REPO, { branch: DEPLOY_BRANCH }),
     build: { builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
     // Dockerfile start commands run in exec form: the shell wrapper expands
     // PORT, and exec keeps uvicorn as the process the signals reach.
@@ -154,7 +157,7 @@ export default defineRailway(() => {
   });
 
   const console = service("console", {
-    source: github(REPO),
+    source: github(REPO, { branch: DEPLOY_BRANCH }),
     build: { builder: "DOCKERFILE", dockerfilePath: "Dockerfile" },
     start: '/bin/sh -c "exec python -m agentos.control_api --host 0.0.0.0 --port $PORT"',
     deploy: {

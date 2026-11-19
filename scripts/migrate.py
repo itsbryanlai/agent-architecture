@@ -10,6 +10,11 @@ Run it as the database owner, not as the app role::
 transaction together with its row there, so a failed one leaves no trace and the next
 run starts from it.
 
+An empty database (no tables at all, as a fresh hosted Postgres is) is built from
+``scripts/init_db.sql`` in one transaction and every migration file is recorded as
+applied, so a new install needs this one command. A database that already has tables
+is never rebuilt: it gets the migrations it lacks.
+
 The role ``agentos_app`` is created with the password in AGENTOS_APP_DB_PASSWORD when it
 does not exist. An existing role keeps its password; ``--set-app-password`` changes it.
 The password is never written to a file and never printed.
@@ -36,6 +41,7 @@ APP_ROLE = "agentos_app"
 OWNER_URL_VAR = "AGENTOS_OWNER_DATABASE_URL"
 APP_PASSWORD_VAR = "AGENTOS_APP_DB_PASSWORD"
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+INIT_DB = Path(__file__).resolve().parent / "init_db.sql"
 _FILE = re.compile(r"(\d{3})_[a-z0-9_]+\.sql")
 # The migration that creates schema_migrations. It runs before the table can be read.
 BOOTSTRAP = "000"
@@ -83,6 +89,14 @@ def applied_versions(conn: psycopg.Connection) -> set[str]:
     return {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
 
 
+def database_is_empty(conn: psycopg.Connection) -> bool:
+    """No tables in the public schema: nothing has been built in this database."""
+    return (
+        conn.execute("SELECT 1 FROM pg_tables WHERE schemaname = 'public' LIMIT 1").fetchone()
+        is None
+    )
+
+
 def record(conn: psycopg.Connection, version: str) -> None:
     conn.execute(
         "INSERT INTO schema_migrations (version) VALUES (%s) ON CONFLICT DO NOTHING", (version,)
@@ -101,10 +115,24 @@ def migrate(
     baseline: str | None = None,
     log=print,
 ) -> list[str]:
-    """Apply the missing migrations, or record the ones up to ``baseline``. Returns versions."""
+    """Apply the missing migrations, or record the ones up to ``baseline``. Returns versions.
+
+    An empty database is built from init_db.sql with every migration recorded, so the
+    returned list of applied migrations is empty.
+    """
     if BOOTSTRAP not in files:
         raise MigrateError(f"migration {BOOTSTRAP} (schema_migrations) is missing")
     done = applied_versions(conn)
+    if not done and baseline is None and database_is_empty(conn):
+        # One transaction: a failed build leaves the database empty and the next run
+        # builds it again. init_db.sql records the migrations it contains; record
+        # every file so schema_migrations lists them all.
+        with conn.transaction():
+            conn.execute(INIT_DB.read_text())
+            for version in files:
+                record(conn, version)
+        log("empty database: built from init_db.sql, recorded every migration as applied")
+        return []
     pending = [v for v in files if v not in done]
     if baseline is not None:
         if baseline not in files:

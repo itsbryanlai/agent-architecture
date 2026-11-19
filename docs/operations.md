@@ -546,7 +546,9 @@ uv run python scripts/migrate.py
 ```
 
 It applies the migrations in `scripts/migrations/` that `schema_migrations` does not list,
-in order, each in its own transaction. It creates `agentos_app` with
+in order, each in its own transaction. An empty database (no tables at all) is instead
+built from `scripts/init_db.sql` in one transaction, with every migration recorded as
+applied. It creates `agentos_app` with
 `AGENTOS_APP_DB_PASSWORD` when the role is missing and leaves an existing role's password
 alone; `--set-app-password` resets it to `AGENTOS_APP_DB_PASSWORD`.
 
@@ -654,6 +656,108 @@ uv run uvicorn agentos.gateway.app:app --port 8000     # terminal 2
 Keep your tunnel pointed at port 8000. The Temporal web UI is at
 <http://localhost:8233>. DM the bot, or @mention it in a channel it has been
 invited to.
+
+## Railway (hosted)
+
+The whole project runs on Railway from code. One app image (the root
+`Dockerfile`, uv-built, non-root, `.venv` baked in) starts as the worker, the
+gateway or the console; three infrastructure images live under `deploy/`.
+`.railway/railway.ts` declares all six services, their volumes and their
+non-secret variables. Apply it with the Railway CLI (`railway config plan`,
+then `railway config apply`); a deploy does not read the file. Secrets are
+never in the file: each `preserve()` entry keeps the value set in that
+service's Railway variables. The full hosted runbook is still to be written.
+
+| Service | Built from | Start command | Port | Volume mount | Public domain |
+|---|---|---|---|---|---|
+| postgres | `deploy/postgres` (pgvector/pgvector:0.8.1-pg16) | image default | 5432 | `/var/lib/postgresql/data` | no |
+| temporal | `deploy/temporal` (temporalio/temporal:1.9.1) | `temporal server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db` | 7233 | `/data` | no |
+| ollama | `deploy/ollama` (ollama/ollama:0.40.16) | entrypoint: serve, then pull `bge-m3` on first start only | 11434 (`PORT`) | `/data` (models in `/data/models`) | no |
+| worker | root `Dockerfile` | `python -m agentos.worker` | none | none | no |
+| gateway | root `Dockerfile` | `uvicorn agentos.gateway.app:app --host 0.0.0.0 --port $PORT` | `$PORT` | none | yes |
+| console | root `Dockerfile` | `python -m agentos.control_api --host 0.0.0.0 --port $PORT` | `$PORT` | none | yes |
+
+Dockerfile start commands run in exec form, so the gateway's and console's
+commands are wrapped in `/bin/sh -c "exec …"` for `$PORT` to expand. Services
+reach each other at `<service>.railway.internal` over `http://` (the private
+network is encrypted); postgres, temporal, ollama and the worker have no public
+domain. Generate the gateway's and console's domains in the dashboard.
+
+Variables, by service (names only; a secret is set in the service's Railway
+variables and kept by `preserve()`). `${{VAR}}` is Railway's reference syntax,
+resolved from the same service's variables.
+
+| Variable | Services | Value shape |
+|---|---|---|
+| `AGENTOS_DATABASE_URL` | worker, gateway, console | `postgresql://agentos_app:${{AGENTOS_APP_DB_PASSWORD}}@postgres.railway.internal:5432/agentos` |
+| `AGENTOS_APP_DB_PASSWORD` | worker, gateway, console | secret: the app role's password, the same in all three |
+| `AGENTOS_OWNER_DATABASE_URL` | worker (pre-deploy only) | `postgresql://agentos:${{AGENTOS_OWNER_DB_PASSWORD}}@postgres.railway.internal:5432/agentos` |
+| `AGENTOS_OWNER_DB_PASSWORD` | worker (pre-deploy only) | secret: the owner role's password |
+| `POSTGRES_PASSWORD` | postgres | secret: the owner role's password, same as above |
+| `POSTGRES_USER`, `POSTGRES_DB` | postgres | `agentos`, `agentos` |
+| `AGENTOS_TEMPORAL_ADDRESS` | worker, gateway | `temporal.railway.internal:7233` |
+| `AGENTOS_EMBED_BASE_URL` | worker | `http://ollama.railway.internal:11434/v1` |
+| `AGENTOS_EMBED_MODEL` | worker | `bge-m3` |
+| `AGENTOS_KEY_SOURCE` | worker, gateway | `env`: payload keys come from the service's variables |
+| `AGENTOS_PAYLOAD_KEY_ACME_V1` | worker, gateway | secret: tenant `acme`'s payload key; one `AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` per tenant and version, the same in both services |
+| `SLACK_SIGNING_SECRET` | gateway | secret |
+| `SLACK_BOT_TOKEN` | worker, gateway, console | secret (or the variable the tenant's `secrets` block names) |
+| `NOTION_TOKEN` | worker, gateway, console | secret (or the tenant's own variable) |
+| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | gateway | secret, optional local override; leave unset so the token lives in the database |
+| `ANTHROPIC_API_KEY` | worker | secret, for the Anthropic provider |
+| `QWEN_API_KEY`, `QWEN_BASE_URL` | worker | secret and endpoint, for the Qwen provider |
+| `AGENTOS_LLM_PROVIDER`, `AGENTOS_MODEL` | worker | `qwen`, `qwen3.7-plus`: the hosted chat model. The worker refuses to start when the model has no entry in `config/prices.yaml` (shipped prices: `qwen3.7-plus`, `bge-m3`) |
+| `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` | console | secrets; sign-in needs both, plus `AGENTOS_CONSOLE_URL` |
+| `AGENTOS_CONSOLE_URL` | console | `https://${{RAILWAY_PUBLIC_DOMAIN}}`: the exact public base URL; the Host and Origin allowlists are built from it |
+| `NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET` | console | secrets, optional (the grant picker) |
+| `OLLAMA_MODELS` | ollama | `/data/models` |
+| `RAILWAY_RUN_UID` | temporal | `0`: the only service that runs as root (see below) |
+
+**Payload keys** follow [Payload keys on a host without files](#payload-keys-on-a-host-without-files):
+`AGENTOS_KEY_SOURCE=env` on the worker and the gateway, one
+`AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` variable per tenant key version, the same
+in both services. Create a tenant's key with `python -m agentos.tenant_keys
+value <tenant_id>` and paste the printed variable into both services; keep
+every older version when rotating. There is no key directory and no volume.
+
+**The Notion webhook token** lives in the database, encrypted with the
+tenant's payload key, so the gateway needs no token directory. Follow
+[Notion webhook](#notion-webhook-optional): after the handshake, print and
+confirm the pending token with `python -m agentos.notion_webhook show --tenant
+<tenant_id>` and `python -m agentos.notion_webhook confirm --tenant
+<tenant_id>`, run where the tenant's payload key variables are set. Leave
+`NOTION_WEBHOOK_VERIFICATION_TOKEN` unset: while it is set the handshake is
+refused and events are verified against the variable instead of the database.
+
+Migrations run as the worker's pre-deploy command,
+`python scripts/migrate.py --set-app-password`, before the worker starts; it
+creates the app role with `AGENTOS_APP_DB_PASSWORD` and applies what the
+database lacks. The first deploy needs nothing else: on an empty database the
+script builds the whole schema from `scripts/init_db.sql` and records every
+migration as applied, so one command brings a fresh Railway Postgres current.
+The gateway and console refuse a behind schema at start-up, so deploy the
+worker first when a change adds a migration.
+
+Volumes are declared in `.railway/railway.ts`: `postgres-data`,
+`temporal-data` and `ollama-models`. Railway mounts a volume root-owned. The
+temporal image runs as the non-root `temporal` user, so that service alone
+sets `RAILWAY_RUN_UID=0` to run as root and write its `/data` volume. The app
+image stays non-root and mounts no volume: payload keys are variables and the
+webhook token is in the database.
+
+Health checks: the gateway and the console answer `/healthz`; the console's
+`/healthz` bypasses its Host guard, so Railway's `healthcheck.railway.app`
+probe passes. The console binds `0.0.0.0` only with sign-in configured, and
+refuses a development-default database password off loopback. At the first
+deploy, check the console's Host rule behind Railway's proxy: with sign-in
+configured the Host and Origin allowlists come from `AGENTOS_CONSOLE_URL`, so
+a request whose `Host` header is the public domain must be accepted and a
+foreign one refused. No code change is planned for it.
+
+The hosted services do not read the agent YAML at run time: tenants and agents
+come from the database. `config/agents.yaml` ships in the image (the default of
+`AGENTOS_CONFIG`) for the one-time imports, `python -m agentos.tenant_store
+import` and `python -m agentos.agent_store import`.
 
 ## Tests
 

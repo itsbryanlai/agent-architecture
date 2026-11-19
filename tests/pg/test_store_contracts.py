@@ -88,6 +88,15 @@ async def test_an_audit_list_refuses_a_limit_below_one(audit, tenant: str):
         await audit.list(tenant, limit=0)
 
 
+async def test_a_resume_is_recorded_for_an_agent_with_no_published_version(audit, tenant: str):
+    """Fails if the store refuses an audience_resume whose agent has no published version, or reads it back with one."""
+    await audit.record(audit_event(tenant, "r1", kind="audience_resume", agent_version=None))
+
+    [event] = await audit.list(tenant)
+
+    assert (event.kind, event.agent_id, event.agent_version) == ("audience_resume", "aa", None)
+
+
 # --- usage -------------------------------------------------------------------------
 
 

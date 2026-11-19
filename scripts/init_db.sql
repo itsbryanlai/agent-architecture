@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 034 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 035 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -1050,6 +1050,41 @@ CREATE POLICY tenant_isolation ON agent_health
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- The platform's record of each task, written by the task workflow and read by the
+-- my_tasks tool for the requester named on the row. Same as migration 035.
+CREATE TABLE IF NOT EXISTS tasks (
+  tenant_id         text        NOT NULL,
+  task_id           text        NOT NULL,
+  requester_user_id text        NOT NULL,
+  agent_id          text        NOT NULL,
+  title             text        NOT NULL DEFAULT '',
+  url               text        NOT NULL DEFAULT '',
+  page_id           text        NOT NULL DEFAULT '',
+  state             text        NOT NULL CHECK (
+    state IN ('awaiting_approval', 'filed', 'watching', 'done', 'failed', 'cancelled')),
+  last_status       text        NOT NULL DEFAULT '',
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  channel           text        NOT NULL,
+  thread_ts         text        NOT NULL,
+  PRIMARY KEY (tenant_id, task_id),
+  CONSTRAINT tasks_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+CREATE INDEX IF NOT EXISTS tasks_requester
+  ON tasks (tenant_id, requester_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS tasks_thread
+  ON tasks (tenant_id, channel, thread_ts);
+
+REVOKE ALL ON tasks FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON tasks TO agentos_app;
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tasks;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1061,5 +1096,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035')
 ON CONFLICT DO NOTHING;

@@ -31,6 +31,7 @@ from agentos.models import AuditEvent
 from agentos.notion_webhook import InMemoryWebhookTokenStore, PostgresWebhookTokenStore
 from agentos.sessions import InMemorySessionStore, PostgresSessionStore
 from agentos.switches import InMemorySwitchStore, PostgresSwitchStore
+from agentos.tasks import InMemoryTaskStore, PostgresTaskStore, TaskRecord
 from agentos.usage import InMemoryUsageStore, PostgresUsageStore, UsageEvent
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
@@ -395,3 +396,117 @@ async def test_agent_health_reports_a_transition_once_and_reads_the_last_check_b
     assert (await health.get(tenant, "bb")).status == AVAILABLE
     assert await health.get(other_tenant, "aa") is None
     assert await health.list(other_tenant) == []
+
+
+# --- tasks ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tasks(store_pool):
+    return twin(store_pool, InMemoryTaskStore, PostgresTaskStore)
+
+
+def task_record(tenant: str, task_id: str, **fields) -> TaskRecord:
+    base = {
+        "tenant_id": tenant,
+        "task_id": task_id,
+        "requester_user_id": "u1",
+        "agent_id": "aa",
+        "title": "New monitor",
+        "url": "https://www.notion.so/monitor",
+        "page_id": "p1",
+        "state": "watching",
+        "last_status": "To do",
+        "updated_at": NOW,
+        "channel": "C1",
+        "thread_ts": "1.1",
+    }
+    return TaskRecord(**(base | fields))
+
+
+async def test_a_task_report_replaces_the_row_and_reads_back(tasks, tenant: str):
+    """Fails if a second report for one task adds a row, or the row read back is not the latest report."""
+    await tasks.record(task_record(tenant, "k1"))
+    later = task_record(
+        tenant, "k1", state="done", last_status="Done", updated_at=NOW + timedelta(hours=1)
+    )
+
+    await tasks.record(later)
+
+    assert await tasks.get(tenant, "k1") == later
+    assert await tasks.list_for_requester(tenant, "u1") == [later]
+    assert await tasks.get(tenant, "missing") is None
+
+
+async def test_a_requester_lists_only_their_own_tasks(tasks, tenant: str, other_tenant: str):
+    """Fails if a listing shows a second user's task in the same tenant, or another tenant's task."""
+    mine = task_record(tenant, "k1")
+    theirs = task_record(tenant, "k2", requester_user_id="u2")
+    elsewhere = task_record(other_tenant, "k3")
+    for row in (mine, theirs, elsewhere):
+        await tasks.record(row)
+
+    assert await tasks.list_for_requester(tenant, "u1") == [mine]
+    assert await tasks.list_for_requester(tenant, "u2") == [theirs]
+    assert await tasks.list_for_requester(other_tenant, "u1") == [elsewhere]
+
+
+async def test_tasks_list_open_first_then_newest_and_at_most_ten(tasks, tenant: str):
+    """Fails if a closed task sorts before an open one, the newest sorts last, or more than ten are listed."""
+    rows = [
+        task_record(tenant, "open-old", state="watching", updated_at=NOW),
+        task_record(tenant, "closed-newest", state="done", updated_at=NOW + timedelta(hours=6)),
+        task_record(
+            tenant, "open-new", state="awaiting_approval", updated_at=NOW + timedelta(hours=3)
+        ),
+        task_record(tenant, "closed-2", state="failed", updated_at=NOW + timedelta(hours=5)),
+        task_record(tenant, "open-mid", state="filed", updated_at=NOW + timedelta(hours=1)),
+        task_record(tenant, "closed-3", state="cancelled", updated_at=NOW + timedelta(hours=4)),
+        task_record(
+            tenant,
+            "open-newest",
+            state="watching",
+            updated_at=NOW + timedelta(hours=5, minutes=30),
+        ),
+        task_record(
+            tenant, "closed-4", state="done", updated_at=NOW + timedelta(hours=3, minutes=30)
+        ),
+        task_record(tenant, "closed-5", state="done", updated_at=NOW + timedelta(hours=2)),
+        task_record(
+            tenant, "closed-6", state="cancelled", updated_at=NOW + timedelta(hours=1, minutes=30)
+        ),
+        task_record(tenant, "closed-7", state="failed", updated_at=NOW + timedelta(hours=1)),
+        task_record(tenant, "closed-8", state="done", updated_at=NOW + timedelta(minutes=30)),
+    ]
+    for row in rows:
+        await tasks.record(row)
+
+    listed = await tasks.list_for_requester(tenant, "u1")
+
+    assert [r.task_id for r in listed] == [
+        "open-newest",
+        "open-new",
+        "open-mid",
+        "open-old",
+        "closed-newest",
+        "closed-2",
+        "closed-3",
+        "closed-4",
+        "closed-5",
+        "closed-6",
+    ]
+
+
+async def test_the_thread_lookup_finds_the_askers_newest_watching_task(tasks, tenant: str):
+    """Fails if the thread lookup returns another user's task, a closed task, another thread's, or an older watching one."""
+    older = task_record(tenant, "k1", updated_at=NOW)
+    newer = task_record(tenant, "k2", updated_at=NOW + timedelta(hours=1))
+    await tasks.record(older)
+    await tasks.record(newer)
+    await tasks.record(task_record(tenant, "k3", requester_user_id="u2"))
+    await tasks.record(task_record(tenant, "k4", state="done"))
+    await tasks.record(task_record(tenant, "k5", thread_ts="9.9"))
+
+    assert await tasks.watching_in_thread(tenant, "C1", "1.1", "u1") == newer
+    assert await tasks.watching_in_thread(tenant, "C1", "1.1", "u3") is None
+    assert await tasks.watching_in_thread(tenant, "C9", "1.1", "u1") is None

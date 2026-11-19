@@ -849,6 +849,78 @@ async def task_hop(r: Rig, stored: bool) -> list[Recorded]:
     return [Recorded(f"run{i + 1}", h) for i, h in enumerate(chain)]
 
 
+async def task_recorded(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(222 if stored else 221)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce)
+    await wait_state(handle, "watching")
+    await finish_watch(r, handle)
+    row = await r.acts.tasks.get(TENANT, handle.id)
+    assert (row.state, row.last_status, row.title) == ("done", "Done", "New monitor")
+    return [await current(r, "", handle.id)]
+
+
+async def my_tasks(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(232 if stored else 231)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce)
+    await wait_state(handle, "watching")
+    # The first poll lands, so the poke the question sends must wait out POKE_GAP.
+    await r.env.sleep(timedelta(minutes=16))
+    page = r.notion.all_pages(DB_ID)[0]["id"]
+    r.notion.set_status(page, "Status", "In progress")
+    r.llm.queue(
+        tool_turn(ToolCall("tu_mt", "my_tasks", {})),
+        answer("It is in progress."),
+    )
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    text = "where is my request?"
+    event_id = f"Ev-{thread}-2"
+    if stored:
+        # The thread's conversation already ran the turn that started the task.
+        await r.acts.content.put_inbound(
+            TENANT,
+            event_id,
+            {
+                "kind": "message",
+                "agent_id": "it-helper",
+                "user_id": ALICE,
+                "text": text,
+                "channel": "C_GENERAL",
+                "thread_ts": thread,
+                "channel_kind": "channel",
+            },
+        )
+        await r.client.get_workflow_handle(conv).signal(
+            ConversationWorkflow.message,
+            InboundMessage(event_id, ALICE, "", "C_GENERAL", thread, "channel", text_stored=True),
+        )
+    else:
+        await start_conversation(r, "it-helper", thread, text, event_id=event_id)
+    # Skip the gap in short steps so the turn's own steps run between them; the wait
+    # inside the tool sees the poke-answered poll's report land.
+    expected = 4 if stored else 2
+    for _ in range(30):
+        if len(r.llm.calls) >= expected:
+            break
+        await r.env.sleep(timedelta(seconds=10))
+    await eventually(lambda: len(r.llm.calls) >= expected, timeout=30)
+    outputs = await r.acts.tool_outputs.get_many(TENANT, conv, ["tu_mt"])
+    assert 'state="watching"' in outputs["tu_mt"][0]
+    assert 'status="In progress"' in outputs["tu_mt"][0]
+    row = await r.acts.tasks.get(TENANT, handle.id)
+    assert row.last_status == "In progress"
+    return [await current(r, "", handle.id), await current(r, "conversation", conv)]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1014,6 +1086,8 @@ for _name, _fn in {
     "task_hop": task_hop,
     "task_card_update_failure": task_card_update_failure,
     "task_unavailable_write": task_unavailable_write,
+    "task_recorded": task_recorded,
+    "my_tasks": my_tasks,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

@@ -5,6 +5,7 @@ The single reference for every kind of event in the audit log (`audit_events`). 
 table by `scripts/init_db.sql` and the migrations. A kind that is not in both cannot be written.
 
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
+[Feedback](#feedback) ·
 [Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
 [Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) ·
@@ -42,6 +43,19 @@ is the Slack user who asked, agent and version are the ones the turn is pinned t
 | `notice` | A final text that is not a model answer was shown: the hand-off announcement, the step-limit notice, the failure notice or the empty-message prompt. A failure notice posted before an agent could be loaded records version 0. | why: `step_limit`, `hand_off`, `failure`, `empty_message` | - | - | out: hash of the text shown; in: - | Not written if the text was not shown; the activity retries | `<conversation>:audit:notice:<reason>:<placeholder ts or reply idempotency key>` |
 | `tool_call` | A read tool ran (`search_knowledge`, a Notion read) and its output was stored. | tool name | - | - | in: hash of the tool input; out: hash of the output text | Written with `error` when the tool failed, or when the agent or the connector was switched off (the model got the off message); nothing is read then | `<conversation>:audit:tool:<tool use id>` |
 | `hand_off` | A front door hands the thread to a specialist, before the announcement is shown. Agent and version are the front door's. | - | specialist's agent ID | - | - | A hand-off the specialist's audience refuses is `audience_refused`, not this | `<tenant>:audit:hand-off:<event id>` |
+
+## Feedback
+
+Written by the gateway when a person clicks 👍 or 👎 on an answer — the user's action, not the
+agent's (D-38). The voter is the Slack user of the signed request; the agent and version are the
+ones the answer's button names. The optional reason a 👎 may carry lives in `answer_feedback`
+only, never here, and is purged with that row by retention. A repeated identical click records
+nothing; a changed vote records again. Submitting or dismissing the reason form records nothing
+new.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `feedback` | A person's vote on an answer is recorded: 👍 or 👎, a second click by the same person replacing it | the voter / `user:<voter>` | The agent and version that answered | `feedback` | the vote: `up` or `down` | `ok` | `<conversation>:audit:feedback:<answer ts>:<voter>:<vote>` |
 
 ## Writes
 
@@ -224,6 +238,8 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 ## What you see in a live run
 
 - A DM question that searches the knowledge: `tool_call` (`search_knowledge`, `ok`), then `answer`.
+- Someone clicks 👎 on an answer and types a reason: `feedback` (target `down`, the voter as
+  requester); the reason stays in `answer_feedback`, not in the log.
 - A request that files a Notion item: `approval`, then `write` (`ok`, target the new page ID). If the
   agent was switched off between approval and write: `approval`, then `write` with `error`.
 - A front door that hands off: `hand_off` (front door as the agent, specialist as target), a `notice` (`hand_off`) for the announcement, then the specialist's own `tool_call` and `answer` rows.

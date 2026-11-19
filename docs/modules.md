@@ -7,7 +7,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `worker.py` | Temporal worker: runs every workflow and activity, builds one Slack and one Notion client per tenant. Refuses to start on a missing secret, key, price or an old schema; a broken grant disables its agent (`agent_health.py`), never the worker | `core/test_config.py`, `core/test_pool_settings.py`, `core/test_agent_health.py` |
-| `gateway/app.py` | HTTP ingress for Slack events, button clicks and Notion webhooks. Verifies signatures, takes the tenant from the request (never from text), stores each event before answering, handles a click within 2.0 s; a tenant with no default agent gets one fixed not-set-up reply per event | `core/test_gateway.py`, `connectors/test_notion_webhook.py`, `core/test_content_refs.py`, `core/test_front_door.py` |
+| `gateway/app.py` | HTTP ingress for Slack events, button clicks and Notion webhooks. Verifies signatures, takes the tenant from the request (never from text), stores each event before answering, handles a click within 2.0 s; a tenant with no default agent gets one fixed not-set-up reply per event; a feedback click records the signed clicker's vote | `core/test_gateway.py`, `connectors/test_notion_webhook.py`, `core/test_content_refs.py`, `core/test_front_door.py`, `core/test_answer_feedback.py` |
 | `gateway/relay.py` | Signals conversation workflows with the events the gateway stored. At least once; one thread's messages are never delivered out of order | `core/test_content_refs.py` |
 | `gateway/notion_signature.py` | Checks Notion's webhook signature in constant time | `connectors/test_notion_webhook.py` |
 | `control_api.py` | The control-plane JSON API, a separate process from the gateway. Loopback only without sign-in; every request acts as one verified user | `console/test_control_api.py` |
@@ -30,7 +30,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `workflows/page_refresh.py` | Refreshes one page after webhook events, coalescing a burst | `knowledge/test_page_refresh.py` |
 | `workflows/audience_watch.py` | Acts on one `channel_shared` event; one never-reused ID per event | `console/test_audience_watch.py` |
 | `workflows/retention.py` | Purges one tenant's expired rows, a batch per activity | `core/test_retention_workflow.py` |
-| `activities.py` | All I/O the workflows do. One tenant per activity; the gate runs first in every activity that acts for an agent; writes happen once behind a lease | `core/test_agent_gate.py`, `connectors/test_exactly_once.py`, `connectors/test_restart_write.py`, `core/test_retry_safety.py`, `core/test_tool_outputs.py` |
+| `activities.py` | All I/O the workflows do. One tenant per activity; the gate runs first in every activity that acts for an agent; writes happen once behind a lease; a final answer carries the feedback buttons, a fixed stop text none | `core/test_agent_gate.py`, `connectors/test_exactly_once.py`, `connectors/test_restart_write.py`, `core/test_retry_safety.py`, `core/test_tool_outputs.py`, `core/test_answer_feedback.py` |
 | `task_notices.py` | The lines a task posts in the thread, written in one place from stored content | `core/test_task_workflow.py` |
 | `models.py` | Plain data types passed through Temporal (IDs and small values), audit kinds, editable-field limits | `core/test_task_limits.py`, `core/test_payload_codec.py` |
 | `ids.py` | The only place workflow, schedule and event-key IDs are built; every ID starts with the tenant | `core/test_ids.py` |
@@ -41,6 +41,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `content_store.py` | Where message text, model replies, tool inputs and task drafts live while Temporal carries references | `core/test_content_refs.py`, `pg/test_stores.py` |
+| `feedback.py` | Answer feedback: the 👍/👎 buttons under an answer and one changeable vote per person per answer, with an optional reason on a 👎. The voter is the signed clicker, never the payload; the reason is the only free text and is purged with the row | `core/test_answer_feedback.py`, `pg/test_store_contracts.py` |
 | `stores.py` | Chat history, idempotency records, task links and external writes. Every call takes `tenant_id` and runs under row-level security | `pg/test_stores.py` |
 | `tasks.py` | The platform's record of each task: the state row the task workflow writes and `my_tasks` reads for the asker, open first, newest first, at most 10; the in-thread poke's lookup and the listed-state mapping | `core/test_my_tasks.py`, `pg/test_store_contracts.py` |
 | `unit_of_work.py` | One transaction and the tenant lock for a change and its audit event | `console/test_control_plane.py`, `pg/test_publish_hash.py` |

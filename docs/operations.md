@@ -316,15 +316,21 @@ tenant's Slack client from the new token on its next read.
 
 **A tenant with no agents yet.** An installed tenant has no agents and no
 Notion. Its `default_agent` is NULL until an admin sets one; until then the
-gateway answers every DM and mention with one fixed reply — "This app is
+gateway answers every DM and mention with one fixed reply — "<app name> is
 installed but not set up yet. An admin can finish setup at
-`<AGENTOS_CONSOLE_URL>`." — with no model call and no Notion call. Set
+`<AGENTOS_CONSOLE_URL>`." — with no model call and no Notion call. The app
+name is `display_information.name` from `slack/app-manifest.yaml` ("This app"
+when the manifest has no name). The reply is sent at most once per event: the
+event is stored delivered first, so a Slack retry posts nothing. Set
 `AGENTOS_CONSOLE_URL` in the gateway's environment too, so the reply names
 the console. A tenant with no Notion token is served Slack-only; connecting
 Notion and publishing agents is the admin's next step in the console.
 
 Errors render a page that names what went wrong (a Slack error code, the
-allowlist refusal, a conflicting tenant) and never a token. The bot token is
+allowlist refusal, a conflicting tenant) and never a token. A tenant ID that
+already serves another workspace, and a workspace that already belongs to
+another tenant ID, are both refused with 409: an install never takes over
+another tenant's row. The bot token is
 stored only as ciphertext in `tenant_credentials` (migration `032`), under
 the tenant's payload key with the tenant ID as associated data; the audit row
 holds IDs only.

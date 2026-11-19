@@ -8,7 +8,7 @@ import pytest
 
 from agentos.history_view import char_len, window
 from agentos.stores import PostgresHistoryStore
-from tests.pg.conftest import MIGRATIONS, TestDatabase
+from tests.pg.conftest import MIGRATIONS, Databases, TestDatabase
 
 
 def text(role: str, body: str) -> tuple[str, list[dict]]:
@@ -66,8 +66,11 @@ async def test_append_records_the_size_the_window_counts(db: TestDatabase, pool,
     assert stored == char_len({"role": role, "content": content})
 
 
-def test_the_migration_fills_the_size_of_rows_written_before_it(db: TestDatabase, tenant: str):
+def test_the_migration_fills_the_size_of_rows_written_before_it(databases: Databases, tenant: str):
     """Fails if rows with no stored size keep size 0 after the migration, so a window ignores them."""
+    # Re-running 024 also re-adds audit_events_agent_required as it stood at 024, so this
+    # schema change needs a database of its own, not the shared one.
+    db = databases.create(init=True)
     role, content = text("user", "héllo " * 20)
     with db.owner() as conn:
         conn.execute(

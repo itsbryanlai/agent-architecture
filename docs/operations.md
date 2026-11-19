@@ -910,8 +910,9 @@ export AGENTOS_REQUIRE_GRANT_PICKER=1       # optional: refuse unpicked new gran
 
 Setting only one of the two OAuth variables, or `AGENTOS_REQUIRE_GRANT_PICKER` without
 both, stops the process at start. Without them, behaviour is as before: the admin still
-sees each grant's live title and parent, a warning when the creator's label differs, and a
-diff against the published version, and must tick a box to publish a version that widens
+sees each grant's live title and parent, a warning when the creator's label and the live
+title don't contain one another once normalised, and a diff against the published version,
+and must tick a box to publish a version that widens
 access. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
 
 Sign-in counts as configured only when all three variables are set and the URL is

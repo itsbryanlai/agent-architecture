@@ -352,9 +352,10 @@ workspace's tenant, taken from the signed event's `team_id`: in one unit of
 work it **disables the tenant**, **deletes its `slack_bot` credential** and
 records one `uninstall` audit event (the event type in `tool`, the team ID in
 `target`, never a token). The **Notion credential is kept**, with the rest of
-the tenant's data, under normal retention. A repeat or out-of-order event
-finds the tenant already disabled with no credential and changes nothing
-more; an event for an unknown workspace is ignored with a log line.
+the tenant's data, under normal retention. A retry of an event already
+handled changes nothing, even after a reinstall (its audit key is checked
+first), and an out-of-order event finds the tenant already disabled with no
+credential and changes nothing more; an event for an unknown workspace is ignored with a log line.
 `tokens_revoked` acts only when bot tokens were revoked — a user-token-only
 revocation changes nothing.
 

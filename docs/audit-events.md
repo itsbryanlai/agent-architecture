@@ -192,8 +192,10 @@ allowlist, a failed code exchange) writes nothing. The bot token is never in the
 
 Written by the gateway's Slack event handler (`app_uninstalled`, or `tokens_revoked`
 naming bot tokens), in the same transaction as the tenant disable and the deletion of
-its `slack_bot` credential. The Notion credential is kept. A repeat or out-of-order
-event records nothing: the tenant is already disabled with no credential. An event for
+its `slack_bot` credential. The Notion credential is kept. A retry of an event already
+handled records and changes nothing, even after a reinstall (its audit key is checked
+first); an out-of-order event records nothing: the tenant is already disabled with no
+credential. An event for
 an unknown workspace, or a `tokens_revoked` naming no bot token, records nothing. No
 user acts: the event comes from Slack, so the requester and identity are the system
 marker. The row never holds a token.

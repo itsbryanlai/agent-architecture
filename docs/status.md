@@ -32,6 +32,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Change and audit event in one transaction | built | `unit_of_work.py`, `control.py` | Switches command and one-time imports run outside `ControlPlane` on purpose |
 | Grants checked before every connector call | built | `connectors/notion.py` | |
 | Grant check at publish, access diff, widening acknowledgement | built | `grant_checker.py`, `access_diff.py`, `control.py` | |
+| Agent health: a broken grant disables one agent, never the worker | built | `agent_health.py`, `worker.py`, `activities.py` | Fixed reply and refused Submit while unavailable; creator and admins told once per transition; re-checked on the directory refresh (D-35) |
 | Notion picker (creator may grant only what they can see) | partial | `notion_picker.py`, `grant_picks.py` | Only when configured; without it the admin's approval is the only check |
 | Nightly re-check of creators' access, suspension, notification | target | none | |
 | Creators read only their own agents | built | `control.py` (`Principal`) | |

@@ -95,7 +95,7 @@ member's Slack user ID. Key as for the agent lifecycle.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | approver | outcome | Event key |
 |---|---|---|---|---|---|---|---|---|
-| `audience_refused` | A turn is refused because the asker is not in the agent's audience, or a hand-off to a specialist is refused for the same reason. | Slack user who asked / `agent:<agent id>` | The agent that was asked (for a refused hand-off, the specialist, at its published version) | reason code: `channel`, `dm`, `guest`, `external`, `deactivated`, `unavailable`, `off`, `paused` | the front door's ID for a refused hand-off, else - | - | `error` when the lookup failed (`unavailable`), else `ok` | `<tenant>:audit:audience-refused:<event id>:<agent id>:<front door or empty>` |
+| `audience_refused` | A turn is refused because the asker is not in the agent's audience, or a hand-off to a specialist is refused for the same reason. | Slack user who asked / `agent:<agent id>` | The agent that was asked (for a refused hand-off, the specialist, at its published version) | reason code: `channel`, `dm`, `guest`, `external`, `deactivated`, `unavailable`, `off`, `paused`, `health` | the front door's ID for a refused hand-off, else - | - | `error` when the lookup failed (`unavailable`), else `ok` | `<tenant>:audit:audience-refused:<event id>:<agent id>:<front door or empty>` |
 | `audience_confirm` | An admin publishes a version after confirming the counted audience (total, guests, other workspaces). Written only when the plane counts audiences. | submitter / `user:<admin>` | Published version | - | `total=N guests=N external=N` | the admin | `ok` | Control key |
 | `audience_pause` | The watch finds a channel an agent answers in has been shared with another organisation, and pauses the agent there. One row per agent paused. | `system:audience-watch` for both | The agent's published version | why: `channel_shared` | the channel ID | - | `ok` | `<tenant>:audit:audience-pause:<agent id>:<channel>:<paused at>` (once per pause) |
 | `audience_resume` | An editor or admin ends a pause after confirming the channel's people. | actor / `user:<actor>` | The published version; the agent with an empty version when it has no published version | the pause's reason | `<channel> total=N guests=N external=N` | the actor | `ok` | Control key |
@@ -117,6 +117,17 @@ changed: turning off what is off, or on what is on, records nothing.
 |---|---|---|---|---|---|---|---|
 | `switch_off` | A switch is turned off | admin's Slack ID / `user:<admin>`, or `operator:<login>` for both | The agent for an `agent` switch, else empty; never a version | scope: `agent`, `all_agents`, `connector`, `writes` | the agent ID or connector name; empty for `all_agents` and `writes` | `ok` | Control key |
 | `switch_on` | A switch is turned back on | as above | as above | scope | as above | `ok` | Control key |
+
+## Agent health
+
+Written by the worker's grant check, only on a transition: an agent becoming unavailable,
+or available again. A repeated check that finds the same status records nothing. The reason
+itself (the grant and the problem) lives in `agent_health`, never in the audit row; the row
+carries its hash. A switch an admin turns off or on is not a health transition (see Switches).
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `agent_health` | The worker's grant check flips an agent's health: unavailable (a grant problem) or available again (a passing check). | `system:agent-health` for both | The agent and the version checked | the new status: `unavailable` or `available` | - | `ok` | `<tenant>:audit:agent-health:<agent id>:<checked at>` (once per transition); `output_sha256` is the hash of the reason when unavailable |
 
 ## Retention
 

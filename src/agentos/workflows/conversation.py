@@ -51,8 +51,10 @@ Rules this workflow keeps:
   workflow goes on to wait for the next message.
 * While a tool step runs long, the placeholder shows that step's label, fixed
   runtime text built from the agent's grants and config, never the model's words
-  or a tool's input. Labels are throttled in workflow time, awaited inside the
-  step so none lands after the final reply, and a failed edit is dropped.
+  or a tool's input. Labels are throttled in workflow time and awaited inside the
+  step, and a failed edit is dropped. A dropped edit may still reach Slack after
+  the reply, so once one is dropped the turn's final text is posted as a new
+  message in the thread instead of editing the placeholder.
 * Workflow code is deterministic: no I/O, ``workflow.uuid4()`` for IDs.
 """
 
@@ -152,6 +154,7 @@ PATCH_CONTIGUOUS_MARKERS = "contiguous-citation-markers"
 PATCH_NOTICE_AUDIT = "notice-audit"
 PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
 PATCH_PROGRESS = "progress"
+PATCH_PROGRESS_DROPPED = "progress-dropped"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -174,14 +177,14 @@ def progress_label(
     kind: str,
     *,
     source_titles: list[str] | None = None,
-    page_title: str = "",
     agent_name: str = "",
 ) -> str | None:
     """The placeholder text while ``name`` runs, or None for a tool with no label.
 
-    ``source_titles`` are the agent's granted knowledge pages, ``page_title`` a page
-    the runtime already knows, ``agent_name`` the specialist a hand-off names. Each
-    is escaped for Slack mrkdwn here, once, at the point of use.
+    ``source_titles`` are the agent's granted knowledge pages, ``agent_name`` the specialist a
+    hand-off names. Each is escaped for Slack mrkdwn here, once, at the point of use. A Notion
+    read shows the fixed "Reading Notion…": the runtime never knows the page title before the
+    read returns, and the label must not wait on it.
     """
     if name == "search_knowledge":
         titles = source_titles or []
@@ -191,8 +194,6 @@ def progress_label(
     if name == HAND_OFF_TOOL:
         return HANDING_OVER.format(agent=escape_slack(agent_name))
     if kind == READ_KIND:
-        if page_title:
-            return f"Reading {escape_slack(page_title)}…"
         return READING_NOTION
     if kind in EDITABLE_FIELDS:
         return DRAFTING_REQUEST
@@ -218,6 +219,9 @@ class _TurnState:
         self.ingested = False
         # When the turn last showed a progress label; the throttle reads it.
         self.last_progress: datetime | None = None
+        # True once a progress edit on this placeholder was dropped: a late attempt may still
+        # land on it after the reply, so the final text is posted as a new message instead.
+        self.progress_dropped = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -446,18 +450,18 @@ class ConversationWorkflow:
                 self._log_failure(ref, err, "recovery")
         try:
             if workflow.patched(PATCH_NOTICE_AUDIT):
-                await workflow.execute_activity_method(
+                await self._finalize(
+                    state,
                     AgentActivities.finalize_notice,
-                    args=[ctx, placeholder_ts, TURN_FAILED, "failure"],
-                    start_to_close_timeout=ACTIVITY_TIMEOUT,
-                    retry_policy=RETRY,
+                    AgentActivities.post_final_notice,
+                    [ctx, placeholder_ts, TURN_FAILED, "failure"],
                 )
             else:
-                await workflow.execute_activity_method(
+                await self._finalize(
+                    state,
                     AgentActivities.finalize_reply,
-                    args=[ctx, placeholder_ts, TURN_FAILED, [], False],
-                    start_to_close_timeout=ACTIVITY_TIMEOUT,
-                    retry_policy=RETRY,
+                    AgentActivities.post_final_reply,
+                    [ctx, placeholder_ts, TURN_FAILED, [], False],
                 )
         except ActivityError as err:
             self._log_failure(ref, err, "recovery")
@@ -692,19 +696,31 @@ class ConversationWorkflow:
             step += 1
 
         if workflow.patched(PATCH_NOTICE_AUDIT):
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_notice,
-                args=[ctx, placeholder_ts, OUT_OF_STEPS, "step_limit"],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_notice,
+                [ctx, placeholder_ts, OUT_OF_STEPS, "step_limit"],
             )
         else:
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_reply,
-                args=[ctx, placeholder_ts, OUT_OF_STEPS, [], False],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_reply,
+                [ctx, placeholder_ts, OUT_OF_STEPS, [], False],
             )
+
+    async def _finalize(self, state: "_TurnState", activity, post_activity, args: list) -> None:
+        """Show the turn's final text. ``args[1]`` is the placeholder ts in every finalize
+        activity. When a progress edit was dropped, a late attempt may still land on the
+        placeholder, so the text is posted as a new message (``post_activity``, once under a key
+        derived from the placeholder) instead of edited onto it."""
+        if state.progress_dropped:
+            activity = post_activity
+            args = [*args, ids.slack_final_post_key(args[1])]
+        await workflow.execute_activity_method(
+            activity, args=args, start_to_close_timeout=ACTIVITY_TIMEOUT, retry_policy=RETRY
+        )
 
     async def _reply(
         self,
@@ -729,18 +745,18 @@ class ConversationWorkflow:
             await self._append(ctx, conv_id, step_key, "assistant", content)
             state.reply_stored = True
         if not model_answer and workflow.patched(PATCH_NOTICE_AUDIT):
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_notice,
-                args=[ctx, placeholder_ts, shown, "step_limit"],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_notice,
+                [ctx, placeholder_ts, shown, "step_limit"],
             )
         else:
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_reply,
-                args=[ctx, placeholder_ts, shown, citations, model_answer],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_reply,
+                [ctx, placeholder_ts, shown, citations, model_answer],
             )
         if not state.reply_stored:
             await self._append(ctx, conv_id, step_key, "assistant", content)
@@ -777,11 +793,11 @@ class ConversationWorkflow:
         The activity posts it and then keeps it in history, so a reply that was not shown is
         not stored; recovery stores the failure notice in its place.
         """
-        await workflow.execute_activity_method(
+        await self._finalize(
+            state,
             AgentActivities.finalize_model_reply,
-            args=[ctx, placeholder_ts, key, list(self.citations), cut_short],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
+            AgentActivities.post_final_model_reply,
+            [ctx, placeholder_ts, key, list(self.citations), cut_short],
         )
         state.reply_stored = True
 
@@ -965,18 +981,18 @@ class ConversationWorkflow:
         )
         announcement = HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name)
         if workflow.patched(PATCH_NOTICE_AUDIT):
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_notice,
-                args=[state.ctx, state.placeholder_ts, announcement, "hand_off"],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_notice,
+                [state.ctx, state.placeholder_ts, announcement, "hand_off"],
             )
         else:
-            await workflow.execute_activity_method(
+            await self._finalize(
+                state,
                 AgentActivities.finalize_reply,
-                args=[state.ctx, state.placeholder_ts, announcement, [], False],
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=RETRY,
+                AgentActivities.post_final_reply,
+                [state.ctx, state.placeholder_ts, announcement, [], False],
             )
         placeholder_ts: str = await workflow.execute_activity_method(
             AgentActivities.post_placeholder,
@@ -999,6 +1015,9 @@ class ConversationWorkflow:
         self.ref = new_ref
         state.ctx = ctx
         state.placeholder_ts = placeholder_ts
+        # The specialist's placeholder is new: no progress edit was dropped on it, so its
+        # final text may edit it even if the front door's placeholder was left unsafe.
+        state.progress_dropped = False
         state.handed_off = True
         return specialist, ctx, placeholder_ts
 
@@ -1122,33 +1141,45 @@ class ConversationWorkflow:
 
         The label shows only once the step has run ``PROGRESS_AFTER``, and at most one
         edit lands per ``PROGRESS_GAP`` across the turn's steps. The edit is awaited
-        here, before the step's result returns, so it can never land after the final
-        reply; a failure is dropped. A step that finishes in time shows nothing.
+        here, before the step's result returns, so a landed edit never comes after the
+        final reply; a failure is dropped. A dropped edit may still land late, which is
+        why the turn then posts its final text as a new message. A step that finishes in
+        time shows nothing.
         """
         if not workflow.patched(PATCH_PROGRESS) or label is None:
             return await coro
         task = asyncio.ensure_future(coro)
         started = workflow.now()
         try:
-            await workflow.wait_condition(lambda: task.done(), timeout=PROGRESS_AFTER)
-        except TimeoutError:
-            while not task.done():
-                eligible = started + PROGRESS_AFTER
-                if state.last_progress is not None:
-                    eligible = max(eligible, state.last_progress + PROGRESS_GAP)
-                now = workflow.now()
-                if now >= eligible:
-                    state.last_progress = now
-                    assert state.placeholder_ts is not None
-                    await self._progress_update(ctx, state.placeholder_ts, label)
-                    break
-                try:
-                    await workflow.wait_condition(lambda: task.done(), timeout=eligible - now)
-                except TimeoutError:
-                    pass
-        return await task
+            try:
+                await workflow.wait_condition(lambda: task.done(), timeout=PROGRESS_AFTER)
+            except TimeoutError:
+                while not task.done():
+                    eligible = started + PROGRESS_AFTER
+                    if state.last_progress is not None:
+                        eligible = max(eligible, state.last_progress + PROGRESS_GAP)
+                    now = workflow.now()
+                    if now >= eligible:
+                        # Claim the throttle slot before the edit, not after: parallel steps
+                        # see it taken and wait their turn, and a dropped edit still uses its
+                        # slot, so no other step edits the placeholder in its place.
+                        state.last_progress = now
+                        assert state.placeholder_ts is not None
+                        await self._progress_update(ctx, state, state.placeholder_ts, label)
+                        break
+                    try:
+                        await workflow.wait_condition(lambda: task.done(), timeout=eligible - now)
+                    except TimeoutError:
+                        pass
+            return await task
+        finally:
+            # A cancelled wrapper must not leave the wrapped step running on beside it.
+            if not task.done():
+                task.cancel()
 
-    async def _progress_update(self, ctx: TurnContext, placeholder_ts: str, label: str) -> None:
+    async def _progress_update(
+        self, ctx: TurnContext, state: "_TurnState", placeholder_ts: str, label: str
+    ) -> None:
         try:
             await workflow.execute_activity_method(
                 AgentActivities.update_progress,
@@ -1158,6 +1189,12 @@ class ConversationWorkflow:
             )
         except ActivityError as err:
             self._log_failure(self._ref(), err, "progress")
+            # The edit was dropped, but a late attempt may still reach Slack after the reply.
+            # The placeholder is no longer safe to edit, so the final text is posted as a new
+            # message. A history recorded before this change replays with the marker absent and
+            # keeps editing the placeholder, as it did then.
+            if workflow.patched(PATCH_PROGRESS_DROPPED):
+                state.progress_dropped = True
 
     async def _start_task(
         self, ctx: TurnContext, agent: AgentVersion, call: ToolCall, kind: str

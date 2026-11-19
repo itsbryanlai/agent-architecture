@@ -345,7 +345,9 @@ class AgentActivities:
             self.post_placeholder,
             self.update_progress,
             self.finalize_reply,
+            self.post_final_reply,
             self.finalize_notice,
+            self.post_final_notice,
             self.run_read_tool,
             self.post_approval_card,
             self.update_card,
@@ -370,6 +372,7 @@ class AgentActivities:
             self.discard_message,
             self.call_model,
             self.finalize_model_reply,
+            self.post_final_model_reply,
             self.run_stored_read_tool,
             self.draft_task,
             self.prepare_stored_comment,
@@ -1060,6 +1063,23 @@ class AgentActivities:
             has_text=_has_text(step),
         )
 
+    async def _show_final_text(
+        self,
+        ctx: TurnContext,
+        slack: SlackPoster,
+        placeholder_ts: str,
+        text: str,
+        post_key: str | None,
+    ) -> None:
+        """Show the turn's final text: edit the placeholder, or, when ``post_key`` is set, post
+        it as a new message in the thread. A dropped progress edit may still land on the
+        placeholder after the reply, so the reply must not be written there; the new message is
+        posted once under ``post_key`` (the same marker and lease as any other post)."""
+        if post_key is None:
+            await slack.update_message(ctx.channel, placeholder_ts, text)
+        else:
+            await self._post_once(ctx.tenant_id, post_key, ctx.channel, text, ctx.thread_ts)
+
     @activity.defn(name="finalize_model_reply")
     async def finalize_model_reply(
         self,
@@ -1077,6 +1097,35 @@ class AgentActivities:
         post never leaves history claiming the user saw an answer.
         """
         self._log("finalize_model_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_model_reply(ctx, placeholder_ts, step_key, citations, cut_short, None)
+
+    @activity.defn(name="post_final_model_reply")
+    async def post_final_model_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        step_key: str,
+        citations: list[Citation],
+        cut_short: bool,
+        post_key: str,
+    ) -> None:
+        """``finalize_model_reply`` for a turn whose dropped progress edit may still land on the
+        placeholder: the reply is posted as a new message in the thread, once under ``post_key``,
+        instead of editing the placeholder."""
+        self._log("post_final_model_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_model_reply(
+            ctx, placeholder_ts, step_key, citations, cut_short, post_key
+        )
+
+    async def _finalize_model_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        step_key: str,
+        citations: list[Citation],
+        cut_short: bool,
+        post_key: str | None,
+    ) -> None:
         conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
         step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
         if step is None or step.reply_text is None:
@@ -1088,7 +1137,7 @@ class AgentActivities:
         footer = await self._sources_footer(ctx, text, citations)
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, shown)
-        await slack.update_message(ctx.channel, placeholder_ts, rendered + footer)
+        await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
         await self._record(
             ctx,
             "answer",
@@ -1111,9 +1160,10 @@ class AgentActivities:
     async def update_progress(self, ctx: TurnContext, placeholder_ts: str, text: str) -> None:
         """Edit the placeholder to a progress label while the turn runs.
 
-        The workflow awaits this inside the step, before the step's result returns, so
-        the edit never lands after the final reply, and drops a failure. Setting the
-        same text twice is the same edit, so a retry needs no lease.
+        The workflow awaits this inside the step, before the step's result returns, and
+        drops a failure. Setting the same text twice is the same edit, so a retry needs no
+        lease. A dropped attempt may still reach Slack after the reply; the workflow marks
+        the placeholder unsafe and posts the final text as a new message instead.
         """
         self._log("update_progress", ctx.tenant_id, ctx.agent_id)
         slack = self._runtime(ctx.tenant_id).slack
@@ -1144,10 +1194,37 @@ class AgentActivities:
         notices posted through this path are not recorded as answers.
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, None)
+
+    @activity.defn(name="post_final_reply")
+    async def post_final_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        text: str,
+        citations: list[Citation] | None,
+        audit_answer: bool,
+        post_key: str,
+    ) -> None:
+        """``finalize_reply`` for a turn whose dropped progress edit may still land on the
+        placeholder: the reply is posted as a new message in the thread, once under ``post_key``,
+        instead of editing the placeholder."""
+        self._log("post_final_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, post_key)
+
+    async def _finalize_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        text: str,
+        citations: list[Citation] | None,
+        audit_answer: bool,
+        post_key: str | None,
+    ) -> None:
         footer = await self._sources_footer(ctx, text, citations or [])
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, text)
-        await slack.update_message(ctx.channel, placeholder_ts, rendered + footer)
+        await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
         if audit_answer:
             conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
             await self._record(
@@ -1169,9 +1246,24 @@ class AgentActivities:
         updates the same message and records once.
         """
         self._log("finalize_notice", ctx.tenant_id, ctx.agent_id, tool=tool)
+        await self._finalize_notice(ctx, placeholder_ts, text, tool, None)
+
+    @activity.defn(name="post_final_notice")
+    async def post_final_notice(
+        self, ctx: TurnContext, placeholder_ts: str, text: str, tool: str, post_key: str
+    ) -> None:
+        """``finalize_notice`` for a turn whose dropped progress edit may still land on the
+        placeholder: the notice is posted as a new message in the thread, once under
+        ``post_key``, instead of editing the placeholder."""
+        self._log("post_final_notice", ctx.tenant_id, ctx.agent_id, tool=tool)
+        await self._finalize_notice(ctx, placeholder_ts, text, tool, post_key)
+
+    async def _finalize_notice(
+        self, ctx: TurnContext, placeholder_ts: str, text: str, tool: str, post_key: str | None
+    ) -> None:
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, text)
-        await slack.update_message(ctx.channel, placeholder_ts, rendered)
+        await self._show_final_text(ctx, slack, placeholder_ts, rendered, post_key)
         conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
         await self._record(
             ctx,

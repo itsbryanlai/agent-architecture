@@ -5,13 +5,14 @@ from datetime import timedelta
 import pytest
 
 from agentos.models import LLMResponse, ToolCall
+from agentos.workflows import PROGRESS_TIMEOUT
 from agentos.workflows.conversation import (
     PROGRESS_AFTER,
     ConversationWorkflow,
     progress_label,
 )
 from tests.conftest import eventually
-from tests.helpers.conversation import inbound, placeholders, start_conversation
+from tests.helpers.conversation import THREAD, inbound, placeholders, start_conversation
 
 
 def search_call(call_id: str = "tu_s") -> ToolCall:
@@ -45,12 +46,6 @@ def answer(text: str) -> LLMResponse:
         ("search_knowledge", "read", {"source_titles": []}, "Searching the knowledge sources…"),
         ("search_items", "read", {}, "Reading Notion…"),
         ("my_items", "read", {}, "Reading Notion…"),
-        (
-            "search_items",
-            "read",
-            {"page_title": "Laptop <policy>"},
-            "Reading Laptop &lt;policy&gt;…",
-        ),
         ("create_item", "create_item", {}, "Drafting the request…"),
         ("add_comment", "add_comment", {}, "Drafting the request…"),
         ("hand_off", "", {"agent_name": "IT helper"}, "Handing over to IT helper…"),
@@ -122,7 +117,7 @@ async def test_fast_turn_shows_no_progress(harness):
 
 
 async def test_final_reply_wins_over_a_late_progress_edit(harness):
-    """Fails if a progress edit still in flight when the turn finishes overwrites the answer."""
+    """Fails if the reply posts before an in-flight progress edit completes, so the edit could land after it."""
     h = harness
     h.llm.queue(tool_step(search_call()), answer("The answer."), answer("Sentinel."))
     read = h.notion.hang_next_read()
@@ -133,8 +128,14 @@ async def test_final_reply_wins_over_a_late_progress_edit(harness):
     await h.wf_env.sleep(PROGRESS_AFTER)
     await edit.reached.wait()  # the progress edit is in flight
     read.release()  # the step finishes while the edit is still open
-    edit.release()
 
+    # The awaited edit blocks the answer. Advance well past the point where a
+    # fire-and-forget edit would have let it post (the steps after the edit are instant);
+    # the edit is still held, so the answer must not be there yet.
+    await h.wf_env.sleep(PROGRESS_AFTER)
+    assert not [u for u in h.slack.updates() if u["text"] == "The answer."]
+
+    edit.release()  # the edit lands, then the answer
     await eventually(lambda: [u for u in h.slack.updates() if u["text"] == "The answer."])
     # Settle point: a later message and its reply; then the placeholder's last word.
     await handle.signal(ConversationWorkflow.message, inbound("EvP3b", "again"))
@@ -148,18 +149,57 @@ async def test_final_reply_wins_over_a_late_progress_edit(harness):
 
 
 async def test_failed_progress_edit_is_dropped(harness):
-    """Fails if a progress edit Slack refuses fails the turn instead of being dropped."""
+    """Fails if a refused progress edit fails the turn, or its answer is still written onto the placeholder."""
     h = harness
-    h.llm.queue(tool_step(search_call()), answer("Still answered."))
+    h.llm.queue(tool_step(search_call()), answer("Still answered."), answer("Sentinel."))
     read = h.notion.hang_next_read()
     h.slack.fail_next_update(ValueError("slack down"), times=2)
 
-    await start_conversation(h, inbound("EvP4", "look for laptops"))
+    handle = await start_conversation(h, inbound("EvP4", "look for laptops"))
     await read.reached.wait()
     # Both attempts of the one edit fail, the second past the retry gap.
     await h.wf_env.sleep(PROGRESS_AFTER + timedelta(seconds=2))
     read.release()
 
-    await eventually(lambda: [u for u in h.slack.updates() if u["text"] == "Still answered."])
+    # The turn still answers, as a new message; the refused edit never landed.
+    await eventually(lambda: [p for p in h.slack.posts() if p["text"] == "Still answered."])
+    # Settle point: a later message and its reply, then assert no edit landed.
+    await handle.signal(ConversationWorkflow.message, inbound("EvP4b", "again"))
+    await eventually(lambda: [u for u in h.slack.updates() if u["text"] == "Sentinel."])
+
     ph = placeholders(h)[0]["ts"]
-    assert [u["text"] for u in h.slack.updates() if u["ts"] == ph] == ["Still answered."]
+    assert [u for u in h.slack.updates() if u["ts"] == ph] == []
+
+
+async def test_a_dropped_progress_edit_makes_the_answer_a_new_message(harness):
+    """Fails if a progress edit that times out on both attempts still lets the finalize edit the placeholder."""
+    h = harness
+    h.llm.queue(tool_step(search_call()), answer("The answer."), answer("Sentinel."))
+    read = h.notion.hang_next_read()
+    first_edit = h.slack.hang_next_update()
+
+    handle = await start_conversation(h, inbound("EvP5", "look for laptops"))
+    await read.reached.wait()
+    await h.wf_env.sleep(PROGRESS_AFTER)
+    await first_edit.reached.wait()  # the first attempt is held open
+
+    # The first attempt times out; arm the retry before it starts, then let it time out too,
+    # so the one edit is dropped after both attempts.
+    await h.wf_env.sleep(PROGRESS_TIMEOUT + timedelta(seconds=0.5))
+    retry_edit = h.slack.hang_next_update()
+    await h.wf_env.sleep(PROGRESS_TIMEOUT + timedelta(seconds=1))
+    read.release()
+
+    # The answer arrives as a new message in the thread, not an edit of the placeholder.
+    await eventually(lambda: [p for p in h.slack.posts() if p["text"] == "The answer."])
+    # Settle point: a later message and its reply; then the placeholder's edits.
+    await handle.signal(ConversationWorkflow.message, inbound("EvP5b", "again"))
+    await eventually(lambda: [u for u in h.slack.updates() if u["text"] == "Sentinel."])
+
+    ph = placeholders(h)[0]["ts"]
+    assert [u for u in h.slack.updates() if u["ts"] == ph] == []
+    answer_posts = [p for p in h.slack.posts() if p["text"] == "The answer."]
+    assert len(answer_posts) == 1
+    assert answer_posts[0]["thread_ts"] == THREAD
+    first_edit.release()
+    retry_edit.release()

@@ -864,6 +864,28 @@ async def progress(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def progress_dropped(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(204 if stored else 203)
+    r.llm.queue(
+        tool_turn(ToolCall("tu_i", "search_items", {"query": "laptop"})),
+        answer("The laptop policy."),
+    )
+    # The step runs long enough for a progress edit, and both attempts of that edit are
+    # refused, so it is dropped: the answer is posted as a new message, not an edit.
+    read_hang = r.notion.hang_next_read("query_database")
+    r.slack.fail_next_update(ValueError("slack down"), times=2)
+    await start_conversation(r, "it-helper", thread, "any laptop requests?", stored=stored)
+    await read_hang.reached.wait()
+    await r.env.sleep(PROGRESS_AFTER + timedelta(seconds=2))
+    read_hang.release()
+    await r.env.sleep(timedelta(seconds=1))
+    await eventually(
+        lambda: [p for p in r.slack.posts() if p["text"] == "The laptop policy."], timeout=30
+    )
+    assert not r.slack.updates()
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 def _both(fn):
     return {
         False: lambda r: fn(r, False),
@@ -881,6 +903,7 @@ for _name, _fn in {
     "knowledge_answer": knowledge_answer,
     "knowledge_two_searches": knowledge_two_searches,
     "progress": progress,
+    "progress_dropped": progress_dropped,
     "audience_refusal": audience_refusal,
     "hand_off_refused": hand_off_refused,
     "failed_turn": failed_turn,

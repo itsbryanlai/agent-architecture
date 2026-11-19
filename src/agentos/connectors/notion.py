@@ -706,7 +706,8 @@ class FakeNotionAPI:
 
 
 class Hang:
-    """A write held open until a test lets it go. ``reached`` is set once it is waiting."""
+    """A call held open until a test lets it go — a Notion write or read, or a Slack edit.
+    ``reached`` is set once it is waiting."""
 
     def __init__(self) -> None:
         self.reached = asyncio.Event()

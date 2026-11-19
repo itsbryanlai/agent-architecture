@@ -231,6 +231,7 @@ async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(
 # --- uninstall --------------------------------------------------------------------
 
 UNINSTALL_TOKEN = "xoxb-made-up-uninstall"
+REINSTALL_TOKEN = "xoxb-made-up-reinstall"
 NOTION_TOKEN = "ntn-made-up-kept"
 
 
@@ -257,7 +258,7 @@ async def uninstall_gateway(agents, temporal, secret):
         audit=audit,
         uow=InMemoryUnitOfWork(store, credential_store, audit),
     )
-    return TestClient(app), store, credential_store, audit
+    return TestClient(app), store, credential_store, audit, credentials
 
 
 @pytest.mark.parametrize(
@@ -266,16 +267,25 @@ async def uninstall_gateway(agents, temporal, secret):
         "app_uninstalled",
         "tokens_revoked bot",
         "repeat and out of order",
+        "late retry after reinstall",
         "unknown team",
         "oauth only",
     ],
-    ids=["app-uninstalled", "tokens-revoked", "repeat", "unknown-team", "oauth-only"],
+    ids=[
+        "app-uninstalled",
+        "tokens-revoked",
+        "repeat",
+        "late-retry-after-reinstall",
+        "unknown-team",
+        "oauth-only",
+    ],
 )
 async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
     """Fails if an uninstall event leaves the tenant enabled, its Slack token stored or its
-    Notion token deleted, a repeat or out-of-order event audits again, or an unknown team or
-    a user-token-only revocation is acted on."""
-    client, store, credential_store, audit = uninstall_gateway
+    Notion token deleted, a repeat or out-of-order event audits again, a late retry of a
+    processed event disables a reinstalled tenant or deletes its fresh token, or an unknown
+    team or a user-token-only revocation is acted on."""
+    client, store, credential_store, audit, credentials = uninstall_gateway
     uninstall = {"type": "app_uninstalled"}
     revoked_bot = {"type": "tokens_revoked", "tokens": {"oauth": [], "bot": [UNINSTALL_TOKEN]}}
     revoked_oauth = {
@@ -286,11 +296,24 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         "app_uninstalled": [(TEAM, "EvU1", uninstall)],
         "tokens_revoked bot": [(TEAM, "EvU1", revoked_bot)],
         "repeat and out of order": [(TEAM, "EvU1", uninstall), (TEAM, "EvU2", revoked_bot)],
+        "late retry after reinstall": [(TEAM, "EvU1", uninstall)],
         "unknown team": [("T_OTHER", "EvU1", uninstall)],
         "oauth only": [(TEAM, "EvU1", revoked_oauth)],
     }[case]
     for team, event_id, event in payloads:
         payload = {"type": "event_callback", "team_id": team, "event_id": event_id, "event": event}
+        assert post_event(client, secret, payload).status_code == 200
+    if case == "late retry after reinstall":
+        # A reinstall re-enables the tenant and stores a fresh token; then Slack delivers
+        # the same uninstall event again, late.
+        await store.set_enabled(TENANT, True)
+        await credentials.store_with_current_key(TENANT, SLACK_BOT, REINSTALL_TOKEN)
+        payload = {
+            "type": "event_callback",
+            "team_id": TEAM,
+            "event_id": "EvU1",
+            "event": uninstall,
+        }
         assert post_event(client, secret, payload).status_code == 200
     # The settle: a relay pass finds nothing to deliver, and no workflow was started.
     assert await deliver_inbound(client.app) == 0
@@ -301,6 +324,13 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         assert ref.enabled is True
         assert await credential_store.get(TENANT, SLACK_BOT) is not None
         assert audit.events == []
+        return
+    if case == "late retry after reinstall":
+        assert ref.enabled is True
+        row = await store.load(TENANT)
+        assert await credentials.slack_bot_token(row.config) == REINSTALL_TOKEN
+        assert await credential_store.get(TENANT, NOTION) is not None
+        assert [(e.kind, e.tool) for e in audit.events] == [("uninstall", "app_uninstalled")]
         return
     assert ref.enabled is False
     assert await credential_store.get(TENANT, SLACK_BOT) is None

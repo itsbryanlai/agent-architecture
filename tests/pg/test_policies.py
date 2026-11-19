@@ -402,6 +402,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "webhook_token",
                 "payload_key",
                 "install",
+                "uninstall",
                 "connector",
                 "tenant_settings",
             )

@@ -210,6 +210,8 @@ async def build_tenant_clients(
 ) -> tuple[TenantRegistry, RegistrySync]:
     """The worker's tenant clients at start-up, and the sync that keeps them current.
 
+    The registry carries the directory's stored-but-disabled marks from the start, so a
+    restart ends a disabled tenant's pending work cleanly before the first sync pass.
     Both resolve each tenant's tokens through ``TenantCredentials``: the encrypted
     credential row first, else the environment variable the tenant's settings name.
     A tenant connected only in the console is served with no variable exported, and
@@ -225,6 +227,9 @@ async def build_tenant_clients(
         slack_token=credentials.slack_bot_token,
         notion_token=credentials.notion_token,
     )
+    # The first sync pass is an interval away; until it lands, a stored-but-disabled
+    # tenant would look not-yet-loaded and its pending work would retry, not end cleanly.
+    registry.set_disabled(set(await directory.disabled_tenants()))
     sync = RegistrySync(
         directory,
         registry,

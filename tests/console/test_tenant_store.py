@@ -442,6 +442,34 @@ async def test_the_disabled_mark_follows_the_directory(monkeypatch):
     assert registry.get(GLOBEX).config.slack_team_id == GLOBEX_TEAM
 
 
+async def test_the_start_up_registry_marks_stored_but_disabled_tenants(monkeypatch):
+    """Fails if a restarted worker reports a stored-but-disabled tenant as not-yet-loaded
+    until its first sync, so the tenant's pending work retries instead of ending cleanly."""
+    store, clock = InMemoryTenantStore(acme(), globex()), Clock()
+    set_secrets(monkeypatch, "ACME", "GLOBEX")
+    await store.set_enabled(GLOBEX, False)
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credentials = TenantCredentials(InMemoryCredentialStore(), keys)
+    _built, slack, notion = fake_factories()
+
+    registry, _sync = await build_tenant_clients(
+        await startup_tenants(directory),
+        directory,
+        Settings(),
+        credentials,
+        keys,
+        logging.getLogger("test"),
+        slack_factory=slack,
+        notion_factory=notion,
+    )
+
+    with pytest.raises(TenantDisabled):
+        registry.get(GLOBEX)
+
+
 async def test_a_sync_that_drops_a_tenant_forgets_its_cached_token():
     """Fails if a tenant the sync drops keeps its decrypted token in the resolver cache."""
     store, clock = InMemoryTenantStore(globex()), Clock()

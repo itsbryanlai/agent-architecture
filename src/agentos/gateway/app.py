@@ -475,16 +475,18 @@ async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
 
 
 async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: dict) -> None:
-    """Disable the workspace's tenant and delete its Slack credential, once.
+    """Disable the workspace's tenant and delete its Slack credential, once per event.
 
     In one unit of work: the tenant row disabled, its ``slack_bot`` credential deleted
     and one ``uninstall`` audit event (the event type in ``tool``, the team ID in
     ``target``, never a token). The Notion credential is kept: a reinstall resumes the
-    tenant with its data. A repeat or out-of-order event finds the tenant already
-    disabled with no credential and changes nothing more; the re-check sits inside the
-    unit's tenant lock, so two events arriving together still record one uninstall.
-    ``tokens_revoked`` acts only when bot tokens were revoked; an unknown team is
-    ignored with a log line.
+    tenant with its data. The event's audit key is authoritative: a retry of an event
+    already processed changes nothing even after a reinstall re-enabled the tenant and
+    stored a fresh token, while a new uninstall event (a new ``event_id``) still acts.
+    An out-of-order event with a different ID finds the tenant already disabled with no
+    credential and changes nothing more. Both checks sit inside the unit's tenant lock,
+    so two events arriving together still record one uninstall. ``tokens_revoked`` acts
+    only when bot tokens were revoked; an unknown team is ignored with a log line.
     """
     kind = event.get("type")
     if kind == "tokens_revoked" and not (event.get("tokens") or {}).get("bot"):
@@ -498,7 +500,18 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
         log.warning("ignored uninstall event from an unknown Slack workspace team_id=%s", team_id)
         return
     tenant = ref.tenant_id
+    event_key = ids.audit_control_key(
+        tenant, "uninstall", payload.get("event_id") or uuid.uuid4().hex
+    )
     async with d.uow.begin(tenant) as conn:
+        if await d.audit.get(tenant, event_key, conn=conn) is not None:
+            log.info(
+                "tenant_id=%s team_id=%s uninstall event already processed; %s changes nothing",
+                tenant,
+                team_id,
+                kind,
+            )
+            return
         row = await d.tenant_store.load(tenant)
         if row is None:
             return
@@ -515,9 +528,7 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
         await d.audit.record(
             AuditEvent(
                 tenant_id=tenant,
-                event_key=ids.audit_control_key(
-                    tenant, "uninstall", payload.get("event_id") or uuid.uuid4().hex
-                ),
+                event_key=event_key,
                 kind="uninstall",
                 agent_id=None,
                 agent_version=None,

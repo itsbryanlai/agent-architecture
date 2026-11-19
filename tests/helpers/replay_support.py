@@ -1105,6 +1105,79 @@ async def task_tenant_disabled(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id)]
 
 
+async def conversation_tenant_disabled(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(262 if stored else 261)
+    r.llm.queue(
+        tool_turn(ToolCall("tu_i", "search_items", {"query": "laptop"})),
+        answer("Back online."),
+    )
+    # The turn is inside its tool step, placeholder posted, when the app is uninstalled:
+    # the runtime stops serving the tenant, as the worker's sync does after the gateway's
+    # uninstall event. The tool itself finishes (it holds the runtime it started with);
+    # the next model step is the one refused.
+    items_hang = r.notion.hang_next_read("query_database")
+    handle = await start_conversation(r, "it-helper", thread, "any laptop requests?", stored=stored)
+    await items_hang.reached.wait()
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    # No virtual time passes on its own in this window, so no progress edit lands.
+    with r.env.auto_time_skipping_disabled():
+        runtime = r.acts.registry.get(TENANT)
+        r.acts.registry.remove(TENANT)
+        r.acts.registry.set_disabled({TENANT})
+        items_hang.release()
+
+        async def recovered() -> bool:
+            messages = await r.acts.history.load(TENANT, conv)
+            return any(
+                m["role"] == "assistant" and any(b.get("text") == TURN_FAILED for b in m["content"])
+                for m in messages
+            )
+
+        await eventually(recovered, timeout=30)
+    # A reinstall restores the runtime, and the same workflow answers the next message.
+    # That reply is the settle: nothing was posted for the turn the uninstall stopped.
+    r.acts.registry.set(TENANT, runtime)
+    event_id = f"Ev-{thread}-2"
+    text = "hello again"
+    if stored:
+        await r.acts.content.put_inbound(
+            TENANT,
+            event_id,
+            {
+                "kind": "message",
+                "agent_id": "it-helper",
+                "user_id": ALICE,
+                "text": text,
+                "channel": "C_GENERAL",
+                "thread_ts": thread,
+                "channel_kind": "channel",
+            },
+        )
+    await handle.signal(
+        ConversationWorkflow.message,
+        InboundMessage(
+            event_id,
+            ALICE,
+            "" if stored else text,
+            "C_GENERAL",
+            thread,
+            "channel",
+            text_stored=stored,
+        ),
+    )
+    await replies(r, 1)
+    assert [u["text"] for u in r.slack.updates()] == ["Back online."]
+    assert len(r.slack.posts()) == 2  # the two placeholders; no failure notice
+    history = await r.client.get_workflow_handle(conv).fetch_history()
+    assert not any(
+        e.HasField("activity_task_scheduled_event_attributes")
+        and e.activity_task_scheduled_event_attributes.activity_type.name
+        in ("finalize_notice", "post_final_notice", "post_in_thread", "post_notice_in_thread")
+        for e in history.events
+    ), "the stopped turn posted a failure notice or finalized its placeholder"
+    return [await current(r, "", conv)]
+
+
 async def progress(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(202 if stored else 201)
     scope = ids.knowledge_scope(ROOT_A)
@@ -1205,6 +1278,7 @@ for _name, _fn in {
     "task_card_update_failure": task_card_update_failure,
     "task_unavailable_write": task_unavailable_write,
     "task_tenant_disabled": task_tenant_disabled,
+    "conversation_tenant_disabled": conversation_tenant_disabled,
     "task_recorded": task_recorded,
     "my_tasks": my_tasks,
     "my_tasks_once": my_tasks_once,

@@ -1152,6 +1152,8 @@ class AgentActivities:
         Returns the ts of the message that shows the text. ``buttons_for``, when set, builds
         the answer's feedback buttons from that ts: the placeholder edit carries them at once;
         a new message's ts is Slack's, so it is posted first and edited once more to carry them.
+        That second edit is best effort: the answer is already posted, so a failed edit leaves
+        it without buttons instead of failing the activity, and it is still recorded.
         """
         if post_key is None:
             blocks = buttons_for(placeholder_ts) if buttons_for is not None else None
@@ -1159,7 +1161,14 @@ class AgentActivities:
             return placeholder_ts
         ts = await self._post_once(ctx.tenant_id, post_key, ctx.channel, text, ctx.thread_ts)
         if buttons_for is not None:
-            await slack.update_message(ctx.channel, ts, text, blocks=buttons_for(ts))
+            try:
+                await slack.update_message(ctx.channel, ts, text, blocks=buttons_for(ts))
+            except Exception as err:  # noqa: BLE001 - the answer stands without its buttons
+                log.warning(
+                    "tenant_id=%s answer buttons not added error_type=%s",
+                    ctx.tenant_id,
+                    type(err).__name__,
+                )
         return ts
 
     def _answer_buttons(

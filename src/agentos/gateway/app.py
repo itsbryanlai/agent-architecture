@@ -91,6 +91,7 @@ from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
 from agentos.tenant_store import TenantSource, as_source
+from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 
 log = logging.getLogger("agentos.gateway")
 
@@ -152,6 +153,9 @@ class GatewayDeps:
     # None in tests that never click a feedback button.
     feedback: FeedbackStore | None = None
     audit: AuditStore | None = None
+    # The transaction a vote and its audit event commit in together. None in tests that
+    # never click a feedback button; create_app defaults it for the in-memory stores.
+    uow: UnitOfWork | None = None
     # When a vote is recorded; tests inject a fixed clock.
     clock: Callable[[], datetime] = _utcnow
 
@@ -171,11 +175,16 @@ def create_app(
     app_name: str = "This app",
     feedback: FeedbackStore | None = None,
     audit: AuditStore | None = None,
+    uow: UnitOfWork | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
+        # A vote and its audit event commit together; the in-memory stores roll back as one
+        # unit. Stores in Postgres need a PostgresUnitOfWork, passed by the real lifespan.
+        if uow is None and feedback is not None:
+            uow = InMemoryUnitOfWork(*[s for s in (feedback, audit) if s is not None])
         app.state.deps = GatewayDeps(
             settings,
             as_source(tenants),
@@ -190,6 +199,7 @@ def create_app(
             app_name=app_name,
             feedback=feedback,
             audit=audit,
+            uow=uow,
             clock=clock,
         )
 
@@ -836,10 +846,11 @@ async def _feedback_clicked(
 ) -> None:
     """Record the signed clicker's vote on the answer the button names, and acknowledge it.
 
-    A second click replaces the voter's earlier vote; the audit event of an identical repeat
-    stores nothing. A 👎 also opens the reason form. The vote stands even when the form or the
-    ephemeral thanks cannot be shown; a failed store write propagates and the click is told to
-    try again.
+    A second click replaces the voter's earlier vote. Every click is audited as its own event
+    (the key carries the vote's time), and the vote and its event commit in one transaction, so
+    a failed audit insert leaves no vote behind. A 👎 also opens the reason form. The vote stands
+    even when the form or the ephemeral thanks cannot be shown; a failed store write propagates
+    and the click is told to try again.
     """
     ref = _feedback_ref(tenant, action)
     if ref is None or not clicker:
@@ -847,34 +858,40 @@ async def _feedback_clicked(
     conversation_id, answer_ts, agent_id, agent_version = ref
     if d.feedback is None:
         raise RuntimeError("the gateway has no feedback store to keep a vote in")
-    await d.feedback.record_vote(
-        AnswerFeedback(
-            tenant,
-            conversation_id,
-            answer_ts,
-            clicker,
-            agent_id,
-            agent_version,
-            vote,
-            None,
-            d.clock(),
+    if d.uow is None:
+        raise RuntimeError("the gateway has no unit of work to commit a vote with its audit event")
+    at = d.clock()
+    async with d.uow.begin(tenant) as conn:
+        await d.feedback.record_vote(
+            AnswerFeedback(
+                tenant,
+                conversation_id,
+                answer_ts,
+                clicker,
+                agent_id,
+                agent_version,
+                vote,
+                None,
+                at,
+            ),
+            conn=conn,
         )
-    )
-    if d.audit is not None:
-        await d.audit.record(
-            AuditEvent(
-                tenant_id=tenant,
-                event_key=ids.audit_feedback_key(conversation_id, answer_ts, clicker, vote),
-                kind="feedback",
-                agent_id=agent_id,
-                agent_version=agent_version,
-                requester_user_id=clicker,
-                identity=f"user:{clicker}",
-                conversation_id=conversation_id,
-                tool="feedback",
-                target=vote,
+        if d.audit is not None:
+            await d.audit.record(
+                AuditEvent(
+                    tenant_id=tenant,
+                    event_key=ids.audit_feedback_key(conversation_id, answer_ts, clicker, vote, at),
+                    kind="feedback",
+                    agent_id=agent_id,
+                    agent_version=agent_version,
+                    requester_user_id=clicker,
+                    identity=f"user:{clicker}",
+                    conversation_id=conversation_id,
+                    tool="feedback",
+                    target=vote,
+                ),
+                conn=conn,
             )
-        )
     if vote == "down":
         if d.slack_for is None:
             log.warning("tenant_id=%s feedback form not opened: no Slack client", tenant)
@@ -1064,6 +1081,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
+    from agentos.unit_of_work import PostgresUnitOfWork
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -1126,6 +1144,7 @@ async def _real_lifespan(app: FastAPI):
             app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
             feedback=PostgresFeedbackStore(pool),
             audit=PostgresAuditStore(pool),
+            uow=PostgresUnitOfWork(pool),
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

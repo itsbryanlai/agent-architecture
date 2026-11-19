@@ -5,6 +5,7 @@ never collide and every ID says whose data it belongs to.
 """
 
 import hashlib
+from datetime import datetime
 
 from agentos.connectors.notion import normalize_id
 
@@ -74,10 +75,13 @@ def audit_notice_key(conversation_id: str, tool: str, marker: str) -> str:
     return f"{conversation_id}:audit:notice:{tool}:{marker}"
 
 
-def audit_feedback_key(conversation_id: str, answer_ts: str, voter: str, vote: str) -> str:
-    """One person's vote on one answer: a repeated identical click records once, a changed
-    vote records again. The reason text is never part of the event."""
-    return f"{conversation_id}:audit:feedback:{answer_ts}:{voter}:{vote}"
+def audit_feedback_key(
+    conversation_id: str, answer_ts: str, voter: str, vote: str, at: datetime
+) -> str:
+    """One click on one answer. Every click is audited, so the key carries the vote's time:
+    up → down → up records three events and an identical double click records twice (Slack
+    does not retry clicks). The reason text is never part of the event."""
+    return f"{conversation_id}:audit:feedback:{answer_ts}:{voter}:{vote}:{at.isoformat()}"
 
 
 def audit_hand_off_key(tenant: str, event_id: str) -> str:

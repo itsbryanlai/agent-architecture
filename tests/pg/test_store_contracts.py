@@ -5,11 +5,17 @@ constraints, grants, policies) stay in the other modules of this folder."""
 from __future__ import annotations
 
 import dataclasses
+import json
+import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from urllib.parse import urlencode
 
+import httpx
 import pytest
+from slack_sdk.signature import SignatureVerifier
 
+from agentos import ids
 from agentos.agent_health import (
     AVAILABLE,
     UNAVAILABLE,
@@ -20,7 +26,14 @@ from agentos.agent_health import (
 from agentos.audience_pauses import InMemoryPauseStore, PostgresPauseStore
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore
 from agentos.budgets import BudgetNotFound, InMemoryBudgetStore, PostgresBudgetStore
-from agentos.feedback import AnswerFeedback, InMemoryFeedbackStore, PostgresFeedbackStore
+from agentos.config import Settings, TenantsConfig, parse_agents_config
+from agentos.feedback import (
+    AnswerFeedback,
+    InMemoryFeedbackStore,
+    PostgresFeedbackStore,
+    feedback_blocks,
+)
+from agentos.gateway.app import create_app
 from agentos.grant_picks import InMemoryGrantPickStore, PickedObject, PostgresGrantPickStore
 from agentos.members import (
     InMemoryMemberStore,
@@ -31,9 +44,14 @@ from agentos.members import (
 from agentos.models import AuditEvent
 from agentos.notion_webhook import InMemoryWebhookTokenStore, PostgresWebhookTokenStore
 from agentos.sessions import InMemorySessionStore, PostgresSessionStore
+from agentos.slack_client import FakeSlack
+from agentos.stores import InMemoryTaskLinkStore
 from agentos.switches import InMemorySwitchStore, PostgresSwitchStore
 from agentos.tasks import InMemoryTaskStore, PostgresTaskStore, TaskRecord
+from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import InMemoryUsageStore, PostgresUsageStore, UsageEvent
+from tests.conftest import TEAM, agents_dict
+from tests.helpers.gateway import FakeTemporalClient, signed_headers
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 
@@ -552,3 +570,61 @@ async def test_a_vote_is_one_per_person_and_answer_and_a_second_click_replaces_i
     assert (await feedback.get(tenant, conv, "1.2", "U1")).reason is None
     assert await feedback.get(other_tenant, conv, "1.2", "U1") is None
     assert await feedback.set_reason(other_tenant, conv, "1.2", "U1", "x") is False
+
+
+class RecordThenFail(PostgresAuditStore):
+    """Writes the event on the unit's connection, then fails as a lost connection would."""
+
+    async def record(self, event, conn=None):
+        await super().record(event, conn=conn)
+        raise RuntimeError("audit failed after the insert")
+
+
+async def test_a_failed_audit_insert_leaves_no_vote(pool, tenant: str):
+    """Fails if a vote commits although its audit insert failed, so the vote is left without
+    an audit event."""
+    sec = secrets.token_hex(16)
+    raw = agents_dict()
+    raw["tenant_id"] = tenant
+    slack = FakeSlack()
+
+    async def slack_for(t):
+        return slack
+
+    feedback = PostgresFeedbackStore(pool)
+    app = create_app(
+        Settings(),
+        TenantsConfig.of(parse_agents_config(raw)),
+        FakeTemporalClient(),
+        InMemoryTaskLinkStore(),
+        SignatureVerifier(sec),
+        slack_for=slack_for,
+        feedback=feedback,
+        audit=RecordThenFail(pool),
+        uow=PostgresUnitOfWork(pool),
+        clock=lambda: NOW,
+    )
+    conv = ids.conversation_id(tenant, "C1", "1.1")
+    blocks = feedback_blocks(conv, "1.2", "it-helper", 1)
+    button = next(e for e in blocks[0]["elements"] if e["action_id"] == "answer_feedback_up")
+    payload = {
+        "type": "block_actions",
+        "team": {"id": TEAM},
+        "user": {"id": "U1"},
+        "trigger_id": "trig-1",
+        "channel": {"id": "C1"},
+        "message": {"ts": "1.2", "thread_ts": "1.1"},
+        "actions": [{"action_id": "answer_feedback_up", "value": button["value"]}],
+    }
+    body = urlencode({"payload": json.dumps(payload)}).encode()
+    headers = signed_headers(sec, body, "application/x-www-form-urlencoded")
+
+    # The ASGI transport runs the gateway in this test's loop, on the pool's own connections.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post("/slack/interactivity", content=body, headers=headers)
+
+    assert resp.status_code == 200  # the clicker is told to try again; nothing is half done
+    assert await feedback.get(tenant, conv, "1.2", "U1") is None
+    assert await PostgresAuditStore(pool).list(tenant) == []

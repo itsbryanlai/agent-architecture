@@ -436,7 +436,7 @@ class AuditEvent:
     conversation_id: str | None = None
     task_id: str | None = None
     tool: str | None = None
-    target: str | None = None  # a Notion page or database ID, or a specialist ID
+    target: str | None = None  # a Notion page or database ID, a specialist ID, or a feedback vote
     input_sha256: str | None = None
     output_sha256: str | None = None
     approver_user_id: str | None = None

@@ -357,7 +357,26 @@ class ChannelOutsideAudience(AudienceError):
 
 
 class AudienceNotConfirmed(AudienceError):
-    """The approver did not confirm the people who can reach the agent, or the people changed."""
+    """The approver did not confirm the people who can reach the agent, or the people changed.
+
+    The message is the API's machine-readable refusal. ``counts`` is the fresh count the
+    confirmation must match, ``place`` is ``agent`` for a publish or ``channel`` for a
+    resume, and ``changed`` says a confirmation was given but no longer matches; the
+    console renders its own sentence from these, never by rewriting the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        counts: dict[str, int] | None = None,
+        place: str = "agent",
+        changed: bool = False,
+    ):
+        super().__init__(message)
+        self.counts = counts
+        self.place = place
+        self.changed = changed
 
 
 class AudienceCheckUnavailable(AudienceError):

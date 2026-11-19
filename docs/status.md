@@ -31,19 +31,19 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Agent versions, roles, publish, hash-bound approval | built | `agent_store.py`, `control.py` | |
 | Change and audit event in one transaction | built | `unit_of_work.py`, `control.py` | Switches command and one-time imports run outside `ControlPlane` on purpose |
 | Grants checked before every connector call | built | `connectors/notion.py` | |
-| Grant check at publish, access diff, widening acknowledgement | built | `grant_checker.py`, `access_diff.py`, `control.py` | |
-| Agent health: a broken grant disables one agent, never the worker | built | `agent_health.py`, `worker.py`, `activities.py` | Fixed reply and refused Submit while unavailable; creator and admins told once per transition; re-checked on the directory refresh (D-35) |
+| Grant check at publish, access diff, widening acknowledgement | built | `grant_checker.py`, `access_diff.py`, `control.py` | A single data source's title is the database's live title; an audience that closes direct messages is named plainly in the diff |
+| Agent health: a broken grant disables one agent, never the worker | built | `agent_health.py`, `worker.py`, `activities.py` | Fixed reply and refused Submit while unavailable; creator and admins told once per transition; re-checked on the directory refresh (D-35); status, reason and last check on the console settings page, an unavailable badge on the agents list |
 | Notion picker (creator may grant only what they can see) | partial | `notion_picker.py`, `grant_picks.py` | Only when configured; without it the admin's approval is the only check |
 | Nightly re-check of creators' access, suspension, notification | target | none | |
 | Creators read only their own agents | built | `control.py` (`Principal`) | |
 | Console, Sign in with Slack, sessions, CSRF | built | `web_ui.py`, `slack_signin.py`, `sessions.py`, `control_api.py` | |
-| Console connectors page, tenant-settings page | partial | `web_ui.py`, `control.py`, `notion_picker.py`, `credentials.py`, migration 034 | The tenant-settings page is built (default agent, channel routing, Connect Notion by OAuth, webhook confirm); connector health status (last success, last error) is the follow-up. The connectors page is in the v1 scope in product.md |
+| Console connectors page, tenant-settings page | partial | `web_ui.py`, `control.py`, `notion_picker.py`, `credentials.py`, migration 034 | The tenant-settings page is built (default agent, channel routing, Connect Notion by OAuth, webhook confirm, agent health with reason and last check); connector health status (last success, last error) is the follow-up. The connectors page is in the v1 scope in product.md |
 | Audit log, append-only | built | `audit.py`, migration 005 | |
 | Audit export | target | none | |
 | Usage and cost, CSV, repricing | built | `usage.py`, `usage_reprice.py` | |
 | Monthly budgets, including the unknown-spend stop | built | `budgets.py` | Overspend is bounded, not zero (D-21) |
 | Kill switches, agent-off cancels approved writes | built | `switches.py`, `activities.py` | |
-| Audience (channels, DMs, guests), publish confirmation | built | `audience.py`, `control.py` | |
+| Audience (channels, DMs, guests), publish confirmation | built | `audience.py`, `control.py` | The console words a missing confirmation plainly from its counts; the API keeps `confirm_audience` |
 | Audience watch: pause on a shared channel | partial | `audience_watch.py`, `audience_pauses.py`, `workflows/audience_watch.py` | Built and tested with fakes; never run against a real Slack Connect channel |
 | Row-level security | built | `scripts/init_db.sql`, migrations, `tests/pg/` | Run against a real Postgres by the `pg` test tier |
 | Tenants in Postgres with live reload | built | `tenant_store.py` | |

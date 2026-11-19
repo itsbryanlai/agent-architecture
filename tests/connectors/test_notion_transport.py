@@ -81,3 +81,39 @@ async def test_a_successful_create_returns_the_page_and_sends_the_body():
     sent = json.loads(page_posts(requests)[0].content)
     assert sent["parent"] == {"type": "data_source_id", "data_source_id": "ds-1"}
     assert sent["children"] == children
+
+
+@pytest.mark.parametrize(
+    ("reply", "found"),
+    [
+        (
+            httpx.Response(
+                200,
+                json={
+                    "object": "data_source",
+                    "id": "ds-1",
+                    "title": [{"plain_text": "IT requests"}],
+                },
+            ),
+            True,
+        ),
+        (
+            httpx.Response(404, json=error_body("object_not_found", "Could not find data source")),
+            False,
+        ),
+    ],
+    ids=["success", "not shared"],
+)
+async def test_retrieve_data_source_reads_the_data_source_object(reply, found):
+    """Fails if retrieve_data_source does not read /v1/data_sources/{id}, or a Notion refusal
+    comes back as anything but the SDK's own error with its status."""
+    api, requests = api_with(lambda request: reply)
+
+    if found:
+        source = await api.retrieve_data_source("ds-1")
+        assert source["title"][0]["plain_text"] == "IT requests"
+    else:
+        with pytest.raises(APIResponseError) as err:
+            await api.retrieve_data_source("ds-1")
+        assert err.value.status == 404
+    assert [r.url.path for r in requests] == ["/v1/data_sources/ds-1"]

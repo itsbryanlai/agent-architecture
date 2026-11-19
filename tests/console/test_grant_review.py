@@ -258,6 +258,29 @@ async def test_a_narrowing_version_shows_no_banner_and_publishes_freely(h):
     )
 
 
+@pytest.mark.parametrize(
+    ("audience", "warns"),
+    [
+        ({"channels": ["C0REQUESTS"]}, True),
+        ({"channels": ["C0REQUESTS"], "dm": "everyone"}, False),
+    ],
+    ids=["omits dm", "dm everyone"],
+)
+async def test_a_draft_closing_direct_messages_warns_plainly(h, audience, warns):
+    """Fails if a draft whose audience omits dm does not say plainly that direct messages
+    will be closed, on the version page and in the diff the publish confirmation shows,
+    or a draft keeping dm open warns."""
+    await publish_first(h)
+    version = await second_version(h, lambda d: d.update(audience=audience))
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(f"/ui/{TENANT}/agents/it-helper/versions/{version}")).text
+    warning = "Direct messages: nobody (add <code>dm: everyone</code> to keep them open)"
+    assert (warning in page) is warns
+    diff_line = "changed: direct messages: nobody (add dm: everyone to keep them open)"
+    assert (diff_line in page) is warns
+
+
 # --- check-grants detail -------------------------------------------------------------
 
 

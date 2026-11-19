@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
+from agentos.agent_health import AVAILABLE, UNAVAILABLE, AgentHealth
 from agentos.audit import event_json
 from agentos.config import parse_agents_config
 from agentos.credentials import NOTION, InMemoryCredentialStore, TenantCredentials
@@ -376,6 +377,39 @@ async def test_routing_is_validated_like_the_yaml_import_and_audited(case, statu
     else:
         assert (config.default_agent, config.channels) == (None, {})
         assert [e for e in h.audit.events if e.kind == "tenant_settings"] == []
+
+
+@pytest.mark.parametrize(
+    ("case", "status_cell"),
+    [
+        ("available", "<td>available</td>"),
+        ("unavailable", '<span class="error">unavailable</span>'),
+        ("never checked", "<td>never checked</td>"),
+    ],
+    ids=["available", "unavailable", "never-checked"],
+)
+async def test_the_settings_page_shows_each_published_agents_health(case, status_cell):
+    """Fails if the settings page hides a published agent's health status, the reason an
+    unavailable agent is down, or when it was last checked."""
+    seen: dict = {}
+    h = await build_harness(seen)
+    await publish_helper(h)
+    reason = "the granted database is not shared with the integration"
+    if case != "never checked":
+        status = AVAILABLE if case == "available" else UNAVAILABLE
+        await h.health.record(
+            AgentHealth(
+                TENANT, "it-helper", 1, status, reason if case == "unavailable" else None, h.clock()
+            )
+        )
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(SETTINGS)).text
+    assert "Agent health" in page and status_cell in page
+    if case == "unavailable":
+        assert reason in page and "2026-11-14 12:00 UTC" in page
+    else:
+        assert reason not in page
 
 
 @pytest.mark.parametrize("default_set", [False, True], ids=["not set up", "set up"])

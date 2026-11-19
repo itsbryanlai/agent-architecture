@@ -38,7 +38,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from agentos import ids
 from agentos.access_diff import WideningNotAcknowledged
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
-from agentos.audience import AudienceError
+from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
 from agentos.connectors.notion import normalize_id
@@ -432,20 +432,25 @@ class WebUI:
         err: Exception,
         back: str | None = None,
         rerender: Callable[[int, str], Awaitable[Response]] | None = None,
+        message: str | None = None,
     ) -> Response:
-        """A refusal as a page: the control plane's message with the status the API maps."""
+        """A refusal as a page: the control plane's message with the status the API maps.
+
+        ``message`` overrides the text when the console words a refusal itself.
+        """
         status = status_of(err)
         status = None if status is None else page_status(status)
         if status is None:
             log.error("console error: %s", type(err).__name__)
             return _message("Something went wrong", "Internal error.", 500, ctx, back)
+        text = str(err) if message is None else message
         if rerender is not None:
             try:
-                return await rerender(status, str(err))
+                return await rerender(status, text)
             except AgentNotFound:
                 # The page to show again is one this person may not read.
                 pass
-        return _message(_TITLES.get(status, "Refused"), str(err), status, ctx, back)
+        return _message(_TITLES.get(status, "Refused"), text, status, ctx, back)
 
     def base(self, ctx: Ctx) -> str:
         return f"/ui/{quote(ctx.tenant_id, safe='')}"
@@ -640,6 +645,7 @@ class WebUI:
             status,
             ctx=ctx,
             agents=agents,
+            health=await ctx.plane.agent_health(ctx.tenant_id, ctx.principal),
             error=error,
             notice=notice,
             new_id=ctx.get("agent_id"),
@@ -724,7 +730,9 @@ class WebUI:
             async def again(status: int, message: str) -> Response:
                 return await self.agent_page(request, ctx, agent_id, status, message)
 
-            return await self.failure(request, ctx, err, rerender=again)
+            return await self.failure(
+                request, ctx, err, rerender=again, message=_console_refusal(err)
+            )
         return _redirect(f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}?done=resumed")
 
     async def owner_of(self, ctx: Ctx, agent_id: str) -> str | None:
@@ -974,7 +982,9 @@ class WebUI:
             )
         except (AudienceError, WideningNotAcknowledged, GrantNotPicked) as err:
             status = page_status(status_of(err) or 409)
-            return await self.version_page(request, ctx, agent_id, version, status, str(err))
+            return await self.version_page(
+                request, ctx, agent_id, version, status, _console_refusal(err) or str(err)
+            )
         except GrantProblems as err:
             return await self.version_page(
                 request, ctx, agent_id, version, 409, str(err), reports=err.reports
@@ -1328,6 +1338,32 @@ _TITLES = {
     422: "Invalid",
     503: "Notion could not be reached",
 }
+
+
+def _console_refusal(err: Exception) -> str | None:
+    """The console's own sentence for a refused audience confirmation, or None.
+
+    Rendered from the refusal's structured counts and place, never by rewriting the
+    API's message; every other refusal keeps the control plane's text.
+    """
+    if not isinstance(err, AudienceNotConfirmed) or err.counts is None:
+        return None
+    c = err.counts
+    people = f"{c['total']} people: {c['guests']} guests, {c['external']} from other workspaces"
+    if err.place == "channel":
+        box = "I confirm these people may see what this agent says here"
+        action = "resume"
+        who = "The people in this channel"
+    else:
+        box = "I confirm these people may see what this agent can access"
+        action = "publish"
+        who = "The people who can reach this agent"
+    if err.changed:
+        return (
+            f"{who} changed since they were counted ({people}). "
+            f"Review them, tick '{box}' and {action} again."
+        )
+    return f"Tick '{box}' ({people}) and {action} again."
 
 
 def _audience_confirmation(ctx: Ctx) -> dict[str, int] | None:

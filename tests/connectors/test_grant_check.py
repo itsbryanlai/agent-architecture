@@ -272,6 +272,25 @@ async def test_a_label_contained_in_the_live_title_is_not_flagged(agents, label,
     assert report.live_title == live_title
 
 
+@pytest.mark.parametrize(
+    ("container_title", "data_source_title"),
+    [("New database", "IT requests"), ("IT requests", None)],
+    ids=["container differs", "no data source"],
+)
+async def test_a_single_data_sources_title_is_the_live_title(
+    agents, container_title, data_source_title
+):
+    """Fails if a database whose container title differs from its single data source's title
+    shows the container's title instead of the name people see in Notion."""
+    api = make_fake_notion()
+    api.set_database_info(DB_ID, container_title, data_source_title=data_source_title)
+
+    [report] = await NotionGrantChecker(lambda t: api).check(TENANT, agents.agents["it-helper"])
+
+    assert report.live_title == "IT requests"
+    assert api.count("retrieve_data_source") == (1 if data_source_title is not None else 0)
+
+
 async def test_the_check_command_reads_published_definitions_from_the_database_not_the_yaml(
     agents, capsys
 ):

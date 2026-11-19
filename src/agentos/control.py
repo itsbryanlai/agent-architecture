@@ -110,6 +110,7 @@ from cryptography.exceptions import InvalidTag
 
 from agentos import ids
 from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
+from agentos.agent_health import AgentHealth, HealthStore
 from agentos.agent_store import (
     PENDING,
     AgentNotFound,
@@ -260,6 +261,7 @@ class TenantSettingsView:
     ``notion_connected_by``/``at`` come from the tenant's newest ``connector`` connect
     event. ``notion_env_var`` names the environment variable in use when no credential
     is connected; None when Notion is connected or the tenant has no token at all.
+    ``health`` holds the worker's last check of each published agent, by agent ID.
     """
 
     default_agent: str | None
@@ -274,6 +276,8 @@ class TenantSettingsView:
     notion_connected_at: datetime | None = None
     notion_env_var: str | None = None
     webhook_state: str | None = None
+    # The tenant's health rows by agent ID; an agent with no row was never checked.
+    health: dict[str, AgentHealth] = field(default_factory=dict)
 
 
 def _slack_problem(err: Exception) -> str:
@@ -344,6 +348,7 @@ class ControlPlane:
         tenant_store: TenantStore | None = None,
         webhook_tokens: WebhookTokens | None = None,
         slack_for: Callable[[str], Awaitable[SlackPoster]] | None = None,
+        health: HealthStore | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
         self._require_picker = require_grant_picker
@@ -363,6 +368,9 @@ class ControlPlane:
         self._tenant_store = tenant_store
         self._webhook_tokens = webhook_tokens
         self._slack_for = slack_for
+        # Agent health is read-only here: the worker's checks write it. None leaves the
+        # console without health to show.
+        self._health = health
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
         settings_stores = [s for s in (credentials, tenant_store, webhook_tokens) if s is not None]
         self._uow = (
@@ -503,6 +511,18 @@ class ControlPlane:
         """Every agent for an admin; the agents they created for a creator."""
         who = await self._require(tenant_id, actor, ADMIN, CREATOR)
         return [a for a in await self._agents.list_agents(tenant_id) if who.sees(a.agent_id)]
+
+    async def agent_health(self, tenant_id: str, actor: Actor) -> dict[str, AgentHealth]:
+        """The health rows of the agents this person may read, by agent ID.
+
+        An admin reads every agent's, a creator their own. The status is what the
+        agents list badges; the reason is shown only on the admin settings page.
+        A plane built without a health store has no rows.
+        """
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._health is None:
+            return {}
+        return {h.agent_id: h for h in await self._health.list(tenant_id) if who.sees(h.agent_id)}
 
     async def versions(
         self, tenant_id: str, actor: Actor, agent_id: str
@@ -749,12 +769,17 @@ class ControlPlane:
         if confirm is None:
             raise AudienceNotConfirmed(
                 f"{said}. Confirm that they may see what this agent says here: send "
-                f"confirm_audience {json.dumps(now)}."
+                f"confirm_audience {json.dumps(now)}.",
+                counts=now,
+                place="channel",
             )
         if confirm != now:
             raise AudienceNotConfirmed(
                 f"The people in this channel changed since they were counted: {said}. "
-                "Review them and confirm again."
+                "Review them and confirm again.",
+                counts=now,
+                place="channel",
+                changed=True,
             )
         return summary
 
@@ -797,12 +822,17 @@ class ControlPlane:
         if confirm is None:
             raise AudienceNotConfirmed(
                 f"{said}. Confirm that they may see what this agent can access: send "
-                f"confirm_audience {json.dumps(now)}."
+                f"confirm_audience {json.dumps(now)}.",
+                counts=now,
+                place="agent",
             )
         if confirm != now:
             raise AudienceNotConfirmed(
                 f"The people who can reach this agent changed since they were counted: {said}. "
-                "Review them and confirm again."
+                "Review them and confirm again.",
+                counts=now,
+                place="agent",
+                changed=True,
             )
         return summary
 
@@ -1240,6 +1270,11 @@ class ControlPlane:
         webhook_state = (
             None if self._webhook_tokens is None else await self._webhook_tokens.state(tenant_id)
         )
+        health = (
+            {}
+            if self._health is None
+            else {h.agent_id: h for h in await self._health.list(tenant_id)}
+        )
         return TenantSettingsView(
             default_agent=config.default_agent,
             channels=dict(config.channels),
@@ -1253,6 +1288,7 @@ class ControlPlane:
             notion_connected_at=connected_at,
             notion_env_var=notion_env_var,
             webhook_state=webhook_state,
+            health=health,
         )
 
     async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:

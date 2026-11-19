@@ -496,6 +496,34 @@ async def knowledge_two_searches(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", conv)]
 
 
+async def knowledge_uncited(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(26 if stored else 25)
+    scope = ids.knowledge_scope(ROOT_A)
+    await r.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, scope, ROOT_A.replace("-", "")],
+        id=ids.index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    r.llm.queue(
+        tool_turn(
+            ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"}),
+        ),
+        answer("Try the steps in the guidebook."),
+    )
+    await start_conversation(r, "it-helper", thread, "how do I reset my vpn?", stored=stored)
+    await replies(r, 1)
+    # The answer cites none of the passages the search returned, so the reply names the
+    # page it searched instead of leaving the user without a source.
+    meta = await r.acts.knowledge.page_meta(TENANT, [scope], [ROOT_A.replace("-", "")])
+    title, url = meta[ROOT_A.replace("-", "")]
+    assert (
+        r.slack.updates()[0]["text"]
+        == f"Try the steps in the guidebook.\n\nSearched: <{url}|{title}>"
+    )
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 async def audience_refusal(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(32 if stored else 31)
     await start_conversation(r, "unlisted", thread, "hello", stored=stored)
@@ -936,6 +964,7 @@ for _name, _fn in {
     "hand_off_notice": hand_off_notice,
     "knowledge_answer": knowledge_answer,
     "knowledge_two_searches": knowledge_two_searches,
+    "knowledge_uncited": knowledge_uncited,
     "progress": progress,
     "progress_dropped": progress_dropped,
     "audience_refusal": audience_refusal,

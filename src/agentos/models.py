@@ -124,6 +124,9 @@ class Citation:
     marker: int  # the number the model writes
     scope: str  # e.g. "notion:page:<32-hex root id>"
     page_id: str  # normalized 32-hex Notion page id
+    # The passage's distance from the question, so the reply can name the nearest pages it
+    # searched. None on a citation recorded before distances were carried.
+    distance: float | None = None
 
 
 @dataclass

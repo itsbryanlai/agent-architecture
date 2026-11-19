@@ -6,7 +6,9 @@ tools:
     risk: read
     description: >-
       Search the documents this agent was given access to. Returns numbered
-      passages with their page titles; cite a passage by its number, like [2].
+      passages with their page titles. Every statement you take from a passage
+      must end with that passage's number in square brackets, like [2]; an
+      answer that uses a passage without its number is incomplete.
     input_schema:
       type: object
       properties:

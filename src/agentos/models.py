@@ -390,6 +390,8 @@ HEALTH_AUDIT_KINDS = ("agent_health",)
 CONNECTOR_AUDIT_KINDS = ("connector",)
 # A tenant's default agent and channel routing, set by an admin in the console.
 TENANT_SETTINGS_AUDIT_KINDS = ("tenant_settings",)
+# A person's 👍/👎 on an answer: the agent and version that answered, never the reason text.
+FEEDBACK_AUDIT_KINDS = ("feedback",)
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -406,6 +408,7 @@ AUDIT_KINDS = (
     + HEALTH_AUDIT_KINDS
     + CONNECTOR_AUDIT_KINDS
     + TENANT_SETTINGS_AUDIT_KINDS
+    + FEEDBACK_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -433,7 +436,7 @@ class AuditEvent:
     conversation_id: str | None = None
     task_id: str | None = None
     tool: str | None = None
-    target: str | None = None  # a Notion page or database ID, or a specialist ID
+    target: str | None = None  # a Notion page or database ID, a specialist ID, or a feedback vote
     input_sha256: str | None = None
     output_sha256: str | None = None
     approver_user_id: str | None = None

@@ -89,7 +89,8 @@ from agentos.audience import (
 )
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
-from agentos.budgets import BudgetGuard
+from agentos.budgets import SPEND_UNKNOWN, BudgetGuard
+from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors import notion_errors
 from agentos.connectors.manifest import (
@@ -106,6 +107,7 @@ from agentos.connectors.notion import (
 )
 from agentos.connectors.notion_limiter import bulk_priority
 from agentos.content_store import ContentStore, InMemoryContentStore, StoredStep
+from agentos.feedback import answer_blocks
 from agentos.history_view import prepare_for_model
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
@@ -214,6 +216,10 @@ POST_LEASE_SECONDS = ACTIVITY_TIMEOUT.total_seconds() + 5
 # A retryable failure: another attempt holds the lease for this write.
 WRITE_IN_PROGRESS = "WriteInProgress"
 REQUESTER_NAME_MAX = 80
+
+# Stop reasons whose reply is a fixed runtime text (agent off or unavailable, budget
+# reached, spend unknown), not a model answer: it carries no feedback buttons.
+FIXED_STOP_REASONS = frozenset({SWITCHED_OFF, BUDGET_STOP_REASON, SPEND_UNKNOWN})
 
 T = TypeVar("T")
 
@@ -1136,15 +1142,44 @@ class AgentActivities:
         placeholder_ts: str,
         text: str,
         post_key: str | None,
-    ) -> None:
+        buttons_for: Callable[[str], list[dict]] | None = None,
+    ) -> str:
         """Show the turn's final text: edit the placeholder, or, when ``post_key`` is set, post
         it as a new message in the thread. A dropped progress edit may still land on the
         placeholder after the reply, so the reply must not be written there; the new message is
-        posted once under ``post_key`` (the same marker and lease as any other post)."""
+        posted once under ``post_key`` (the same marker and lease as any other post).
+
+        Returns the ts of the message that shows the text. ``buttons_for``, when set, builds
+        the answer's feedback buttons from that ts: the placeholder edit carries them at once;
+        a new message's ts is Slack's, so it is posted first and edited once more to carry them.
+        That second edit is best effort: the answer is already posted, so a failed edit leaves
+        it without buttons instead of failing the activity, and it is still recorded.
+        """
         if post_key is None:
-            await slack.update_message(ctx.channel, placeholder_ts, text)
-        else:
-            await self._post_once(ctx.tenant_id, post_key, ctx.channel, text, ctx.thread_ts)
+            blocks = buttons_for(placeholder_ts) if buttons_for is not None else None
+            await slack.update_message(ctx.channel, placeholder_ts, text, blocks=blocks)
+            return placeholder_ts
+        ts = await self._post_once(ctx.tenant_id, post_key, ctx.channel, text, ctx.thread_ts)
+        if buttons_for is not None:
+            try:
+                await slack.update_message(ctx.channel, ts, text, blocks=buttons_for(ts))
+            except Exception as err:  # noqa: BLE001 - the answer stands without its buttons
+                log.warning(
+                    "tenant_id=%s answer buttons not added error_type=%s",
+                    ctx.tenant_id,
+                    type(err).__name__,
+                )
+        return ts
+
+    def _answer_buttons(
+        self, ctx: TurnContext, conversation_id: str, text: str
+    ) -> Callable[[str], list[dict]]:
+        """The feedback buttons of one answer, built from the ts of the message that shows it."""
+
+        def buttons(answer_ts: str) -> list[dict]:
+            return answer_blocks(text, conversation_id, answer_ts, ctx.agent_id, ctx.agent_version)
+
+        return buttons
 
     @activity.defn(name="finalize_model_reply")
     async def finalize_model_reply(
@@ -1247,7 +1282,15 @@ class AgentActivities:
         footer = await self._sources_footer(ctx, text, citations, searched)
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, shown)
-        await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
+        full = rendered + footer
+        # A fixed stop text (agent off or unavailable, budget) is recorded as an answer but
+        # is not one: it carries no feedback buttons.
+        buttons_for = (
+            self._answer_buttons(ctx, conversation_id, full)
+            if step.stop_reason not in FIXED_STOP_REASONS
+            else None
+        )
+        await self._show_final_text(ctx, slack, placeholder_ts, full, post_key, buttons_for)
         await self._record(
             ctx,
             "answer",
@@ -1376,9 +1419,11 @@ class AgentActivities:
         footer = await self._sources_footer(ctx, text, citations or [], searched)
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, text)
-        await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
+        full = rendered + footer
+        conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
+        buttons_for = self._answer_buttons(ctx, conversation_id, full) if audit_answer else None
+        await self._show_final_text(ctx, slack, placeholder_ts, full, post_key, buttons_for)
         if audit_answer:
-            conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
             await self._record(
                 ctx,
                 "answer",

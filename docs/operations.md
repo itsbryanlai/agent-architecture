@@ -747,7 +747,7 @@ uv run python -m agentos.retention set --tenant acme --messages-days 180 --tool-
 | Setting | Default | What goes |
 |---|---|---|
 | `messages_days` | 365 | A conversation's messages, once its newest message is older than this (a thread is never cut in the middle), and a thread's stored specialist idle for longer than this |
-| `tool_outputs_days` | 90 | Tool output text, tool inputs and stored model replies older than this, in a conversation with no newer message; and the drafts of a task whose newest revision is older than this |
+| `tool_outputs_days` | 90 | Tool output text, tool inputs and stored model replies older than this, in a conversation with no newer message; the drafts of a task whose newest revision is older than this; and answer feedback (votes and their reasons) older than this |
 | `idempotency_days` | 90 | Idempotency records older than this, and inbound Slack events (and saved Edit forms) delivered longer ago than this |
 | `sessions_days` | 1 | Console sessions, this many days after they expired (they are also purged at sign-in) |
 
@@ -1381,6 +1381,32 @@ Nothing deletes a task row yet: retention does not cover `tasks`. The worker's s
 wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level security and
 grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
 app role).
+
+## Answer feedback
+
+Every final answer carries two small buttons, 👍 and 👎, under the text. Notices, approval
+cards, the not-set-up reply and the fixed off / unavailable / budget replies carry none.
+
+- One vote per person per answer, changeable: a second click replaces the voter's earlier vote
+  and clears any reason it carried. Another person's vote is separate.
+- The voter is the Slack user of the signed click, never a field of the button or the model.
+  The button names the answer (its conversation ID and message ts) and the agent and version
+  that answered; a click naming another tenant's conversation is refused.
+- A 👎 opens a small modal for an optional one-line reason (at most 300 characters). Submitting
+  or dismissing keeps the vote; a reason attaches only while the vote is still a 👎.
+- The vote is acknowledged to the voter alone ("Thanks — noted.", an ephemeral message);
+  nothing is posted in the thread. Every click is audited as its own `feedback` event — the vote
+  and the agent, never the reason text — and the vote and its event commit in one transaction, so
+  a failed audit write leaves no vote behind and the clicker is told to try again.
+- No model call and no connector call: the gateway records the vote in `answer_feedback`
+  (migration 036) directly, without a workflow. Feedback is the user's action, not the agent's,
+  so the kill-switch gate does not apply (D-38).
+- An answer posted as a new message (after a dropped progress edit) is posted first and edited
+  once more to add its buttons. That edit is best effort: if it fails, the answer stays as posted,
+  without buttons, and is still recorded.
+
+Votes follow the tenant's `tool_outputs_days` retention: the nightly purge deletes votes older
+than the limit, the reason text with them. The reason is the only free text the feature stores.
 
 ## Web console
 

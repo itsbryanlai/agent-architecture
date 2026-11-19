@@ -432,6 +432,36 @@ def _lookup_error(err: Exception) -> SlackLookupError:
     )
 
 
+def _check_blocks(blocks: list[dict] | None) -> None:
+    """Refuse blocks as Slack does: a section's text must be 1..3000 characters.
+
+    The fake keeps what production sends, so a splitter that emits an empty or over-long
+    section fails the test that posts it, as it would fail against Slack.
+    """
+    if not blocks:
+        return
+    from slack_sdk.errors import SlackApiError
+    from slack_sdk.web.slack_response import SlackResponse
+
+    for block in blocks:
+        if block.get("type") != "section":
+            continue
+        text = (block.get("text") or {}).get("text")
+        if isinstance(text, str) and not 0 < len(text) <= 3000:
+            raise SlackApiError(
+                "The request to the Slack API failed.",
+                SlackResponse(
+                    client=None,
+                    http_verb="POST",
+                    api_url="https://slack.com/api/chat.postMessage",
+                    req_args={},
+                    data={"ok": False, "error": "invalid_blocks"},
+                    headers={},
+                    status_code=200,
+                ),
+            )
+
+
 class FakeSlack:
     """Test fake. Every call is appended to ``calls`` as (method, kwargs).
 
@@ -491,6 +521,7 @@ class FakeSlack:
         self._history_refusal = error
 
     async def post_message(self, channel, text, thread_ts=None, blocks=None, metadata=None) -> str:
+        _check_blocks(blocks)
         ts = self._next_ts()
         sent = {
             "channel": channel,
@@ -518,6 +549,7 @@ class FakeSlack:
         return None
 
     async def update_message(self, channel, ts, text, blocks=None) -> None:
+        _check_blocks(blocks)
         if self._fail_next_update is not None:
             error = self._fail_next_update
             if self._update_failures_left is not None:

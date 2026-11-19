@@ -18,7 +18,10 @@ people wrote into Temporal history:
   task workflow decides whether that person may approve. An Edit click opens a
   form prefilled from the task's current draft (only for the requester, only
   while the draft is editable); saving the form stores the values in Postgres and
-  becomes an ``edit`` signal that names them. Slack does not retry a click, so a click is
+  becomes an ``edit`` signal that names them. A 👍/👎 click on an answer records the
+  signed clicker's vote in Postgres (``answer_feedback``) and audits it as ``feedback``;
+  a 👎 also opens a form for an optional one-line reason. No workflow hears of a vote:
+  feedback is the user's action, not the agent's. Slack does not retry a click, so a click is
   handled before the reply, within ``CLICK_TIMEOUT_SECONDS``; when Temporal or the
   database does not answer in time, the person is told to try again (an ephemeral
   message, or an error on the form) and nothing is half done.
@@ -48,6 +51,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -58,15 +62,25 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
 from agentos.agent_store import AgentStore, startup_agent_failure
+from agentos.audit import AuditStore
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
 from agentos.crypto_keys import TenantKeyError
+from agentos.feedback import (
+    FEEDBACK_ACTIONS,
+    FEEDBACK_CALLBACK,
+    REASON_MAX,
+    THANKS,
+    AnswerFeedback,
+    FeedbackStore,
+)
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
     ApprovalDecision,
     AudienceEvent,
+    AuditEvent,
     DraftView,
     EditRequest,
     ExternalUpdate,
@@ -77,6 +91,7 @@ from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
 from agentos.tenant_store import TenantSource, as_source
+from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 
 log = logging.getLogger("agentos.gateway")
 
@@ -102,6 +117,10 @@ MULTILINE_FIELDS = {"details", "comment"}
 CLICK_TIMEOUT_SECONDS = 2.0
 NOTICE_TIMEOUT_SECONDS = 0.7
 TRY_AGAIN = "That didn't go through. Please try again in a moment."
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass
@@ -130,6 +149,15 @@ class GatewayDeps:
     webhook_tokens: WebhookTokens | None = None
     # The app's name from the manifest, for the not-set-up reply; "This app" without one.
     app_name: str = "This app"
+    # Where answer votes and their reasons are kept, and the audit log a vote records into.
+    # None in tests that never click a feedback button.
+    feedback: FeedbackStore | None = None
+    audit: AuditStore | None = None
+    # The transaction a vote and its audit event commit in together. None in tests that
+    # never click a feedback button; create_app defaults it for the in-memory stores.
+    uow: UnitOfWork | None = None
+    # When a vote is recorded; tests inject a fixed clock.
+    clock: Callable[[], datetime] = _utcnow
 
 
 def create_app(
@@ -145,10 +173,18 @@ def create_app(
     content: ContentStore | None = None,
     webhook_tokens: WebhookTokens | None = None,
     app_name: str = "This app",
+    feedback: FeedbackStore | None = None,
+    audit: AuditStore | None = None,
+    uow: UnitOfWork | None = None,
+    clock: Callable[[], datetime] = _utcnow,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
+        # A vote and its audit event commit together; the in-memory stores roll back as one
+        # unit. Stores in Postgres need a PostgresUnitOfWork, passed by the real lifespan.
+        if uow is None and feedback is not None:
+            uow = InMemoryUnitOfWork(*[s for s in (feedback, audit) if s is not None])
         app.state.deps = GatewayDeps(
             settings,
             as_source(tenants),
@@ -161,6 +197,10 @@ def create_app(
             content or InMemoryContentStore(),
             webhook_tokens=webhook_tokens,
             app_name=app_name,
+            feedback=feedback,
+            audit=audit,
+            uow=uow,
+            clock=clock,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -277,6 +317,8 @@ def create_app(
         if payload.get("type") == "view_submission":
             try:
                 async with asyncio.timeout(CLICK_TIMEOUT_SECONDS):
+                    if (payload.get("view") or {}).get("callback_id") == FEEDBACK_CALLBACK:
+                        return await _feedback_reason_submitted(d, tenant, payload)
                     return await _edit_submitted(d, tenant, payload)
             except Exception as err:  # noqa: BLE001 - the form stays open with a message
                 log.warning(
@@ -316,6 +358,10 @@ async def _handle_actions(d: GatewayDeps, tenant: str, payload: dict, clicker: s
     for action in payload.get("actions") or []:
         if action.get("action_id") == EDIT_ACTION:
             await _open_edit_form(d, tenant, payload, action, clicker)
+            continue
+        vote = FEEDBACK_ACTIONS.get(action.get("action_id"))
+        if vote is not None:
+            await _feedback_clicked(d, tenant, payload, action, clicker, vote)
             continue
         approved = APPROVAL_ACTIONS.get(action.get("action_id"))
         if approved is None:
@@ -763,6 +809,184 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
     return Response(status_code=200)
 
 
+def _feedback_ref(tenant: str, action: dict) -> tuple[str, str, str, int] | None:
+    """The answer a feedback button names, or None when the value is bad or another tenant's.
+
+    The value carries references only (the conversation ID, the answer's ts, the agent and
+    version that answered). The voter is never read from it: that is the signed request's user.
+    """
+    try:
+        value = json.loads(action.get("value") or "{}")
+        conversation_id = value["conversation_id"]
+        answer_ts = value["answer_ts"]
+        agent_id = value["agent_id"]
+        agent_version = value["agent_version"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored feedback click with a bad value", tenant)
+        return None
+    if not isinstance(conversation_id, str) or not conversation_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored feedback click for another tenant", tenant)
+        return None
+    if not (
+        isinstance(answer_ts, str)
+        and answer_ts
+        and isinstance(agent_id, str)
+        and agent_id
+        and isinstance(agent_version, int)
+        and not isinstance(agent_version, bool)
+        and agent_version >= 1
+    ):
+        log.warning("tenant_id=%s ignored feedback click with a bad value", tenant)
+        return None
+    return conversation_id, answer_ts, agent_id, agent_version
+
+
+async def _feedback_clicked(
+    d: GatewayDeps, tenant: str, payload: dict, action: dict, clicker: str, vote: str
+) -> None:
+    """Record the signed clicker's vote on the answer the button names, and acknowledge it.
+
+    A second click replaces the voter's earlier vote. Every click is audited as its own event
+    (the key carries the vote's time), and the vote and its event commit in one transaction, so
+    a failed audit insert leaves no vote behind. A 👎 also opens the reason form. The vote stands
+    even when the form or the ephemeral thanks cannot be shown; a failed store write propagates
+    and the click is told to try again.
+    """
+    ref = _feedback_ref(tenant, action)
+    if ref is None or not clicker:
+        return
+    conversation_id, answer_ts, agent_id, agent_version = ref
+    if d.feedback is None:
+        raise RuntimeError("the gateway has no feedback store to keep a vote in")
+    if d.uow is None:
+        raise RuntimeError("the gateway has no unit of work to commit a vote with its audit event")
+    at = d.clock()
+    async with d.uow.begin(tenant) as conn:
+        await d.feedback.record_vote(
+            AnswerFeedback(
+                tenant,
+                conversation_id,
+                answer_ts,
+                clicker,
+                agent_id,
+                agent_version,
+                vote,
+                None,
+                at,
+            ),
+            conn=conn,
+        )
+        if d.audit is not None:
+            await d.audit.record(
+                AuditEvent(
+                    tenant_id=tenant,
+                    event_key=ids.audit_feedback_key(conversation_id, answer_ts, clicker, vote, at),
+                    kind="feedback",
+                    agent_id=agent_id,
+                    agent_version=agent_version,
+                    requester_user_id=clicker,
+                    identity=f"user:{clicker}",
+                    conversation_id=conversation_id,
+                    tool="feedback",
+                    target=vote,
+                ),
+                conn=conn,
+            )
+    if vote == "down":
+        if d.slack_for is None:
+            log.warning("tenant_id=%s feedback form not opened: no Slack client", tenant)
+        else:
+            try:
+                slack = await d.slack_for(tenant)
+                await slack.open_view(
+                    payload.get("trigger_id", ""), _reason_view(conversation_id, answer_ts)
+                )
+            except Exception as err:  # noqa: BLE001 - the vote stands without the form
+                log.warning(
+                    "tenant_id=%s feedback form not opened error_type=%s",
+                    tenant,
+                    type(err).__name__,
+                )
+    await _thank_voter(d, tenant, payload, clicker)
+
+
+def _reason_view(conversation_id: str, answer_ts: str) -> dict:
+    """The 👎 reason form: one optional line. The voter is the signed submitter, not metadata."""
+    return {
+        "type": "modal",
+        "callback_id": FEEDBACK_CALLBACK,
+        "private_metadata": json.dumps(
+            {"conversation_id": conversation_id, "answer_ts": answer_ts}
+        ),
+        "title": {"type": "plain_text", "text": "Feedback"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "reason",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "What was wrong? (optional)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "max_length": REASON_MAX,
+                },
+            }
+        ],
+    }
+
+
+async def _feedback_reason_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Response:
+    """Store the optional reason on the submitter's 👎; the vote stands either way.
+
+    An empty reason stores nothing; an over-long one keeps the form open with a message.
+    A reason reaches only a vote that is still a 👎: one changed to a 👍 meanwhile keeps none.
+    """
+    view = payload.get("view") or {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        conversation_id, answer_ts = meta["conversation_id"], meta["answer_ts"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored feedback form with bad metadata", tenant)
+        return Response(status_code=200)
+    if not isinstance(conversation_id, str) or not conversation_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored feedback form for another tenant", tenant)
+        return Response(status_code=200)
+    if not isinstance(answer_ts, str) or not answer_ts:
+        log.warning("tenant_id=%s ignored feedback form with bad metadata", tenant)
+        return Response(status_code=200)
+    values = (view.get("state") or {}).get("values") or {}
+    raw = ((values.get("reason") or {}).get("value") or {}).get("value")
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if len(reason) > REASON_MAX:
+        return _form_errors({"reason": f"Keep it to {REASON_MAX} characters or fewer."})
+    voter = (payload.get("user") or {}).get("id", "")
+    if reason and voter:
+        if d.feedback is None:
+            raise RuntimeError("the gateway has no feedback store to keep a reason in")
+        await d.feedback.set_reason(tenant, conversation_id, answer_ts, voter, reason)
+    return Response(status_code=200)
+
+
+async def _thank_voter(d: GatewayDeps, tenant: str, payload: dict, clicker: str) -> None:
+    """Acknowledge the vote to the voter alone; best effort, the vote is already stored."""
+    channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get(
+        "channel_id"
+    )
+    thread_ts = (payload.get("message") or {}).get("thread_ts")
+    if d.slack_for is None or not channel:
+        return
+    try:
+        async with asyncio.timeout(NOTICE_TIMEOUT_SECONDS):
+            slack = await d.slack_for(tenant)
+            await slack.post_ephemeral(channel, clicker, THANKS, thread_ts)
+    except Exception as err:  # noqa: BLE001 - the vote stands even if the thanks fails
+        log.warning(
+            "tenant_id=%s feedback thanks not shown error_type=%s", tenant, type(err).__name__
+        )
+
+
 async def _writes_off(d: GatewayDeps, tenant: str) -> bool:
     """Has an admin turned writes off for the tenant? Read now; a failed read fails the click."""
     if d.switches is None:
@@ -837,6 +1061,7 @@ async def _real_lifespan(app: FastAPI):
     from slack_sdk.signature import SignatureVerifier
 
     from agentos.agent_store import PostgresAgentStore
+    from agentos.audit import PostgresAuditStore
     from agentos.config import load_settings
     from agentos.content_store import PostgresContentStore
     from agentos.credentials import PostgresCredentialStore, TenantCredentials
@@ -846,6 +1071,7 @@ async def _real_lifespan(app: FastAPI):
         start_key_refresh,
         startup_key_failure,
     )
+    from agentos.feedback import PostgresFeedbackStore
     from agentos.gateway.relay import InboundRelay
     from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
@@ -855,6 +1081,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
+    from agentos.unit_of_work import PostgresUnitOfWork
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -915,6 +1142,9 @@ async def _real_lifespan(app: FastAPI):
             on_inbound=relay.wake,
             webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
             app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
+            feedback=PostgresFeedbackStore(pool),
+            audit=PostgresAuditStore(pool),
+            uow=PostgresUnitOfWork(pool),
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

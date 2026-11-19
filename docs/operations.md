@@ -1354,6 +1354,16 @@ console is off unless sign-in is configured.
 
 The pages call the same `ControlPlane` methods as the JSON API. Who sees what, the browser guard, the session cookie and the error pages are in [architecture.md §5](architecture.md#control-plane-and-console).
 
+A publish or a resume refused for a missing audience confirmation shows a sentence a
+person acts on — "Tick 'I confirm these people may see what this agent can access'
+(4 people: 1 guests, 1 from other workspaces) and publish again" — rendered from the
+refusal's counts, not the API's `confirm_audience` JSON wording. The JSON API keeps its
+machine-readable message.
+
+An `audience` block that omits `dm` closes direct messages to nobody. The version page
+and the diff say so plainly — "Direct messages: nobody (add `dm: everyone` to keep them
+open)" — and the publish confirmation lists it under what changes.
+
 **In the Slack app** (api.slack.com/apps, the app the gateway uses):
 
 1. OAuth & Permissions → Redirect URLs → add `<AGENTOS_CONSOLE_URL>/auth/slack/callback`
@@ -1408,7 +1418,10 @@ both, stops the process at start. Without them, behaviour is as before: the admi
 sees each grant's live title and parent, a warning when the creator's label and the live
 title don't contain one another as whole words once normalised, and a diff against the published version,
 and must tick a box to publish a version that widens
-access. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
+access. For a database with a single data source (Notion's 2025 model), the live title is
+the data source's title — the name people see as the database name — not the container's
+title, which can differ ("New database"); one extra Notion read, rate-limited like the
+rest. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
 
 **Tenant settings (admins).** `/ui/<tenant>/settings` (the **Settings** nav link) gathers
 the organisation's setup on one page. Every change is audited and picked up by every
@@ -1420,6 +1433,12 @@ process on its next directory refresh, with no restart.
   version, and a mapped channel must be in its agent's audience. Audited as
   `tenant_settings`. A tenant with no default agent sees a "not set up" banner with the
   steps left (create an agent, publish it, choose it here).
+- **Agent health.** Each published agent's status (available / unavailable), the reason
+  and when the worker last checked it, read from `agent_health`; an agent no check has
+  recorded shows "never checked". Read-only: fix the grant in Notion or the agent's
+  definition, and the next check marks it available again (see
+  [What stops start-up](#what-stops-start-up-and-what-only-disables-an-agent)). The
+  agents list badges an unavailable agent.
 - **Connect Notion.** With the public integration configured (the same
   `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET` as the picker), a Notion
   workspace admin signs in and authorizes the integration for the workspace. The callback

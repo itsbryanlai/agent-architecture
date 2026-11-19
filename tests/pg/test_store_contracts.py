@@ -10,6 +10,13 @@ from decimal import Decimal
 
 import pytest
 
+from agentos.agent_health import (
+    AVAILABLE,
+    UNAVAILABLE,
+    AgentHealth,
+    InMemoryAgentHealthStore,
+    PostgresAgentHealthStore,
+)
 from agentos.audience_pauses import InMemoryPauseStore, PostgresPauseStore
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore
 from agentos.budgets import BudgetNotFound, InMemoryBudgetStore, PostgresBudgetStore
@@ -328,3 +335,37 @@ async def test_a_webhook_token_is_pending_once_then_active_then_gone(webhook_tok
     assert await webhook_tokens.clear(tenant) is False
     assert await webhook_tokens.get(tenant) is None
     assert await webhook_tokens.put_pending(tenant, b"ct3", 2) is True
+
+
+# --- agent health ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def health(store_pool):
+    return twin(store_pool, InMemoryAgentHealthStore, PostgresAgentHealthStore)
+
+
+async def test_agent_health_reports_a_transition_once_and_reads_the_last_check_back(
+    health, tenant: str, other_tenant: str
+):
+    """Fails if a repeated status or a first available check reports a transition, or the row read back is not the last check."""
+    broken = AgentHealth(tenant, "aa", 1, UNAVAILABLE, "grant 'g': problem", NOW)
+    assert await health.record(broken) is True
+    assert await health.get(tenant, "aa") == broken
+
+    later = dataclasses.replace(
+        broken, reason="grant 'g': still broken", checked_at=NOW + timedelta(minutes=5)
+    )
+    assert await health.record(later) is False
+    assert await health.get(tenant, "aa") == later
+
+    recovered = dataclasses.replace(
+        broken, status=AVAILABLE, reason=None, checked_at=NOW + timedelta(minutes=10)
+    )
+    assert await health.record(recovered) is True
+    assert await health.list(tenant) == [recovered]
+
+    assert await health.record(AgentHealth(tenant, "bb", 1, AVAILABLE, None, NOW)) is False
+    assert (await health.get(tenant, "bb")).status == AVAILABLE
+    assert await health.get(other_tenant, "aa") is None
+    assert await health.list(other_tenant) == []

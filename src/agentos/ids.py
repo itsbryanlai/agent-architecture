@@ -170,6 +170,20 @@ def scope_gone_notice_key(tenant: str, scope: str, recipient: str, first_seen: s
     return f"{tenant}:scope-gone-notice:{scope}:{first_seen}:{recipient}"
 
 
+# Agent health. One check that flips an agent's status is one transition, named by when it
+# ran: its audit event and the notice to each person happen once, however often the check runs.
+
+
+def audit_agent_health_key(tenant: str, agent_id: str, checked_at: str) -> str:
+    """The audit event of one health transition, named by the check that made it."""
+    return f"{tenant}:audit:agent-health:{agent_id}:{checked_at}"
+
+
+def agent_health_notice_key(tenant: str, agent_id: str, checked_at: str, recipient: str) -> str:
+    """The idempotency key of the direct message that tells one person about one transition."""
+    return f"{tenant}:agent-health-notice:{agent_id}:{checked_at}:{recipient}"
+
+
 def edit_event_id(unique: str) -> str:
     """The ``inbound_events`` row that holds one saved Edit form (not a Slack event)."""
     return f"edit:{unique}"

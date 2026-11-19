@@ -2,9 +2,11 @@
 
 A grant names a Notion database and maps the agent's roles (title, status,
 requested by, request ID) to that database's properties. A mapping that does
-not match the live database makes the worker refuse to start, so the control
-plane checks every database grant of a version when an admin publishes it, and
-on request for an editor, and refuses a publish when any grant has a problem.
+not match the live database makes the agent unavailable, so the control plane
+checks every database grant of a version when an admin publishes it, and on
+request for an editor, and refuses a publish when any grant has a problem; the
+worker's health check (``agent_health.py``) re-checks published agents and
+disables one whose grants fail, never the whole worker.
 
 The check only reads: the schemas of the granted databases and the granted pages.
 A page grant must be readable and not trashed. A transient Notion failure (network

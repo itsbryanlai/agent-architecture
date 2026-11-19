@@ -345,8 +345,8 @@ class NotionDatabaseGrant:
     The ``*_prop`` fields are names, kept as labels for people. The runtime
     addresses Notion properties only by the ``*_prop_id`` fields, which are
     stable across renames. They may be missing in a names-only config so the
-    check command can read it and print the IDs; the worker refuses to start
-    until all four are set.
+    check command can read it and print the IDs; a published agent whose grant
+    lacks them is unavailable until all four are set.
     """
 
     id: str

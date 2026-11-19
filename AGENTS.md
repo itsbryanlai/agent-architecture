@@ -4,6 +4,20 @@ Slack agents that do work, on Temporal. The design is in `docs/product.md`,
 `docs/architecture.md` and `docs/decisions.md`. Code that must differ from them is
 reported as a deviation; the docs are changed only with the maintainer's go.
 
+## Product decisions
+
+Every product decision, and every option proposed for one, is checked against two
+criteria and states how it meets them:
+
+1. **Seamless for the user.** Count the steps a customer, admin or end user takes
+   (installing, connecting a system, granting access, approving). Fewer is better: no
+   developer consoles, no pasted keys or tokens, ideally one click or one share.
+2. **Scalable for the product.** It keeps working as tenants, users, agents and
+   connectors grow: no per-tenant manual step, no hand-run operation, no limit the
+   product will outgrow soon.
+
+An option that fails either criterion is named as such, with the cost of meeting it.
+
 ## Rules the code must keep
 
 - An agent acts with its own granted access, never the asker's. Grants are

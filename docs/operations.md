@@ -1345,6 +1345,32 @@ and logs `possible duplicate Slack post` with the tenant ID and key, and the log
 missing scope once per tenant. A public channel the bot has not joined refuses the lookup the
 same way. `slack/app-manifest.yaml` lists the same scopes.
 
+## Where is my request? (my_tasks)
+
+`my_tasks` answers "where is my request?" from the platform's own `tasks` table
+(migration 035), with no Notion search. The task workflow records each state change
+through an idempotent upsert by task ID, behind the `task-record` patch marker: a task
+that was already running when the change deployed keeps its old shape and simply has
+no row, so it is invisible to `my_tasks` until it ends and a new task records itself.
+The row holds the item's title and link, its last known status, the listed state
+(awaiting approval, filed, watching, done, failed, cancelled), when the task last
+reported, and the thread it lives in — short metadata, never conversation text.
+
+The tool is offered only to an agent with a write grant (a Notion database), takes no
+input, and lists the asker's own tasks: the requester comes from the runtime, open
+tasks first, then newest, at most 10. A question asked in the task's own thread first
+pokes the watch through the webhook's `external_update` signal and waits for the fresh
+report; the watch answers a poke at most once per 60 seconds (`POKE_GAP`), so the
+question never forces a sooner poll, and the wait is bounded — a task that does not
+report in time is listed as it was last recorded. The thread link in the listing opens
+the channel the task's thread lives in (Slack's universal link); a thread permalink
+would need the workspace's domain, which the runtime does not store (D-37).
+
+Nothing deletes a task row yet: retention does not cover `tasks`. The worker's start-up
+wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level security and
+grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
+app role).
+
 ## Web console
 
 The same process serves web pages for agents, versions, members, usage and the audit log,

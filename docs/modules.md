@@ -42,6 +42,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 |---|---|---|
 | `content_store.py` | Where message text, model replies, tool inputs and task drafts live while Temporal carries references | `core/test_content_refs.py`, `pg/test_stores.py` |
 | `stores.py` | Chat history, idempotency records, task links and external writes. Every call takes `tenant_id` and runs under row-level security | `pg/test_stores.py` |
+| `tasks.py` | The platform's record of each task: the state row the task workflow writes and `my_tasks` reads for the asker, open first, newest first, at most 10; the in-thread poke's lookup and the listed-state mapping | `core/test_my_tasks.py`, `pg/test_store_contracts.py` |
 | `unit_of_work.py` | One transaction and the tenant lock for a change and its audit event | `console/test_control_plane.py`, `pg/test_publish_hash.py` |
 | `threads.py` | The agent a thread was handed to, and the day an agent's owner was last mentioned in a refusal | `pg/test_stores.py` |
 | `audit.py` | Append-only audit events: IDs and hashes only, one row per event key | `console/test_audit_log.py`, `pg/test_policies.py` |

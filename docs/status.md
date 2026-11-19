@@ -54,7 +54,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Model allowlist, bring-your-own LLM key | target | none | |
 | Qwen as a chat provider, local embeddings | built | `llm.py`, `knowledge/embedder.py` | |
 | Slack OAuth install, Marketplace listing | partial | `slack_install.py`, `credentials.py`, `web_ui.py`, migration 032 | "Add to Slack" creates the tenant, key, encrypted bot token and first admin (pilot allowlist); a not-set-up tenant gets a fixed reply; no Marketplace listing. Not yet run against a real workspace |
-| Progress updates on the placeholder | built | `workflows/conversation.py`, `activities.py` | Fixed runtime labels per tool, throttled in workflow time; the final reply always replaces them. Behind the `progress` patch marker |
+| Progress updates on the placeholder | built | `workflows/conversation.py`, `activities.py` | Fixed runtime labels per tool, throttled in workflow time; the final reply replaces them, or is posted as a new message when a progress edit was dropped (so a late edit cannot hide it). Behind the `progress` and `progress-dropped` patch markers |
 | Token budget per turn, tenant or agent; cap on writes per task | target | none | Built: step limit, reply token limit, history window, `max_writes_per_turn` |
 | Nightly retention of the audit log | target | none | Audit rows are kept |
 | Worker Versioning | target | none | `workflow.patched` markers are used |

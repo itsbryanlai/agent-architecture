@@ -318,9 +318,10 @@ with another key source the console starts but does not offer the install.
 the installer becomes the tenant's first admin (the tenant row's `admins`
 list, like a YAML tenant's). The tenant ID is stable, built from the Slack
 team ID (`t-<team id lower-cased>`). A **reinstall** of a known workspace
-replaces the bot token (audited as a reinstall) and creates nothing else:
-settings, admins and key stay as they are, and every process rebuilds that
-tenant's Slack client from the new token on its next read.
+replaces the bot token (audited as a reinstall), re-enables the tenant if an
+uninstall disabled it, and creates nothing else: settings, admins, data and
+key stay as they are, and every process rebuilds that tenant's Slack client
+from the new token on its next read.
 
 **A tenant with no agents yet.** An installed tenant has no agents and no
 Notion. Its `default_agent` is NULL until an admin sets one; until then the
@@ -342,6 +343,42 @@ another tenant's row. The bot token is
 stored only as ciphertext in `tenant_credentials` (migration `032`), under
 the tenant's payload key with the tenant ID as associated data; the audit row
 holds IDs only.
+
+## Uninstall and reinstall
+
+When a workspace removes the app, Slack sends `app_uninstalled` (and
+`tokens_revoked` for its bot tokens). The gateway handles both for the
+workspace's tenant, taken from the signed event's `team_id`: in one unit of
+work it **disables the tenant**, **deletes its `slack_bot` credential** and
+records one `uninstall` audit event (the event type in `tool`, the team ID in
+`target`, never a token). The **Notion credential is kept**, with the rest of
+the tenant's data, under normal retention. A repeat or out-of-order event
+finds the tenant already disabled with no credential and changes nothing
+more; an event for an unknown workspace is ignored with a log line.
+`tokens_revoked` acts only when bot tokens were revoked — a user-token-only
+revocation changes nothing.
+
+**Pending work ends cleanly.** Within one directory refresh (about 15 s) and
+one worker sync (5 s), the worker stops serving the tenant. A task awaiting
+approval, executing or watching ends `cancelled` with no Slack post (the
+token is gone) and no retry storm; its final state is still recorded for
+`my_tasks`. A conversation turn in flight fails without a failure notice,
+leaving history valid. A tenant *not yet loaded* (installed seconds ago) is
+different: its activities stay retryable until a refresh picks it up.
+
+**A reinstall resumes the tenant.** "Add to Slack" again into the same
+workspace re-enables the row, stores the new bot token and audits a
+reinstall; agents, settings, admins, the payload key and the kept data are
+untouched, so the tenant works again with no manual step. Full deletion of a
+tenant's data is a later admin action, not part of uninstall.
+
+**Slack app setup (maintainer, once per deployment).** Add the bot events
+`app_uninstalled` and `tokens_revoked` to the app's Event Subscriptions
+(both are in `slack/app-manifest.yaml`), pointed at the same
+`<URL>/slack/events`. Event subscriptions are app-level: saving them takes
+effect without reinstalling the app into each workspace. The uninstall flow
+needs migration `037` (the `uninstall` audit kind); a new install gets it
+from `scripts/init_db.sql`.
 
 ## Encrypted workflow data
 

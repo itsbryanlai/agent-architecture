@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 037 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 038 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -1003,11 +1003,13 @@ CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 -- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as
--- migrations 032 and 034: the kinds are 'slack_bot' and 'notion', and Disconnect removes
--- a row, so the app role may DELETE too.
+-- migrations 032, 034 and 038: the kinds are 'slack_bot', 'notion' and a creator's kept
+-- Notion sign-in ('notion_creator:<Slack user ID>'), and Disconnect or a consent revoke
+-- removes a row, so the app role may DELETE too.
 CREATE TABLE IF NOT EXISTS tenant_credentials (
   tenant_id   text        NOT NULL,
-  kind        text        NOT NULL CHECK (kind IN ('slack_bot', 'notion')),
+  kind        text        NOT NULL CHECK (
+    kind IN ('slack_bot', 'notion') OR kind ~ '^notion_creator:[A-Z0-9_]{1,64}$'),
   ciphertext  bytea       NOT NULL,
   key_version integer     NOT NULL CHECK (key_version >= 1),
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -1047,6 +1049,28 @@ ALTER TABLE agent_health ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_health FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON agent_health;
 CREATE POLICY tenant_isolation ON agent_health
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- The nightly verdict on a creator's access to one granted object, written by the
+-- creator-access pass and read by the health check and the console. Same as migration 038.
+CREATE TABLE IF NOT EXISTS creator_access (
+  tenant_id  text        NOT NULL,
+  agent_id   text        NOT NULL,
+  notion_id  text        NOT NULL,
+  status     text        NOT NULL CHECK (status IN ('verified', 'lost', 'cannot_verify')),
+  checked_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, agent_id, notion_id),
+  CONSTRAINT creator_access_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+REVOKE ALL ON creator_access FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON creator_access TO agentos_app;
+
+ALTER TABLE creator_access ENABLE ROW LEVEL SECURITY;
+ALTER TABLE creator_access FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON creator_access;
+CREATE POLICY tenant_isolation ON creator_access
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
@@ -1122,5 +1146,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038')
 ON CONFLICT DO NOTHING;

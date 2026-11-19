@@ -18,7 +18,9 @@ caller reports it and tries again on its next pass, rather than silently falling
 another token.
 
 A reinstall or a Notion reconnect replaces the row (``put`` upserts); Disconnect removes
-the Notion row (``delete``), the only flow that deletes a credential.
+the Notion row (``delete``). A creator who consents at the picker keeps their own Notion
+sign-in as kind ``notion_creator:<Slack user ID>`` (``ids.notion_creator_kind``), one row
+per tenant and creator; a consented pick replaces it and revoking consent deletes it.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from typing import Any, Protocol
 from cryptography.exceptions import InvalidTag
 from psycopg_pool import AsyncConnectionPool
 
+from agentos import ids
 from agentos.config import AgentsConfig, ConfigError, read_secret
 from agentos.crypto_keys import KeyStore, TenantKeyError
 from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant, encrypt_with_tenant_key
@@ -38,6 +41,7 @@ from agentos.tenants import require_tenant_secret
 
 SLACK_BOT = "slack_bot"
 NOTION = "notion"
+NOTION_CREATOR_PREFIX = "notion_creator:"
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,10 @@ class TenantCredentials:
         """
         for kind in (SLACK_BOT, NOTION):
             self._cache.pop((tenant_id, kind), None)
+        for key in [
+            k for k in self._cache if k[0] == tenant_id and k[1].startswith(NOTION_CREATOR_PREFIX)
+        ]:
+            del self._cache[key]
 
     async def slack_bot_token(self, config: AgentsConfig) -> str:
         """The tenant's Slack bot token: the credential row first, else its env variable.
@@ -233,16 +241,32 @@ class TenantCredentials:
         """Whether the tenant has a stored Notion credential. Reads no token value."""
         return await self._store.get(tenant_id, NOTION) is not None
 
+    async def creator_notion_token(self, tenant_id: str, user_id: str) -> str | None:
+        """The creator's kept Notion sign-in, or None when they never consented.
+
+        The row only: a creator's token exists by consent, so there is no environment
+        fallback. A row that cannot be decrypted raises ``ConfigError`` naming the tenant
+        and key version, never a value.
+        """
+        return await self._resolve_kind(tenant_id, ids.notion_creator_kind(user_id))
+
+    async def creator_consent(self, tenant_id: str, user_id: str) -> bool:
+        """Whether the creator's Notion sign-in is stored. Reads no token value."""
+        return await self._store.get(tenant_id, ids.notion_creator_kind(user_id)) is not None
+
     async def _resolve(self, config: AgentsConfig, kind: str) -> str | None:
-        row = await self._store.get(config.tenant_id, kind)
+        return await self._resolve_kind(config.tenant_id, kind)
+
+    async def _resolve_kind(self, tenant_id: str, kind: str) -> str | None:
+        row = await self._store.get(tenant_id, kind)
         if row is None:
             return None
         source = (row.key_version, row.ciphertext)
-        entry = self._cache.get((config.tenant_id, kind))
+        entry = self._cache.get((tenant_id, kind))
         if entry is not None and entry[0] == source:
             return entry[1]
-        token = await self._decrypt(config.tenant_id, kind, row)
-        self._cache[(config.tenant_id, kind)] = (source, token)
+        token = await self._decrypt(tenant_id, kind, row)
+        self._cache[(tenant_id, kind)] = (source, token)
         return token
 
     async def _decrypt(self, tenant_id: str, kind: str, row: Credential) -> str:

@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
+from agentos import ids
 from agentos.agent_health import AVAILABLE, UNAVAILABLE, AgentHealth
 from agentos.audit import event_json
 from agentos.config import parse_agents_config
@@ -513,6 +514,70 @@ async def test_the_notion_section_says_what_is_in_use_when_nothing_is_connected(
             assert "Using the" not in page
     assert await h.credential_store.get(TENANT, NOTION) is None
     assert [e for e in h.audit.events if e.kind == "connector"] == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["consent", "re-pick replaces", "revoke"],
+    ids=["consent", "replaces", "revoke"],
+)
+async def test_the_pick_flow_keeps_the_sign_in_only_with_consent(case):
+    """Fails if a consented pick does not store the creator's token encrypted (or shows it on
+    a page), a second consented pick keeps the old token, or revoke keeps the token, records
+    nothing, or a second revoke records again."""
+    seen: dict = {}
+    h = await build_harness(seen)
+    await h.plane.add_agent(TENANT, ROOT, "it-helper", published_definition())
+    admin = await h.signed_in(ROOT)
+    kind = ids.notion_creator_kind(ROOT)
+    version = f"/ui/{TENANT}/agents/it-helper/versions/1"
+
+    async def pick(code: str):
+        start = await post(admin, f"{version}/pick/start", await csrf_token(admin), consent="yes")
+        assert start.status_code == 303
+        query = parse_qs(urlsplit(start.headers["location"]).query)
+        response = await admin.get(CALLBACK, params={"code": code, "state": query["state"][0]})
+        assert response.status_code == 303
+        # The consented flow still leaves a listing the creator can pick from.
+        listing = await admin.get(response.headers["location"])
+        assert listing.status_code == 200 and "A page" in listing.text
+
+    async with using(admin):
+        await pick("abc")
+        if case == "re-pick replaces":
+            await pick("second")
+        if case == "revoke":
+            response = await post(admin, f"{version}/pick/revoke", await csrf_token(admin))
+            assert response.status_code == 303
+            assert response.headers["location"].endswith("done=consent-revoked")
+
+        stored = await h.credential_store.get(TENANT, kind)
+        # Settle point: the flow is over; a fresh page load shows the state, never the token.
+        page = (await admin.get(version)).text
+        if case == "revoke":
+            assert stored is None
+            assert "Stop keeping it" not in page
+            again = await post(admin, f"{version}/pick/revoke", await csrf_token(admin))
+            assert again.status_code == 409
+            assert [(e.kind, e.tool) for e in h.audit.events if e.kind == "connector"] == [
+                ("connector", "creator_consent"),
+                ("connector", "creator_consent_revoked"),
+            ]
+        else:
+            code = "second" if case == "re-pick replaces" else "abc"
+            token = f"{WORKSPACE_TOKEN}:{code}"
+            assert stored is not None
+            assert decrypt_for_tenant(h.keys, TENANT, stored.ciphertext, stored.key_version) == (
+                token.encode()
+            )
+            assert token not in page
+            assert 'name="consent" value="yes" checked' in page
+            assert "Stop keeping it" in page
+            connects = [e for e in h.audit.events if e.kind == "connector"]
+            assert [(e.tool, e.target, e.identity) for e in connects] == [
+                ("creator_consent", ROOT, f"user:{ROOT}")
+            ] * (2 if case == "re-pick replaces" else 1)
+            assert all(WORKSPACE_TOKEN not in event_json(e) for e in h.audit.events)
 
 
 async def test_the_pick_purpose_flow_stores_no_credential():

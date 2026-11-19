@@ -53,6 +53,19 @@ def retention_schedule_id(tenant: str) -> str:
     return f"{tenant}:retention-schedule"
 
 
+def creator_access_workflow_id(tenant: str) -> str:
+    return f"{tenant}:creator-access"
+
+
+def creator_access_schedule_id(tenant: str) -> str:
+    return f"{tenant}:creator-access-schedule"
+
+
+def notion_creator_kind(user_id: str) -> str:
+    """The credential kind of one creator's kept Notion sign-in; the row carries the tenant."""
+    return f"notion_creator:{user_id}"
+
+
 def page_refresh_id(tenant: str, page_id: str) -> str:
     """One refresh workflow per page, so a burst of events lands in one run."""
     return f"{tenant}:page-refresh:{normalize_id(page_id)}"

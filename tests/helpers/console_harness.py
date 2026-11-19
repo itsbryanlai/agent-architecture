@@ -123,6 +123,7 @@ class ConsoleHarness:
         webhook_tokens=None,
         slack_for=None,
         directory_ttl: float = 0,
+        creator_access=None,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
@@ -168,6 +169,7 @@ class ConsoleHarness:
             webhook_tokens=webhook_tokens,
             slack_for=slack_for,
             health=self.health,
+            creator_access=creator_access,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

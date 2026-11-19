@@ -688,6 +688,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.budgets import PostgresBudgetStore
     from agentos.config import KEY_SOURCE_DB
     from agentos.connectors.notion import RealNotionAPI
+    from agentos.creator_access import PostgresCreatorAccessStore
     from agentos.credentials import PostgresCredentialStore, TenantCredentials
     from agentos.crypto_keys import (
         TenantKeyError,
@@ -783,6 +784,7 @@ async def _real_lifespan(app: FastAPI):
             webhook_tokens=webhook_tokens,
             slack_for=slack_for,
             health=PostgresAgentHealthStore(pool),
+            creator_access=PostgresCreatorAccessStore(pool),
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:

@@ -15,7 +15,15 @@ import pytest
 from agentos.access_diff import WideningNotAcknowledged, diff_access
 from agentos.audience import EffectiveAudience
 from agentos.config import NotionPageGrant
+from agentos.connectors.notion import normalize_id
 from agentos.control_api import create_app
+from agentos.creator_access import (
+    CANNOT_VERIFY,
+    LOST,
+    VERIFIED,
+    AccessResult,
+    InMemoryCreatorAccessStore,
+)
 from agentos.grant_picks import GrantNotPicked
 from agentos.notion_picker import HttpNotionOAuth, Picker, PickerConfig
 from tests.conftest import DB_ID, TENANT, agents_dict, parse_agents_config
@@ -438,3 +446,33 @@ async def test_a_grant_not_picked_cannot_be_submitted_when_the_picker_is_require
         TENANT, OWNER, "it-helper", 1, [PickedObject(DB_ID.upper(), "database")]
     )
     await hp.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+
+
+@pytest.mark.parametrize(
+    ("status", "cell"),
+    [
+        (VERIFIED, "verified 2026-11-14 12:00 UTC"),
+        (LOST, '<span class="error">lost</span>'),
+        (CANNOT_VERIFY, "cannot verify (no consent)"),
+        (None, '<span class="muted">not checked yet</span>'),
+    ],
+    ids=["verified", "lost", "cannot-verify", "not-checked"],
+)
+async def test_the_version_page_shows_the_creators_access_per_grant(status, cell):
+    """Fails if the version page hides the nightly verdict on a grant, or shows the wrong one."""
+    access = InMemoryCreatorAccessStore()
+    harness = ConsoleHarness(picker=make_picker({}), creator_access=access)
+    await harness.seed_members()
+    await pending(harness)
+    if status is not None:
+        await access.record(
+            TENANT,
+            "it-helper",
+            [AccessResult(normalize_id(DB_ID), status)],
+            harness.clock(),
+            {normalize_id(DB_ID)},
+        )
+    c = await harness.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(VERSION)).text
+    assert cell in page

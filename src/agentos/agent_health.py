@@ -26,6 +26,16 @@ admins when it goes unavailable, the creator when it recovers. The audit row
 and the row commit in one transaction; the direct messages carry an idempotency
 key named by the check that made the transition, so a repeated check tells
 nobody twice. A reason names the grant and the problem, never document content.
+
+A second source feeds the same check: the nightly creator-access pass
+(``creator_access``) stores, per granted object, whether the creator who picked it
+can still read it with their kept Notion sign-in. An object the creator lost marks
+the agent unavailable with "its creator can no longer see '<grant>'"; an object
+with no consent is ``cannot_verify`` and never suspends. The check combines both
+sources on every run — the grants must pass and no granted object may be lost —
+so a passing grant check never recovers an agent whose creator lost access, and a
+passing creator check never recovers one whose grants fail. The two sources cannot
+flap each other: only a check where both pass marks the agent available.
 """
 
 from __future__ import annotations
@@ -43,7 +53,8 @@ from agentos import ids
 from agentos.agent_store import AgentStore
 from agentos.audit import AuditStore, canonical_sha256
 from agentos.config import AgentVersion
-from agentos.connectors.notion import ConnectorError
+from agentos.connectors.notion import ConnectorError, normalize_id
+from agentos.creator_access import LOST, CreatorAccessStore, InMemoryCreatorAccessStore
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker
 from agentos.members import ADMIN, MemberStore
 from agentos.models import AuditEvent
@@ -250,6 +261,7 @@ class AgentHealthChecker:
         members: MemberStore,
         uow: UnitOfWork | None = None,
         clock: Callable[[], datetime] = utcnow,
+        creator_access: CreatorAccessStore | None = None,
     ):
         self._registry = registry
         self._agents = agents
@@ -259,6 +271,9 @@ class AgentHealthChecker:
         self._members = members
         self._uow = uow if uow is not None else InMemoryUnitOfWork(health, audit)
         self._clock = clock
+        self._creator_access = (
+            InMemoryCreatorAccessStore() if creator_access is None else creator_access
+        )
 
     async def check_tenant(self, tenant_id: str, agents: dict[str, AgentVersion]) -> None:
         """Check each given published agent of the tenant and record its health.
@@ -319,10 +334,30 @@ class AgentHealthChecker:
                     report.grant,
                     note,
                 )
+        creator_reason = await self._creator_lost_reason(tenant_id, agent)
         if any(report.problems for report in reports):
-            await self._record(tenant_id, runtime, agent, UNAVAILABLE, unavailable_reason(reports))
+            reason = unavailable_reason(reports)
+            if creator_reason:
+                reason = f"{reason}; {creator_reason}"
+            await self._record(tenant_id, runtime, agent, UNAVAILABLE, reason)
+        elif creator_reason:
+            await self._record(tenant_id, runtime, agent, UNAVAILABLE, creator_reason)
         else:
             await self._record(tenant_id, runtime, agent, AVAILABLE, None)
+
+    async def _creator_lost_reason(self, tenant_id: str, agent: AgentVersion) -> str | None:
+        """One line per granted object the nightly check found its creator can no longer read.
+
+        Only objects the current version grants count: a verdict left by an older version
+        names an object this agent no longer uses. ``cannot_verify`` is not a loss.
+        """
+        rows = await self._creator_access.for_agent(tenant_id, agent.agent_id)
+        lost = [
+            f"its creator can no longer see '{grant.name}'"
+            for grant in (*agent.grants.notion_databases, *agent.grants.notion_pages)
+            if (row := rows.get(normalize_id(grant.id))) is not None and row.status == LOST
+        ]
+        return "; ".join(lost) or None
 
     async def _record(self, tenant_id, runtime, agent: AgentVersion, status, reason) -> None:
         row = AgentHealth(tenant_id, agent.agent_id, agent.version, status, reason, self._clock())

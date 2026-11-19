@@ -68,7 +68,8 @@ class GrantReport:
     # A short category when something is wrong (see ``REASONS``); None when the grant is fine.
     reason: str | None = None
     # What Notion says the object is called and where it sits, now. The creator's label is
-    # ``grant``; ``label_differs`` is set when the two do not contain one another once normalised.
+    # ``grant``; ``label_differs`` is set when the two do not contain one another as a run of
+    # whole words once normalised.
     live_title: str | None = None
     parent: str | None = None
     label_differs: bool = False
@@ -125,8 +126,11 @@ def _normalised_name(name: str) -> str:
 
 
 def _same_name(a: str, b: str) -> bool:
-    left, right = _normalised_name(a), _normalised_name(b)
-    return left in right or right in left
+    left, right = _normalised_name(a).split(), _normalised_name(b).split()
+    if not left or not right:
+        return left == right
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    return any(long[i : i + len(short)] == short for i in range(len(long) - len(short) + 1))
 
 
 def _with_live(report: GrantReport, live: LiveObject) -> GrantReport:

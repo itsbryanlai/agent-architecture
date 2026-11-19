@@ -3,6 +3,23 @@
 from datetime import timedelta
 
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
+
+# An uninstall ends a tenant's pending work cleanly: the task and conversation
+# workflows stop with no Slack post (the token is deleted), behind this marker so
+# histories recorded before it replay unchanged.
+TENANT_DISABLED_PATCH = "tenant-disabled"
+
+
+def is_tenant_disabled(err: ActivityError) -> bool:
+    """True when the activity refused because the tenant's app was uninstalled.
+
+    The runtime reports a disabled tenant as a non-retryable ``TenantDisabled``;
+    a tenant not loaded yet stays retryable and never matches this.
+    """
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == "TenantDisabled"
+
 
 # Activity timeouts: every activity call passes one of these explicitly.
 ACTIVITY_TIMEOUT = timedelta(seconds=30)

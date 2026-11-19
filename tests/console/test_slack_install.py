@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import re
 import secrets as token_source
+from dataclasses import replace
 from urllib.parse import parse_qs
 
 import httpx
@@ -218,6 +219,7 @@ def stored_tenant(tenant_id: str, team_id: str) -> AgentsConfig:
         "error parameter",
         "no state cookie",
         "reinstall by another user",
+        "reinstall after uninstall",
     ],
     ids=[
         "success",
@@ -230,12 +232,14 @@ def stored_tenant(tenant_id: str, team_id: str) -> AgentsConfig:
         "error-param",
         "no-cookie",
         "reinstall-other-user",
+        "reinstall-after-uninstall",
     ],
 )
 async def test_the_install_callback(h, case):
     """Fails if an allowed install does not create the tenant, key, token and first admin with
-    one install audit, a refused or conflicting one writes anything, or a reinstall creates a
-    second tenant or changes the admins."""
+    one install audit, a refused or conflicting one writes anything, a reinstall creates a
+    second tenant or changes the admins, or a reinstall after an uninstall leaves the tenant
+    disabled."""
     if case == "team not allowlisted":
         h = InstallHarness(allowed=("T_OTHER",))
         await h.keys.refresh()
@@ -243,6 +247,12 @@ async def test_the_install_callback(h, case):
         await h.tenants.insert(stored_tenant(h.tenant_id, "T_OTHER_WS"))
     if case == "same team different tenant":
         await h.tenants.insert(stored_tenant("otherco", NEW_TEAM))
+    if case == "reinstall after uninstall":
+        # An imported tenant the uninstall disabled; its settings must survive.
+        await h.tenants.insert(
+            replace(stored_tenant(h.tenant_id, NEW_TEAM), default_agent="it-helper")
+        )
+        await h.tenants.set_enabled(h.tenant_id, False)
     async with h.client() as c:
         if case == "no state cookie":
             # Another browser: a well-formed state, but no cookie was ever set here.
@@ -298,6 +308,16 @@ async def test_the_install_callback(h, case):
         assert len(await h.tenants.list_refs()) == 1
         assert len(h.audit.events) == 1
         assert len(h.oauth.calls) == 1
+        return
+    if case == "reinstall after uninstall":
+        assert response.status_code == 200
+        row = await h.tenants.load(h.tenant_id)
+        assert row.enabled is True
+        assert row.config.admins == ("U_SEED_ADMIN",)
+        assert row.config.default_agent == "it-helper"
+        assert await h.credentials.slack_bot_token(row.config) == BOT_TOKEN
+        assert [(e.kind, e.tool) for e in h.audit.events] == [("install", "reinstall")]
+        assert (await h.credential_store.get(h.tenant_id, SLACK_BOT)).key_version == 1
         return
 
     assert response.status_code == 200

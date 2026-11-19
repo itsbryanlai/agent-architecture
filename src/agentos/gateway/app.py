@@ -13,6 +13,9 @@ people wrote into Temporal history:
   A channel shared with another organisation (``channel_shared``) starts an
   ``AudienceWatchWorkflow`` (one per Slack event ID, never reused), which pauses the
   agents that answer in that channel. People joining a channel start nothing.
+  An uninstall (``app_uninstalled``, or ``tokens_revoked`` naming bot tokens) disables
+  the workspace's tenant and deletes its Slack credential in one unit of work, audited
+  ``uninstall``; the Notion credential is kept, and a repeat event changes nothing more.
 * ``POST /slack/interactivity``: Submit / Cancel clicks become a ``decision``
   signal to the task named on the card. The gateway passes on who clicked; the
   task workflow decides whether that person may approve. An Edit click opens a
@@ -66,6 +69,7 @@ from agentos.audit import AuditStore
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
+from agentos.credentials import SLACK_BOT, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
 from agentos.feedback import (
     FEEDBACK_ACTIONS,
@@ -90,13 +94,17 @@ from agentos.notion_webhook import WebhookTokens
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
-from agentos.tenant_store import TenantSource, as_source
+from agentos.tenant_store import TenantSource, TenantStore, as_source
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 
 log = logging.getLogger("agentos.gateway")
 
 LEADING_MENTION = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 APPROVAL_ACTIONS = {"task_approve": True, "task_cancel": False}
+# The Slack events that end a tenant: the app was uninstalled, or its bot token was
+# revoked. Both disable the tenant and delete its Slack credential; Notion is kept.
+UNINSTALL_EVENTS = {"app_uninstalled", "tokens_revoked"}
+UNINSTALL_IDENTITY = "system:uninstall"
 # Page events that can change what a task or the knowledge index should see.
 # Locking and unlocking a page change neither.
 NOTION_PAGE_EVENTS = {
@@ -147,15 +155,20 @@ class GatewayDeps:
     # The Notion webhook verification tokens, encrypted per tenant. None keeps the
     # local file flow for a gateway built without a database.
     webhook_tokens: WebhookTokens | None = None
+    # The uninstall flow's stores: the tenants table (a disabled row is still found by
+    # its Slack team), the credentials, the audit log and the unit of work that commits
+    # the disable, the token deletion and the audit together. None (a gateway built
+    # without a database) ignores uninstall events with a log line.
+    tenant_store: TenantStore | None = None
+    credentials: TenantCredentials | None = None
+    audit: AuditStore | None = None
+    uow: UnitOfWork | None = None
     # The app's name from the manifest, for the not-set-up reply; "This app" without one.
     app_name: str = "This app"
-    # Where answer votes and their reasons are kept, and the audit log a vote records into.
-    # None in tests that never click a feedback button.
+    # Where answer votes and their reasons are kept. A vote records into ``audit`` in the
+    # same ``uow`` transaction (both above, shared with the uninstall flow); create_app
+    # defaults ``uow`` for the in-memory stores. None in tests that never click a button.
     feedback: FeedbackStore | None = None
-    audit: AuditStore | None = None
-    # The transaction a vote and its audit event commit in together. None in tests that
-    # never click a feedback button; create_app defaults it for the in-memory stores.
-    uow: UnitOfWork | None = None
     # When a vote is recorded; tests inject a fixed clock.
     clock: Callable[[], datetime] = _utcnow
 
@@ -177,6 +190,8 @@ def create_app(
     audit: AuditStore | None = None,
     uow: UnitOfWork | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    tenant_store: TenantStore | None = None,
+    credentials: TenantCredentials | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
@@ -201,6 +216,8 @@ def create_app(
             audit=audit,
             uow=uow,
             clock=clock,
+            tenant_store=tenant_store,
+            credentials=credentials,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -237,12 +254,17 @@ def create_app(
         if payload.get("type") != "event_callback":
             return Response(status_code=200)
         team_id = payload.get("team_id")
+        event = payload.get("event") or {}
+        if event.get("type") in UNINSTALL_EVENTS:
+            # Resolved through the store, not the directory: a repeat or out-of-order
+            # event arrives after the tenant is disabled, and must change nothing more.
+            await _uninstall(d, team_id, payload, event)
+            return Response(status_code=200)
         tenant = await d.tenants.for_slack_team(team_id)
         if tenant is None:
             log.warning("ignored event from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
 
-        event = payload.get("event") or {}
         watched = _audience_event(tenant, payload, event)
         if watched is not None:
             await _start_audience_watch(d, watched)
@@ -450,6 +472,63 @@ async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
         event.tenant_id,
         workflow_id,
     )
+
+
+async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: dict) -> None:
+    """Disable the workspace's tenant and delete its Slack credential, once.
+
+    In one unit of work: the tenant row disabled, its ``slack_bot`` credential deleted
+    and one ``uninstall`` audit event (the event type in ``tool``, the team ID in
+    ``target``, never a token). The Notion credential is kept: a reinstall resumes the
+    tenant with its data. A repeat or out-of-order event finds the tenant already
+    disabled with no credential and changes nothing more; the re-check sits inside the
+    unit's tenant lock, so two events arriving together still record one uninstall.
+    ``tokens_revoked`` acts only when bot tokens were revoked; an unknown team is
+    ignored with a log line.
+    """
+    kind = event.get("type")
+    if kind == "tokens_revoked" and not (event.get("tokens") or {}).get("bot"):
+        log.info("team_id=%s tokens_revoked names no bot token; ignored", team_id)
+        return
+    if d.tenant_store is None or d.credentials is None or d.audit is None or d.uow is None:
+        log.warning("team_id=%s uninstall event ignored: the gateway has no tenant store", team_id)
+        return
+    ref = await d.tenant_store.ref_for_slack_team(team_id or "")
+    if ref is None:
+        log.warning("ignored uninstall event from an unknown Slack workspace team_id=%s", team_id)
+        return
+    tenant = ref.tenant_id
+    async with d.uow.begin(tenant) as conn:
+        row = await d.tenant_store.load(tenant)
+        if row is None:
+            return
+        deleted = await d.credentials.delete(tenant, SLACK_BOT, conn=conn)
+        if not row.enabled and not deleted:
+            log.info(
+                "tenant_id=%s team_id=%s already uninstalled; %s changes nothing",
+                tenant,
+                team_id,
+                kind,
+            )
+            return
+        await d.tenant_store.set_enabled(tenant, False, conn=conn)
+        await d.audit.record(
+            AuditEvent(
+                tenant_id=tenant,
+                event_key=ids.audit_control_key(
+                    tenant, "uninstall", payload.get("event_id") or uuid.uuid4().hex
+                ),
+                kind="uninstall",
+                agent_id=None,
+                agent_version=None,
+                requester_user_id=UNINSTALL_IDENTITY,
+                identity=UNINSTALL_IDENTITY,
+                tool=kind,
+                target=team_id,
+            ),
+            conn=conn,
+        )
+    log.info("tenant_id=%s team_id=%s uninstalled event=%s", tenant, team_id, kind)
 
 
 # Slack events are a few KB and an interactivity payload (a form submission) well
@@ -1093,7 +1172,8 @@ async def _real_lifespan(app: FastAPI):
     key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
-        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenant_store = PostgresTenantStore(pool)
+        directory = TenantDirectory(tenant_store)
         tenants = await startup_tenants(directory)
         try:
             keys = await build_key_store(settings, pool)
@@ -1143,6 +1223,8 @@ async def _real_lifespan(app: FastAPI):
             webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
             app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
             feedback=PostgresFeedbackStore(pool),
+            tenant_store=tenant_store,
+            credentials=credentials,
             audit=PostgresAuditStore(pool),
             uow=PostgresUnitOfWork(pool),
         )

@@ -51,7 +51,9 @@ Rules this workflow keeps:
   thread is switched, and a refused one leaves the thread with the front door.
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
-  workflow goes on to wait for the next message.
+  workflow goes on to wait for the next message. A turn failed because the tenant's
+  app was uninstalled posts nothing (the token is deleted); history is still left
+  valid, so a reinstall resumes the thread. Behind the ``tenant-disabled`` marker.
 * While a tool step runs long, the placeholder shows that step's label, fixed
   runtime text built from the agent's grants and config, never the model's words
   or a tool's input. Labels are throttled in workflow time and awaited inside the
@@ -115,6 +117,8 @@ with workflow.unsafe.imports_passed_through():
         PROGRESS_RETRY,
         PROGRESS_TIMEOUT,
         RETRY,
+        TENANT_DISABLED_PATCH,
+        is_tenant_disabled,
     )
     from agentos.workflows.task import TaskWorkflow
 
@@ -365,6 +369,16 @@ class ConversationWorkflow:
         # A hand-off during the turn changes the thread's agent, so log
         # and recover as whichever agent was running.
         self._log_failure(self._ref(), err)
+        if (
+            isinstance(err, ActivityError)
+            and workflow.patched(TENANT_DISABLED_PATCH)
+            and is_tenant_disabled(err)
+        ):
+            # The app was uninstalled: no token to post a failure notice with. Leave
+            # history valid so a reinstall resumes the thread, and post nothing.
+            if state.ctx is not None and state.placeholder_ts is not None:
+                await self._recover(conv_id, state, post=False)
+            return
         if state.ctx is None or state.placeholder_ts is None:
             # No placeholder to replace, so the user would get no reply at
             # all: post the failure notice as a new message instead.
@@ -432,8 +446,12 @@ class ConversationWorkflow:
             err.activity_type if isinstance(err, ActivityError) else type(err).__name__,
         )
 
-    async def _recover(self, conv_id: str, state: "_TurnState") -> None:
-        """Leave valid history and tell the user. Each step is best effort."""
+    async def _recover(self, conv_id: str, state: "_TurnState", post: bool = True) -> None:
+        """Leave valid history and tell the user. Each step is best effort.
+
+        ``post=False`` leaves the history valid but posts nothing: the tenant's app
+        was uninstalled, so there is no token to post with.
+        """
         ref = self._ref()
         ctx = state.ctx
         placeholder_ts = state.placeholder_ts
@@ -470,6 +488,8 @@ class ConversationWorkflow:
                 )
             except ActivityError as err:
                 self._log_failure(ref, err, "recovery")
+        if not post:
+            return
         try:
             if workflow.patched(PATCH_NOTICE_AUDIT):
                 await self._finalize(

@@ -13,8 +13,9 @@ Then, in one unit of work: the tenant row (its ID built from the team ID in ``id
 stable so a reinstall finds it), the tenant's payload key, the bot token encrypted under
 that key, the installer as the first admin (the tenant row's ``admins`` list, like a YAML
 tenant's), and one ``install`` audit event that never holds the token. A reinstall of a
-known team replaces the token (audited as a reinstall) and creates nothing else: the
-settings, admins and key stay as they are.
+known team replaces the token (audited as a reinstall), re-enables the tenant if an
+uninstall disabled it, and creates nothing else: the settings, admins, data and key stay
+as they are.
 
 The pages are rendered by ``web_ui.py``; this module owns the configuration, the exchange
 with Slack and the unit of work. An error names what went wrong (a Slack error code, the
@@ -334,6 +335,11 @@ class Installer:
                         "the install was refused",
                         409,
                     )
+                if not existing.enabled:
+                    # A reinstall after an uninstall resumes the tenant: its data,
+                    # agents, settings and key stayed; only the enable flag and the
+                    # bot token were gone.
+                    await self._tenants.set_enabled(tenant_id, True, conn=conn)
             key_version, key = await self._ensure_key(tenant_id, conn)
             await self._credentials.store_secret(
                 tenant_id, SLACK_BOT, bot_token, key_version, key, conn=conn

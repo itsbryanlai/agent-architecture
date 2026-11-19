@@ -48,7 +48,14 @@ from agentos.tenant_store import (
     import_tenant,
     startup_tenants,
 )
-from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry, runtime_for
+from agentos.tenants import (
+    RegistrySync,
+    TenantDisabled,
+    TenantRegistry,
+    UnknownTenant,
+    build_registry,
+    runtime_for,
+)
 from agentos.worker import build_tenant_clients
 from tests.conftest import (
     ALICE,
@@ -410,6 +417,29 @@ async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):
     with pytest.raises(UnknownTenant):
         registry.get(GLOBEX)
     assert registry.tenants() == [TENANT]
+
+
+async def test_the_disabled_mark_follows_the_directory(monkeypatch):
+    """Fails if a disabled tenant is reported as merely unknown, or a re-enabled one stays refused."""
+    store, clock = InMemoryTenantStore(acme(), globex()), Clock()
+    set_secrets(monkeypatch, "GLOBEX")
+    registry, sync, _ = await start_worker_registry(monkeypatch, store, clock)
+
+    await store.set_enabled(GLOBEX, False)
+    clock.advance(6)
+    await sync.sync()
+
+    with pytest.raises(TenantDisabled):
+        registry.get(GLOBEX)
+    with pytest.raises(UnknownTenant) as caught:
+        registry.get("never-stored")
+    assert not isinstance(caught.value, TenantDisabled)
+
+    await store.set_enabled(GLOBEX, True)
+    clock.advance(6)
+    await sync.sync()
+
+    assert registry.get(GLOBEX).config.slack_team_id == GLOBEX_TEAM
 
 
 async def test_a_sync_that_drops_a_tenant_forgets_its_cached_token():

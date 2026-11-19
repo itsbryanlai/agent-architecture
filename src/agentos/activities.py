@@ -184,7 +184,7 @@ from agentos.tasks import (
     format_task_list,
     listed_state,
 )
-from agentos.tenants import TenantRegistry, TenantRuntime, UnknownTenant
+from agentos.tenants import TenantDisabled, TenantRegistry, TenantRuntime, UnknownTenant
 from agentos.threads import (
     InMemoryOwnerPingStore,
     InMemoryThreadStore,
@@ -462,9 +462,15 @@ class AgentActivities:
         tenant's runtime: a tenant installed seconds ago appears on the worker's
         next directory refresh (every 5 s), and the shared activity retry policy
         (5 attempts, 1 s doubling to 8 s, about 15 s in total) waits that out.
+
+        A disabled tenant (its app was uninstalled) is non-retryable: its Slack token
+        is deleted, so no retry can post, and the workflow ends the work cleanly.
         """
         try:
             return self.registry.get(tenant_id)
+        except TenantDisabled as err:
+            log.info("tenant_id=%s disabled (uninstalled); activity refused", tenant_id)
+            raise ApplicationError(str(err), type="TenantDisabled", non_retryable=True) from err
         except UnknownTenant as err:
             raise ApplicationError(str(err), type="UnknownTenant") from err
 

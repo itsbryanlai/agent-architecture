@@ -17,7 +17,9 @@ Rules kept here:
 * A ``TenantDirectory`` serves the enabled tenants from a short cache, so a tenant
   added, changed or disabled in the database reaches the gateway, the worker and the
   console within ``DEFAULT_TTL_SECONDS`` without a restart. A disabled tenant is not
-  in what it returns, so every caller treats it as unknown.
+  in what it serves, but ``disabled_tenants`` names it: the worker ends a disabled
+  tenant's pending work cleanly, while a tenant not stored at all stays retryable
+  (it may be installed seconds later).
 * A tenant's settings are never copied back from the YAML file once imported.
 """
 
@@ -105,7 +107,10 @@ class TenantStore(Protocol):
         """
         ...
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None: ...
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
+        """Enable or disable the tenant. ``conn`` joins the change to a unit of work,
+        as ``insert`` does, so a disable commits with its credential deletion and audit."""
+        ...
 
     async def set_routing(
         self,
@@ -235,9 +240,9 @@ class PostgresTenantStore:
                 "or Notion workspace"
             ) from err
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            await conn.execute(
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await db.execute(
                 "UPDATE tenants SET enabled = %s, updated_at = now() WHERE tenant_id = %s",
                 (enabled, tenant_id),
             )
@@ -330,7 +335,7 @@ class InMemoryTenantStore:
         self._put(config, True)
         return True
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None:
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
         self._put(self._rows[tenant_id].config, enabled)
 
     async def set_routing(
@@ -380,7 +385,9 @@ class InMemoryTenantStore:
 class TenantSource(Protocol):
     """What the gateway, worker and console ask for the tenants they serve.
 
-    Only enabled tenants are visible: a disabled tenant is answered as unknown.
+    Only enabled tenants are served: a disabled tenant is answered as unknown.
+    ``disabled_tenants`` still names the stored-but-disabled ones, so the worker can
+    end their pending work cleanly instead of retrying it as not-yet-loaded.
     """
 
     async def snapshot(self) -> TenantsConfig: ...
@@ -390,6 +397,11 @@ class TenantSource(Protocol):
     async def get(self, tenant_id: str) -> AgentsConfig | None: ...
 
     async def only_tenant(self) -> str | None: ...
+
+    async def disabled_tenants(self) -> list[str]:
+        """The stored tenants that are disabled, as after an uninstall. A tenant not
+        stored at all is not named: it may still be installed, so its work retries."""
+        ...
 
     def latest(self) -> TenantsConfig:
         """The tenants as last read, with no read of its own. For sync code that runs
@@ -414,6 +426,9 @@ class StaticTenants:
 
     async def only_tenant(self) -> str | None:
         return self._tenants.only_tenant()
+
+    async def disabled_tenants(self) -> list[str]:
+        return []
 
     def latest(self) -> TenantsConfig:
         return self._tenants
@@ -532,6 +547,12 @@ class TenantDirectory:
             self._unknown = {t: until for t, until in self._unknown.items() if until > now}
         if len(self._unknown) < MAX_UNKNOWN_TENANTS:
             self._unknown[tenant_id] = now + UNKNOWN_TENANT_TTL_SECONDS
+
+    async def disabled_tenants(self) -> list[str]:
+        # The refresh keeps every stored row, enabled or not; the snapshot serves only
+        # the enabled ones. Reading it here brings the rows up to date first.
+        await self.snapshot()
+        return sorted(t for t, row in self._rows.items() if not row.enabled)
 
     async def only_tenant(self) -> str | None:
         return (await self.snapshot()).only_tenant()

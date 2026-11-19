@@ -1086,6 +1086,25 @@ async def task_unavailable_write(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id)]
 
 
+async def task_tenant_disabled(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(252 if stored else 251)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    # The app is uninstalled: the runtime stops serving the tenant and reports it
+    # disabled, as the worker's sync does after the gateway's uninstall event.
+    posts_before = len(r.slack.posts())
+    r.acts.registry.remove(TENANT)
+    r.acts.registry.set_disabled({TENANT})
+    await approve(handle, nonce)
+    assert await handle.result() == "cancelled"
+    assert len(r.slack.posts()) == posts_before
+    assert not r.notion.all_pages(DB_ID)
+    return [await current(r, "", handle.id)]
+
+
 async def progress(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(202 if stored else 201)
     scope = ids.knowledge_scope(ROOT_A)
@@ -1185,6 +1204,7 @@ for _name, _fn in {
     "task_hop": task_hop,
     "task_card_update_failure": task_card_update_failure,
     "task_unavailable_write": task_unavailable_write,
+    "task_tenant_disabled": task_tenant_disabled,
     "task_recorded": task_recorded,
     "my_tasks": my_tasks,
     "my_tasks_once": my_tasks_once,

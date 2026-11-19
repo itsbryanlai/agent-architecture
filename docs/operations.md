@@ -1236,10 +1236,12 @@ any write that is not `application/json`.
 it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
 unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
 also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
-as that user, and nothing in a request (header, query or body) can change it. It also
-needs each tenant's Notion key exported (`NOTION_TOKEN`, or the variable the tenant's
-`secrets.notion_token_env` names), because the grant check and publish read Notion
-with it; the process exits naming an unset variable. With
+as that user, and nothing in a request (header, query or body) can change it. The
+grant check and publish read Notion with each tenant's own token: the encrypted
+credential row once an admin has connected Notion in the console, else the variable
+the tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default). A tenant
+with neither fails its own check or publish with a message naming the variable; the
+process starts and serves the tenant Slack-only. With
 [sign-in configured](#web-console) the process may bind more widely and every
 request acts as the signed-in user instead. What the user may do comes from their role in the
 tenant named in the path (`/tenants/<tenant id>/...`), decided by

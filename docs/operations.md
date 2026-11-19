@@ -2,7 +2,7 @@
 
 How to set up, configure and run the system. What the system does is in [architecture.md](architecture.md); the first-run summary is in the [README](../README.md); what is built is in [status.md](status.md).
 
-Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Payload keys on a host without files](#payload-keys-on-a-host-without-files) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
+Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Payload keys on a host without files](#payload-keys-on-a-host-without-files) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Creator access](#creator-access) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
 
 Prerequisites: [uv](https://docs.astral.sh/uv/) (it installs Python 3.12 for you), Docker with Docker Compose, a tunnel tool (`cloudflared` or `ngrok`), a Slack workspace where you can create apps, a Notion workspace where you can create integrations, and an Anthropic API key (or Qwen, see Model provider).
 
@@ -796,6 +796,36 @@ follow-up still needs is deleted. The record of when an agent's owner was last m
 refusal (`owner_pings`) is purged after two days. Audit and usage rows are kept (append-only by
 design), as are `external_writes`, `task_links` and agent definitions. An inbound event the relay
 has not yet delivered is never purged.
+
+## Creator access
+
+A nightly Temporal schedule (05:00 UTC, after indexing and retention) checks that each
+published agent's creator can still read every Notion object they picked for it. Create or
+update the schedules once, after the worker is running; without `--schedule` the command
+starts one pass per tenant on the worker and prints its counts:
+
+```bash
+uv run python -m agentos.creator_access --schedule       # every stored tenant
+uv run python -m agentos.creator_access --tenant acme    # one pass now, through the worker
+```
+
+The check reads with the creator's own Notion sign-in, which exists only if they ticked
+"Keep my Notion sign-in" before a Choose-from-Notion sign-in. The token is stored encrypted
+per tenant and creator (`tenant_credentials`, kind `notion_creator:<Slack user ID>`); a
+consented pick replaces it, and "Stop keeping it" on the version page deletes it (audited
+`connector`, as `creator_consent` / `creator_consent_revoked`). Without consent the picker
+works unchanged and the grant shows "cannot verify (no consent)" — never a suspension.
+
+One cheap read per object, through the tenant's Notion rate limiter. The verdict per object
+lives in `creator_access`: `verified`, `lost` (Notion refused the creator: gone or unshared)
+or `cannot_verify`. A transient failure (network, rate limit, server error) changes nothing;
+the next pass tries again. The pass then runs the worker's health check, which combines both
+sources: an agent is available only when its grants pass and no granted object is lost. A
+lost object suspends the agent with the reason "its creator can no longer see '<grant>'" —
+the same fixed reply, refused Submit, audit and once-per-transition DMs as a grant problem
+(D-35); the creator and admins are told. A later pass where both sources pass recovers it,
+and the worker's five-minute re-check of unavailable agents means neither source can flap
+the other. The version page shows each grant's last verdict and when it was checked.
 
 ## Run
 

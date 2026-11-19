@@ -137,14 +137,17 @@ changed: turning off what is off, or on what is on, records nothing.
 
 ## Agent health
 
-Written by the worker's grant check, only on a transition: an agent becoming unavailable,
-or available again. A repeated check that finds the same status records nothing. The reason
-itself (the grant and the problem) lives in `agent_health`, never in the audit row; the row
-carries its hash. A switch an admin turns off or on is not a health transition (see Switches).
+Written by the worker's health check, only on a transition: an agent becoming unavailable,
+or available again. The check combines two sources — the grants themselves, and the nightly
+creator-access pass (`creator_access`) — and an agent is available only when both pass. A
+repeated check that finds the same status records nothing. The reason itself (the grant and
+the problem, or the grant the creator can no longer see) lives in `agent_health`, never in
+the audit row; the row carries its hash. A switch an admin turns off or on is not a health
+transition (see Switches).
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `agent_health` | The worker's grant check flips an agent's health: unavailable (a grant problem) or available again (a passing check). | `system:agent-health` for both | The agent and the version checked | the new status: `unavailable` or `available` | - | `ok` | `<tenant>:audit:agent-health:<agent id>:<checked at>` (once per transition); `output_sha256` is the hash of the reason when unavailable |
+| `agent_health` | The worker's health check flips an agent's health: unavailable (a grant problem, or a granted object its creator can no longer see) or available again (both sources pass). | `system:agent-health` for both | The agent and the version checked | the new status: `unavailable` or `available` | - | `ok` | `<tenant>:audit:agent-health:<agent id>:<checked at>` (once per transition); `output_sha256` is the hash of the reason when unavailable |
 
 ## Retention
 
@@ -211,9 +214,16 @@ transaction as the encrypted credential and the tenant's workspace. Admin only. 
 connect (a state this session never began or already spent, a failed code exchange or
 validation call, a workspace another tenant uses) writes nothing. The token is never in the row.
 
+The same kind records a creator's consent to keep their own Notion sign-in for the nightly
+access check (`creator_consent`, written with the encrypted per-creator credential when a
+consented picker flow completes) and its revocation (`creator_consent_revoked`, written with
+the credential's deletion). Any member with a role may consent or revoke for themselves; a
+revoke with nothing stored writes nothing. The token is never in these rows either.
+
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `connector` | Notion is connected (or reconnected), or disconnected | the admin / `user:<admin>` | none | `connect` or `disconnect` | the Notion workspace ID on connect; empty on disconnect | `ok` | Control key |
+| `connector` | A creator consents to keep their Notion sign-in (a consented pick replaces it), or revokes the consent | the creator / `user:<creator>` | none | `creator_consent` or `creator_consent_revoked` | the creator's Slack ID on consent; empty on revoke | `ok` | Control key |
 
 ## Tenant settings
 

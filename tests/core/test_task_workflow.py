@@ -1,8 +1,11 @@
 import asyncio
 import dataclasses
+import logging
 from datetime import timedelta
 
 import pytest
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
 from temporalio.client import WorkflowExecutionStatus
 
 from agentos import ids
@@ -50,6 +53,53 @@ async def test_approve_creates_exactly_once_and_survives_retry(harness):
     assert len(filed) == 1
     card_updates = [u for u in h.slack.updates() if u["text"].startswith("Submitted")]
     assert len(card_updates) == 1
+
+
+async def test_a_failed_card_redraw_logs_the_cause_with_ids_and_no_card_text(harness, caplog):
+    """Fails if a swallowed card-update failure logs no cause, tenant or task, or leaks the card text."""
+    h = harness
+    handle = await start_task(h)
+    # chat.update refuses every attempt, as when the card's message is gone. The response
+    # quotes the rejected card text, so a log that dumped the cause's message would leak it.
+    card_text = "Submitted: New monitor"
+    h.slack.fail_next_update(
+        SlackApiError(
+            "The request to the Slack API failed.",
+            SlackResponse(
+                client=None,
+                http_verb="POST",
+                api_url="https://slack.com/api/chat.update",
+                req_args={},
+                data={"ok": False, "error": "message_not_found", "text": card_text},
+                headers={},
+                status_code=200,
+            ),
+        ),
+        times=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="temporalio.workflow"):
+        await approve(h, handle)
+        await wait_state(handle, "watching")
+        page_id = h.notion.all_pages(DB_ID)[0]["id"]
+        h.notion.set_status(page_id, "Status", "Done")
+        await h.wf_env.sleep(timedelta(minutes=15))
+        assert await handle.result() == "done"
+
+    [record] = [
+        r
+        for r in caplog.records
+        if r.name == "temporalio.workflow" and "failed after retries" in r.getMessage()
+    ]
+    line = record.getMessage()
+    assert "activity update_card failed" in line
+    assert f"tenant_id={TENANT}" in line
+    assert f"task_id={handle.id}" in line
+    assert "error=SlackApiError" in line
+    assert "slack_code=message_not_found" in line
+    assert card_text not in line
+    assert "New monitor" not in line
+    assert "Mine flickers." not in line
 
 
 @pytest.mark.parametrize("tool", ["create_item", "add_comment"])

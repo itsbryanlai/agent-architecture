@@ -314,52 +314,62 @@ async def test_handshake_stores_a_pending_token_once(
 
 
 @pytest.mark.parametrize(
-    ("confirmed", "expected"), [(False, 503), (True, 200)], ids=["pending", "confirmed"]
+    ("state", "expected"),
+    [("pending", 503), ("confirmed", 200), ("undecryptable", 503)],
 )
 async def test_an_event_is_verified_only_against_the_confirmed_token(
-    agents, temporal, links, tmp_path, monkeypatch, confirmed, expected
+    agents, temporal, links, tmp_path, monkeypatch, state, expected
 ):
-    """Fails if an event signed with the pending token is accepted, or one signed with the confirmed token is refused."""
+    """Fails if an event signed with the pending token is accepted, one signed with the confirmed token is refused, or a confirmed token the tenant's key cannot decrypt gives anything but a clean 503."""
     app, store, _keys = make_db_app(agents, temporal, links, tmp_path, monkeypatch)
     async with db_client(app) as client:
         await apost(client, {"verification_token": TOKEN}, None)
-        if confirmed:
+        if state == "undecryptable":
+            other = EnvKeyStore(
+                {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+            )
+            await store.clear(TENANT)
+            await store.put_pending(TENANT, *encrypt_for_tenant(other, TENANT, TOKEN.encode()))
+        if state != "pending":
             await store.confirm(TENANT, NOW)
         body = json.dumps(page_event()).encode()
         resp = await apost(client, page_event(), sign(body))
     assert resp.status_code == expected
-    assert len(temporal.signals) == (1 if confirmed else 0)
+    assert len(temporal.signals) == (1 if state == "confirmed" else 0)
 
 
-async def test_show_confirm_and_clear_manage_the_token_and_audit_the_operator(monkeypatch, capsys):
-    """Fails if show prints a confirmed token, confirm leaves it pending, clear keeps it, or an audit row names the token or misses the operator."""
+@pytest.mark.parametrize(
+    ("command", "before", "code", "after", "prints_token", "audited"),
+    [
+        ("show", "pending", 0, "pending", True, ["show"]),
+        ("show", "active", 1, "active", False, []),
+        ("show", None, 1, None, False, []),
+        ("confirm", "pending", 0, "active", False, ["confirm"]),
+        ("confirm", "active", 1, "active", False, []),
+        ("clear", "active", 0, None, False, ["clear"]),
+        ("clear", None, 1, None, False, []),
+    ],
+)
+async def test_a_token_command_changes_only_the_state_it_names_and_audits_the_operator(
+    monkeypatch, capsys, command, before, code, after, prints_token, audited
+):
+    """Fails if a token command acts on a token in the wrong state, prints a token it must not, or audits without the operator or with the token."""
     store = InMemoryWebhookTokenStore()
     audit = InMemoryAuditStore()
     keys = EnvKeyStore(
         {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
     )
-    blob, version = encrypt_for_tenant(keys, TENANT, TOKEN.encode())
-    await store.put_pending(TENANT, blob, version)
+    if before is not None:
+        await store.put_pending(TENANT, *encrypt_for_tenant(keys, TENANT, TOKEN.encode()))
+        if before == "active":
+            await store.confirm(TENANT, NOW)
     monkeypatch.setattr("agentos.notion_webhook.operator_identity", lambda: "operator:ops")
+    args = build_parser().parse_args(["--tenant", TENANT, command])
 
-    def args(command):
-        return build_parser().parse_args(["--tenant", TENANT, command])
+    assert await execute(args, store, audit, keys, request_id="inv-1") == code
 
-    assert await execute(args("show"), store, audit, keys, request_id="inv-1") == 0
-    assert capsys.readouterr().out.strip() == TOKEN
-    assert await execute(args("confirm"), store, audit, keys, request_id="inv-1") == 0
-    assert (await store.get(TENANT)).state == "active"
-    assert await execute(args("show"), store, audit, keys, request_id="inv-1") == 1
-    assert TOKEN not in capsys.readouterr().out
-    assert await execute(args("clear"), store, audit, keys, request_id="inv-1") == 0
-    assert await store.get(TENANT) is None
-    assert await execute(args("clear"), store, audit, keys, request_id="inv-1") == 1
-
-    rows = [(e.kind, e.tool, e.identity, e.requester_user_id) for e in audit.events]
-    assert rows == [
-        ("webhook_token", "show", "operator:ops", "operator:ops"),
-        ("webhook_token", "confirm", "operator:ops", "operator:ops"),
-        ("webhook_token", "clear", "operator:ops", "operator:ops"),
-    ]
-    for event in audit.events:
-        assert TOKEN not in event_json(event)
+    row = await store.get(TENANT)
+    assert (row.state if row else None) == after
+    assert (TOKEN in capsys.readouterr().out) is prints_token
+    assert [(e.tool, e.identity) for e in audit.events] == [(c, "operator:ops") for c in audited]
+    assert [e for e in audit.events if TOKEN in event_json(e)] == []

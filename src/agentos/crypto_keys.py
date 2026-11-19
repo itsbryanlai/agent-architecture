@@ -177,7 +177,7 @@ def key_var_name(tenant_id: str, version: int) -> str:
 
 # The tenant part is greedy, so the version is the last ``_V<n>``: a tenant ID
 # may itself end in ``-v1`` (``a-v1`` becomes ``A_V1``).
-_KEY_VAR_NAME = re.compile(re.escape(PAYLOAD_KEY_ENV_PREFIX) + r"(.+)_V([0-9]+)")
+_KEY_VAR_NAME = re.compile(re.escape(PAYLOAD_KEY_ENV_PREFIX) + r"(.+)_V([0-9]{1,6})")
 
 
 class EnvKeyStore:

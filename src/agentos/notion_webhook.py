@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from cryptography.exceptions import InvalidTag
 from psycopg_pool import AsyncConnectionPool
 
 from agentos import ids
@@ -197,9 +198,21 @@ class WebhookTokens:
         source = (row.key_version, row.ciphertext)
         entry = self._cache.get(tenant_id)
         if entry is None or entry[0] != source:
-            token = decrypt_for_tenant(
-                self._keys, tenant_id, row.ciphertext, row.key_version
-            ).decode()
+            try:
+                token = decrypt_for_tenant(
+                    self._keys, tenant_id, row.ciphertext, row.key_version
+                ).decode()
+            except (TenantKeyError, InvalidTag):
+                # A key version that is gone or holds another value: refuse events
+                # cleanly (the caller answers 503) instead of failing each one.
+                log.warning(
+                    "tenant_id=%s Notion webhook token cannot be decrypted with key "
+                    "version %s; events are refused until the key is restored or the "
+                    "token is cleared and confirmed again",
+                    tenant_id,
+                    row.key_version,
+                )
+                return None
             self._cache[tenant_id] = (source, token)
             return token
         return entry[1]
@@ -253,7 +266,16 @@ async def execute(
                     "clear it and re-subscribe for a new one"
                 )
                 return 1
-            token = decrypt_for_tenant(keys, args.tenant, row.ciphertext, row.key_version).decode()
+            try:
+                token = decrypt_for_tenant(
+                    keys, args.tenant, row.ciphertext, row.key_version
+                ).decode()
+            except InvalidTag:
+                print(
+                    f"refused: the webhook token of tenant '{args.tenant}' cannot be decrypted "
+                    f"with key version {row.key_version}; clear it and re-subscribe"
+                )
+                return 1
             async with unit.begin(args.tenant) as conn:
                 await audit.record(_event(args.tenant, "show", identity, invocation), conn=conn)
             print(token)
@@ -279,11 +301,13 @@ async def execute(
 
 async def run(args: argparse.Namespace) -> int:
     from agentos.audit import PostgresAuditStore
+    from agentos.schema_version import require_current_schema
 
     settings = load_settings()
     pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     try:
+        await require_current_schema(pool)
         return await execute(
             args,
             PostgresWebhookTokenStore(pool),

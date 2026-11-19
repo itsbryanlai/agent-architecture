@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import base64
 import secrets
+from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from temporalio.api.common.v1 import Payload
 from temporalio.converter import WorkflowSerializationContext
 
 import agentos.gateway.app as gateway_app
-from agentos import crypto_keys, ids, temporal_client, worker
-from agentos.config import Settings, TenantsConfig
-from agentos.crypto_keys import create_key, key_var_name
+from agentos import ids, temporal_client, worker
+from agentos.config import Settings
+from agentos.crypto_keys import key_var_name
 from agentos.gateway.app import _real_lifespan, create_app
 from agentos.temporal_client import build_temporal_client
 
@@ -60,46 +60,23 @@ async def noop(*args, **kwargs):
     return None
 
 
-async def empty_tenants(*args, **kwargs):
-    return TenantsConfig({})
+async def acme_tenant(*args, **kwargs):
+    # Only the tenant IDs matter here: the key check runs before anything reads a config.
+    return SimpleNamespace(tenants={"acme": None})
 
 
 async def fake_client(settings):
     return object()
 
 
-@pytest.mark.parametrize("key_source", ["env", "files"])
-async def test_every_process_builds_its_key_store_through_the_factory(
-    key_source, tmp_path, monkeypatch
-):
-    """Fails if the worker, the gateway or the Temporal client builds a key store of its own instead of the shared factory."""
-    if key_source == "env":
-        monkeypatch.setenv(
-            key_var_name("acme", 1), base64.b64encode(secrets.token_bytes(32)).decode()
-        )
-        settings = Settings(
-            slack_signing_secret="x", database_url="postgresql://unused", key_source="env"
-        )
-    else:
-        create_key(tmp_path / "keys", "acme")
-        settings = Settings(
-            slack_signing_secret="x",
-            database_url="postgresql://unused",
-            key_dir=str(tmp_path / "keys"),
-        )
+ENV_SETTINGS = Settings(
+    slack_signing_secret="x", database_url="postgresql://unused", key_source="env"
+)
 
-    calls: list[tuple[str, Settings]] = []
-    real_factory = crypto_keys.build_key_store
 
-    def spy(label):
-        def factory(settings):
-            calls.append((label, settings))
-            return real_factory(settings)
-
-        return factory
-
-    # The Temporal client: the converter it connects with must encrypt under the
-    # factory's store, for the key source the settings name.
+async def test_the_temporal_client_encrypts_with_the_key_variable(monkeypatch):
+    """Fails if the Temporal client's converter ignores AGENTOS_KEY_SOURCE=env and looks for a key file instead of the key variable."""
+    monkeypatch.setenv(key_var_name("acme", 1), base64.b64encode(secrets.token_bytes(32)).decode())
     captured = {}
 
     async def fake_connect(address, **kwargs):
@@ -107,8 +84,7 @@ async def test_every_process_builds_its_key_store_through_the_factory(
         return object()
 
     monkeypatch.setattr(temporal_client.Client, "connect", fake_connect)
-    monkeypatch.setattr(temporal_client, "build_key_store", spy("temporal_client"))
-    await build_temporal_client(settings)
+    await build_temporal_client(ENV_SETTINGS)
     codec = captured["converter"].payload_codec.with_context(
         WorkflowSerializationContext(
             namespace="default", workflow_id=ids.conversation_id("acme", "C1", "1.0")
@@ -117,33 +93,34 @@ async def test_every_process_builds_its_key_store_through_the_factory(
     (encrypted,) = await codec.encode([Payload(metadata={"encoding": b"json/plain"}, data=b'"x"')])
     assert encrypted.metadata["encryption-key-id"] == b"acme/v1"
 
-    # The gateway, through its real start-up lifespan.
-    monkeypatch.setattr("agentos.config.load_settings", lambda: settings)
+
+async def start_gateway(monkeypatch):
+    monkeypatch.setattr("agentos.config.load_settings", lambda: ENV_SETTINGS)
     monkeypatch.setattr("psycopg_pool.AsyncConnectionPool", FakePool)
     monkeypatch.setattr("agentos.schema_version.require_current_schema", noop)
-    monkeypatch.setattr("agentos.tenant_store.startup_tenants", empty_tenants)
+    monkeypatch.setattr("agentos.tenant_store.startup_tenants", acme_tenant)
     monkeypatch.setattr(gateway_app, "startup_agent_failure", noop)
     monkeypatch.setattr("agentos.gateway.relay.InboundRelay", FakeRelay)
     monkeypatch.setattr(temporal_client, "build_temporal_client", fake_client)
-    monkeypatch.setattr(crypto_keys, "build_key_store", spy("gateway"))
     app = create_app(None, None, None, None, None, lifespan=_real_lifespan)
-    with TestClient(app):
-        assert app.state.deps.webhook_tokens is not None
+    async with _real_lifespan(app):
+        pass
 
-    # The worker, through its real start-up.
-    monkeypatch.setattr(worker, "load_settings", lambda: settings)
+
+async def start_worker(monkeypatch):
+    monkeypatch.setattr(worker, "load_settings", lambda: ENV_SETTINGS)
     monkeypatch.setattr(worker, "AsyncConnectionPool", FakePool)
     monkeypatch.setattr(worker, "require_current_schema", noop)
-    monkeypatch.setattr(worker, "startup_tenants", empty_tenants)
-    monkeypatch.setattr(worker, "startup_agent_failure", noop)
-    monkeypatch.setattr(worker, "published_tenants", empty_tenants)
+    monkeypatch.setattr(worker, "startup_tenants", acme_tenant)
     monkeypatch.setattr(worker, "build_llm", lambda settings: object())
     monkeypatch.setattr(worker, "startup_price_failure", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "build_temporal_client", fake_client)
-    monkeypatch.setattr(worker, "RegistrySync", FakeSync)
-    monkeypatch.setattr(worker, "Worker", FakeWorker)
-    monkeypatch.setattr(worker, "build_key_store", spy("worker"))
     await worker.main()
 
-    assert [label for label, _ in calls] == ["temporal_client", "gateway", "worker"]
-    assert all(s is settings for _, s in calls)
+
+@pytest.mark.parametrize("start", [start_gateway, start_worker], ids=["gateway", "worker"])
+async def test_start_up_reads_the_key_source_the_settings_name(start, monkeypatch):
+    """Fails if the gateway or the worker checks tenant keys in a key directory when the settings name key variables."""
+    with pytest.raises(SystemExit) as refused:
+        await start(monkeypatch)
+    assert key_var_name("acme", 1) in str(refused.value)

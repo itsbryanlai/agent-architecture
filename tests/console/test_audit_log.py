@@ -288,7 +288,9 @@ async def test_activity_retry_records_once(harness):
     h.audit.fail_next_records(2)  # the tool-call record fails, then the retry succeeds
 
     await converse(h, "it-helper", inbound("Ev1"))
-    await eventually(lambda: h.slack.updates(), timeout=30)
+    # The answer is recorded after the tool step completes; a progress edit on the
+    # placeholder can land earlier while the read retries, so it is not the settle point.
+    await eventually(lambda: events(h, "answer"), timeout=30)
 
     assert len(await events(h, "tool_call")) == 1
     assert len(await events(h, "answer")) == 1

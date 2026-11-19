@@ -61,7 +61,7 @@ Inside the deployment:
 
 ## 3. Workflow model
 
-Status: **built**. Not built yet: progress updates on the placeholder (it stays "Thinking…" until the reply), a token budget per turn and a cap on writes per task (§8).
+Status: **built**. Not built yet: a token budget per turn and a cap on writes per task (§8).
 
 Conversations and tasks are separate workflows, because **a conversation ends but the work it started does not.**
 
@@ -417,11 +417,11 @@ Where in code: `src/agentos/switches.py`, `AgentActivities._gate` and `_gate_wri
 
 ## 9. Slack integration
 
-Status: **partial**. Built: Events API, interactivity, signed requests, per-tenant workspace mapping, Sign in with Slack for the console. Target: a distributed app with OAuth install, Marketplace listing, progress updates on the placeholder.
+Status: **partial**. Built: Events API, interactivity, signed requests, per-tenant workspace mapping, Sign in with Slack for the console, progress updates on the placeholder, a pilot OAuth install for allowlisted workspaces. Target: OAuth install for any workspace, Marketplace listing.
 
 - One Slack app per deployment (Events API and interactivity), installed by hand from `slack/app-manifest.yaml` or through the pilot OAuth install on the console (`/install/slack`, allowlisted workspaces only). Target: OAuth install for any workspace, and a Marketplace listing.
 - **Acknowledge first.** A message event is stored in Postgres and answered at once, whether or not Temporal is reachable; a Slack retry stores nothing, and if the event can't be stored the gateway answers with an error so Slack sends it again. Button clicks are not retried by Slack, so a click is handled before the reply, within 2.0 seconds; when Temporal or the database doesn't answer in time the person gets an ephemeral "That didn't go through. Please try again in a moment." (or an error on the form) and nothing is half done.
-- Responsiveness: a "Thinking…" placeholder is posted at once and replaced with the final answer. Target: progress updates ("Searching Notion…").
+- Responsiveness: a "Thinking…" placeholder is posted at once and replaced with the final answer. While a tool step runs long, the placeholder is edited to that step's fixed runtime label (never the model's words), throttled in workflow time: a step must run 2 seconds before its label shows, and at most one label lands per 3 seconds. A progress edit that is dropped may still reach Slack after the reply, so the final answer is then posted as a new message in the thread instead of editing the placeholder.
 - Slack posts land once. Slack has no idempotency key, so each post carries a marker in its message metadata (a hash of the tenant and the post's key, never content) and is made through the same lease as a Notion write: overlapping attempts never both post, and the `ts` is kept under the idempotency key. An attempt that follows one that got as far as sending first looks the post up by its marker (the thread's replies, or the channel's recent history) and uses that `ts` if it is there. This needs the history scopes (`channels:history`, `groups:history`, `im:history`, `mpim:history`). When Slack refuses the lookup, the retry posts again and logs a possible duplicate with the tenant and key; the missing scope is named once per tenant.
 - The model writes Markdown, which Slack doesn't render. Replies are converted to Slack's mrkdwn when they are posted; code, links and citation numbers pass through unchanged, and stored history keeps the model's Markdown.
 - Text the runtime didn't write itself (the model's, the requester's, a Notion title) has `&`, `<` and `>` escaped before it is posted, in replies, approval cards and thread lines, so a page the model read can't make it ping a channel or show a link whose text hides where it goes.

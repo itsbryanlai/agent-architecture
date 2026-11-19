@@ -187,3 +187,10 @@ def slack_post_marker(tenant: str, idem_key: str) -> str:
 def slack_post_write_key(idem_key: str) -> str:
     """The ``external_writes`` key that makes one Slack post happen once."""
     return f"{idem_key}:slack-post"
+
+
+def slack_final_post_key(placeholder_ts: str) -> str:
+    """The idempotency key of a final text posted as a new message because a dropped progress
+    edit may still land on the placeholder. One placeholder is finalized once per turn, so its
+    ts names that one post; the tenant scopes it in the idempotency store."""
+    return f"{placeholder_ts}:final"

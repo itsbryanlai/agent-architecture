@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from agentos.connectors.notion import Hang
 
 log = logging.getLogger(__name__)
 
@@ -402,6 +405,7 @@ class FakeSlack:
         self._history_refusal: SlackHistoryUnavailable | None = None
         self._fail_next_update: Exception | None = None
         self._update_failures_left: int | None = None
+        self._hang_next_update: Hang | None = None
 
     def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
         """Make directory lookups raise ``error``: ``times`` of them, or all until set to None."""
@@ -412,6 +416,15 @@ class FakeSlack:
         """Make update_message raise ``error``: the next ``times`` calls, or all when None."""
         self._fail_next_update = error
         self._update_failures_left = times
+
+    def hang_next_update(self) -> Hang:
+        """The next update_message waits until the returned ``Hang`` is released, as a
+        slow Slack edit does. Other updates run normally."""
+        from agentos.connectors.notion import Hang
+
+        hang = Hang()
+        self._hang_next_update = hang
+        return hang
 
     def _next_ts(self) -> str:
         self._ts += 1
@@ -456,6 +469,9 @@ class FakeSlack:
                 if self._update_failures_left <= 0:
                     self._fail_next_update = None
             raise error
+        hang, self._hang_next_update = self._hang_next_update, None
+        if hang is not None:
+            await hang.wait()
         self.calls.append(
             ("update_message", {"channel": channel, "ts": ts, "text": text, "blocks": blocks})
         )

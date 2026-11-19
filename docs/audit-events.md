@@ -7,7 +7,8 @@ table by `scripts/init_db.sql` and the migrations. A kind that is not in both ca
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
 [Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
-[Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
+[Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) ·
+[Connector](#connector) · [Tenant settings](#tenant-settings) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
 [How to read it](#how-to-read-it) · [What you see in a live run](#what-you-see-in-a-live-run)
 
 ## Columns
@@ -140,13 +141,15 @@ Rows in `audit_events` are not subject to retention themselves.
 ## Webhook token
 
 Written by the host command that manages a tenant's Notion webhook verification token
-(`python -m agentos.notion_webhook`), as `operator:<OS login>` (which names the requester too).
-Written only when the command did something: a show of an already-confirmed token, or a confirm
-or clear with nothing to change, records nothing. The token itself is never in the row.
+(`python -m agentos.notion_webhook`), as `operator:<OS login>` (which names the requester too),
+or by the console's settings page (an admin), as `user:<Slack ID>`. The two surfaces share one
+state machine and audit kind. Written only when the step did something: a show of an
+already-confirmed token, or a confirm or clear with nothing to change, records nothing. The
+token itself is never in the row.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `webhook_token` | The operator shows the pending token, confirms it, or clears it | `operator:<OS login>` for both | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<random>`: a repeat run records again |
+| `webhook_token` | The pending token is shown (revealed), confirmed, or cleared | `operator:<OS login>` for both from the command; the admin / `user:<admin>` from the console | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<request ID or random>`: a retry with the same request ID records once |
 
 ## Payload key
 
@@ -168,6 +171,28 @@ allowlist, a failed code exchange) writes nothing. The bot token is never in the
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
+
+## Connector
+
+Written by the console's Connect Notion and Disconnect (the control plane), in the same
+transaction as the encrypted credential and the tenant's workspace. Admin only. A refused
+connect (a state this session never began or already spent, a failed code exchange or
+validation call, a workspace another tenant uses) writes nothing. The token is never in the row.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `connector` | Notion is connected (or reconnected), or disconnected | the admin / `user:<admin>` | none | `connect` or `disconnect` | the Notion workspace ID on connect; empty on disconnect | `ok` | Control key |
+
+## Tenant settings
+
+Written by the console's settings page (the control plane), in the same transaction as the
+tenants row change. Admin only. Setting what is already in force changes nothing and records
+nothing; a refused change (an unpublished agent, a channel outside its agent's audience)
+records nothing.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `tenant_settings` | The default agent or the channel routing changes | the admin / `user:<admin>` | none | `routing` | `default=<agent or ->; <channel>-><agent>,...`, cut at 300 characters | `ok` | Control key |
 
 ## Access review
 

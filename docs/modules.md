@@ -17,7 +17,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `switches.py` | Kill switches: the table, the gate's state, and the operator command. Read with no cache; an unreadable switch fails the step | `console/test_kill_switches.py`, `core/test_agent_gate.py` |
 | `check_grants.py` | Command that checks Notion grants and prints property IDs | `connectors/test_grant_check.py` |
 | `tenant_keys.py` | Command that creates or rotates a tenant's payload key (a file, or a wrapped database row in `db` mode), or prints a new key or master key value for a host variable; never overwrites or prints an existing key | `core/test_payload_codec.py`, `pg/test_tenant_payload_keys.py` |
-| `notion_webhook.py` | The Notion webhook verification token, encrypted per tenant (pending, then confirmed), and the operator command that shows, confirms or clears it | `connectors/test_notion_webhook.py`, `pg/test_store_contracts.py` |
+| `notion_webhook.py` | The Notion webhook verification token, encrypted per tenant (pending, then confirmed); the operator command and the console's admin steps (through `ControlPlane`) show, confirm or clear it | `connectors/test_notion_webhook.py`, `pg/test_store_contracts.py` |
 | `usage_reprice.py` | Command that prices a past month's unpriced usage rows by appending adjustments; never changes a stored row | `console/test_usage.py`, `pg/test_reprice.py` |
 
 ## Workflows and activities
@@ -47,9 +47,9 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `audit.py` | Append-only audit events: IDs and hashes only, one row per event key | `console/test_audit_log.py`, `pg/test_policies.py` |
 | `schema_version.py` | Start-up check that the database has every migration the code expects | `pg/test_schema.py` |
 | `sessions.py` | Console sessions kept server-side; only the SHA-256 of the session ID is stored | `console/test_web_ui.py`, `pg/test_stores.py` |
-| `tenant_store.py` | Tenants in the database: one-time import, narrow cross-tenant reads, and the cached live view every process serves from; an empty table starts serving none | `console/test_tenant_store.py` |
-| `tenants.py` | The tenants one process serves and each tenant's own Slack and Notion clients, built from the resolved credential (env fallback); a Slack-only tenant has no Notion client; an unknown tenant never falls back to another | `console/test_tenants.py` |
-| `credentials.py` | Per-tenant connector credentials, encrypted with the tenant's payload key; the one resolver for a tenant's Slack bot token (row first, env fallback, one key reload on a miss) | `connectors/test_credentials.py`, `pg/test_credential_store.py` |
+| `tenant_store.py` | Tenants in the database: one-time import, narrow cross-tenant reads, settings writes (routing, the Notion workspace), and the cached live view every process serves from; an empty table starts serving none | `console/test_tenant_store.py`, `pg/test_tenant_store_contract.py` |
+| `tenants.py` | The tenants one process serves and each tenant's own Slack and Notion clients, built from the resolved credentials (row first, env fallback); a sync rebuilds a client whose credential changed; a Slack-only tenant has no Notion client; an unknown tenant never falls back to another | `console/test_tenants.py`, `console/test_tenant_store.py` |
+| `credentials.py` | Per-tenant connector credentials, encrypted with the tenant's payload key; the resolvers for a tenant's Slack bot and Notion tokens (row first, env fallback, one key reload on a miss); Disconnect deletes the Notion row | `connectors/test_credentials.py`, `pg/test_credential_store.py` |
 | `config.py` | Settings from the environment and agent definitions from YAML; the only module that reads environment variables. Validates every definition field and bound | `core/test_config.py`, `core/test_settings_env.py` |
 
 ## Agents, control and access
@@ -57,13 +57,13 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `agent_store.py` | Agent versions and their publish lifecycle; a published version never changes; the one-time YAML import | `console/test_agent_store.py`, `pg/test_publish_hash.py`, `pg/test_agent_id_pattern.py` |
-| `control.py` | The control plane: the only place roles are checked and the only writer (besides the operator command and imports) of agents, members, budgets and switches; one audit event per change in the same transaction | `console/test_control_plane.py`, `console/test_publish_review.py` |
+| `control.py` | The control plane: the only place roles are checked and the only writer (besides the operator command, the install and imports) of agents, members, budgets, switches and tenant settings; one audit event per change in the same transaction | `console/test_control_plane.py`, `console/test_publish_review.py`, `console/test_tenant_settings.py` |
 | `control_errors.py` | Maps control-plane refusals to HTTP statuses, once | `console/test_web_ui.py` |
 | `members.py` | Stored admins and creators; config-file admins are not rows | `console/test_control_plane.py` |
 | `grant_checker.py` | Checks a version's Notion grants against the live objects before publish | `connectors/test_grant_check.py` |
 | `agent_health.py` | A broken grant disables one agent, never the worker: the health row, the start-up and refresh checks, the fixed reply's refusal, and the once-per-transition audit and DMs. A transient Notion failure changes no health | `core/test_agent_health.py`, `pg/test_store_contracts.py` |
 | `grant_picks.py` | Which granted objects were picked from the creator's own Notion account | `console/test_grant_review.py` |
-| `notion_picker.py` | The creator's Notion sign-in, used once to list what they can see; no token stored | `console/test_grant_review.py` |
+| `notion_picker.py` | The creator's Notion sign-in, used once to list what they can see (no token stored), and Connect Notion's workspace authorization, whose token the control plane stores encrypted | `console/test_grant_review.py`, `console/test_tenant_settings.py` |
 | `access_diff.py` | What a version adds compared with the published one, and whether it widens access | `console/test_grant_review.py` |
 | `slack_signin.py` | Sign in with Slack (OpenID Connect) for the console and the session identity | `console/test_slack_sign_in.py` |
 | `slack_install.py` | The Slack OAuth install: the manifest's bot scopes, the code exchange, the pilot allowlist, and the unit of work that creates the tenant, key, encrypted token and first admin (a reinstall replaces the token only) | `console/test_slack_install.py` |
@@ -92,7 +92,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `knowledge/notion_text.py` | Turns a Notion page into text and chunks | `knowledge/test_indexing.py` |
 | `knowledge/embedder.py` | Embeddings behind one interface for any OpenAI-compatible endpoint, and a deterministic fake | `knowledge/test_embed_endpoint.py`, `knowledge/test_knowledge_sync.py` |
 | `llm.py` | The LLM client (Claude or Qwen); history is stored in one format whichever provider runs | `core/test_llm.py`, `core/test_llm_errors.py` |
-| `slack_client.py` | Posting to Slack, and the lookups the audience checks use | `core/test_slack_rate_limits.py`, `core/test_client_timeouts.py` |
+| `slack_client.py` | Posting to Slack, and the lookups the audience checks and the channel picker use | `core/test_slack_rate_limits.py`, `core/test_client_timeouts.py` |
 | `slack_format.py` | Markdown to Slack mrkdwn out, Slack's encoding decoded in; text the runtime did not write is escaped | `core/test_slack_format.py`, `core/test_slack_escaping.py` |
 
 ## Encryption

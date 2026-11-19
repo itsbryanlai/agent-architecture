@@ -20,11 +20,14 @@ const REPO = "itsbryanlai/agent-architecture";
 const APP_DATABASE_URL =
   "postgresql://agentos_app:${{shared.AGENTOS_APP_DB_PASSWORD}}@postgres.railway.internal:5432/agentos";
 const TEMPORAL_ADDRESS = "temporal.railway.internal:7233";
+// Railway records a volume's region at creation; declaring it keeps a later plan
+// from reading the region as a removal.
+const VOLUME_REGION = "us-west2";
 
 export default defineRailway(() => {
-  const postgresData = volume("postgres-data", { sizeMB: 5120 });
-  const temporalData = volume("temporal-data", { sizeMB: 1024 });
-  const ollamaModels = volume("ollama-models", { sizeMB: 5120 });
+  const postgresData = volume("postgres-data", { sizeMB: 5000, region: VOLUME_REGION });
+  const temporalData = volume("temporal-data", { sizeMB: 1024, region: VOLUME_REGION });
+  const ollamaModels = volume("ollama-models", { sizeMB: 5000, region: VOLUME_REGION });
 
   const postgres = service("postgres", {
     source: github(REPO, { rootDirectory: "deploy/postgres" }),

@@ -687,15 +687,18 @@ that documents it.
    ([IaC](https://docs.railway.com/infrastructure-as-code)). Then `railway config
    plan`, read the changes (variable values are redacted), and `railway config
    apply` ([config](https://docs.railway.com/cli/config)). This creates the six
-   services and the three volumes; it does not deploy them.
+   services and the three volumes, and each service starts its first deploy at
+   once from the GitHub source, so set the shared variables (step 3) first:
+   they can exist before any service. Volumes are at most 5000 MB on the
+   current plan; a larger size fails the whole apply with no message naming it.
 3. **Set the secret variables** the table below lists, once each, as project
    shared variables (dashboard: Project Settings → Shared Variables); the
    services already reference them. For `acme`'s existing
    payload key, the value to paste is the key file's content: the file already
    holds the base64 of the 32 bytes. The maintainer prints it themselves —
    `cat ~/.agentos/keys/acme.key` (the file under their `AGENTOS_KEY_DIR`) — and
-   pastes it as `AGENTOS_PAYLOAD_KEY_ACME_V1` into the worker and the gateway; no
-   agent runs that command. A new tenant's key comes from `python -m
+   pastes it as the shared variable `AGENTOS_PAYLOAD_KEY_ACME_V1`; no agent runs
+   that command. A new tenant's key comes from `python -m
    agentos.tenant_keys value <tenant_id>` (see [Payload keys on a host without
    files](#payload-keys-on-a-host-without-files)).
 4. **Generate the public domains.** `railway domain --service gateway` and

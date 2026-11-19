@@ -110,10 +110,12 @@ from agentos.knowledge.search import (
     cited_markers,
     escape_attribute,
     format_sources,
+    searched_footer,
+    searched_pages,
     select_passages,
     sources_footer,
 )
-from agentos.knowledge.store import KnowledgeStore
+from agentos.knowledge.store import ChunkHit, KnowledgeStore
 from agentos.llm import LLMClient
 from agentos.models import (
     CUT_SHORT,
@@ -358,6 +360,8 @@ class AgentActivities:
             self.update_progress,
             self.finalize_reply,
             self.post_final_reply,
+            self.finalize_searched_reply,
+            self.post_final_searched_reply,
             self.finalize_notice,
             self.post_final_notice,
             self.run_read_tool,
@@ -385,6 +389,8 @@ class AgentActivities:
             self.call_model,
             self.finalize_model_reply,
             self.post_final_model_reply,
+            self.finalize_searched_model_reply,
+            self.post_final_searched_model_reply,
             self.run_stored_read_tool,
             self.draft_task,
             self.prepare_stored_comment,
@@ -1120,7 +1126,9 @@ class AgentActivities:
         post never leaves history claiming the user saw an answer.
         """
         self._log("finalize_model_reply", ctx.tenant_id, ctx.agent_id)
-        await self._finalize_model_reply(ctx, placeholder_ts, step_key, citations, cut_short, None)
+        await self._finalize_model_reply(
+            ctx, placeholder_ts, step_key, citations, cut_short, None, []
+        )
 
     @activity.defn(name="post_final_model_reply")
     async def post_final_model_reply(
@@ -1137,7 +1145,48 @@ class AgentActivities:
         instead of editing the placeholder."""
         self._log("post_final_model_reply", ctx.tenant_id, ctx.agent_id)
         await self._finalize_model_reply(
-            ctx, placeholder_ts, step_key, citations, cut_short, post_key
+            ctx, placeholder_ts, step_key, citations, cut_short, post_key, []
+        )
+
+    @activity.defn(name="finalize_searched_model_reply")
+    async def finalize_searched_model_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        step_key: str,
+        citations: list[Citation],
+        cut_short: bool,
+        searched: list[Citation],
+    ) -> None:
+        """``finalize_model_reply`` plus the passages this turn's searches returned, so an
+        answer that cites none of them still shows where it searched.
+
+        A separate activity, not an optional argument of ``finalize_model_reply``: Temporal
+        decodes by type only when the call carries every argument, so calls already in a
+        history would stop decoding.
+        """
+        self._log("finalize_searched_model_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_model_reply(
+            ctx, placeholder_ts, step_key, citations, cut_short, None, searched
+        )
+
+    @activity.defn(name="post_final_searched_model_reply")
+    async def post_final_searched_model_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        step_key: str,
+        citations: list[Citation],
+        cut_short: bool,
+        searched: list[Citation],
+        post_key: str,
+    ) -> None:
+        """``finalize_searched_model_reply`` for a turn whose dropped progress edit may still
+        land on the placeholder: the reply is posted as a new message in the thread, once
+        under ``post_key``, instead of editing the placeholder."""
+        self._log("post_final_searched_model_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_model_reply(
+            ctx, placeholder_ts, step_key, citations, cut_short, post_key, searched
         )
 
     async def _finalize_model_reply(
@@ -1148,6 +1197,7 @@ class AgentActivities:
         citations: list[Citation],
         cut_short: bool,
         post_key: str | None,
+        searched: list[Citation],
     ) -> None:
         conversation_id = ids.conversation_id(ctx.tenant_id, ctx.channel, ctx.thread_ts)
         step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
@@ -1157,7 +1207,7 @@ class AgentActivities:
             )
         text = step.reply_text
         shown = text + CUT_SHORT if cut_short else text
-        footer = await self._sources_footer(ctx, text, citations)
+        footer = await self._sources_footer(ctx, text, citations, searched)
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, shown)
         await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
@@ -1217,7 +1267,7 @@ class AgentActivities:
         notices posted through this path are not recorded as answers.
         """
         self._log("finalize_reply", ctx.tenant_id, ctx.agent_id)
-        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, None)
+        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, None, [])
 
     @activity.defn(name="post_final_reply")
     async def post_final_reply(
@@ -1233,7 +1283,48 @@ class AgentActivities:
         placeholder: the reply is posted as a new message in the thread, once under ``post_key``,
         instead of editing the placeholder."""
         self._log("post_final_reply", ctx.tenant_id, ctx.agent_id)
-        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, post_key)
+        await self._finalize_reply(ctx, placeholder_ts, text, citations, audit_answer, post_key, [])
+
+    @activity.defn(name="finalize_searched_reply")
+    async def finalize_searched_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        text: str,
+        citations: list[Citation],
+        audit_answer: bool,
+        searched: list[Citation],
+    ) -> None:
+        """``finalize_reply`` plus the passages this turn's searches returned, so an answer
+        that cites none of them still shows where it searched.
+
+        A separate activity, not an optional argument of ``finalize_reply``: Temporal decodes
+        by type only when the call carries every argument, so calls already in a history
+        would stop decoding.
+        """
+        self._log("finalize_searched_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_reply(
+            ctx, placeholder_ts, text, citations, audit_answer, None, searched
+        )
+
+    @activity.defn(name="post_final_searched_reply")
+    async def post_final_searched_reply(
+        self,
+        ctx: TurnContext,
+        placeholder_ts: str,
+        text: str,
+        citations: list[Citation],
+        audit_answer: bool,
+        searched: list[Citation],
+        post_key: str,
+    ) -> None:
+        """``finalize_searched_reply`` for a turn whose dropped progress edit may still land
+        on the placeholder: the reply is posted as a new message in the thread, once under
+        ``post_key``, instead of editing the placeholder."""
+        self._log("post_final_searched_reply", ctx.tenant_id, ctx.agent_id)
+        await self._finalize_reply(
+            ctx, placeholder_ts, text, citations, audit_answer, post_key, searched
+        )
 
     async def _finalize_reply(
         self,
@@ -1243,8 +1334,9 @@ class AgentActivities:
         citations: list[Citation] | None,
         audit_answer: bool,
         post_key: str | None,
+        searched: list[Citation],
     ) -> None:
-        footer = await self._sources_footer(ctx, text, citations or [])
+        footer = await self._sources_footer(ctx, text, citations or [], searched)
         slack = self._runtime(ctx.tenant_id).slack
         rendered = await self._rendered_reply(ctx, slack, text)
         await self._show_final_text(ctx, slack, placeholder_ts, rendered + footer, post_key)
@@ -1310,15 +1402,25 @@ class AgentActivities:
                 names[user_id] = "someone"
         return render_mentions(converted, ctx.requester_user_id, names)
 
-    async def _sources_footer(self, ctx: TurnContext, text: str, citations: list[Citation]) -> str:
-        if not citations or self.knowledge is None:
+    async def _sources_footer(
+        self, ctx: TurnContext, text: str, citations: list[Citation], searched: list[Citation]
+    ) -> str:
+        """The footer of a reply: a Sources line for the numbers it cites, else a Searched
+        line naming the pages whose passages this turn returned but the answer did not cite.
+        Both are built from stored page metadata of scopes still granted to the agent.
+        """
+        if (not citations and not searched) or self.knowledge is None:
             return ""
         scopes = await self._granted_scopes(ctx.tenant_id, ctx.agent_id)
         cited = [c for c in cited_markers(text, citations) if c.scope in scopes]
-        if not cited:
+        if cited:
+            meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in cited])
+            return sources_footer(cited, meta)
+        pages = searched_pages(searched, scopes)
+        if not pages:
             return ""
-        meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in cited])
-        return sources_footer(cited, meta)
+        meta = await self.knowledge.page_meta(ctx.tenant_id, scopes, [c.page_id for c in pages])
+        return searched_footer(pages, meta)
 
     async def _granted_scopes(self, tenant_id: str, agent_id: str) -> list[str]:
         agent = await self._agent(tenant_id, agent_id)
@@ -1406,9 +1508,11 @@ class AgentActivities:
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
         if not roots or self.knowledge is None or self.embedder is None:
+            self._log_search(ctx, len(roots), 0, 0, [])
             return "This agent has no documents to search.", True, []
         query = call.input.get("query")
         if not isinstance(query, str) or not query.strip():
+            self._log_search(ctx, len(roots), 0, 0, [])
             return "search_knowledge needs a non-empty 'query'.", True, []
         try:
             [vector] = await self.embedder.embed([query.strip()])
@@ -1420,16 +1524,42 @@ class AgentActivities:
         hits = await self.knowledge.search(
             ctx.tenant_id, list(roots), vector, limit=SEARCH_CANDIDATES, embed_model=model
         )
+        candidates = len(hits)
         cutoff = embed_max_distance(model, self.settings.embed_max_distance)
         if cutoff is not None:
             hits = [hit for hit in hits if hit.distance <= cutoff]
         checker = PageChecker(self._runtime(ctx.tenant_id).notion_api)
         kept = await select_passages(hits, checker, roots)
+        self._log_search(ctx, len(roots), candidates, candidates - len(hits), kept)
         citations = [
-            Citation(first_marker + i, hit.scope, hit.page_id) for i, hit in enumerate(kept)
+            Citation(first_marker + i, hit.scope, hit.page_id, distance=hit.distance)
+            for i, hit in enumerate(kept)
         ]
         passages = [(c.marker, hit.title, hit.text) for c, hit in zip(citations, kept)]
         return format_sources(passages), False, citations
+
+    def _log_search(
+        self, ctx: TurnContext, scopes: int, hits: int, dropped: int, kept: list[ChunkHit]
+    ) -> None:
+        """One line per search_knowledge call: what it found and kept, enough to tell a
+        search that found nothing from one whose passages the answer did not cite.
+        Page IDs and distances only, never a title or passage text.
+        """
+        best: dict[str, float] = {}
+        for hit in kept:
+            best.setdefault(hit.page_id, hit.distance)
+        pages = ",".join(f"{page_id}:{distance:.4f}" for page_id, distance in best.items())
+        log.info(
+            "search_knowledge returned tenant_id=%s agent_id=%s scopes=%d hits=%d dropped=%d"
+            " kept=%d pages=%s",
+            ctx.tenant_id,
+            ctx.agent_id,
+            scopes,
+            hits,
+            dropped,
+            len(kept),
+            pages,
+        )
 
     async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""

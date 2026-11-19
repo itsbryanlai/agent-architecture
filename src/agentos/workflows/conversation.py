@@ -20,7 +20,10 @@ Rules this workflow keeps:
   reply activity builds the Sources line from stored page metadata.
   Citation numbers are unique for the life of the thread (they carry over
   turns and continue-as-new), so a number cited from an earlier turn still
-  means the same page.
+  means the same page. An answer that cites none of the passages its turn's
+  searches returned still shows where it searched: the workflow passes the
+  turn's own citations to the reply activity (behind the ``searched-footer``
+  marker), which names those pages in a Searched line instead.
 * Identity comes from the runtime. The requester is the Slack user who sent the
   message, put into ``TurnContext`` here, never anything the LLM said.
 * Writes never run here. A call to a write tool (the connector manifest's ``risk`` says
@@ -155,6 +158,7 @@ PATCH_NOTICE_AUDIT = "notice-audit"
 PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
 PATCH_PROGRESS = "progress"
 PATCH_PROGRESS_DROPPED = "progress-dropped"
+PATCH_SEARCHED_FOOTER = "searched-footer"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -222,6 +226,9 @@ class _TurnState:
         # True once a progress edit on this placeholder was dropped: a late attempt may still
         # land on it after the reply, so the final text is posted as a new message instead.
         self.progress_dropped = False
+        # The citations this turn's searches kept, so the reply can name the pages it
+        # searched even when the answer cites none of them. References only, like citations.
+        self.searched: list[Citation] = []
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -685,6 +692,7 @@ class ConversationWorkflow:
             results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
             for result in results:
                 self.citations.extend(result.citations)
+                state.searched.extend(result.citations)
             del self.citations[:-MAX_CITATIONS]
             await workflow.execute_activity_method(
                 AgentActivities.append_tool_results,
@@ -751,6 +759,20 @@ class ConversationWorkflow:
                 AgentActivities.post_final_notice,
                 [ctx, placeholder_ts, shown, "step_limit"],
             )
+        elif workflow.patched(PATCH_SEARCHED_FOOTER):
+            await self._finalize(
+                state,
+                AgentActivities.finalize_searched_reply,
+                AgentActivities.post_final_searched_reply,
+                [
+                    ctx,
+                    placeholder_ts,
+                    shown,
+                    citations,
+                    model_answer,
+                    state.searched if model_answer else [],
+                ],
+            )
         else:
             await self._finalize(
                 state,
@@ -793,12 +815,20 @@ class ConversationWorkflow:
         The activity posts it and then keeps it in history, so a reply that was not shown is
         not stored; recovery stores the failure notice in its place.
         """
-        await self._finalize(
-            state,
-            AgentActivities.finalize_model_reply,
-            AgentActivities.post_final_model_reply,
-            [ctx, placeholder_ts, key, list(self.citations), cut_short],
-        )
+        if workflow.patched(PATCH_SEARCHED_FOOTER):
+            await self._finalize(
+                state,
+                AgentActivities.finalize_searched_model_reply,
+                AgentActivities.post_final_searched_model_reply,
+                [ctx, placeholder_ts, key, list(self.citations), cut_short, state.searched],
+            )
+        else:
+            await self._finalize(
+                state,
+                AgentActivities.finalize_model_reply,
+                AgentActivities.post_final_model_reply,
+                [ctx, placeholder_ts, key, list(self.citations), cut_short],
+            )
         state.reply_stored = True
 
     def _kind(self, call: ToolCall | ToolCallRef) -> str:
@@ -1018,6 +1048,7 @@ class ConversationWorkflow:
         # The specialist's placeholder is new: no progress edit was dropped on it, so its
         # final text may edit it even if the front door's placeholder was left unsafe.
         state.progress_dropped = False
+        state.searched = []
         state.handed_off = True
         return specialist, ctx, placeholder_ts
 

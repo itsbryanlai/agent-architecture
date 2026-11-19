@@ -12,7 +12,7 @@ import pytest
 from agentos import ids
 from agentos.activities import approval_card_blocks
 from agentos.config import TASK_QUEUE
-from agentos.knowledge.search import sources_footer
+from agentos.knowledge.search import searched_footer, sources_footer
 from agentos.models import ApprovalDecision, Citation, TaskSpec, TurnContext
 from agentos.slack_format import escape_slack, from_slack_text, to_slack_mrkdwn
 from agentos.workflows.task import TaskWorkflow
@@ -61,8 +61,11 @@ def test_leading_quote_marker_still_quotes():
 
 def test_footer_link_stays_live_and_title_is_escaped():
     cited = [Citation(1, "notion:page:" + "a" * 32, "a" * 32)]
-    footer = sources_footer(cited, {"a" * 32: ("R&D <!here>", "https://n.so/p?a=1")})
+    meta = {"a" * 32: ("R&D <!here>", "https://n.so/p?a=1")}
+    footer = sources_footer(cited, meta)
     assert footer == "\n\nSources: [1] <https://n.so/p?a=1|R&amp;D &lt;!here&gt;>"
+    searched = searched_footer(cited, meta)
+    assert searched == "\n\nSearched: <https://n.so/p?a=1|R&amp;D &lt;!here&gt;>"
 
 
 def _spec(tool: str, payload: dict) -> TaskSpec:

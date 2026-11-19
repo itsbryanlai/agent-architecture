@@ -398,6 +398,8 @@ NOT_GATED = {
     "update_progress": "edits the placeholder to a fixed runtime progress label; the reply or off notice replaces it, so it must still run",
     "finalize_reply": "posts the reply or the fixed off notice that call_llm returned",
     "post_final_reply": "posts that same reply as a new message when a progress edit was dropped",
+    "finalize_searched_reply": "posts that same reply plus the turn's Searched line; no agent effect",
+    "post_final_searched_reply": "posts that same reply as a new message when a progress edit was dropped",
     "finalize_notice": "shows a fixed non-answer notice and records its audit row; no agent effect",
     "post_final_notice": "posts that same notice as a new message when a progress edit was dropped",
     "post_in_thread": "posts a fixed notice (reminder, refusal, failure); no agent effect",
@@ -413,6 +415,8 @@ NOT_GATED = {
     "discard_message": "clears the inbound event's text when a turn ended before ingest; no model, connector or post",
     "finalize_model_reply": "posts the reply or the fixed off notice that call_model stored",
     "post_final_model_reply": "posts that same reply as a new message when a progress edit was dropped",
+    "finalize_searched_model_reply": "posts that same reply plus the turn's Searched line; no agent effect",
+    "post_final_searched_model_reply": "posts that same reply as a new message when a progress edit was dropped",
     "apply_edit": "stores the requester's saved edit as the next draft revision; no model or connector",
     "post_task_notice": "posts a fixed line about a task in its thread; no agent effect",
 }

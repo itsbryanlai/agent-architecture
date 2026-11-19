@@ -265,6 +265,9 @@ async def test_a_database_notion_will_not_show_is_a_grant_problem(agents, code):
         ("Acme Corp IT Helpdesk Guidebook", "IT Helpdesk Guidebook", False),
         ("Acme Corp — IT Helpdesk", "acme corp it helpdesk", False),
         ("IT Helpdesk Guidebook", "HR Policy Handbook", True),
+        ("HR", "Shrink requests", True),
+        ("IT", "Edit log", True),
+        ("---", "IT Helpdesk Guidebook", True),
     ],
 )
 async def test_a_label_contained_in_the_live_title_is_not_flagged(agents, label, live_title, warns):

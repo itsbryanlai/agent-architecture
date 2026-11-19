@@ -67,7 +67,7 @@ from tests.conftest import (
 from tests.helpers.agents import republish
 from tests.helpers.audience import CHAN, THREAD, converse, running, say, tenant_dict
 from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
-from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
+from tests.helpers.console_harness import ConsoleHarness, csrf_token, fake_slack_for, post, using
 from tests.helpers.control_api import JSON, StandIn
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -657,7 +657,7 @@ def publish_world(channels=None, slack=None):
     audit = InMemoryAuditStore()
     agents = InMemoryAgentStore()
     members = InMemoryMemberStore()
-    inspector = SlackAudienceInspector(lambda t: slack, lambda t: TEAM, clock=Clock())
+    inspector = SlackAudienceInspector(fake_slack_for(slack), lambda t: TEAM, clock=Clock())
     plane = ControlPlane(
         agents,
         members,
@@ -856,7 +856,7 @@ def console_world(slack=None):
         users={u.id: u for u in (GUEST, EXTERNAL)},
         channel_members={CHAN: ["U_M1", "U_M2", "U_GUEST", "U_EXT"]},
     )
-    inspector = SlackAudienceInspector(lambda t: slack, lambda t: TEAM, clock=Clock())
+    inspector = SlackAudienceInspector(fake_slack_for(slack), lambda t: TEAM, clock=Clock())
     return ConsoleHarness(audience=inspector), slack
 
 

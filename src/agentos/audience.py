@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -398,7 +398,7 @@ class SlackAudienceInspector:
 
     def __init__(
         self,
-        slack_for: Callable[[str], SlackPoster],
+        slack_for: Callable[[str], Awaitable[SlackPoster]],
         team_for: Callable[[str], str],
         ttl: float = CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -413,14 +413,15 @@ class SlackAudienceInspector:
         hit = self._workspace.get(tenant_id)
         if not fresh and hit is not None and self._clock() < hit[0]:
             return hit[1]
-        listed = {u.id: u for u in await self._slack_for(tenant_id).list_users()}
+        slack = await self._slack_for(tenant_id)
+        listed = {u.id: u for u in await slack.list_users()}
         self._workspace[tenant_id] = (self._clock() + self._ttl, listed)
         return listed
 
     async def summary(
         self, tenant_id: str, audience: EffectiveAudience, fresh: bool = True
     ) -> AudienceSummary:
-        slack = self._slack_for(tenant_id)
+        slack = await self._slack_for(tenant_id)
         team = self._team_for(tenant_id)
         users: dict[str, SlackUser] | None = None
         everyone: dict[str, SlackUser] = {}

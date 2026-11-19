@@ -43,6 +43,7 @@ from agentos.config import ConfigError
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
+from agentos.crypto_keys import TenantKeyError
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
 from agentos.members import ADMIN, CREATOR, ROLES
@@ -55,6 +56,19 @@ from agentos.notion_picker import (
     authorize_url as notion_authorize_url,
 )
 from agentos.sessions import SESSION_LIFETIME, session_hash
+from agentos.slack_install import (
+    INSTALL_CALLBACK_PATH,
+    INSTALL_COOKIE,
+    INSTALL_COOKIE_SECONDS,
+    INSTALL_PATH,
+    SlackInstallError,
+    grant_from_response,
+    new_install_state,
+    read_install_cookie,
+)
+from agentos.slack_install import (
+    authorize_url as install_authorize_url,
+)
 from agentos.slack_signin import (
     CALLBACK_PATH,
     LOGIN_COOKIE,
@@ -293,6 +307,10 @@ class WebUI:
         self.route("GET", base + "/switches", self.switches)
         self.route("POST", base + "/switches/off", self.turn_off)
         self.route("POST", base + "/switches/on", self.turn_on)
+        if self.deps.console is not None:
+            # Public pages: the install runs before any tenant (or session) exists.
+            app.add_route(INSTALL_PATH, self.install_page, methods=["GET"])
+            app.add_route(INSTALL_CALLBACK_PATH, self.install_callback, methods=["GET"])
 
     # --- plumbing ---------------------------------------------------------------------
 
@@ -502,6 +520,79 @@ class WebUI:
             await self.deps.sessions.delete(session.tenant_id, token)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
+
+    # --- the Slack install --------------------------------------------------------------
+
+    async def install_page(self, request: Request) -> Response:
+        """The public "Add to Slack" page. The state cookie binds the flow to this browser."""
+        install = self.deps.install
+        if install is None:
+            return _message("Not available", "Installing is not enabled on this console.", 404)
+        config = install.config
+        if not config.allowed_teams:
+            return _message(
+                "Install not enabled",
+                "Installing is not enabled on this console yet. "
+                "Ask the platform operator to enable it for your workspace.",
+                200,
+            )
+        state = new_install_state()
+        response = _page("install.html", authorize_url=install_authorize_url(config, state))
+        response.set_cookie(
+            INSTALL_COOKIE,
+            state,
+            max_age=INSTALL_COOKIE_SECONDS,
+            path=INSTALL_PATH,
+            **_cookie_options(config.secure_cookies),
+        )
+        return response
+
+    async def install_callback(self, request: Request) -> Response:
+        """Slack sends the browser back here; one unit of work creates the tenant."""
+        install = self.deps.install
+        if install is None:
+            return _message("Not available", "Installing is not enabled on this console.", 404)
+        config = install.config
+
+        def done(response: Response) -> Response:
+            response.delete_cookie(INSTALL_COOKIE, path=INSTALL_PATH)
+            return response
+
+        def refused(text: str, status: int = 400) -> Response:
+            return done(_message("Install failed", text, status, back=INSTALL_PATH))
+
+        query = request.query_params
+        state, code = query.get("state", ""), query.get("code", "")
+        cookie = read_install_cookie(request.cookies.get(INSTALL_COOKIE))
+        if cookie is None or not state or not _same(state, cookie):
+            return refused("The install could not be verified. Start again.")
+        if "error" in query or not code or len(code) > 1024:
+            return refused("Slack did not complete the install.")
+        try:
+            body = await install.oauth.exchange_code(code, config.redirect_uri)
+            team_id, bot_token, installer = grant_from_response(body)
+            result = await install.install(team_id, bot_token, installer)
+        except SlackInstallError as err:
+            log.warning("install refused: %s", err)
+            return refused(str(err), err.status)
+        except ConfigError as err:
+            log.warning("install refused: %s", err)
+            return refused(str(err), 409)
+        except TenantKeyError as err:
+            log.warning("install refused: %s", err)
+            return refused(str(err), 503)
+        if result.created:
+            text = (
+                f"The app is installed for workspace {result.team_id}. Sign in to finish the setup."
+            )
+        else:
+            text = (
+                f"The app was reinstalled for workspace {result.team_id}; "
+                "its bot token was replaced."
+            )
+        return done(
+            _message("Installed", text, 200, back=f"/ui/{quote(result.tenant_id, safe='')}/agents")
+        )
 
     # --- pages ------------------------------------------------------------------------
 

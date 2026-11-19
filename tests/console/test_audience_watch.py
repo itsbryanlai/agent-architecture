@@ -56,7 +56,7 @@ from tests.conftest import ALICE, TEAM, TENANT, agents_dict, eventually, make_fa
 from tests.helpers.agents import helper_block
 from tests.helpers.audience import CHAN, OWNER, THREAD, converse
 from tests.helpers.console_harness import ROOT as CONSOLE_ADMIN
-from tests.helpers.console_harness import ConsoleHarness, csrf_token, post, using
+from tests.helpers.console_harness import ConsoleHarness, csrf_token, fake_slack_for, post, using
 from tests.helpers.gateway import FakeTemporalClient, signed_headers
 from tests.helpers.temporal import new_scope, replace_server_if_stuck
 
@@ -116,7 +116,9 @@ class World:
         self.watch = AudienceWatchActivities(
             self.registry, self.store, self.members, self.pauses, self.audit, self.idem
         )
-        inspector = SlackAudienceInspector(lambda t: self.slack, lambda t: TEAM, clock=Clock())
+        inspector = SlackAudienceInspector(
+            fake_slack_for(self.slack), lambda t: TEAM, clock=Clock()
+        )
         self.plane = ControlPlane(
             self.store,
             self.members,
@@ -549,7 +551,7 @@ async def test_a_page_read_may_not_have_counts_when_slack_cannot_be_read():
 
 async def console_world():
     slack = FakeSlack(users=dict(PEOPLE), channel_members={CHAN: [ALICE, GUEST.id]})
-    inspector = SlackAudienceInspector(lambda t: slack, lambda t: TEAM, clock=Clock())
+    inspector = SlackAudienceInspector(fake_slack_for(slack), lambda t: TEAM, clock=Clock())
     h = ConsoleHarness(audience=inspector)
     await h.seed_members()
     raw = agents_dict()

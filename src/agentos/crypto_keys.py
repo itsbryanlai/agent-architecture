@@ -516,6 +516,26 @@ async def ensure_tenant_key(
         return (await cur.fetchone())[0]
 
 
+async def tenant_key_material(
+    pool: AsyncConnectionPool, masters: MasterKeys, tenant_id: str, conn=None
+) -> tuple[int, bytes]:
+    """The tenant's newest key version and its bytes, creating version 1 when it has none.
+
+    Reads the row on ``conn`` (the connection of a unit of work), so a caller that just
+    created the key inside an open transaction can encrypt with it before it commits.
+    The key bytes stay in memory; nothing logs or stores them.
+    """
+    version = await ensure_tenant_key(pool, masters, tenant_id, conn=conn)
+    async with joined_transaction(pool, tenant_id, conn) as db:
+        cur = await db.execute(
+            "SELECT wrapped_key, master_version FROM tenant_payload_keys "
+            "WHERE tenant_id = %s AND version = %s",
+            (tenant_id, version),
+        )
+        blob, master_version = await cur.fetchone()
+    return version, unwrap_key(masters, tenant_id, version, blob, master_version)
+
+
 async def rotate_tenant_key(
     pool: AsyncConnectionPool, masters: MasterKeys, tenant_id: str, conn=None
 ) -> int:

@@ -9,6 +9,15 @@ import hashlib
 from agentos.connectors.notion import normalize_id
 
 
+def tenant_for_slack_team(team_id: str) -> str:
+    """The stable tenant ID of a Slack workspace: its team ID, lower-cased, behind a prefix.
+
+    One workspace always maps to the same tenant, so a reinstall finds the row the
+    first install created. The caller checks the result against ``TENANT_ID_PATTERN``.
+    """
+    return f"t-{team_id.lower()}"
+
+
 def conversation_id(tenant: str, channel: str, thread_ts: str) -> str:
     return f"{tenant}:conv:{channel}:{thread_ts}"
 

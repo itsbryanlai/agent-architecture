@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Add to Slack{% endblock %}
+{% block body %}
+<h1>Add to Slack</h1>
+<p>Install the app into your Slack workspace. Slack asks you to approve the access the
+app needs; an admin finishes the setup in this console afterwards.</p>
+<p><a href="{{ authorize_url }}">Add to Slack</a></p>
+{% endblock %}

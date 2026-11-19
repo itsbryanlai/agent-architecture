@@ -397,13 +397,15 @@ class AgentActivities:
     def _runtime(self, tenant_id: str) -> TenantRuntime:
         """The clients and config of the tenant an activity works for.
 
-        An unknown tenant fails the activity for good; it is never answered
-        with another tenant's runtime.
+        An unknown tenant is a retryable failure, never answered with another
+        tenant's runtime: a tenant installed seconds ago appears on the worker's
+        next directory refresh (every 5 s), and the shared activity retry policy
+        (5 attempts, 1 s doubling to 8 s, about 15 s in total) waits that out.
         """
         try:
             return self.registry.get(tenant_id)
         except UnknownTenant as err:
-            raise _non_retryable(err) from err
+            raise ApplicationError(str(err), type="UnknownTenant") from err
 
     async def _agent(self, tenant_id: str, agent_id: str) -> AgentVersion:
         """The agent's current published version, read from the store on every call."""

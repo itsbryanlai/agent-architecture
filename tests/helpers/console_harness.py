@@ -207,6 +207,15 @@ def csrf_in(html: str) -> str:
     return match.group(1)
 
 
+def fake_slack_for(slack):
+    """An async tenant-to-client factory returning one fake, as the real resolver's shape."""
+
+    async def factory(tenant_id: str):
+        return slack
+
+    return factory
+
+
 def request_id_in(html: str, action: str) -> str:
     form = re.search(rf'<form[^>]*action="{re.escape(action)}".*?</form>', html, re.DOTALL)
     assert form, f"no form posts to {action}"

@@ -3,12 +3,17 @@
 Rules kept here:
 
 * A tenant's tokens are used only for that tenant. Each tenant has its own
-  Slack client and its own Notion client, built from the environment variables
-  its config names. One tenant's client never serves another tenant's work.
+  Slack client, built from the token ``TenantCredentials`` resolves for it (its
+  encrypted credential row first, else the environment variable its config
+  names), and its own Notion client when it has a Notion token. One tenant's
+  client never serves another tenant's work.
 * An unknown tenant is never answered with a default tenant: ``get`` raises.
-* Secrets come only from environment variables. A missing one fails with a
-  message naming the variable and the tenant, never a value, and no value is
-  kept anywhere but inside the client that needs it.
+* A tenant with no Notion token is served Slack-only: its runtime carries no
+  Notion client, and nothing calls one for it (its agents hold no Notion grants
+  until an admin connects Notion and publishes).
+* A missing secret fails with a message naming the variable and the tenant,
+  never a value, and no value is kept anywhere but inside the client that needs
+  it.
 """
 
 from __future__ import annotations
@@ -48,15 +53,24 @@ class TenantRuntime:
     config: AgentsConfig
     # The clients hold tokens, so they stay out of repr.
     slack: SlackPoster = field(repr=False)
-    notion_api: NotionAPI = field(repr=False)
+    # None for a Slack-only tenant (no Notion token): no activity of its agents calls Notion.
+    notion_api: NotionAPI | None = field(default=None, repr=False)
     # What this tenant's Notion workspace says about people. Shared by every connector built
     # for the tenant, so a requester is looked up once per cache lifetime, not once per call.
     notion_users: NotionUserCache = field(default_factory=NotionUserCache, repr=False)
+    # The token the Slack client was built with, so a sync rebuilds it when a reinstall
+    # replaces the credential. In memory only, like the client's own copy; never logged.
+    slack_token: str = field(default="", repr=False)
 
 
-def runtime_for(config: AgentsConfig, slack: SlackPoster, notion_api: NotionAPI) -> TenantRuntime:
+def runtime_for(
+    config: AgentsConfig,
+    slack: SlackPoster,
+    notion_api: NotionAPI | None = None,
+    slack_token: str = "",
+) -> TenantRuntime:
     """Build a tenant's runtime."""
-    return TenantRuntime(config, slack, notion_api)
+    return TenantRuntime(config, slack, notion_api, slack_token=slack_token)
 
 
 class TenantRegistry:
@@ -90,11 +104,13 @@ class TenantRegistry:
 class RegistrySync:
     """Keeps a worker's ``TenantRegistry`` equal to the directory's enabled tenants.
 
-    ``sync`` adds a tenant added to the database (building its clients from the
-    variables its settings name), swaps in changed settings, and drops a tenant that
-    was disabled or removed, so the worker serves a tenant without a restart. A new
-    tenant that cannot be admitted (a secret variable is unset, or ``admit`` returns a
-    reason) is left out and reported once per reason; the next ``sync`` tries again.
+    ``sync`` adds a tenant added to the database (building its clients from the token
+    the resolver returns, or the variables its settings name without one), swaps in
+    changed settings, rebuilds a client whose credential was replaced, and drops a
+    tenant that was disabled or removed, so the worker serves a tenant without a
+    restart. A new tenant that cannot be admitted (its Slack token is unavailable, or
+    ``admit`` returns a reason) is left out and reported once per reason; the next
+    ``sync`` tries again. A tenant with no Notion token is served Slack-only.
     """
 
     def __init__(
@@ -104,12 +120,16 @@ class RegistrySync:
         slack_factory: Callable[[str], SlackPoster],
         notion_factory: Callable[[str], NotionAPI],
         admit: Callable[[AgentsConfig], Awaitable[str | None]] | None = None,
+        slack_token: Callable[[AgentsConfig], Awaitable[str]] | None = None,
     ):
         self._directory = directory
         self._registry = registry
         self._slack_factory = slack_factory
         self._notion_factory = notion_factory
         self._admit = admit
+        # Resolves a tenant's Slack bot token (credential row first, env fallback).
+        # None reads only the environment variable the tenant's settings name.
+        self._slack_token = slack_token
         self._reported: set[tuple[str, str]] = set()
 
     def _report(self, tenant_id: str, reason: str) -> None:
@@ -130,9 +150,21 @@ class RegistrySync:
                 current = self._registry.get(tenant_id)
             except UnknownTenant:
                 current = None
-            if current is not None and current.config == config:
+            try:
+                if self._slack_token is not None:
+                    token = await self._slack_token(config)
+                else:
+                    token = require_tenant_secret(config, "slack_bot_token_env")
+            except ConfigError as err:
+                self._report(tenant_id, str(err))
                 continue
-            if current is not None and current.config.secrets == config.secrets:
+            if current is not None and current.config == config and current.slack_token == token:
+                continue
+            if (
+                current is not None
+                and current.config.secrets == config.secrets
+                and current.slack_token == token
+            ):
                 self._registry.set(tenant_id, replace(current, config=config))
                 continue
             try:
@@ -141,12 +173,13 @@ class RegistrySync:
                     if failure:
                         self._report(tenant_id, failure)
                         continue
-                slack = self._slack_factory(require_tenant_secret(config, "slack_bot_token_env"))
-                notion = self._notion_factory(require_tenant_secret(config, "notion_token_env"))
+                slack = self._slack_factory(token)
+                notion_token = read_secret(config.secrets.notion_token_env)
+                notion = self._notion_factory(notion_token) if notion_token else None
             except ConfigError as err:
                 self._report(tenant_id, str(err))
                 continue
-            self._registry.set(tenant_id, runtime_for(config, slack, notion))
+            self._registry.set(tenant_id, runtime_for(config, slack, notion, slack_token=token))
             if current is None:
                 added.append(tenant_id)
                 log.info("tenant_id=%s now served", tenant_id)
@@ -178,50 +211,31 @@ def require_tenant_secret(config: AgentsConfig, field_name: str) -> str:
     return value
 
 
-def notion_key_failure(tenants_config: TenantsConfig) -> str | None:
-    """Why the control plane may not start, or None.
-
-    Every tenant's agents can be granted Notion pages and databases, and the grant
-    check (also run inside every publish) reads them with that tenant's own
-    Notion key. A tenant whose variable is unset is named by variable, never value.
-    """
-    failures = []
-    for config in tenants_config.tenants.values():
-        try:
-            require_tenant_secret(config, "notion_token_env")
-        except ConfigError as err:
-            failures.append(str(err))
-    return "\n".join(failures) or None
-
-
-def build_registry(
+async def build_registry(
     tenants_config: TenantsConfig,
     settings: Settings,
     slack_factory: Callable[[str], SlackPoster],
     notion_factory: Callable[[str], NotionAPI],
+    slack_token: Callable[[AgentsConfig], Awaitable[str]] | None = None,
 ) -> TenantRegistry:
-    """Build every tenant's clients from the variables its config names.
+    """Build every tenant's clients from its own resolved credentials.
 
-    Production passes ``RealSlackPoster`` and ``RealNotionAPI``; tests pass
-    factories that return fakes. ``settings`` carries the platform-wide
-    settings; the tenants' secrets are not in it.
+    Production passes ``RealSlackPoster`` and ``RealNotionAPI`` and the credential
+    resolver; tests pass factories that return fakes. ``settings`` carries the
+    platform-wide settings; the tenants' secrets are not in it. A tenant with no
+    Notion token gets a Slack-only runtime.
     """
     runtimes = {}
     for tenant_id, config in tenants_config.tenants.items():
-        slack = slack_factory(require_tenant_secret(config, "slack_bot_token_env"))
-        notion = notion_factory(require_tenant_secret(config, "notion_token_env"))
-        runtimes[tenant_id] = runtime_for(config, slack, notion)
+        if slack_token is not None:
+            token = await slack_token(config)
+        else:
+            token = require_tenant_secret(config, "slack_bot_token_env")
+        slack = slack_factory(token)
+        notion_token = read_secret(config.secrets.notion_token_env)
+        notion = notion_factory(notion_token) if notion_token else None
+        runtimes[tenant_id] = runtime_for(config, slack, notion, slack_token=token)
     return TenantRegistry(runtimes)
-
-
-def build_slack_clients(
-    tenants_config: TenantsConfig, slack_factory: Callable[[str], SlackPoster]
-) -> dict[str, SlackPoster]:
-    """One Slack client per tenant, each with that tenant's own bot token."""
-    return {
-        tenant_id: slack_factory(require_tenant_secret(config, "slack_bot_token_env"))
-        for tenant_id, config in tenants_config.tenants.items()
-    }
 
 
 def granted_roots(agents: AgentsConfig) -> dict[str, str]:

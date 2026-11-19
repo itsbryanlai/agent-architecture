@@ -56,6 +56,13 @@ from agentos.notion_picker import (
     picker_from_settings,
 )
 from agentos.sessions import SessionStore
+from agentos.slack_install import (
+    INSTALL_CALLBACK_PATH,
+    INSTALL_PATH,
+    HttpSlackOAuth,
+    Installer,
+    install_from_settings,
+)
 from agentos.slack_signin import (
     CALLBACK_PATH,
     Console,
@@ -64,7 +71,6 @@ from agentos.slack_signin import (
     sign_in_from_settings,
 )
 from agentos.tenant_store import TenantSource, as_source
-from agentos.tenants import notion_key_failure
 from agentos.web_ui import CONSOLE_FORM_PREFIXES, install_web_ui
 
 log = logging.getLogger("agentos.control_api")
@@ -227,6 +233,7 @@ class ControlDeps:
     sessions: SessionStore | None = None
     console: Console | None = None
     picker: Picker | None = None
+    install: Installer | None = None
 
 
 def create_app(
@@ -238,13 +245,14 @@ def create_app(
     sessions: SessionStore | None = None,
     console: Console | None = None,
     picker: Picker | None = None,
+    install: Installer | None = None,
 ) -> FastAPI:
     """Build the API. Tests pass fakes; the real process fills ``deps`` on startup.
 
     With a ``console`` the app also serves the web pages, and ``identity`` should be
     ``SlackSession()``. The Host and Origin allowlists then include the console URL.
     """
-    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker)
+    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker, install)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
@@ -270,7 +278,7 @@ def create_app(
             and request.method in ("GET", "HEAD")
             and headers.get("sec-fetch-mode") == "navigate"
             and headers.get("sec-fetch-dest") == "document"
-            and (path in ("/", "/login") or path.startswith("/ui/"))
+            and (path in ("/", "/login", INSTALL_PATH) or path.startswith("/ui/"))
         )
 
     @app.middleware("http")
@@ -306,6 +314,7 @@ def create_app(
         arrives_from_slack = console is not None and request.url.path in (
             CALLBACK_PATH,
             NOTION_CALLBACK_PATH,
+            INSTALL_CALLBACK_PATH,
         )
         if (
             headers.get("sec-fetch-site") in ("cross-site", "same-site")
@@ -675,7 +684,15 @@ async def _real_lifespan(app: FastAPI):
     from agentos.audience_pauses import PostgresPauseStore
     from agentos.audit import PostgresAuditStore
     from agentos.budgets import PostgresBudgetStore
+    from agentos.config import KEY_SOURCE_DB
     from agentos.connectors.notion import RealNotionAPI
+    from agentos.credentials import PostgresCredentialStore, TenantCredentials
+    from agentos.crypto_keys import (
+        TenantKeyError,
+        build_key_store,
+        master_keys_from_env,
+        tenant_key_material,
+    )
     from agentos.grant_checker import NotionGrantChecker
     from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
@@ -695,8 +712,14 @@ async def _real_lifespan(app: FastAPI):
     try:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
-        if failure := notion_key_failure(await startup_tenants(directory)):
-            raise SystemExit(failure)
+        # A tenant with no Notion token is served Slack-only; its grant checks fail at
+        # publish time with a message naming the variable, not at start-up.
+        await startup_tenants(directory)
+        try:
+            keys = await build_key_store(settings, pool)
+        except TenantKeyError as err:
+            raise SystemExit(str(err)) from err
+        credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
         apis: dict[str, RealNotionAPI] = {}
 
         def notion_for(tenant_id: str) -> RealNotionAPI:
@@ -705,17 +728,19 @@ async def _real_lifespan(app: FastAPI):
                 apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
             return apis[tenant_id]
 
-        slack_clients: dict[str, RealSlackPoster] = {}
+        slack_clients: dict[str, tuple[str, RealSlackPoster]] = {}
 
-        def slack_for(tenant_id: str) -> RealSlackPoster:
-            # Built on first use, so a tenant whose Slack variable is unset fails its
-            # own publish with a message naming the variable, not the whole console.
-            if tenant_id not in slack_clients:
-                config = directory.latest().get(tenant_id)
-                slack_clients[tenant_id] = RealSlackPoster(
-                    require_tenant_secret(config, "slack_bot_token_env"), tenant_id=tenant_id
-                )
-            return slack_clients[tenant_id]
+        async def slack_for(tenant_id: str) -> RealSlackPoster:
+            # Built on first use and rebuilt when the credential changes, so a tenant
+            # whose Slack token is unavailable fails its own publish with a message
+            # naming the cause, not the whole console.
+            config = directory.latest().get(tenant_id)
+            token = await credentials.slack_bot_token(config)
+            entry = slack_clients.get(tenant_id)
+            if entry is None or entry[0] != token:
+                entry = (token, RealSlackPoster(token, tenant_id=tenant_id))
+                slack_clients[tenant_id] = entry
+            return entry[1]
 
         def team_for(tenant_id: str) -> str:
             return directory.latest().get(tenant_id).slack_team_id
@@ -737,6 +762,27 @@ async def _real_lifespan(app: FastAPI):
             require_grant_picker=settings.require_grant_picker,
         )
         app.state.deps.tenants = directory
+        if app.state.deps.console is not None:
+            try:
+                install_config = install_from_settings(settings)
+            except ConfigError as err:
+                raise SystemExit(str(err)) from err
+            if install_config is not None:
+                if settings.key_source != KEY_SOURCE_DB:
+                    log.info("Slack install not offered: AGENTOS_KEY_SOURCE is not 'db'")
+                else:
+                    masters = master_keys_from_env()
+                    app.state.deps.install = Installer(
+                        install_config,
+                        HttpSlackOAuth(install_config.client_id, install_config.client_secret),
+                        PostgresTenantStore(pool),
+                        credentials,
+                        PostgresAuditStore(pool),
+                        PostgresUnitOfWork(pool),
+                        ensure_key=lambda tenant_id, conn: tenant_key_material(
+                            pool, masters, tenant_id, conn=conn
+                        ),
+                    )
         yield
     finally:
         await pool.close()

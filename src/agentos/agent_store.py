@@ -995,7 +995,9 @@ async def startup_agent_failure(store: AgentStore, tenants: TenantsConfig) -> st
     problems = []
     for tenant_id, config in tenants.tenants.items():
         published = await store.published_all(tenant_id)
-        named = [("default_agent", config.default_agent)]
+        # A tenant installed from Slack has no default agent yet: the gateway answers
+        # its messages with the fixed not-set-up reply, so there is nothing to check.
+        named = [] if config.default_agent is None else [("default_agent", config.default_agent)]
         named += [(f"channel '{channel}'", agent) for channel, agent in config.channels.items()]
         for label, agent_id in named:
             if agent_id not in published:

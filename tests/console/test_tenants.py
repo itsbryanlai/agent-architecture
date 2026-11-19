@@ -143,26 +143,27 @@ def test_webhook_path_with_bad_tenant_id_is_404(tmp_path, webhook_tokens):
     assert temporal.signals == []
 
 
-def test_missing_tenant_secret_names_variable(monkeypatch):
+async def test_missing_slack_secret_names_variable(monkeypatch):
+    """Fails if a tenant whose Slack token is unavailable is built, or the error names a value."""
     tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
     values = {
         "SLACK_BOT_TOKEN_ACME": token_source.token_hex(8),
         "NOTION_TOKEN_ACME": token_source.token_hex(8),
-        "SLACK_BOT_TOKEN_GLOBEX": token_source.token_hex(8),
+        "NOTION_TOKEN_GLOBEX": token_source.token_hex(8),
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN_GLOBEX", raising=False)
 
     with pytest.raises(ConfigError) as err:
-        build_registry(tenants, Settings(), lambda t: FakeSlack(), lambda t: FakeNotionAPI())
+        await build_registry(tenants, Settings(), lambda t: FakeSlack(), lambda t: FakeNotionAPI())
 
     message = str(err.value)
-    assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
+    assert "SLACK_BOT_TOKEN_GLOBEX" in message and "globex" in message
     assert not any(value in message for value in values.values())
 
 
-def test_registry_builds_each_tenants_clients_from_its_own_variables(monkeypatch):
+async def test_registry_builds_each_tenants_clients_from_its_own_variables(monkeypatch):
     tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
     expected = {}
     for suffix in ("ACME", "GLOBEX"):
@@ -171,7 +172,7 @@ def test_registry_builds_each_tenants_clients_from_its_own_variables(monkeypatch
             monkeypatch.setenv(f"{kind}_{suffix}", expected[f"{kind}_{suffix}"])
     seen = []
 
-    registry = build_registry(
+    registry = await build_registry(
         tenants,
         Settings(),
         lambda value: seen.append(value) or FakeSlack(),
@@ -367,7 +368,8 @@ async def test_turn_uses_its_tenants_clients_only(two_tenants):
     assert h.notions[TENANT].calls == []
 
 
-async def test_unknown_tenant_activity_fails_non_retryable():
+async def test_unknown_tenant_activity_is_retryable():
+    """Fails if an activity for a tenant the worker does not know yet fails for good."""
     config = parse_agents_config(agents_dict())
     registry = TenantRegistry({TENANT: runtime_for(config, FakeSlack(), FakeNotionAPI())})
     acts = AgentActivities(
@@ -393,10 +395,10 @@ async def test_unknown_tenant_activity_fails_non_retryable():
 
     with pytest.raises(ApplicationError) as caught:
         await acts.post_placeholder(ctx, "key")
-    assert caught.value.non_retryable is True
+    assert caught.value.non_retryable is False
     with pytest.raises(ApplicationError) as caught:
         await acts.load_agent("initech", "it-helper")
-    assert caught.value.non_retryable is True
+    assert caught.value.non_retryable is False
 
 
 def make_acts(*configs):
@@ -433,21 +435,23 @@ async def test_load_agent_one_argument_compat():
 @pytest.mark.parametrize(
     "globex_key_set", [False, True], ids=["a key is unset", "every key is set"]
 )
-def test_the_console_starts_only_when_every_tenants_notion_key_is_set(monkeypatch, globex_key_set):
-    """Fails if the console starts with a tenant's Notion key unset, names the wrong tenant, or refuses to start with every key set."""
-    from agentos.tenants import notion_key_failure
-
+async def test_a_tenant_is_served_with_or_without_its_notion_key(monkeypatch, globex_key_set):
+    """Fails if a tenant whose Notion key is unset is not served Slack-only, or a set key is not used."""
     tenants = TenantsConfig.of(*(parse_agents_config(r) for r in two_tenant_dicts()))
+    for suffix in ("ACME", "GLOBEX"):
+        monkeypatch.setenv(f"SLACK_BOT_TOKEN_{suffix}", token_source.token_hex(8))
     monkeypatch.setenv("NOTION_TOKEN_ACME", token_source.token_hex(8))
     if globex_key_set:
         monkeypatch.setenv("NOTION_TOKEN_GLOBEX", token_source.token_hex(8))
     else:
         monkeypatch.delenv("NOTION_TOKEN_GLOBEX", raising=False)
 
-    message = notion_key_failure(tenants)
+    registry = await build_registry(
+        tenants, Settings(), lambda t: FakeSlack(), lambda t: FakeNotionAPI()
+    )
 
+    assert registry.tenants() == [TENANT, GLOBEX]
     if globex_key_set:
-        assert message is None
+        assert registry.get(GLOBEX).notion_api is not None
     else:
-        assert "NOTION_TOKEN_GLOBEX" in message and "globex" in message
-        assert "NOTION_TOKEN_ACME" not in message
+        assert registry.get(GLOBEX).notion_api is None

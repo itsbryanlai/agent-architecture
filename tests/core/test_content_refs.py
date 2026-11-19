@@ -76,7 +76,7 @@ class Gateway:
             temporal or h.client,
             InMemoryTaskLinkStore(),
             SignatureVerifier(self.secret),
-            slack_for=lambda tenant: h.slack,
+            slack_for=self._slack_for,
             agents=h.agent_store,
             content=h.acts.content,
         )
@@ -84,6 +84,9 @@ class Gateway:
         self.http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app), base_url="http://gateway"
         )
+
+    async def _slack_for(self, tenant):
+        return self.h.slack
 
     async def post(self, path: str, body: bytes, content_type: str) -> httpx.Response:
         return await self.http.post(

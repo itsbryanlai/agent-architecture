@@ -40,7 +40,7 @@ from agentos.config import (
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
 from agentos.content_store import PostgresContentStore
-from agentos.crypto_keys import LocalKeyStore, check_keys, startup_key_failure
+from agentos.crypto_keys import KeyStore, build_key_store, check_keys, startup_key_failure
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -227,7 +227,7 @@ TENANT_SYNC_SECONDS = 5.0
 
 async def admit_new_tenant(
     config: AgentsConfig,
-    keys: LocalKeyStore,
+    keys: KeyStore,
     agent_store: PostgresAgentStore,
     log: logging.Logger,
 ) -> str | None:
@@ -269,7 +269,7 @@ async def main() -> None:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
-        keys = LocalKeyStore(settings.key_dir)
+        keys = build_key_store(settings)
         key_failure = startup_key_failure(keys, tenants.tenants)
         if key_failure:
             raise SystemExit(key_failure)

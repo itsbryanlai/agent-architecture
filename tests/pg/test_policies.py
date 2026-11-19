@@ -74,6 +74,8 @@ SEEDS = {
     "external_writes": "INSERT INTO external_writes "
     "(tenant_id, idem_key, state, lease_until, lease_token) "
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
+    "notion_webhook_tokens": "INSERT INTO notion_webhook_tokens "
+    "(tenant_id, state, ciphertext, key_version) VALUES (%(t)s, 'pending', '\\x00', 1)",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
@@ -108,6 +110,7 @@ PRIVILEGES = {
     "model_steps": "SELECT INSERT DELETE",
     "tool_inputs": "SELECT INSERT DELETE",
     "task_drafts": "SELECT INSERT DELETE",
+    "notion_webhook_tokens": "SELECT INSERT UPDATE DELETE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }
@@ -372,6 +375,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "budget_set",
                 "switch_off",
                 "switch_on",
+                "webhook_token",
             )
         ],
     ],

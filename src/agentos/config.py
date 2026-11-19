@@ -37,6 +37,14 @@ DEFAULT_PRICES_PATH = "config/prices.yaml"
 DEFAULT_NOTION_TOKEN_DIR = "~/.agentos"
 # The directory of per-tenant payload encryption key files, <tenant_id>.key.
 DEFAULT_KEY_DIR = "~/.agentos/keys"
+# Where payload keys come from: owner-only files (the default, unchanged local
+# runs) or host variables named AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>.
+KEY_SOURCE_FILES = "files"
+KEY_SOURCE_ENV = "env"
+KEY_SOURCES = (KEY_SOURCE_FILES, KEY_SOURCE_ENV)
+DEFAULT_KEY_SOURCE = KEY_SOURCE_FILES
+# The prefix of the variables that hold payload keys when the source is env.
+PAYLOAD_KEY_ENV_PREFIX = "AGENTOS_PAYLOAD_KEY_"
 # The variable names a tenant without a ``secrets`` block uses. Only one tenant
 # may use them.
 DEFAULT_SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -105,6 +113,10 @@ class Settings:
     # Where each tenant's payload encryption key file lives. A leading "~" is
     # expanded when the key is read. Holds a directory name, never a key.
     key_dir: str = DEFAULT_KEY_DIR
+    # Where payload keys are read from: "files" (key_dir) or "env" (the
+    # AGENTOS_PAYLOAD_KEY_<TENANT>_V<n> variables). Every process chooses its
+    # key store through agentos.crypto_keys.build_key_store, so they agree.
+    key_source: str = DEFAULT_KEY_SOURCE
     # Lets the payload codec read payloads that were never encrypted (a history
     # from before encryption). Off by default: with Temporal reachable, a
     # plaintext payload would otherwise be accepted as genuine.
@@ -182,6 +194,15 @@ def _parse_provider(raw: str | None) -> str:
     return provider
 
 
+def _parse_key_source(raw: str | None) -> str:
+    source = (raw or DEFAULT_KEY_SOURCE).strip().lower()
+    if source not in KEY_SOURCES:
+        raise ConfigError(
+            f"AGENTOS_KEY_SOURCE must be one of {', '.join(KEY_SOURCES)}; got {raw!r}"
+        )
+    return source
+
+
 def _parse_flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in _TRUE_VALUES
 
@@ -235,6 +256,7 @@ def load_settings() -> Settings:
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         notion_token_dir=env.get("AGENTOS_NOTION_TOKEN_DIR") or DEFAULT_NOTION_TOKEN_DIR,
         key_dir=env.get("AGENTOS_KEY_DIR") or DEFAULT_KEY_DIR,
+        key_source=_parse_key_source(env.get("AGENTOS_KEY_SOURCE")),
         allow_plaintext_payloads=_parse_flag(env.get("AGENTOS_ALLOW_PLAINTEXT_PAYLOADS")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         qwen_api_key=env.get("QWEN_API_KEY"),
@@ -271,6 +293,17 @@ def read_secret(env_name: str) -> str | None:
     this returns; error messages name the variable only.
     """
     return os.environ.get(env_name) or None
+
+
+def payload_key_env() -> dict[str, str]:
+    """The payload key variables and their values, for the variable key store.
+
+    Values are key material: the store keeps them in memory only, and nothing
+    logs, prints or ``repr``s them.
+    """
+    return {
+        name: value for name, value in os.environ.items() if name.startswith(PAYLOAD_KEY_ENV_PREFIX)
+    }
 
 
 # The dataclasses below travel through Temporal (``load_agent`` returns an

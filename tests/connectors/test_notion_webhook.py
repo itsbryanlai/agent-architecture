@@ -1,20 +1,33 @@
 """The Notion webhook accepts only signed events and never logs the token."""
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import secrets
 import stat
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos.agent_store import seeded_agent_store
+from agentos.audit import InMemoryAuditStore, event_json
 from agentos.config import Settings, TenantsConfig
+from agentos.crypto_keys import EnvKeyStore, key_var_name
 from agentos.gateway.app import create_app
 from agentos.gateway.notion_signature import verify_notion_signature
+from agentos.notion_webhook import (
+    InMemoryWebhookTokenStore,
+    WebhookTokens,
+    build_parser,
+    execute,
+)
+from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import TENANT
 from tests.helpers.gateway import FakeTemporalClient
@@ -22,6 +35,7 @@ from tests.helpers.gateway import FakeTemporalClient
 TOKEN = "secret_verification_token_abc123"
 PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 TASK_ID = f"{TENANT}:task:t1"
+NOW = datetime(2026, 11, 19, 12, 0, tzinfo=UTC)
 
 
 def sign(body: bytes, token: str = TOKEN) -> str:
@@ -241,3 +255,121 @@ def test_the_signature_is_computed_even_for_a_header_that_cannot_match(header):
 
     assert not verify_notion_signature(b"{}", header, TOKEN, mac=counting_mac)
     assert len(calls) == 1
+
+
+# --- the token in the database ---------------------------------------------------------
+
+
+def make_db_app(agents, temporal, links, tmp_path, monkeypatch):
+    """A gateway whose webhook tokens live in the (fake) database, encrypted under a generated key."""
+    monkeypatch.delenv("NOTION_WEBHOOK_VERIFICATION_TOKEN", raising=False)
+    store = InMemoryWebhookTokenStore()
+    keys = EnvKeyStore(
+        {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+    )
+    settings = Settings(notion_token_dir=str(tmp_path / "sub"))
+    app = create_app(
+        settings,
+        TenantsConfig.of(agents),
+        temporal,
+        links,
+        SignatureVerifier("x"),
+        agents=seeded_agent_store(agents),
+        webhook_tokens=WebhookTokens(store, keys),
+    )
+    return app, store, keys
+
+
+def db_client(app) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+async def apost(client, payload: dict, signature: str | None):
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if signature is not None:
+        headers["X-Notion-Signature"] = signature
+    return await client.post("/notion/webhook", content=body, headers=headers)
+
+
+async def test_handshake_stores_a_pending_token_once(
+    agents, temporal, links, tmp_path, monkeypatch, caplog
+):
+    """Fails if a second handshake replaces the pending token, or the token reaches a log or a file."""
+    app, store, keys = make_db_app(agents, temporal, links, tmp_path, monkeypatch)
+    async with db_client(app) as client:
+        with caplog.at_level(logging.DEBUG):
+            assert (await apost(client, {"verification_token": TOKEN}, None)).status_code == 200
+            assert (
+                await apost(client, {"verification_token": "replacement-token"}, None)
+            ).status_code == 409
+    row = store.snapshot()[TENANT]
+    assert row.state == "pending"
+    assert decrypt_for_tenant(keys, TENANT, row.ciphertext, row.key_version) == TOKEN.encode()
+    assert TOKEN.encode() not in row.ciphertext
+    assert TOKEN not in caplog.text
+    assert "replacement-token" not in caplog.text
+    assert TENANT in caplog.text
+    assert not (tmp_path / "sub").exists()
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [("pending", 503), ("confirmed", 200), ("undecryptable", 503)],
+)
+async def test_an_event_is_verified_only_against_the_confirmed_token(
+    agents, temporal, links, tmp_path, monkeypatch, state, expected
+):
+    """Fails if an event signed with the pending token is accepted, one signed with the confirmed token is refused, or a confirmed token the tenant's key cannot decrypt gives anything but a clean 503."""
+    app, store, _keys = make_db_app(agents, temporal, links, tmp_path, monkeypatch)
+    async with db_client(app) as client:
+        await apost(client, {"verification_token": TOKEN}, None)
+        if state == "undecryptable":
+            other = EnvKeyStore(
+                {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+            )
+            await store.clear(TENANT)
+            await store.put_pending(TENANT, *encrypt_for_tenant(other, TENANT, TOKEN.encode()))
+        if state != "pending":
+            await store.confirm(TENANT, NOW)
+        body = json.dumps(page_event()).encode()
+        resp = await apost(client, page_event(), sign(body))
+    assert resp.status_code == expected
+    assert len(temporal.signals) == (1 if state == "confirmed" else 0)
+
+
+@pytest.mark.parametrize(
+    ("command", "before", "code", "after", "prints_token", "audited"),
+    [
+        ("show", "pending", 0, "pending", True, ["show"]),
+        ("show", "active", 1, "active", False, []),
+        ("show", None, 1, None, False, []),
+        ("confirm", "pending", 0, "active", False, ["confirm"]),
+        ("confirm", "active", 1, "active", False, []),
+        ("clear", "active", 0, None, False, ["clear"]),
+        ("clear", None, 1, None, False, []),
+    ],
+)
+async def test_a_token_command_changes_only_the_state_it_names_and_audits_the_operator(
+    monkeypatch, capsys, command, before, code, after, prints_token, audited
+):
+    """Fails if a token command acts on a token in the wrong state, prints a token it must not, or audits without the operator or with the token."""
+    store = InMemoryWebhookTokenStore()
+    audit = InMemoryAuditStore()
+    keys = EnvKeyStore(
+        {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+    )
+    if before is not None:
+        await store.put_pending(TENANT, *encrypt_for_tenant(keys, TENANT, TOKEN.encode()))
+        if before == "active":
+            await store.confirm(TENANT, NOW)
+    monkeypatch.setattr("agentos.notion_webhook.operator_identity", lambda: "operator:ops")
+    args = build_parser().parse_args(["--tenant", TENANT, command])
+
+    assert await execute(args, store, audit, keys, request_id="inv-1") == code
+
+    row = await store.get(TENANT)
+    assert (row.state if row else None) == after
+    assert (TOKEN in capsys.readouterr().out) is prints_token
+    assert [(e.tool, e.identity) for e in audit.events] == [(c, "operator:ops") for c in audited]
+    assert [e for e in audit.events if TOKEN in event_json(e)] == []

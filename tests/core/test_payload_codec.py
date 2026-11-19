@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import secrets
 import stat
 
 import pytest
@@ -24,10 +25,12 @@ from agentos.agent_store import seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings
 from agentos.crypto_keys import (
+    EnvKeyStore,
     LocalKeyStore,
     TenantKeyError,
     check_keys,
     create_key,
+    key_var_name,
     startup_key_failure,
 )
 from agentos.llm import ScriptedLLMClient
@@ -210,6 +213,27 @@ async def test_rotation_encodes_with_newest_and_decodes_every_version(keys, tmp_
     assert await codec.decode([before, after]) == [json_payload("one"), json_payload("two")]
 
 
+# Generated test keys; never a real tenant's key material.
+ENV_KEY_A = secrets.token_bytes(32)
+ENV_KEY_B = secrets.token_bytes(32)
+
+
+async def test_the_codec_round_trips_with_variable_keys_and_reads_older_versions():
+    """Fails if a payload encrypted from variable keys does not decode, or a version added later breaks older payloads."""
+    env = {key_var_name("acme", 1): base64.b64encode(ENV_KEY_A).decode()}
+    workflow_id = ids.conversation_id("acme", "C1", "1.0")
+    codec = bound(TenantPayloadCodec(EnvKeyStore(env)), workflow_id)
+    (before,) = await codec.encode([json_payload("one")])
+    assert before.metadata["encryption-key-id"] == b"acme/v1"
+
+    # A redeploy with _V2 added and _V1 kept: new payloads use _V2, old ones still read.
+    env[key_var_name("acme", 2)] = base64.b64encode(ENV_KEY_B).decode()
+    rotated = bound(TenantPayloadCodec(EnvKeyStore(env)), workflow_id)
+    (after,) = await rotated.encode([json_payload("two")])
+    assert after.metadata["encryption-key-id"] == b"acme/v2"
+    assert await rotated.decode([before, after]) == [json_payload("one"), json_payload("two")]
+
+
 def test_rotate_needs_an_existing_key_and_never_overwrites(tmp_path, capsys):
     """Fails if rotate invents a first key, or overwrites a version that exists."""
     key_dir = tmp_path / "keys"
@@ -260,6 +284,42 @@ def test_key_never_in_repr_or_error(tmp_path):
     assert "short" not in str(err.value)
 
 
+@pytest.mark.parametrize(
+    ("env", "usable"),
+    [
+        ({"AGENTOS_PAYLOAD_KEY_ACME_V1": base64.b64encode(ENV_KEY_A).decode()}, True),
+        ({"AGENTOS_PAYLOAD_KEY_ACME_V1": "not%base64"}, False),
+        ({"AGENTOS_PAYLOAD_KEY_ACME_V1": base64.b64encode(b"short").decode()}, False),
+        ({}, False),
+        (
+            {
+                "AGENTOS_PAYLOAD_KEY_ACME_V1": base64.b64encode(ENV_KEY_A).decode(),
+                "AGENTOS_PAYLOAD_KEY_acme_V1": base64.b64encode(ENV_KEY_B).decode(),
+            },
+            False,
+        ),
+    ],
+    ids=["valid", "malformed", "wrong-length", "missing", "two-variables-one-key"],
+)
+def test_the_variable_key_store_reads_only_usable_keys(env, usable):
+    """Fails if a malformed, wrong-length, missing or doubly-claimed key variable is used, or an error or repr names key material."""
+    store = EnvKeyStore(env)
+    if usable:
+        assert store.key("acme") == ENV_KEY_A
+        assert store.versions("acme") == [1]
+        assert store.latest_version("acme") == 1
+        assert startup_key_failure(store, ["acme"]) is None
+    else:
+        with pytest.raises(TenantKeyError) as err:
+            store.key("acme")
+        assert "acme" in str(err.value)
+        assert "AGENTOS_PAYLOAD_KEY_ACME_V1" in str(err.value)
+        for value in env.values():
+            assert value not in str(err.value)
+        assert startup_key_failure(store, ["acme"]) is not None
+    assert base64.b64encode(ENV_KEY_A).decode() not in repr(store)
+
+
 def test_create_key_refuses_overwrite(tmp_path, capsys):
     key_dir = tmp_path / "keys"
     assert tenant_keys_main(["create", "acme"], key_dir=str(key_dir)) == 0
@@ -270,6 +330,34 @@ def test_create_key_refuses_overwrite(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "already exists" in captured.err
     assert (key_dir / "acme.key").read_bytes() == first
+
+
+def test_tenant_keys_value_prints_a_new_key_for_a_variable_and_keeps_existing_keys(
+    tmp_path, capsys
+):
+    """Fails if the value command prints an existing key, prints a value that is not a new 32-byte key, or writes a key file."""
+    key_dir = tmp_path / "keys"
+    assert tenant_keys_main(["create", "acme"], key_dir=str(key_dir)) == 0
+    first = (key_dir / "acme.key").read_bytes()
+    capsys.readouterr()
+
+    assert tenant_keys_main(["value", "acme"], key_dir=str(key_dir)) == 1
+    assert tenant_keys_main(["value", "ghost", "--next"], key_dir=str(key_dir)) == 2
+    assert tenant_keys_main(["value", "acme", "--next"], key_dir=str(key_dir)) == 0
+    captured = capsys.readouterr()
+    name, _, encoded = captured.out.strip().partition("=")
+    assert name == "AGENTOS_PAYLOAD_KEY_ACME_V2"
+    assert len(base64.b64decode(encoded, validate=True)) == 32
+    assert first.decode().strip() not in captured.out
+    assert "older" in captured.err
+    assert (key_dir / "acme.key").read_bytes() == first
+    assert not (key_dir / "acme.v2.key").exists()
+
+    assert tenant_keys_main(["value", "globex"], key_dir=str(key_dir)) == 0
+    captured = capsys.readouterr()
+    name, _, encoded = captured.out.strip().partition("=")
+    assert name == "AGENTOS_PAYLOAD_KEY_GLOBEX_V1"
+    assert len(base64.b64decode(encoded, validate=True)) == 32
 
 
 async def test_workflow_history_is_encrypted(tmp_path, agents):

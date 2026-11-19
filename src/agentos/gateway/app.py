@@ -26,7 +26,8 @@ people wrote into Temporal history:
   ``external_update`` signal to the task watching that page. Polling covers
   anything the webhook misses. Events must carry a valid ``X-Notion-Signature``,
   made with that tenant's own verification token; the subscription handshake's
-  token is written to an owner-only file, never logged. ``POST /notion/webhook``
+  token is stored encrypted in the database as pending, confirmed by a host
+  command, and never logged. ``POST /notion/webhook``
   is an alias that works only while exactly one tenant is configured.
 
 Every Slack request must carry a valid Slack signature. The gateway decides the
@@ -60,6 +61,7 @@ from agentos.agent_store import AgentStore, startup_agent_failure
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
+from agentos.crypto_keys import TenantKeyError
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
@@ -70,6 +72,7 @@ from agentos.models import (
     ExternalUpdate,
     field_error,
 )
+from agentos.notion_webhook import WebhookTokens
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
@@ -121,6 +124,9 @@ class GatewayDeps:
     content: ContentStore | None = None
     # Called after an event was stored, so the relay delivers it without waiting for its next pass.
     on_inbound: Callable[[], None] | None = None
+    # The Notion webhook verification tokens, encrypted per tenant. None keeps the
+    # local file flow for a gateway built without a database.
+    webhook_tokens: WebhookTokens | None = None
 
 
 def create_app(
@@ -134,6 +140,7 @@ def create_app(
     agents: AgentStore | None = None,
     switches: SwitchStore | None = None,
     content: ContentStore | None = None,
+    webhook_tokens: WebhookTokens | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
@@ -148,6 +155,7 @@ def create_app(
             agents,
             switches,
             content or InMemoryContentStore(),
+            webhook_tokens=webhook_tokens,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -416,8 +424,9 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
     """Handle one Notion webhook request for the tenant its URL names.
 
     The tenant comes from the path, never from the body. The signature is
-    checked with that tenant's own verification token, read from the variable
-    its config names, so another tenant's token cannot pass.
+    checked with that tenant's own verification token: the variable its config
+    names when set, else the token confirmed in the database, so another
+    tenant's token cannot pass.
     """
     if not TENANT_ID_PATTERN.fullmatch(tenant):
         # Never look up, or build a file name from, a path that is not a tenant ID.
@@ -442,12 +451,16 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
         # One-time subscription handshake, recognised by its body (a token
         # and no event type), whatever its headers. Notion's handshake can
         # carry a signature header, but it cannot be verified: its key is
-        # the very token being delivered. The token goes to an owner-only
-        # file, never to a log, and the operator pastes it into Notion.
-        # The handshake is closed once a token is configured, and also while
-        # the token file exists: the file is created exclusively and never
-        # followed through a symlink, so nobody can replace it with a value
-        # of their own. The operator deletes the file to start over.
+        # the very token being delivered. With a token store the token is
+        # encrypted under the tenant's payload key and stored pending; the
+        # operator prints it once with agentos.notion_webhook show, pastes it
+        # into Notion and confirms it. Without one (a gateway built without a
+        # database) it goes to an owner-only file as before. Either way it
+        # never reaches a log. The handshake is closed once a token is
+        # configured, and while a token is pending or active: the insert
+        # cannot replace one, and the file is created exclusively and never
+        # followed through a symlink. The operator clears the token to start
+        # over.
         if set(payload) != {"verification_token"} or not (
             0 < len(payload["verification_token"]) <= MAX_VERIFICATION_TOKEN
         ):
@@ -462,6 +475,34 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
                 token_env,
             )
             return Response(status_code=409)
+        if d.webhook_tokens is not None:
+            try:
+                stored = await d.webhook_tokens.accept_handshake(
+                    tenant, payload["verification_token"]
+                )
+            except TenantKeyError:
+                log.warning(
+                    "tenant_id=%s Notion webhook handshake refused: the tenant has no usable "
+                    "encryption key",
+                    tenant,
+                )
+                return Response(status_code=503)
+            if not stored:
+                log.warning(
+                    "tenant_id=%s Notion webhook handshake refused: a verification token is "
+                    "already pending or active; clear it with: "
+                    "uv run python -m agentos.notion_webhook clear --tenant %s",
+                    tenant,
+                    tenant,
+                )
+                return Response(status_code=409)
+            log.warning(
+                "tenant_id=%s Notion webhook verification token pending; print it once with: "
+                "uv run python -m agentos.notion_webhook show --tenant %s",
+                tenant,
+                tenant,
+            )
+            return Response(status_code=200)
         try:
             path = _write_token_file(
                 _token_file(d.settings.notion_token_dir, tenant), payload["verification_token"]
@@ -489,8 +530,15 @@ async def _notion_webhook(d: GatewayDeps, tenant: str, request: Request) -> Resp
             token_env,
         )
         return Response(status_code=200)
+    if not token and d.webhook_tokens is not None:
+        token = await d.webhook_tokens.active(tenant)
     if not token:
-        log.warning("tenant_id=%s Notion webhook event refused: %s is not set", tenant, token_env)
+        log.warning(
+            "tenant_id=%s Notion webhook event refused: no active verification token "
+            "(%s is not set)",
+            tenant,
+            token_env,
+        )
         return Response(status_code=503)
     if not verify_notion_signature(body, signature, token):
         reason = "missing" if signature is None else "invalid"
@@ -750,8 +798,9 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings
     from agentos.content_store import PostgresContentStore
-    from agentos.crypto_keys import LocalKeyStore, startup_key_failure
+    from agentos.crypto_keys import build_key_store, startup_key_failure
     from agentos.gateway.relay import InboundRelay
+    from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
     from agentos.slack_client import RealSlackPoster
     from agentos.stores import PostgresTaskLinkStore
@@ -772,7 +821,8 @@ async def _real_lifespan(app: FastAPI):
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
-        key_failure = startup_key_failure(LocalKeyStore(settings.key_dir), tenants.tenants)
+        keys = build_key_store(settings)
+        key_failure = startup_key_failure(keys, tenants.tenants)
         if key_failure:
             raise SystemExit(key_failure)
         agent_failure = await startup_agent_failure(agent_store, tenants)
@@ -809,6 +859,7 @@ async def _real_lifespan(app: FastAPI):
             switches=PostgresSwitchStore(pool),
             content=content,
             on_inbound=relay.wake,
+            webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

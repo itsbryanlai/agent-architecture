@@ -375,6 +375,8 @@ USAGE_AUDIT_KINDS = ("usage_repriced",)
 RETENTION_AUDIT_KINDS = ("retention_set",)
 # Choosing grants from Notion, and an approver accepting that a version widens access.
 ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
+# A tenant's Notion webhook token, shown, confirmed or cleared by a host command.
+WEBHOOK_AUDIT_KINDS = ("webhook_token",)
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -385,6 +387,7 @@ AUDIT_KINDS = (
     + USAGE_AUDIT_KINDS
     + RETENTION_AUDIT_KINDS
     + ACCESS_AUDIT_KINDS
+    + WEBHOOK_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -404,7 +407,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a membership event, a tenant-wide budget or a tenant-wide switch
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -432,6 +435,7 @@ class AuditEvent:
             + SWITCH_AUDIT_KINDS
             + USAGE_AUDIT_KINDS
             + RETENTION_AUDIT_KINDS
+            + WEBHOOK_AUDIT_KINDS
         )
         if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
             if not self.agent_id:

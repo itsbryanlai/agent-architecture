@@ -21,6 +21,7 @@ from agentos.members import (
     PostgresMemberStore,
 )
 from agentos.models import AuditEvent
+from agentos.notion_webhook import InMemoryWebhookTokenStore, PostgresWebhookTokenStore
 from agentos.sessions import InMemorySessionStore, PostgresSessionStore
 from agentos.switches import InMemorySwitchStore, PostgresSwitchStore
 from agentos.usage import InMemoryUsageStore, PostgresUsageStore, UsageEvent
@@ -302,3 +303,28 @@ async def test_a_pick_is_kept_per_agent_by_normalised_id_and_choosing_again_refr
     assert mine[plain].picked_at == NOW + timedelta(days=1)
     assert await picks.for_agent(tenant, "bb") == {}
     assert await picks.for_agent(other_tenant, "aa") == {}
+
+
+# --- notion webhook tokens -----------------------------------------------------------
+
+
+@pytest.fixture
+def webhook_tokens(store_pool):
+    return twin(store_pool, InMemoryWebhookTokenStore, PostgresWebhookTokenStore)
+
+
+async def test_a_webhook_token_is_pending_once_then_active_then_gone(webhook_tokens, tenant: str):
+    """Fails if a second handshake replaces the stored token, an active token confirms again, or clear leaves the row behind."""
+    assert await webhook_tokens.get(tenant) is None
+    assert await webhook_tokens.put_pending(tenant, b"ct1", 1) is True
+    assert await webhook_tokens.put_pending(tenant, b"ct2", 1) is False
+    row = await webhook_tokens.get(tenant)
+    assert (row.state, row.ciphertext, row.key_version) == ("pending", b"ct1", 1)
+    assert await webhook_tokens.confirm(tenant, NOW) is True
+    assert await webhook_tokens.confirm(tenant, NOW) is False
+    row = await webhook_tokens.get(tenant)
+    assert (row.state, row.confirmed_at) == ("active", NOW)
+    assert await webhook_tokens.clear(tenant) is True
+    assert await webhook_tokens.clear(tenant) is False
+    assert await webhook_tokens.get(tenant) is None
+    assert await webhook_tokens.put_pending(tenant, b"ct3", 2) is True

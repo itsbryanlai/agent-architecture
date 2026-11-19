@@ -16,7 +16,8 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `retention.py` | Nightly purge of expired rows per tenant and the command that schedules it. Limits never fall below the longest a task can live | `core/test_retention_schedule.py`, `core/test_retention_workflow.py`, `pg/test_retention.py` |
 | `switches.py` | Kill switches: the table, the gate's state, and the operator command. Read with no cache; an unreadable switch fails the step | `console/test_kill_switches.py`, `core/test_agent_gate.py` |
 | `check_grants.py` | Command that checks Notion grants and prints property IDs | `connectors/test_grant_check.py` |
-| `tenant_keys.py` | Command that creates or rotates a tenant's payload key; never overwrites | `core/test_payload_codec.py` |
+| `tenant_keys.py` | Command that creates or rotates a tenant's payload key file, or prints a new value for a key variable; never overwrites or prints an existing key | `core/test_payload_codec.py` |
+| `notion_webhook.py` | The Notion webhook verification token, encrypted per tenant (pending, then confirmed), and the operator command that shows, confirms or clears it | `connectors/test_notion_webhook.py`, `pg/test_store_contracts.py` |
 | `usage_reprice.py` | Command that prices a past month's unpriced usage rows by appending adjustments; never changes a stored row | `console/test_usage.py`, `pg/test_reprice.py` |
 
 ## Workflows and activities
@@ -96,7 +97,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `payload_codec.py` | Encrypts every Temporal payload with its tenant's key, bound to the workflow ID; the tenant comes from the workflow ID only | `core/test_payload_codec.py`, `core/test_encrypted_flow.py` |
-| `crypto_keys.py` | Per-tenant key files, owner-only; the one seam where a cloud key service would replace local files | `core/test_payload_codec.py` |
+| `crypto_keys.py` | Per-tenant payload keys from owner-only files or host variables, chosen in one factory every process uses; the seam where a cloud key service would replace them | `core/test_payload_codec.py`, `core/test_key_store_factory.py` |
 | `temporal_client.py` | The one way to connect to Temporal, so every client encrypts its payloads | `core/test_encrypted_flow.py` |
 
 ## Outside `src/agentos`

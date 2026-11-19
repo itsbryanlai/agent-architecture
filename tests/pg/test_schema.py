@@ -138,3 +138,22 @@ def test_migrate_script_applies_everything_once_and_names_a_missing_url(
     with database.owner() as conn:
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
     assert sorted(versions) == list(EXPECTED_VERSIONS)
+
+
+@pytest.mark.parametrize("runs", [1, 2], ids=["empty database", "second run"])
+def test_migrate_builds_an_empty_database_from_init_db(
+    databases: Databases, db: TestDatabase, runs: int
+):
+    """Fails if migrate.py runs the migrations over an empty database or leaves schema_migrations empty."""
+    migrate = load_migrate()
+    database = databases.create()
+    with database.owner() as conn:
+        for _ in range(runs):
+            applied = migrate.migrate(conn, migrate.migration_files(), log=lambda _line: None)
+        assert applied == []
+        versions = [
+            row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ]
+        assert versions == list(EXPECTED_VERSIONS)
+        with db.owner() as reference:
+            assert catalog.difference(catalog.dump(reference), catalog.dump(conn)) == []

@@ -798,7 +798,12 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_store import PostgresAgentStore
     from agentos.config import load_settings
     from agentos.content_store import PostgresContentStore
-    from agentos.crypto_keys import build_key_store, startup_key_failure
+    from agentos.crypto_keys import (
+        TenantKeyError,
+        build_key_store,
+        start_key_refresh,
+        startup_key_failure,
+    )
     from agentos.gateway.relay import InboundRelay
     from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
@@ -812,22 +817,26 @@ async def _real_lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
     verifier = SignatureVerifier(settings.require("slack_signing_secret"))
-    client = await build_temporal_client(settings)
     pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
     agent_store = PostgresAgentStore(pool)
     relay_task: asyncio.Task | None = None
+    key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
-        keys = build_key_store(settings)
+        try:
+            keys = await build_key_store(settings, pool)
+        except TenantKeyError as err:
+            raise SystemExit(str(err)) from err
         key_failure = startup_key_failure(keys, tenants.tenants)
         if key_failure:
             raise SystemExit(key_failure)
         agent_failure = await startup_agent_failure(agent_store, tenants)
         if agent_failure:
             raise SystemExit(agent_failure)
+        client = await build_temporal_client(settings, keys)
         slack_clients: dict[str, RealSlackPoster] = {}
 
         def slack_for(tenant_id: str) -> RealSlackPoster:
@@ -863,11 +872,14 @@ async def _real_lifespan(app: FastAPI):
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")
+        key_refresh = start_key_refresh(keys)
         yield
     finally:
         if relay_task is not None:
             relay_task.cancel()
             await asyncio.gather(relay_task, return_exceptions=True)
+        if key_refresh is not None:
+            key_refresh.cancel()
         await pool.close()
 
 

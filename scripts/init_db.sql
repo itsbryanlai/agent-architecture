@@ -152,7 +152,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
-  ('grant_pick'), ('widening_confirm'), ('webhook_token')
+  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -180,7 +180,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
-             'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token')
+             'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
+             'payload_key')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -973,6 +974,30 @@ CREATE POLICY tenant_isolation ON notion_webhook_tokens
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Tenant payload keys, wrapped by master keys from host variables. Same as migration 031.
+-- The app role reads every row of this one table (the codec decrypts for whichever tenant a
+-- payload belongs to) and inserts only within its own tenant; stored versions are never
+-- updated or deleted.
+CREATE TABLE IF NOT EXISTS tenant_payload_keys (
+  tenant_id      text        NOT NULL,
+  version        integer     NOT NULL CHECK (version >= 1),
+  wrapped_key    bytea       NOT NULL,
+  master_version integer     NOT NULL CHECK (master_version >= 1),
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, version)
+);
+
+REVOKE ALL ON tenant_payload_keys FROM agentos_app;
+GRANT SELECT, INSERT ON tenant_payload_keys TO agentos_app;
+
+ALTER TABLE tenant_payload_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_payload_keys FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS key_read ON tenant_payload_keys;
+CREATE POLICY key_read ON tenant_payload_keys FOR SELECT USING (true);
+DROP POLICY IF EXISTS key_insert ON tenant_payload_keys;
+CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -984,5 +1009,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031')
 ON CONFLICT DO NOTHING;

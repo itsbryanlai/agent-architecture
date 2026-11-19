@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import secrets
 from types import SimpleNamespace
 
@@ -65,12 +66,15 @@ async def acme_tenant(*args, **kwargs):
     return SimpleNamespace(tenants={"acme": None})
 
 
-async def fake_client(settings):
+async def fake_client(settings, keys=None, pool=None):
     return object()
 
 
 ENV_SETTINGS = Settings(
     slack_signing_secret="x", database_url="postgresql://unused", key_source="env"
+)
+DB_SETTINGS = Settings(
+    slack_signing_secret="x", database_url="postgresql://unused", key_source="db"
 )
 
 
@@ -94,8 +98,8 @@ async def test_the_temporal_client_encrypts_with_the_key_variable(monkeypatch):
     assert encrypted.metadata["encryption-key-id"] == b"acme/v1"
 
 
-async def start_gateway(monkeypatch):
-    monkeypatch.setattr("agentos.config.load_settings", lambda: ENV_SETTINGS)
+async def start_gateway(monkeypatch, settings):
+    monkeypatch.setattr("agentos.config.load_settings", lambda: settings)
     monkeypatch.setattr("psycopg_pool.AsyncConnectionPool", FakePool)
     monkeypatch.setattr("agentos.schema_version.require_current_schema", noop)
     monkeypatch.setattr("agentos.tenant_store.startup_tenants", acme_tenant)
@@ -107,8 +111,8 @@ async def start_gateway(monkeypatch):
         pass
 
 
-async def start_worker(monkeypatch):
-    monkeypatch.setattr(worker, "load_settings", lambda: ENV_SETTINGS)
+async def start_worker(monkeypatch, settings):
+    monkeypatch.setattr(worker, "load_settings", lambda: settings)
     monkeypatch.setattr(worker, "AsyncConnectionPool", FakePool)
     monkeypatch.setattr(worker, "require_current_schema", noop)
     monkeypatch.setattr(worker, "startup_tenants", acme_tenant)
@@ -119,8 +123,16 @@ async def start_worker(monkeypatch):
 
 
 @pytest.mark.parametrize("start", [start_gateway, start_worker], ids=["gateway", "worker"])
-async def test_start_up_reads_the_key_source_the_settings_name(start, monkeypatch):
-    """Fails if the gateway or the worker checks tenant keys in a key directory when the settings name key variables."""
+@pytest.mark.parametrize(
+    ("settings", "named"),
+    [(ENV_SETTINGS, key_var_name("acme", 1)), (DB_SETTINGS, "AGENTOS_MASTER_KEY_V1")],
+    ids=["env", "db without a master"],
+)
+async def test_start_up_reads_the_key_source_the_settings_name(start, settings, named, monkeypatch):
+    """Fails if the gateway or the worker checks tenant keys in a key directory when the settings name key variables, or starts in db mode with no master key variable."""
+    for name in list(os.environ):
+        if name.startswith("AGENTOS_MASTER_KEY_V"):
+            monkeypatch.delenv(name)
     with pytest.raises(SystemExit) as refused:
-        await start(monkeypatch)
-    assert key_var_name("acme", 1) in str(refused.value)
+        await start(monkeypatch, settings)
+    assert named in str(refused.value)

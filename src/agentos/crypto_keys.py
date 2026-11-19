@@ -8,9 +8,15 @@ cloud key service replaces local files later.
 
 ``EnvKeyStore`` reads the same keys from host variables named
 ``AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>`` (``<TENANT>`` is the tenant ID upper-cased
-with ``-`` turned to ``_``), for hosts without a key directory. Every process
-chooses between the two through ``build_key_store``, so the worker, the gateway
-and the Temporal client always agree.
+with ``-`` turned to ``_``), for hosts without a key directory.
+
+``DatabaseKeyStore`` serves tenant keys stored in ``tenant_payload_keys``,
+wrapped by master keys from ``AGENTOS_MASTER_KEY_V<n>`` variables: one master
+variable set once, and the app generates each tenant's key, so a new tenant
+needs no variable and no redeploy. It serves unwrapped keys from memory, loaded
+by an async ``refresh()``; the codec triggers one refresh on a miss. Every
+process chooses its store through ``build_key_store``, so the worker, the
+gateway and the Temporal client always agree.
 
 Rules enforced here:
 
@@ -21,26 +27,44 @@ Rules enforced here:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import logging
 import os
 import re
+import secrets
 import stat
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Protocol
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from psycopg_pool import AsyncConnectionPool
+
 from agentos.config import (
+    KEY_SOURCE_DB,
     KEY_SOURCE_ENV,
+    MASTER_KEY_ENV_PREFIX,
     PAYLOAD_KEY_ENV_PREFIX,
     TENANT_ID_PATTERN,
+    ConfigError,
     Settings,
+    master_key_env,
     payload_key_env,
 )
+from agentos.stores import joined_transaction
+
+log = logging.getLogger("agentos.keys")
 
 KEY_BYTES = 32
 KEY_FILE_MODE = 0o600
 KEY_DIR_MODE = 0o700
+# How often a process re-reads the stored tenant keys. Short, because a tenant
+# installed seconds ago must be served without a restart.
+KEY_REFRESH_SECONDS = 5.0
+_NONCE_BYTES = 12
 
 
 class TenantKeyError(RuntimeError):
@@ -92,6 +116,10 @@ class KeyStore(Protocol):
 
     def key(self, tenant_id: str, version: int = 1) -> bytes:
         """The tenant's 256-bit key. Raises ``TenantKeyError`` if it can't be used safely."""
+        ...
+
+    async def refresh(self) -> None:
+        """Re-read the keys from the source. A store that reads live on a miss has nothing to do."""
         ...
 
 
@@ -167,6 +195,9 @@ class LocalKeyStore:
             )
         self._cache[(tenant_id, version)] = key
         return key
+
+    async def refresh(self) -> None:
+        """Nothing to reload: a key file is read on every cache miss."""
 
 
 def key_var_name(tenant_id: str, version: int) -> str:
@@ -266,16 +297,283 @@ class EnvKeyStore:
         self._cache[(tenant_id, version)] = key
         return key
 
+    async def refresh(self) -> None:
+        """Nothing to reload: the variables were read when the store was built."""
 
-def build_key_store(settings: Settings) -> KeyStore:
+
+class MasterKeys:
+    """The master keys that wrap tenant payload keys, by version.
+
+    Values are key material: kept in memory only, never logged, never in
+    ``repr`` and never in an error. The highest version wraps new keys; every
+    older version stays while a key wrapped under it is kept.
+    """
+
+    def __init__(self, keys: Mapping[int, bytes]):
+        self._keys = dict(keys)
+
+    def __repr__(self) -> str:
+        return f"MasterKeys(versions={sorted(self._keys)})"
+
+    @property
+    def latest(self) -> int:
+        return max(self._keys)
+
+    def key(self, version: int) -> bytes:
+        try:
+            return self._keys[version]
+        except KeyError:
+            raise TenantKeyError(
+                f"master key version {version} is not set; keep {MASTER_KEY_ENV_PREFIX}{version} "
+                "in the host's variables while a key wrapped under it is kept"
+            ) from None
+
+
+_MASTER_VAR_NAME = re.compile(re.escape(MASTER_KEY_ENV_PREFIX) + r"([0-9]{1,6})")
+
+
+def master_keys_from_env(env: Mapping[str, str] | None = None) -> MasterKeys:
+    """Master keys from ``AGENTOS_MASTER_KEY_V<n>`` variables, base64 of 32 bytes.
+
+    A malformed name or value is refused with an error naming the variable,
+    never the value; so are two names claiming one version (``_V01`` beside
+    ``_V1``). No master variable at all is refused too: a process in db mode
+    can wrap and unwrap nothing without one.
+    """
+    source = master_key_env() if env is None else env
+    keys: dict[int, bytes] = {}
+    names: dict[int, str] = {}
+    for name in sorted(source):
+        if not name.startswith(MASTER_KEY_ENV_PREFIX):
+            continue
+        match = _MASTER_VAR_NAME.fullmatch(name)
+        if match is None or int(match.group(1)) < 1:
+            raise TenantKeyError(
+                f"variable {name} is not a master key variable; the name is "
+                f"{MASTER_KEY_ENV_PREFIX}<n> with n at least 1"
+            )
+        version = int(match.group(1))
+        if version in keys:
+            raise TenantKeyError(
+                f"variables {names[version]} and {name} both claim master key version "
+                f"{version}; one master version has one variable"
+            )
+        try:
+            key = base64.b64decode(source[name].strip(), validate=True)
+        except (binascii.Error, ValueError):
+            raise TenantKeyError(f"variable {name} is not valid base64") from None
+        if len(key) != KEY_BYTES:
+            raise TenantKeyError(f"variable {name} holds {len(key)} bytes, expected {KEY_BYTES}")
+        keys[version] = key
+        names[version] = name
+    if not keys:
+        raise TenantKeyError(
+            f"no master key variable is set; set {MASTER_KEY_ENV_PREFIX}1 to a new base64 "
+            "master key (uv run python -m agentos.tenant_keys master-value)"
+        )
+    return MasterKeys(keys)
+
+
+def wrap_key(masters: MasterKeys, tenant_id: str, version: int, key: bytes) -> tuple[bytes, int]:
+    """Wrap a tenant key under the newest master: (nonce || ciphertext, master version).
+
+    The associated data is the key ID (``tenant/vN``), so a wrapped key copied
+    to another tenant's row, or stored as another version, does not unwrap.
+    """
+    _check_tenant(tenant_id)
+    master_version = masters.latest
+    nonce = os.urandom(_NONCE_BYTES)
+    data = AESGCM(masters.key(master_version)).encrypt(
+        nonce, key, key_id(tenant_id, version).encode()
+    )
+    return nonce + data, master_version
+
+
+def unwrap_key(
+    masters: MasterKeys, tenant_id: str, version: int, blob: bytes, master_version: int
+) -> bytes:
+    """The tenant key ``wrap_key`` stored. Refuses a blob that does not authenticate."""
+    master = masters.key(master_version)
+    if len(blob) <= _NONCE_BYTES:
+        raise TenantKeyError(
+            f"the wrapped key of tenant '{tenant_id}' version {version} is malformed "
+            f"({len(blob)} bytes); expected a nonce and ciphertext under master version "
+            f"{master_version}"
+        )
+    nonce, data = blob[:_NONCE_BYTES], blob[_NONCE_BYTES:]
+    try:
+        return AESGCM(master).decrypt(nonce, data, key_id(tenant_id, version).encode())
+    except InvalidTag:
+        raise TenantKeyError(
+            f"the wrapped key of tenant '{tenant_id}' version {version} does not authenticate "
+            f"under master version {master_version}; it may have been moved from another "
+            "tenant's row or another version"
+        ) from None
+
+
+class DatabaseKeyStore:
+    """Tenant keys from ``tenant_payload_keys``, unwrapped into memory by ``refresh``.
+
+    The sync reads serve what the last refresh loaded; the codec triggers one
+    refresh on a miss, so a tenant installed seconds ago is served without a
+    restart. A row that does not unwrap is kept as its error: that tenant's
+    reads raise it, and every other tenant keeps working.
+    """
+
+    def __init__(self, pool: AsyncConnectionPool, masters: MasterKeys):
+        self._pool = pool
+        self._masters = masters
+        self._cache: dict[tuple[str, int], bytes | TenantKeyError] = {}
+
+    def __repr__(self) -> str:
+        return f"DatabaseKeyStore(masters={self._masters!r})"
+
+    async def refresh(self) -> None:
+        """Read every row and unwrap it: the app role's one cross-tenant read."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT tenant_id, version, wrapped_key, master_version FROM tenant_payload_keys"
+            )
+            rows = await cur.fetchall()
+        cache: dict[tuple[str, int], bytes | TenantKeyError] = {}
+        for tenant_id, version, blob, master_version in rows:
+            try:
+                cache[(tenant_id, version)] = unwrap_key(
+                    self._masters, tenant_id, version, blob, master_version
+                )
+            except TenantKeyError as err:
+                log.warning("tenant_id=%s key version %s not loaded: %s", tenant_id, version, err)
+                cache[(tenant_id, version)] = err
+        self._cache = cache
+
+    async def run(self, interval_seconds: float = KEY_REFRESH_SECONDS) -> None:
+        """Refresh forever. A failed pass is logged, not fatal: the last good keys keep serving."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.refresh()
+            except Exception as err:  # noqa: BLE001 - the loop must outlive one failed read
+                log.error(
+                    "payload key refresh failed, serving the previous keys: %s", type(err).__name__
+                )
+
+    def versions(self, tenant_id: str) -> list[int]:
+        """The versions the tenant has a usable key for, ascending."""
+        _check_tenant(tenant_id)
+        return sorted(
+            version
+            for (tenant, version), entry in self._cache.items()
+            if tenant == tenant_id and isinstance(entry, bytes)
+        )
+
+    def latest_version(self, tenant_id: str) -> int:
+        """The version new payloads are encrypted with. Raises if the tenant has no usable key."""
+        found = self.versions(tenant_id)
+        if not found:
+            # Raises the same "no key, create one" error as a direct read.
+            self.key(tenant_id, 1)
+        return found[-1]
+
+    def key(self, tenant_id: str, version: int = 1) -> bytes:
+        """The tenant's 256-bit key. Raises ``TenantKeyError`` naming the tenant, never a value."""
+        _check_tenant(tenant_id)
+        entry = self._cache.get((tenant_id, version))
+        if entry is None:
+            raise TenantKeyError(
+                f"no encryption key for tenant '{tenant_id}' version {version} in the database; "
+                f"create one with: uv run python -m agentos.tenant_keys create {tenant_id}"
+            )
+        if isinstance(entry, TenantKeyError):
+            raise entry
+        return entry
+
+
+async def ensure_tenant_key(
+    pool: AsyncConnectionPool, masters: MasterKeys, tenant_id: str, conn=None
+) -> int:
+    """The tenant's newest key version, creating version 1 when the tenant has none.
+
+    Two concurrent callers create one row: the insert is ``ON CONFLICT DO
+    NOTHING`` and the loser reads the version the winner stored. The key the
+    losing insert generated is discarded, never stored. ``conn`` joins a unit
+    of work, so the key and its audit event commit together.
+    """
+    _check_tenant(tenant_id)
+    async with joined_transaction(pool, tenant_id, conn) as db:
+        blob, master_version = wrap_key(masters, tenant_id, 1, secrets.token_bytes(KEY_BYTES))
+        cur = await db.execute(
+            "INSERT INTO tenant_payload_keys (tenant_id, version, wrapped_key, master_version) "
+            "VALUES (%s, 1, %s, %s) ON CONFLICT (tenant_id, version) DO NOTHING RETURNING version",
+            (tenant_id, blob, master_version),
+        )
+        if await cur.fetchone() is not None:
+            return 1
+        cur = await db.execute(
+            "SELECT max(version) FROM tenant_payload_keys WHERE tenant_id = %s", (tenant_id,)
+        )
+        return (await cur.fetchone())[0]
+
+
+async def rotate_tenant_key(
+    pool: AsyncConnectionPool, masters: MasterKeys, tenant_id: str, conn=None
+) -> int:
+    """Add the next key version after the tenant's newest; older versions stay.
+
+    A concurrent rotate that wins the race for one version makes this call take
+    the next, so two rotates add two versions and neither overwrites.
+    """
+    _check_tenant(tenant_id)
+    async with joined_transaction(pool, tenant_id, conn) as db:
+        while True:
+            cur = await db.execute(
+                "SELECT max(version) FROM tenant_payload_keys WHERE tenant_id = %s", (tenant_id,)
+            )
+            latest = (await cur.fetchone())[0]
+            if latest is None:
+                raise TenantKeyError(
+                    f"tenant '{tenant_id}' has no key to rotate; "
+                    f"create one with: uv run python -m agentos.tenant_keys create {tenant_id}"
+                )
+            version = latest + 1
+            blob, master_version = wrap_key(
+                masters, tenant_id, version, secrets.token_bytes(KEY_BYTES)
+            )
+            cur = await db.execute(
+                "INSERT INTO tenant_payload_keys (tenant_id, version, wrapped_key, master_version) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (tenant_id, version) DO NOTHING "
+                "RETURNING version",
+                (tenant_id, version, blob, master_version),
+            )
+            if await cur.fetchone() is not None:
+                return version
+
+
+async def build_key_store(settings: Settings, pool: AsyncConnectionPool | None = None) -> KeyStore:
     """The one place a process chooses its key store, so every process agrees.
 
-    ``AGENTOS_KEY_SOURCE=env`` reads the key variables; the default ``files``
+    ``AGENTOS_KEY_SOURCE=env`` reads the key variables; ``db`` reads the tenant
+    keys the database stores, unwrapped with the master key variables (it needs
+    the database pool, and loads once before returning); the default ``files``
     reads ``AGENTOS_KEY_DIR``.
     """
+    if settings.key_source == KEY_SOURCE_DB:
+        if pool is None:
+            raise ConfigError(
+                "AGENTOS_KEY_SOURCE=db needs the database pool; pass it to build_key_store"
+            )
+        store = DatabaseKeyStore(pool, master_keys_from_env())
+        await store.refresh()
+        return store
     if settings.key_source == KEY_SOURCE_ENV:
         return EnvKeyStore(payload_key_env())
     return LocalKeyStore(settings.key_dir)
+
+
+def start_key_refresh(keys: KeyStore) -> asyncio.Task | None:
+    """The periodic refresh task of a store that needs one; None for a live-read store."""
+    if isinstance(keys, DatabaseKeyStore):
+        return asyncio.create_task(keys.run(), name="payload-key-refresh")
+    return None
 
 
 def create_key(directory: str | Path, tenant_id: str, *, rotate: bool = False) -> Path:
@@ -287,8 +585,6 @@ def create_key(directory: str | Path, tenant_id: str, *, rotate: bool = False) -
     payloads written under them still decode. Files are created exclusively,
     so an existing key is never overwritten.
     """
-    import secrets
-
     store = LocalKeyStore(directory)
     if rotate:
         existing = store.versions(tenant_id)

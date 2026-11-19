@@ -312,7 +312,7 @@ async def run(args: argparse.Namespace) -> int:
             args,
             PostgresWebhookTokenStore(pool),
             PostgresAuditStore(pool),
-            build_key_store(settings),
+            await build_key_store(settings, pool),
             PostgresUnitOfWork(pool),
         )
     finally:

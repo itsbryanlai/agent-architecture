@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 
 from psycopg_pool import AsyncConnectionPool
@@ -50,6 +50,7 @@ from temporalio.common import WorkflowIDConflictPolicy
 from agentos import ids
 from agentos.agent_store import AgentStore, PostgresAgentStore, with_published_agents
 from agentos.config import (
+    KEY_SOURCE_DB,
     TASK_QUEUE,
     AgentsConfig,
     Settings,
@@ -207,35 +208,43 @@ async def run(
     if not schedule and not any(granted_roots(a) for a in selected):
         print("No published agent has a Notion page grant, so there is nothing to index.")
         return
-    client = await build_temporal_client(settings)
-    if schedule:
-        # Every selected tenant is planned, including one with no grants left,
-        # so its stale schedules and stored pages are deleted.
-        async with open_store(settings) as store:
-            for agents in selected:
-                plan = await apply_schedules(client, agents, store)
-                for label, items in (
-                    ("created schedule", plan.create),
-                    ("updated schedule", plan.update),
-                    ("deleted schedule", plan.delete),
-                    ("deleted stored pages of", plan.purged),
-                ):
-                    for item in items:
-                        print(f"{label} {item}")
-        return
-    started = []
-    for agents in selected:
-        started += await start_indexing(client, agents, confirm_gone)
-    for workflow_id, _ in started:
-        print(f"started {workflow_id}")
-    if wait:
-        for workflow_id, handle in started:
-            summary = await handle.result()
-            print(
-                f"{workflow_id}: pages={summary.pages} changed={summary.changed} "
-                f"skipped={summary.skipped} failed={summary.failed} pruned={summary.pruned}"
-                + (" root-gone" if summary.root_gone else "")
+    async with AsyncExitStack() as stack:
+        pool = None
+        if settings.key_source == KEY_SOURCE_DB:
+            pool = await stack.enter_async_context(
+                AsyncConnectionPool(
+                    settings.require("database_url"), open=False, **settings.pool_args()
+                )
             )
+        client = await build_temporal_client(settings, pool=pool)
+        if schedule:
+            # Every selected tenant is planned, including one with no grants left,
+            # so its stale schedules and stored pages are deleted.
+            async with open_store(settings) as store:
+                for agents in selected:
+                    plan = await apply_schedules(client, agents, store)
+                    for label, items in (
+                        ("created schedule", plan.create),
+                        ("updated schedule", plan.update),
+                        ("deleted schedule", plan.delete),
+                        ("deleted stored pages of", plan.purged),
+                    ):
+                        for item in items:
+                            print(f"{label} {item}")
+            return
+        started = []
+        for agents in selected:
+            started += await start_indexing(client, agents, confirm_gone)
+        for workflow_id, _ in started:
+            print(f"started {workflow_id}")
+        if wait:
+            for workflow_id, handle in started:
+                summary = await handle.result()
+                print(
+                    f"{workflow_id}: pages={summary.pages} changed={summary.changed} "
+                    f"skipped={summary.skipped} failed={summary.failed} pruned={summary.pruned}"
+                    + (" root-gone" if summary.root_gone else "")
+                )
 
 
 def main() -> None:

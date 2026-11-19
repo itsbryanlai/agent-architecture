@@ -36,6 +36,7 @@ Rules this workflow keeps:
 from __future__ import annotations
 
 import dataclasses
+import re
 from datetime import timedelta
 
 from temporalio import workflow
@@ -647,8 +648,16 @@ class TaskWorkflow:
         """Run an activity whose failure must not end the task (a card redraw, a notice)."""
         try:
             await self._act(method, *args)
-        except ActivityError:
-            workflow.logger.warning("activity %s failed after retries; continuing", method.__name__)
+        except ActivityError as err:
+            error_type, slack_code = _failure_cause(err)
+            workflow.logger.warning(
+                "activity %s failed after retries; continuing tenant_id=%s task_id=%s error=%s slack_code=%s",
+                method.__name__,
+                self._spec.ctx.tenant_id,
+                workflow.info().workflow_id,
+                error_type,
+                slack_code,
+            )
 
     async def _act_write(self, method, *args):
         """Run an approved write. New histories heartbeat it, so a stuck attempt is cancelled."""
@@ -723,6 +732,29 @@ def _reason(err: ActivityError) -> str:
     if isinstance(cause, ApplicationError):
         return cause.message
     return str(cause or err)
+
+
+def _failure_cause(err: ActivityError) -> tuple[str, str]:
+    """The failure's exception type and, for a Slack API failure, Slack's error code.
+
+    The innermost application error in the cause chain names the type. A Slack code is
+    read out of its message, which is never logged itself: it can quote card or payload
+    text. Only names, IDs and codes reach the log.
+    """
+    app: ApplicationError | None = None
+    cause: BaseException | None = err.cause
+    while cause is not None:
+        if isinstance(cause, ApplicationError):
+            app = cause
+        cause = cause.__cause__
+    if app is None:
+        return type(err.cause or err).__name__, ""
+    error_type = app.type or type(app).__name__
+    code = ""
+    if error_type == "SlackApiError":
+        match = re.search(r"'error': '([a-z_]+)'", app.message)
+        code = match.group(1) if match else ""
+    return error_type, code
 
 
 def _done_values(agent: AgentVersion, database_id: str) -> list[str]:

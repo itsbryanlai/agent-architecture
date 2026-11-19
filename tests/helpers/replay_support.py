@@ -22,6 +22,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
 from temporalio import workflow
 from temporalio.client import Client, WorkflowHistory
 from temporalio.converter import DataConverter
@@ -786,6 +788,40 @@ async def task_hop(r: Rig, stored: bool) -> list[Recorded]:
     return [Recorded(f"run{i + 1}", h) for i, h in enumerate(chain)]
 
 
+def _slack_update_error() -> SlackApiError:
+    """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
+    return SlackApiError(
+        "The request to the Slack API failed.",
+        SlackResponse(
+            client=None,
+            http_verb="POST",
+            api_url="https://slack.com/api/chat.update",
+            req_args={},
+            data={"ok": False, "error": "message_not_found"},
+            headers={},
+            status_code=200,
+        ),
+    )
+
+
+async def task_card_update_failure(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(192 if stored else 191)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+        # The conversation's reply update lands before the card redraw that will fail.
+        await replies(r, 1)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    # The agent is turned off after the card was shown, so the pre-write check refuses and
+    # the refusal redraw runs through _try; chat.update then refuses every attempt.
+    assert await r.switches.switch_off(TENANT, "agent", "it-helper", ADMIN, datetime.now(UTC))
+    r.slack.fail_next_update(_slack_update_error(), times=None)
+    await approve(handle, nonce)
+    assert await handle.result() == "cancelled"
+    return [await current(r, "", handle.id)]
+
+
 def _both(fn):
     return {
         False: lambda r: fn(r, False),
@@ -817,6 +853,7 @@ for _name, _fn in {
     "task_expired": task_expired,
     "watch_done": watch_done,
     "task_hop": task_hop,
+    "task_card_update_failure": task_card_update_failure,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

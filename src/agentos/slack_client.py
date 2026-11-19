@@ -401,15 +401,17 @@ class FakeSlack:
         self.messages: list[dict] = []
         self._history_refusal: SlackHistoryUnavailable | None = None
         self._fail_next_update: Exception | None = None
+        self._update_failures_left: int | None = None
 
     def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
         """Make directory lookups raise ``error``: ``times`` of them, or all until set to None."""
         self._lookup_error = error
         self._lookup_failures_left = times
 
-    def fail_next_update(self, error: Exception) -> None:
-        """Make the next update_message raise ``error`` once."""
+    def fail_next_update(self, error: Exception, times: int | None = 1) -> None:
+        """Make update_message raise ``error``: the next ``times`` calls, or all when None."""
         self._fail_next_update = error
+        self._update_failures_left = times
 
     def _next_ts(self) -> str:
         self._ts += 1
@@ -448,7 +450,11 @@ class FakeSlack:
 
     async def update_message(self, channel, ts, text, blocks=None) -> None:
         if self._fail_next_update is not None:
-            error, self._fail_next_update = self._fail_next_update, None
+            error = self._fail_next_update
+            if self._update_failures_left is not None:
+                self._update_failures_left -= 1
+                if self._update_failures_left <= 0:
+                    self._fail_next_update = None
             raise error
         self.calls.append(
             ("update_message", {"channel": channel, "ts": ts, "text": text, "blocks": blocks})

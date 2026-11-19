@@ -19,6 +19,7 @@ from agentos.slack_client import FakeSlack
 from agentos.tenant_store import InMemoryTenantStore
 from tests.conftest import (
     ACME_WORKSPACE,
+    GLOBEX_TEAM,
     GLOBEX_WORKSPACE,
     TEAM,
     TENANT,
@@ -74,18 +75,33 @@ def connect_transport(
                 },
             )
         if request.url.path == "/v1/users/me":
-            seen["auth"] = request.headers["authorization"]
             if raise_on == "validation":
                 raise httpx.ConnectError("connection refused")
             return httpx.Response(
                 validation_status, json={"object": "user", "id": "bot-1", "type": "bot"}
+            )
+        if request.url.path == "/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "object": "page",
+                            "id": "page-1",
+                            "properties": {
+                                "title": {"type": "title", "title": [{"plain_text": "A page"}]}
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                },
             )
         return httpx.Response(404)
 
     return httpx.MockTransport(handler)
 
 
-async def build_harness(seen: dict, **transport_kw) -> ConsoleHarness:
+async def build_harness(seen: dict, *, directory_ttl: float = 0, **transport_kw) -> ConsoleHarness:
     acme, globex = two_tenant_dicts()
     acme["admins"] = globex["admins"] = [ROOT]
     store = InMemoryTenantStore(parse_agents_config(acme), parse_agents_config(globex))
@@ -103,6 +119,7 @@ async def build_harness(seen: dict, **transport_kw) -> ConsoleHarness:
         credentials=credentials,
         webhook_tokens=webhook_tokens,
         slack_for=fake_slack_for(slack),
+        directory_ttl=directory_ttl,
     )
     await harness.seed_members()
     harness.store = store
@@ -136,6 +153,7 @@ async def connect_flow(c, code: str = "abc"):
         "bad state",
         "reused state",
         "other session",
+        "other tenant's session",
         "validation refused",
         "token refused",
         "transport failure",
@@ -148,6 +166,7 @@ async def connect_flow(c, code: str = "abc"):
         "bad-state",
         "reused-state",
         "other-session",
+        "other-tenant",
         "validation-refused",
         "token-refused",
         "transport-failure",
@@ -157,7 +176,8 @@ async def connect_flow(c, code: str = "abc"):
 )
 async def test_the_notion_connect_callback_stores_only_a_validated_workspace_token(case):
     """Fails if the callback stores a token it did not validate, accepts a state this session
-    never began or one already spent, writes anything on a refusal, or lets a non-admin start."""
+    never began, one already spent or one begun in another tenant, writes anything on a
+    refusal, or lets a non-admin start."""
     kw = {
         "validation refused": {"validation_status": 401},
         "token refused": {"token_status": 400},
@@ -184,6 +204,13 @@ async def test_the_notion_connect_callback_stores_only_a_validated_workspace_tok
         elif case == "other session":
             state = await start_state(admin)
             other = await h.signed_in(ADMIN2)
+            async with using(other):
+                response = await other.get(CALLBACK, params={"code": "c", "state": state})
+            assert response.status_code == 400
+            assert "code" not in seen
+        elif case == "other tenant's session":
+            state = await start_state(admin)
+            other = await h.signed_in(ROOT, GLOBEX_TEAM)
             async with using(other):
                 response = await other.get(CALLBACK, params={"code": "c", "state": state})
             assert response.status_code == 400
@@ -388,3 +415,91 @@ async def test_reveal_shows_the_pending_webhook_token_once_to_an_admin():
         ("webhook_token", "show", f"user:{ROOT}")
     ]
     assert all(token not in event_json(e) for e in h.audit.events)
+
+
+async def test_the_page_shows_a_routing_change_at_once_and_an_unchanged_form_records_nothing():
+    """Fails if the settings page serves the directory cache after a routing change, or an
+    unchanged resubmit records a second event because the no-op comparison read the cache."""
+    seen: dict = {}
+    h = await build_harness(seen, directory_ttl=15)
+    await publish_helper(h)
+    await h.store.set_routing(TENANT, None, {})
+    admin = await h.signed_in(ROOT)
+    async with using(admin):
+        await admin.get(SETTINGS)  # prime the directory cache
+        saved = await post(
+            admin,
+            f"{SETTINGS}/routing",
+            await csrf_token(admin),
+            default_agent="it-helper",
+            new_channel=CHANNEL,
+            new_agent="it-helper",
+        )
+        assert saved.status_code == 303
+        # Still inside the cache's TTL: the page must show the mapping just saved.
+        page = (await admin.get(SETTINGS)).text
+        assert f'name="route_{CHANNEL}"' in page
+        again = await post(
+            admin,
+            f"{SETTINGS}/routing",
+            await csrf_token(admin),
+            default_agent="it-helper",
+            **{f"route_{CHANNEL}": "it-helper"},
+        )
+        assert again.status_code == 303
+    events = [e for e in h.audit.events if e.kind == "tenant_settings"]
+    assert [(e.tool, e.target) for e in events] == [
+        ("routing", f"default=it-helper; {CHANNEL}->it-helper")
+    ]
+
+
+@pytest.mark.parametrize("case", ["no token", "env only"], ids=["not-connected", "env-only"])
+async def test_the_notion_section_says_what_is_in_use_when_nothing_is_connected(case, monkeypatch):
+    """Fails if an env-only tenant is told "Not connected", or Disconnect with nothing stored
+    changes or records anything instead of explaining there is nothing to remove."""
+    seen: dict = {}
+    h = await build_harness(seen)
+    monkeypatch.delenv("NOTION_TOKEN_ACME", raising=False)
+    if case == "env only":
+        monkeypatch.setenv("NOTION_TOKEN_ACME", "ntn-env-fallback")
+    admin = await h.signed_in(ROOT)
+    async with using(admin):
+        page = (await admin.get(SETTINGS)).text
+        if case == "env only":
+            assert "Using the" in page and "NOTION_TOKEN_ACME" in page
+            assert "(not connected in the console)" in page
+            assert "Not connected." not in page
+            refused = await post(admin, f"{SETTINGS}/notion/disconnect", await csrf_token(admin))
+            assert refused.status_code == 409
+            assert "Nothing is stored to disconnect" in refused.text
+            config = (await h.store.load(TENANT)).config
+            assert await h.credentials.notion_token(config) == "ntn-env-fallback"
+        else:
+            assert "Not connected." in page
+            assert "Using the" not in page
+    assert await h.credential_store.get(TENANT, NOTION) is None
+    assert [e for e in h.audit.events if e.kind == "connector"] == []
+
+
+async def test_the_pick_purpose_flow_stores_no_credential():
+    """Fails if a Choose-from-Notion flow stores a Notion credential or records a connector
+    event: only the connect purpose stores the workspace token."""
+    seen: dict = {}
+    h = await build_harness(seen)
+    await h.plane.add_agent(TENANT, ROOT, "it-helper", published_definition())
+    admin = await h.signed_in(ROOT)
+    async with using(admin):
+        version = f"/ui/{TENANT}/agents/it-helper/versions/1"
+        start = await post(admin, f"{version}/pick/start", await csrf_token(admin))
+        assert start.status_code == 303
+        query = parse_qs(urlsplit(start.headers["location"]).query)
+        assert query["owner"] == ["user"]
+        response = await admin.get(CALLBACK, params={"code": "abc", "state": query["state"][0]})
+        assert response.status_code == 303
+        assert response.headers["location"].endswith("/pick")
+        assert seen["code"] == "abc"
+        # Settle point: the flow is over; the settings page still shows Notion not connected.
+        page = (await admin.get(SETTINGS)).text
+        assert "Connect Notion" in page and "Connected to" not in page
+    assert await h.credential_store.get(TENANT, NOTION) is None
+    assert [e for e in h.audit.events if e.kind == "connector"] == []

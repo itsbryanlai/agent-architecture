@@ -49,6 +49,7 @@ from agentos.tenant_store import (
     startup_tenants,
 )
 from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry, runtime_for
+from agentos.worker import build_tenant_clients
 from tests.conftest import (
     ALICE,
     GLOBEX,
@@ -509,6 +510,53 @@ async def test_the_notion_client_follows_the_resolved_credential(monkeypatch):
     clock.advance(6)
     await sync.sync()
     assert built["notion"] == ["notion-ACME", row_token, "notion-ACME"]
+
+
+async def test_a_tenant_connected_only_in_the_console_is_served_without_a_variable(monkeypatch):
+    """Fails if the worker needs the Notion variable exported for a tenant whose token is a
+    credential row, or keeps a stale Notion client when the row is replaced or removed."""
+    set_secrets(monkeypatch, "ACME")
+    monkeypatch.delenv("NOTION_TOKEN_ACME")
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    row_token = "ntn-connected-in-the-console"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, row_token.encode()), 1
+    )
+    credentials = TenantCredentials(credential_store, keys)
+    built, slack, notion = fake_factories()
+
+    registry, sync = await build_tenant_clients(
+        await startup_tenants(directory),
+        directory,
+        Settings(),
+        credentials,
+        keys,
+        logging.getLogger("test"),
+        slack_factory=slack,
+        notion_factory=notion,
+    )
+
+    assert built["notion"] == [row_token]
+    assert registry.get(TENANT).notion_api is not None
+
+    replaced = "ntn-reconnected"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, replaced.encode()), 1
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == [row_token, replaced]
+
+    await credential_store.delete(TENANT, NOTION)
+    clock.advance(6)
+    await sync.sync()
+    assert registry.get(TENANT).notion_api is None
+    assert built["notion"] == [row_token, replaced]
 
 
 async def test_a_new_tenant_with_an_unset_variable_waits_and_is_reported_once(monkeypatch, caplog):

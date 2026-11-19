@@ -121,6 +121,7 @@ class ConsoleHarness:
         credentials=None,
         webhook_tokens=None,
         slack_for=None,
+        directory_ttl: float = 0,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
@@ -140,9 +141,12 @@ class ConsoleHarness:
             configs.append(parse_agents_config(globex))
         self.tenants = TenantsConfig.of(*configs)
         # With a tenant store the settings writes are live: the plane and the app read
-        # through a directory that re-reads the store on every ask (ttl 0).
+        # through a directory that re-reads the store on every ask (ttl 0), unless a
+        # test sets a real TTL to exercise the cache.
         source = (
-            self.tenants if tenant_store is None else TenantDirectory(tenant_store, ttl_seconds=0)
+            self.tenants
+            if tenant_store is None
+            else TenantDirectory(tenant_store, ttl_seconds=directory_ttl)
         )
         self.plane = ControlPlane(
             self.agents,

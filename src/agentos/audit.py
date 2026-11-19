@@ -83,6 +83,10 @@ class AuditStore(Protocol):
         """
         ...
 
+    async def latest(self, tenant_id: str, kind: str, tool: str) -> AuditEvent | None:
+        """The tenant's newest event of this kind and tool, or None. One row, not a page."""
+        ...
+
 
 def _check_limit(limit: int) -> int:
     if not 1 <= limit <= MAX_LIMIT:
@@ -166,6 +170,20 @@ class PostgresAuditStore:
             rows = await cur.fetchall()
         return [AuditEvent(**dict(zip(_READ_COLUMN_NAMES, row))) for row in rows]
 
+    async def latest(self, tenant_id: str, kind: str, tool: str) -> AuditEvent | None:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                f"""
+                SELECT {_READ_COLUMNS} FROM audit_events
+                WHERE tenant_id = %s AND kind = %s AND tool = %s
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (tenant_id, kind, tool),
+            )
+            row = await cur.fetchone()
+        return None if row is None else AuditEvent(**dict(zip(_READ_COLUMN_NAMES, row)))
+
 
 class InMemoryAuditStore:
     def __init__(self) -> None:
@@ -219,6 +237,16 @@ class InMemoryAuditStore:
             and (before_seq is None or (e.seq is not None and e.seq < before_seq))
         ]
         return list(reversed(mine))[:limit]
+
+    async def latest(self, tenant_id: str, kind: str, tool: str) -> AuditEvent | None:
+        return next(
+            (
+                e
+                for e in reversed(self.events)
+                if e.tenant_id == tenant_id and e.kind == kind and e.tool == tool
+            ),
+            None,
+        )
 
 
 def event_json(event: AuditEvent) -> str:

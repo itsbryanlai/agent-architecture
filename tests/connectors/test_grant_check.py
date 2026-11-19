@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import httpx
+import psycopg
 import pytest
 from notion_client.errors import RequestTimeoutError
 
@@ -187,14 +188,29 @@ def test_anything_else_is_not_transient(error):
     assert not is_transient(error)
 
 
-async def test_a_failure_building_the_client_is_not_a_notion_outage(agents):
-    def no_client(tenant_id):
-        raise ConfigError("tenant 'acme': environment variable NOTION_TOKEN is not set")
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ConfigError("tenant 'acme': environment variable NOTION_TOKEN is not set"), ConfigError),
+        (ConnectionError("database is down"), GrantCheckUnavailable),
+        (psycopg.OperationalError("connection failed"), GrantCheckUnavailable),
+        (RuntimeError("a bug"), RuntimeError),
+    ],
+    ids=["setup-error", "store-down", "driver-outage", "bug"],
+)
+async def test_a_failure_resolving_the_client_keeps_setup_errors_and_maps_outages(
+    agents, error, expected
+):
+    """Fails if a setup error resolving the Notion client is reported as an outage, a store
+    outage surfaces as itself instead of the unavailable answer, or a bug is hidden."""
 
-    checker = NotionGrantChecker(no_client)
+    def resolve(tenant_id):
+        raise error
 
-    with pytest.raises(ConfigError, match="NOTION_TOKEN"):
-        await checker.check("acme", agents.agents["it-helper"])
+    with pytest.raises(expected) as err:
+        await NotionGrantChecker(resolve).check("acme", agents.agents["it-helper"])
+    if expected is GrantCheckUnavailable:
+        assert err.value.__cause__ is error
 
 
 async def test_an_unexpected_error_while_checking_propagates_as_itself(agents):
@@ -301,3 +317,19 @@ async def test_the_check_command_prints_property_ids_for_a_draft_before_it_is_pu
     assert code == 0
     assert "version 2" in out and "grant 'IT requests'" in out
     assert 'status: "stat1"' in out
+
+
+async def test_the_check_command_resolves_the_client_through_an_async_resolver(agents, capsys):
+    """Fails if the command cannot build the tenant's Notion client through a credential
+    resolver that reads the database (an async notion_for)."""
+    store = InMemoryAgentStore()
+    await make_published(store, "db-helper", helper_block())
+    api = make_fake_notion()
+
+    async def notion_for(config):
+        return api
+
+    code = await check_published(TenantsConfig.of(agents), store, notion_for)
+
+    assert code == 0
+    assert "agent 'db-helper'" in capsys.readouterr().out

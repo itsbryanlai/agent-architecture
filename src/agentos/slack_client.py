@@ -43,13 +43,21 @@ class SlackLookupError(Exception):
     """A read of Slack's directory failed. ``transient`` says whether a retry may help.
 
     ``retry_after`` is the seconds Slack asked for in a ``Retry-After`` header, if it did.
+    ``scope`` is the OAuth scope Slack says the call needed, when it named one.
     """
 
-    def __init__(self, code: str, transient: bool = False, retry_after: float | None = None):
+    def __init__(
+        self,
+        code: str,
+        transient: bool = False,
+        retry_after: float | None = None,
+        scope: str | None = None,
+    ):
         super().__init__(f"Slack lookup failed: {code}")
         self.code = code
         self.transient = transient
         self.retry_after = retry_after
+        self.scope = scope
 
 
 class SlackHistoryUnavailable(Exception):
@@ -101,11 +109,10 @@ class SlackUser:
 
 @dataclass(frozen=True)
 class SlackChannel:
-    """One channel of the workspace, from ``conversations.list``: enough to pick it."""
+    """One channel the app is in, from ``conversations.list``: enough to pick it."""
 
     id: str
     name: str
-    is_private: bool = False
 
 
 class SlackPoster(Protocol):
@@ -170,9 +177,9 @@ class SlackPoster(Protocol):
         ...
 
     async def list_channels(self) -> list[SlackChannel]:
-        """The non-archived channels the app can see, all pages (needs ``channels:read``
-        and ``groups:read``): public channels of the workspace and the private ones the
-        bot is in. The console's routing picker offers these."""
+        """The non-archived channels the app is in, all pages (needs ``channels:read``
+        and ``groups:read``): public and private alike, but only ones the bot joined,
+        so it can answer there. The console's routing picker offers these."""
         ...
 
 
@@ -338,12 +345,9 @@ class RealSlackPoster:
                     cursor=cursor,
                 )
                 channels.extend(
-                    SlackChannel(
-                        id=raw.get("id", ""),
-                        name=raw.get("name", ""),
-                        is_private=bool(raw.get("is_private")),
-                    )
+                    SlackChannel(id=raw.get("id", ""), name=raw.get("name", ""))
                     for raw in resp.get("channels") or []
+                    if raw.get("is_member")
                 )
                 cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
                 if not cursor:
@@ -423,7 +427,9 @@ def _lookup_error(err: Exception) -> SlackLookupError:
         or (isinstance(status, int) and (status == 429 or status >= 500))
         or not hasattr(err, "response")
     )
-    return SlackLookupError(code, transient=transient, retry_after=retry_after)
+    return SlackLookupError(
+        code, transient=transient, retry_after=retry_after, scope=_needed_scope(err)
+    )
 
 
 class FakeSlack:

@@ -6,16 +6,18 @@ property IDs of a version before it is published, name it:
 ``--tenant T --agent A [--version N]`` (default: the agent's newest draft or pending version,
 else its published one). The worker will not start on a published agent without property IDs,
 so run this on the draft, paste the ``property_ids`` block into the definition, then publish.
-It reads only the granted databases' schemas, with that tenant's own Notion token (the
-variable named in its ``secrets`` block, ``NOTION_TOKEN`` by default); it never changes a
-database or a definition. Page grants are checked by reading the page: it must be readable
-and not trashed or archived. Exits 1 if any grant has a problem, otherwise 0.
+It reads only the granted databases' schemas, with that tenant's own Notion token (its
+encrypted credential row first, else the variable named in its ``secrets`` block,
+``NOTION_TOKEN`` by default); it never changes a database or a definition. Page grants are
+checked by reading the page: it must be readable and not trashed or archived. Exits 1 if
+any grant has a problem, otherwise 0.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import sys
 from collections.abc import Callable
 
@@ -24,14 +26,12 @@ from psycopg_pool import AsyncConnectionPool
 from agentos.agent_store import PENDING, AgentStore, PostgresAgentStore
 from agentos.config import AgentsConfig, AgentVersion, ConfigError, TenantsConfig, load_settings
 from agentos.connectors.notion import RealNotionAPI, check_grant, check_page_grant
+from agentos.credentials import PostgresCredentialStore, TenantCredentials
+from agentos.crypto_keys import build_key_store
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
 from agentos.tenants import require_tenant_secret
 
 ROLES = ("title", "status", "requested_by", "request_id")
-
-
-def _notion_for(config: AgentsConfig):
-    return RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
 
 
 async def _version_to_check(
@@ -60,16 +60,17 @@ def _missing(agent_id: str, version: int | None) -> AgentVersion:
 async def check_published(
     tenants: TenantsConfig,
     agents: AgentStore,
-    notion_for: Callable[[AgentsConfig], object] = _notion_for,
+    notion_for: Callable[[AgentsConfig], object],
     tenant_id: str | None = None,
     agent_id: str | None = None,
     version: int | None = None,
 ) -> int:
     """Check agents from ``agents``; print the result; return 0 or 1.
 
-    Without ``agent_id``, every published agent of each tenant (or of ``tenant_id``). With it,
-    one version of that agent (see the module docstring); ``tenant_id`` is then required
-    unless there is a single tenant.
+    ``notion_for`` builds a tenant's Notion client; it may be async (the credential
+    resolver reads the database). Without ``agent_id``, every published agent of each
+    tenant (or of ``tenant_id``). With it, one version of that agent (see the module
+    docstring); ``tenant_id`` is then required unless there is a single tenant.
     """
     failed = False
     configs = list(tenants.tenants.values())
@@ -85,6 +86,8 @@ async def check_published(
         print(f"tenant '{config.tenant_id}':")
         try:
             api = notion_for(config)
+            if inspect.isawaitable(api):
+                api = await api
             if agent_id is None:
                 chosen = list((await agents.published_all(config.tenant_id)).values())
             else:
@@ -128,9 +131,21 @@ async def run(args: argparse.Namespace) -> int:
     await pool.open()
     try:
         tenants = await startup_tenants(TenantDirectory(PostgresTenantStore(pool)))
+        keys = await build_key_store(settings, pool)
+        credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
+
+        async def notion_for(config: AgentsConfig) -> RealNotionAPI:
+            # The same resolution the worker and the console use: the credential row
+            # first, else the variable; a tenant with neither names the variable.
+            token = await credentials.notion_token(config)
+            if token is None:
+                token = require_tenant_secret(config, "notion_token_env")
+            return RealNotionAPI(token)
+
         return await check_published(
             tenants,
             PostgresAgentStore(pool),
+            notion_for,
             tenant_id=args.tenant,
             agent_id=args.agent,
             version=args.version,

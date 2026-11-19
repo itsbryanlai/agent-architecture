@@ -1233,7 +1233,13 @@ class WebUI:
 
             return await self.failure(request, ctx, err, rerender=again)
         if not changed:
-            return await self.settings_page(request, ctx, 409, "Notion is not connected.")
+            return await self.settings_page(
+                request,
+                ctx,
+                409,
+                "Nothing is stored to disconnect: Notion is not connected in the console. "
+                "The environment variable, if set, is unchanged.",
+            )
         return _redirect(self.base(ctx) + "/settings?done=notion-disconnected")
 
     async def webhook_reveal(self, request: Request, ctx: Ctx) -> Response:

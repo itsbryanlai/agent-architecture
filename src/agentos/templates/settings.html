@@ -81,6 +81,12 @@
   {{ post_button(base ~ "/settings/notion/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
 </div>
 <p class="muted">Reconnect replaces the stored token (a workspace admin signs in again). Disconnect removes it: agents with Notion grants stop reading and writing until Notion is connected again. The token is stored encrypted for this organisation only, and is never shown.</p>
+{% elif view.notion_env_var %}
+<p class="muted">Using the <code>{{ view.notion_env_var }}</code> variable (not connected in the console). Connect Notion stores a workspace token for this organisation and takes over from the variable; Disconnect has nothing stored to remove.</p>
+<div class="actions">
+  {{ post_button(base ~ "/settings/notion/start", ctx.csrf, "Connect Notion") }}
+  {{ post_button(base ~ "/settings/notion/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
+</div>
 {% else %}
 <p class="muted">Not connected. A Notion workspace admin signs in and authorizes the integration for the workspace; the returned token is stored encrypted for this organisation only. Agents still use only the pages and databases they are granted.</p>
 {{ post_button(base ~ "/settings/notion/start", ctx.csrf, "Connect Notion") }}

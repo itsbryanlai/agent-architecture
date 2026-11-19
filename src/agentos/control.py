@@ -141,11 +141,13 @@ from agentos.budgets import (
     parse_amount,
 )
 from agentos.config import (
-    _CHANNEL_ID,
+    CHANNEL_ID,
+    AgentsConfig,
     AgentVersion,
     ConfigError,
     TenantsConfig,
     channel_audience_problems,
+    read_secret,
 )
 from agentos.connectors.notion import normalize_id
 from agentos.credentials import NOTION, TenantCredentials
@@ -255,8 +257,9 @@ class TenantSettingsView:
 
     ``published`` are the agents a default or a channel may name. ``slack_channels`` is
     None when Slack could not be read (``slack_problem`` says why); the page still renders.
-    ``notion_connected_by``/``at`` come from the latest ``connector`` connect event within
-    the audit page read; a very busy tenant may show the connection without them.
+    ``notion_connected_by``/``at`` come from the tenant's newest ``connector`` connect
+    event. ``notion_env_var`` names the environment variable in use when no credential
+    is connected; None when Notion is connected or the tenant has no token at all.
     """
 
     default_agent: str | None
@@ -269,13 +272,15 @@ class TenantSettingsView:
     notion_workspace_name: str | None = None
     notion_connected_by: str | None = None
     notion_connected_at: datetime | None = None
+    notion_env_var: str | None = None
     webhook_state: str | None = None
 
 
 def _slack_problem(err: Exception) -> str:
     """A reason fit to show: the Slack error code or the configuration message, no secrets."""
     if isinstance(err, SlackLookupError):
-        return f"Slack said '{err.code}'"
+        scope = f" (needs {err.scope})" if err.scope else ""
+        return f"Slack said '{err.code}'{scope}"
     return str(err)
 
 
@@ -1201,9 +1206,13 @@ class ControlPlane:
         await self._require_role(tenant_id, actor, ADMIN)
 
     async def tenant_settings(self, tenant_id: str, actor: Actor) -> TenantSettingsView:
-        """The settings page's reads, for an admin. A Slack read failure is reported, not fatal."""
+        """The settings page's reads, for an admin. A Slack read failure is reported, not fatal.
+
+        The tenant row is read fresh from the store, not from the directory cache: a
+        routing change shows on the page at once, even inside the cache's TTL.
+        """
         await self._require(tenant_id, actor, ADMIN)
-        config = await self._tenants.get(tenant_id)
+        config = await self._fresh_config(tenant_id)
         if config is None:
             raise ConfigError(f"tenant '{tenant_id}' is not available")
         published = sorted(
@@ -1223,12 +1232,11 @@ class ControlPlane:
         if self._credentials is not None:
             connected = await self._credentials.notion_connected(tenant_id)
             if connected:
-                events = await self._audit.list(tenant_id, 200)
-                event = next(
-                    (e for e in events if e.kind == "connector" and e.tool == "connect"), None
-                )
+                event = await self._audit.latest(tenant_id, "connector", "connect")
                 if event is not None:
                     connected_by, connected_at = event.requester_user_id, event.at
+        env_var = config.secrets.notion_token_env
+        notion_env_var = None if connected or not read_secret(env_var) else env_var
         webhook_state = (
             None if self._webhook_tokens is None else await self._webhook_tokens.state(tenant_id)
         )
@@ -1243,8 +1251,20 @@ class ControlPlane:
             notion_workspace_name=config.notion_workspace_name,
             notion_connected_by=connected_by,
             notion_connected_at=connected_at,
+            notion_env_var=notion_env_var,
             webhook_state=webhook_state,
         )
+
+    async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:
+        """The tenant's stored settings as they are now, or None when unknown or disabled.
+
+        With a store, the row is read directly, bypassing the directory's cache; a plane
+        without one (a fixed tenant set) answers from its source, which holds no cache.
+        """
+        if self._tenant_store is None:
+            return await self._tenants.get(tenant_id)
+        row = await self._tenant_store.load(tenant_id)
+        return row.config if row is not None and row.enabled else None
 
     async def set_tenant_routing(
         self,
@@ -1264,7 +1284,9 @@ class ControlPlane:
         await self._require_role(tenant_id, actor, ADMIN)
         if self._tenant_store is None:
             raise ConfigError("tenant settings cannot be changed on this console")
-        config = await self._tenants.get(tenant_id)
+        # Fresh, not the directory cache: the no-op comparison must see a change this
+        # page made moments ago, or an unchanged resubmit records a second event.
+        config = await self._fresh_config(tenant_id)
         if config is None:
             raise ConfigError(f"tenant '{tenant_id}' is not available")
         published = await self._agents.published_all(tenant_id)
@@ -1272,7 +1294,7 @@ class ControlPlane:
         if default_agent is not None and default_agent not in published:
             raise ConfigError(f"default agent '{default_agent}' has no published version")
         for channel, agent_id in channels.items():
-            if not _CHANNEL_ID.fullmatch(channel):
+            if not CHANNEL_ID.fullmatch(channel):
                 raise ConfigError(f"'{channel}' is not a Slack channel ID")
             if agent_id not in published:
                 raise ConfigError(

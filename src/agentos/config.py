@@ -413,7 +413,7 @@ DEFAULT_MAX_WRITES_PER_TURN = 2
 MAX_WRITES_PER_TURN_RANGE = (1, 10)
 
 # Slack IDs: C for a public channel, G for a private one, S for a user group.
-_CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
+CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
 _USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
 
 
@@ -812,7 +812,7 @@ def _parse_audience(agent_where: str, raw: Any) -> Audience | None:
     if unknown:
         raise ConfigError(f"{where}: unknown field '{min(unknown)}'")
     channels = _id_list(
-        f"{where}", "channels", raw.get("channels", []), _CHANNEL_ID, "Slack channel ID"
+        f"{where}", "channels", raw.get("channels", []), CHANNEL_ID, "Slack channel ID"
     )
     dm = raw.get("dm")
     dm_everyone = False

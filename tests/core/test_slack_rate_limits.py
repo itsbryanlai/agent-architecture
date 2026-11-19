@@ -18,6 +18,7 @@ from agentos.config import Settings, parse_agents_config
 from agentos.llm import ScriptedLLMClient
 from agentos.models import TurnContext
 from agentos.slack_client import (
+    MAX_PAGES,
     FakeSlack,
     RealSlackPoster,
     SlackHistoryUnavailable,
@@ -200,6 +201,57 @@ async def test_a_history_read_refused_for_a_missing_scope_names_the_scope(serve)
         await poster.find_post("C1", None, "m1", since=1700000000.0)
 
     assert (refused.value.code, refused.value.scope) == ("missing_scope", "channels:history")
+
+
+def channel_page(channels: list[dict], cursor: str) -> dict:
+    return {
+        "ok": True,
+        "channels": channels,
+        "response_metadata": {"next_cursor": cursor},
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["two pages then end", "non-member filtered", "too many pages", "missing scope"],
+    ids=["two-pages", "non-member-filtered", "too-many-pages", "missing-scope"],
+)
+async def test_list_channels_over_the_wire(serve, case):
+    """Fails if the channel read loses a page, offers a channel the app is not in, reads
+    past the page bound, or drops the scope Slack names when it refuses the read."""
+    member = {"id": "C1", "name": "general", "is_member": True, "is_private": False}
+    outsider = {"id": "C2", "name": "not-joined", "is_member": False, "is_private": False}
+    private_member = {"id": "C3", "name": "team", "is_member": True, "is_private": True}
+    scripts = {
+        "two pages then end": [
+            (200, None, channel_page([member], "c2")),
+            (200, None, channel_page([private_member], "")),
+        ],
+        "non-member filtered": [(200, None, channel_page([member, outsider], ""))],
+        "too many pages": [(200, None, channel_page([member], "again"))],
+        "missing scope": [
+            (200, None, {"ok": False, "error": "missing_scope", "needed": "channels:read"})
+        ],
+    }
+    server, url = await serve(scripts[case])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    if case == "too many pages":
+        with pytest.raises(SlackLookupError) as err:
+            await poster.list_channels()
+        assert err.value.code == "too_many_pages"
+        assert len(server.requests) == MAX_PAGES
+        return
+    if case == "missing scope":
+        with pytest.raises(SlackLookupError) as err:
+            await poster.list_channels()
+        assert (err.value.code, err.value.scope) == ("missing_scope", "channels:read")
+        return
+
+    channels = await poster.list_channels()
+
+    assert [c.id for c in channels] == (["C1", "C3"] if case == "two pages then end" else ["C1"])
+    assert server.requests == ["conversations.list"] * len(scripts[case])
 
 
 def wire_blocks(sent: dict) -> list:

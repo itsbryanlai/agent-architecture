@@ -190,7 +190,7 @@ async def test_before_sign_in_an_unknown_tenant_and_a_real_one_answer_alike(h):
 async def test_the_admin_pages_are_refused_to_a_creator_by_the_control_plane(h):
     c = await h.signed_in(OWNER)
     async with using(c):
-        for path in ("/members", "/audit"):
+        for path in ("/members", "/audit", "/settings"):
             response = await c.get(UI + path)
             assert response.status_code == 403
             assert "may not do this" in response.text
@@ -206,11 +206,13 @@ async def test_pages_need_a_session(h):
             VERSION,
             f"{UI}/members",
             f"{UI}/audit",
+            f"{UI}/settings",
         ):
             response = await c.get(path)
             assert response.status_code == 303 and response.headers["location"] == "/login", path
-        posted = await post(c, f"{VERSION}/publish", "anything")
-        assert posted.status_code == 303 and posted.headers["location"] == "/login"
+        for path in (f"{VERSION}/publish", f"{UI}/settings/routing"):
+            posted = await post(c, path, "anything")
+            assert posted.status_code == 303 and posted.headers["location"] == "/login", path
     assert await status_of_version(h) == "pending"
 
 
@@ -625,6 +627,11 @@ async def test_a_creator_cannot_drive_the_admin_forms(h):
             (f"{UI}/members", {"user_id": "U_NEW", "role": "admin"}),
             (f"{UI}/members/{OTHER}/role", {"role": "admin"}),
             (f"{UI}/members/{OTHER}/remove", {}),
+            (f"{UI}/settings/routing", {"default_agent": "it-helper"}),
+            (f"{UI}/settings/notion/disconnect", {}),
+            (f"{UI}/settings/webhook/reveal", {}),
+            (f"{UI}/settings/webhook/confirm", {}),
+            (f"{UI}/settings/webhook/clear", {}),
         ]:
             response = await post(c, path, token, **fields)
             assert response.status_code == 403, path
@@ -683,6 +690,12 @@ FORM_ROUTES = [
     ("members", {"user_id": "U_NEW", "role": "creator"}),
     ("switches/off", {"scope": "writes", "target": ""}),
     ("budgets", {"agent_id": "mine", "amount": "5"}),
+    ("settings/routing", {"default_agent": "it-helper"}),
+    ("settings/notion/start", {}),
+    ("settings/notion/disconnect", {}),
+    ("settings/webhook/reveal", {}),
+    ("settings/webhook/confirm", {}),
+    ("settings/webhook/clear", {}),
 ]
 
 
@@ -910,12 +923,22 @@ async def test_only_pages_are_open_to_a_cross_site_navigation(h):
 
 async def test_other_tenants_data_is_not_reachable_through_a_session(h):
     await h.plane.add_agent(GLOBEX, ROOT, "globex-secret", helper_block())
+    globex_events = len([e for e in h.audit.events if e.tenant_id == GLOBEX])
     c = await h.signed_in(OWNER)
     async with using(c):
-        for path in (f"/ui/{GLOBEX}/agents", f"/ui/{GLOBEX}/agents/globex-secret"):
+        for path in (
+            f"/ui/{GLOBEX}/agents",
+            f"/ui/{GLOBEX}/agents/globex-secret",
+            f"/ui/{GLOBEX}/settings",
+        ):
             response = await c.get(path)
             assert response.status_code == 403 and "globex-secret" not in response.text
         token = await csrf_token(c)
-        posted = await post(c, f"/ui/{GLOBEX}/members", token, user_id="U_NEW", role="admin")
-        assert posted.status_code == 403
+        for path, fields in (
+            (f"/ui/{GLOBEX}/members", {"user_id": "U_NEW", "role": "admin"}),
+            (f"/ui/{GLOBEX}/settings/routing", {"default_agent": "it-helper"}),
+        ):
+            posted = await post(c, path, token, **fields)
+            assert posted.status_code == 403, path
     assert await h.members.get_member(GLOBEX, "U_NEW") is None
+    assert len([e for e in h.audit.events if e.tenant_id == GLOBEX]) == globex_events

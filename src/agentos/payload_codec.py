@@ -18,6 +18,10 @@ Rules enforced here:
   codec with no workflow bound refuses every encrypted payload.
 * A tenant may hold several key versions (see ``crypto_keys``); decoding
   accepts any version the tenant still has.
+* A key the store has not loaded triggers one refresh of the source before
+  refusing, so a tenant installed seconds ago is served without a restart. The
+  remaining failure is a ``TenantKeyError``: a workflow task or activity retry,
+  never a terminal workflow failure.
 * A payload without the encrypted tag is refused unless the codec was built
   with ``allow_plaintext=True`` (a setting, off by default).
 * Payloads written before keys were versioned carry the bare tenant ID as key
@@ -139,8 +143,8 @@ class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
                 "refusing to send a payload: no tenant could be derived from its workflow ID"
             )
         tenant = self._tenant_id
-        version = self._keys.latest_version(tenant)
-        aead = AESGCM(self._keys.key(tenant, version))
+        version = await self._latest_version(tenant)
+        aead = AESGCM(await self._key(tenant, version))
         aad = associated_data(self._workflow_id)
         out: list[Payload] = []
         for payload in payloads:
@@ -180,7 +184,23 @@ class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
             if legacy and not self._allow_legacy:
                 raise PayloadRefused("refusing a payload with an unversioned key ID")
             aad = tenant.encode() if legacy else associated_data(self._workflow_id)
-            aead = AESGCM(self._keys.key(tenant, version))
+            aead = AESGCM(await self._key(tenant, version))
             plain = aead.decrypt(payload.metadata[NONCE_METADATA], payload.data, aad)
             out.append(Payload.FromString(plain))
         return out
+
+    async def _latest_version(self, tenant: str) -> int:
+        """The tenant's newest version, re-reading the source once on a miss."""
+        try:
+            return self._keys.latest_version(tenant)
+        except TenantKeyError:
+            await self._keys.refresh()
+            return self._keys.latest_version(tenant)
+
+    async def _key(self, tenant: str, version: int) -> bytes:
+        """The tenant's key, re-reading the source once on a miss."""
+        try:
+            return self._keys.key(tenant, version)
+        except TenantKeyError:
+            await self._keys.refresh()
+            return self._keys.key(tenant, version)

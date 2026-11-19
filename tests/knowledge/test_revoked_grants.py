@@ -111,7 +111,7 @@ async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(m
     await seed(store, SCOPE_A)
     client = FakeScheduleClient([ids.index_schedule_id(TENANT, SCOPE_A)])
 
-    async def build_client(_settings):
+    async def build_client(_settings, keys=None, pool=None):
         return client
 
     class OpenStore:

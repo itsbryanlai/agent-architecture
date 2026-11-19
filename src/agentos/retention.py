@@ -38,6 +38,7 @@ import math
 import os
 import sys
 import uuid
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -59,6 +60,7 @@ from temporalio.client import (
 
 from agentos import ids
 from agentos.config import (
+    KEY_SOURCE_DB,
     MAX_APPROVAL_EXPIRES_HOURS,
     MAX_WATCH_DAYS,
     TASK_QUEUE,
@@ -454,11 +456,20 @@ async def run(tenant: str | None, schedule: bool, clock=_utcnow) -> None:
         raise SystemExit(f"unknown tenant '{tenant}'; configured: {', '.join(tenants.tenants)}")
     selected = [tenant] if tenant else list(tenants.tenants)
     if schedule:
-        client = await build_temporal_client(settings)
-        for tenant_id in selected:
-            print(
-                f"{await apply_schedule(client, tenant_id)} schedule {ids.retention_schedule_id(tenant_id)}"
-            )
+        async with AsyncExitStack() as stack:
+            pool = None
+            if settings.key_source == KEY_SOURCE_DB:
+                pool = await stack.enter_async_context(
+                    AsyncConnectionPool(
+                        settings.require("database_url"), open=False, **settings.pool_args()
+                    )
+                )
+            client = await build_temporal_client(settings, pool=pool)
+            for tenant_id in selected:
+                print(
+                    f"{await apply_schedule(client, tenant_id)} schedule "
+                    f"{ids.retention_schedule_id(tenant_id)}"
+                )
         return
     pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()

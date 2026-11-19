@@ -137,6 +137,16 @@ or clear with nothing to change, records nothing. The token itself is never in t
 |---|---|---|---|---|---|---|---|
 | `webhook_token` | The operator shows the pending token, confirms it, or clears it | `operator:<OS login>` for both | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<random>`: a repeat run records again |
 
+## Payload key
+
+Written by the host command that creates or rotates a tenant's payload key in the database
+(`python -m agentos.tenant_keys create|rotate <tenant_id>` with `AGENTOS_KEY_SOURCE=db`),
+as `operator:<OS login>` (which names the requester too). The key material is never in the row.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `payload_key` | The operator creates the tenant's key (idempotent) or adds its next version | `operator:<OS login>` for both | none | `create` or `rotate` | - | `ok` | `<tenant>:audit:control:payload_key:<command>:<random>`: a repeat run records again |
+
 ## Access review
 
 Written with the publish or the pick, by the control plane. Identity `user:<Slack ID>`.

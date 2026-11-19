@@ -40,7 +40,14 @@ from agentos.config import (
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
 from agentos.content_store import PostgresContentStore
-from agentos.crypto_keys import KeyStore, build_key_store, check_keys, startup_key_failure
+from agentos.crypto_keys import (
+    KeyStore,
+    TenantKeyError,
+    build_key_store,
+    check_keys,
+    start_key_refresh,
+    startup_key_failure,
+)
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -269,7 +276,10 @@ async def main() -> None:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
         tenants = await startup_tenants(directory)
-        keys = build_key_store(settings)
+        try:
+            keys = await build_key_store(settings, pool)
+        except TenantKeyError as err:
+            raise SystemExit(str(err)) from err
         key_failure = startup_key_failure(keys, tenants.tenants)
         if key_failure:
             raise SystemExit(key_failure)
@@ -370,7 +380,7 @@ async def main() -> None:
                 budget_guard,
                 idempotency,
             ).all()
-        client = await build_temporal_client(settings)
+        client = await build_temporal_client(settings, keys)
         tenant_sync = RegistrySync(
             directory,
             registry,
@@ -389,11 +399,15 @@ async def main() -> None:
         # A tenant added to, changed in or disabled in the database is picked up here,
         # without a restart. Its own start-up work (key check, grant check) runs when
         # it first appears; see ``admit_new_tenant``.
+        key_refresh = start_key_refresh(keys)
         refresher = asyncio.create_task(tenant_sync.run(TENANT_SYNC_SECONDS))
         try:
             await worker.run()
         finally:
             refresher.cancel()
+            if key_refresh is not None:
+                key_refresh.cancel()
+                await asyncio.gather(key_refresh, return_exceptions=True)
     finally:
         await pool.close()
 

@@ -38,13 +38,17 @@ DEFAULT_NOTION_TOKEN_DIR = "~/.agentos"
 # The directory of per-tenant payload encryption key files, <tenant_id>.key.
 DEFAULT_KEY_DIR = "~/.agentos/keys"
 # Where payload keys come from: owner-only files (the default, unchanged local
-# runs) or host variables named AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>.
+# runs), host variables named AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>, or the database:
+# tenant keys wrapped by master keys from AGENTOS_MASTER_KEY_V<n> variables.
 KEY_SOURCE_FILES = "files"
 KEY_SOURCE_ENV = "env"
-KEY_SOURCES = (KEY_SOURCE_FILES, KEY_SOURCE_ENV)
+KEY_SOURCE_DB = "db"
+KEY_SOURCES = (KEY_SOURCE_FILES, KEY_SOURCE_ENV, KEY_SOURCE_DB)
 DEFAULT_KEY_SOURCE = KEY_SOURCE_FILES
 # The prefix of the variables that hold payload keys when the source is env.
 PAYLOAD_KEY_ENV_PREFIX = "AGENTOS_PAYLOAD_KEY_"
+# The prefix of the variables that hold master keys when the source is db.
+MASTER_KEY_ENV_PREFIX = "AGENTOS_MASTER_KEY_V"
 # The variable names a tenant without a ``secrets`` block uses. Only one tenant
 # may use them.
 DEFAULT_SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -303,6 +307,17 @@ def payload_key_env() -> dict[str, str]:
     """
     return {
         name: value for name, value in os.environ.items() if name.startswith(PAYLOAD_KEY_ENV_PREFIX)
+    }
+
+
+def master_key_env() -> dict[str, str]:
+    """The master key variables and their values, for the database key store.
+
+    Values are key material: the store keeps them in memory only, and nothing
+    logs, prints or ``repr``s them.
+    """
+    return {
+        name: value for name, value in os.environ.items() if name.startswith(MASTER_KEY_ENV_PREFIX)
     }
 
 

@@ -11,6 +11,7 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from temporalio.api.common.v1 import Payload
+from temporalio.client import WorkflowExecutionStatus
 from temporalio.converter import (
     ActivitySerializationContext,
     DataConverter,
@@ -23,7 +24,7 @@ from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import seeded_agent_store
 from agentos.audit import InMemoryAuditStore
-from agentos.config import TASK_QUEUE, Settings
+from agentos.config import TASK_QUEUE, Settings, parse_agents_config
 from agentos.crypto_keys import (
     EnvKeyStore,
     LocalKeyStore,
@@ -48,8 +49,9 @@ from agentos.tenant_keys import main as tenant_keys_main
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.conversation import TURN_FAILED, ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, BOB, TENANT, eventually, make_fake_notion
+from tests.conftest import ALICE, BOB, TENANT, agents_dict, eventually, make_fake_notion
 from tests.helpers.codec import all_payloads, is_sdk_patch_record
+from tests.helpers.keys import RefreshableKeyStore
 
 CHANNEL = "C1"
 THREAD = "1700000000.000100"
@@ -509,3 +511,92 @@ async def test_failure_messages_are_encrypted(tmp_path, agents):
     raw = b"".join(event.SerializeToString() for event in history.events)
     assert any(e.HasField("activity_task_failed_event_attributes") for e in history.events)
     assert FAILURE_MARKER.encode() not in raw
+
+
+async def test_a_key_the_worker_has_not_loaded_retries_until_a_miss_refresh_finds_it(agents):
+    """Fails if a workflow whose tenant key is not in the worker's store fails terminally, or a key that appears in the source later is not picked up without a manual refresh."""
+    other = parse_agents_config(agents_dict() | {"tenant_id": "globex"})
+    key_a, key_b = secrets.token_bytes(32), secrets.token_bytes(32)
+    source = {(TENANT, 1): key_a, ("globex", 1): key_b}
+    keys = RefreshableKeyStore(source)
+    await keys.refresh()
+    converter: DataConverter = tenant_data_converter(keys)
+
+    llm = ScriptedLLMClient()
+    llm.queue(LLMResponse(text="Done, nothing to file.", tool_calls=[], stop_reason="end_turn"))
+    llm.queue(LLMResponse(text="Done, nothing to file.", tool_calls=[], stop_reason="end_turn"))
+    slack = FakeSlack(emails={ALICE: "alice@example.com"})
+    acts = AgentActivities(
+        settings=Settings(),
+        registry=TenantRegistry(
+            {
+                TENANT: runtime_for(agents, slack, make_fake_notion()),
+                "globex": runtime_for(other, slack, make_fake_notion()),
+            }
+        ),
+        history=InMemoryHistoryStore(),
+        idem=InMemoryIdempotencyStore(),
+        links=InMemoryTaskLinkStore(),
+        llm=llm,
+        tool_outputs=InMemoryToolOutputStore(),
+        audit=InMemoryAuditStore(),
+        agents=seeded_agent_store(agents, other),
+    )
+    # Own Temporal server, not the session's: it needs the encrypting data converter.
+    env = await WorkflowEnvironment.start_time_skipping(data_converter=converter)
+    try:
+        handle_a = await env.client.start_workflow(
+            ConversationWorkflow.run,
+            ConversationRef(TENANT, "it-helper", CHANNEL, THREAD),
+            id=ids.conversation_id(TENANT, CHANNEL, THREAD),
+            task_queue=TASK_QUEUE,
+            start_signal="message",
+            start_signal_args=[
+                InboundMessage(
+                    event_id="Ev1",
+                    user_id=ALICE,
+                    text="hello acme",
+                    channel=CHANNEL,
+                    thread_ts=THREAD,
+                    channel_kind="channel",
+                )
+            ],
+        )
+        # The client encrypted acme's input with the key; the worker's store now
+        # loads without it, as a worker started before the tenant's key existed.
+        del source[(TENANT, 1)]
+        await keys.refresh()
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ConversationWorkflow],
+            activities=acts.all(),
+        ):
+            await env.client.start_workflow(
+                ConversationWorkflow.run,
+                ConversationRef("globex", "it-helper", "C2", "1700000000.000200"),
+                id=ids.conversation_id("globex", "C2", "1700000000.000200"),
+                task_queue=TASK_QUEUE,
+                start_signal="message",
+                start_signal_args=[
+                    InboundMessage(
+                        event_id="Ev2",
+                        user_id=ALICE,
+                        text="hello globex",
+                        channel="C2",
+                        thread_ts="1700000000.000200",
+                        channel_kind="channel",
+                    )
+                ],
+            )
+            # globex's reply settles that the worker serves tasks while acme's is not.
+            await eventually(lambda: [u for u in slack.updates() if u["channel"] == "C2"])
+            assert [u for u in slack.updates() if u["channel"] == CHANNEL] == []
+            assert (await handle_a.describe()).status == WorkflowExecutionStatus.RUNNING
+            source[(TENANT, 1)] = key_a  # no manual refresh: the codec's miss must trigger it
+            # The server's workflow-task retry backoff runs in real time, not skipped time.
+            await eventually(
+                lambda: [u for u in slack.updates() if u["channel"] == CHANNEL], timeout=30.0
+            )
+    finally:
+        await env.shutdown()

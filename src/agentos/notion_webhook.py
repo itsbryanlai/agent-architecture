@@ -187,7 +187,12 @@ class WebhookTokens:
         False when the tenant already has a pending or active token: nothing is
         replaced. Raises ``TenantKeyError`` when the tenant has no usable key.
         """
-        blob, version = encrypt_for_tenant(self._keys, tenant_id, token.encode())
+        try:
+            blob, version = encrypt_for_tenant(self._keys, tenant_id, token.encode())
+        except TenantKeyError:
+            # A tenant installed since the last key refresh: reload once, then retry.
+            await self._keys.refresh()
+            blob, version = encrypt_for_tenant(self._keys, tenant_id, token.encode())
         return await self._store.put_pending(tenant_id, blob, version)
 
     async def active(self, tenant_id: str) -> str | None:
@@ -199,9 +204,7 @@ class WebhookTokens:
         entry = self._cache.get(tenant_id)
         if entry is None or entry[0] != source:
             try:
-                token = decrypt_for_tenant(
-                    self._keys, tenant_id, row.ciphertext, row.key_version
-                ).decode()
+                token = await self._decrypt(tenant_id, row.ciphertext, row.key_version)
             except (TenantKeyError, InvalidTag):
                 # A key version that is gone or holds another value: refuse events
                 # cleanly (the caller answers 503) instead of failing each one.
@@ -216,6 +219,14 @@ class WebhookTokens:
             self._cache[tenant_id] = (source, token)
             return token
         return entry[1]
+
+    async def _decrypt(self, tenant_id: str, blob: bytes, version: int) -> str:
+        """Decrypt with the tenant's key, reloading the keys once when it is missing."""
+        try:
+            return decrypt_for_tenant(self._keys, tenant_id, blob, version).decode()
+        except TenantKeyError:
+            await self._keys.refresh()
+            return decrypt_for_tenant(self._keys, tenant_id, blob, version).decode()
 
 
 # --- the command line -----------------------------------------------------------------
@@ -312,7 +323,7 @@ async def run(args: argparse.Namespace) -> int:
             args,
             PostgresWebhookTokenStore(pool),
             PostgresAuditStore(pool),
-            build_key_store(settings),
+            await build_key_store(settings, pool),
             PostgresUnitOfWork(pool),
         )
     finally:

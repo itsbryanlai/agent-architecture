@@ -76,10 +76,17 @@ SEEDS = {
     "VALUES (%(t)s, 'k', 'claimed', now(), 'tok')",
     "notion_webhook_tokens": "INSERT INTO notion_webhook_tokens "
     "(tenant_id, state, ciphertext, key_version) VALUES (%(t)s, 'pending', '\\x00', 1)",
+    "tenant_payload_keys": "INSERT INTO tenant_payload_keys "
+    "(tenant_id, version, wrapped_key, master_version) VALUES (%(t)s, 1, '\\x00', 1)",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
 OWNER_WRITTEN = {"usage_adjustments"}
+
+# The one table the app role reads across tenants and with no tenant set: the codec
+# decrypts for whichever tenant a payload belongs to. Its read policy is proven by
+# tests/pg/test_tenant_payload_keys.py; the write bound below still applies to it.
+CROSS_TENANT_READS = {"tenant_payload_keys"}
 
 # What the app role may do, per table (the other three privileges are never granted).
 PRIVILEGES = {
@@ -111,6 +118,7 @@ PRIVILEGES = {
     "tool_inputs": "SELECT INSERT DELETE",
     "task_drafts": "SELECT INSERT DELETE",
     "notion_webhook_tokens": "SELECT INSERT UPDATE DELETE",
+    "tenant_payload_keys": "SELECT INSERT",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }
@@ -145,7 +153,7 @@ async def count(pool, tenant: str | None, table: str, where: str = "true", args=
 async def test_every_tenant_table_shows_a_tenant_only_its_own_rows(
     db: TestDatabase, pool, tenant: str, other_tenant: str
 ):
-    """Fails if any tenant table lets a tenant read or write another's rows, or any row with none set."""
+    """Fails if any tenant table lets a tenant write another's rows, or any table but the key directory lets a tenant read another's rows or rows with no tenant set."""
     tables = public_tables(db, with_tenant_id=True)
     assert tables == set(SEEDS), "add a seed row to SEEDS for each new tenant table"
     third = f"{tenant}-x"
@@ -159,12 +167,13 @@ async def test_every_tenant_table_shows_a_tenant_only_its_own_rows(
             async with tenant_transaction(pool, t) as conn:
                 await conn.execute(statement, {"t": t})
     for table, seed in SEEDS.items():
-        if await count(pool, tenant, table) != 1:
-            failures.append(f"{table}: a tenant sees rows that are not its own")
-        if await count(pool, tenant, table, "tenant_id = %s", (other_tenant,)) != 0:
-            failures.append(f"{table}: another tenant's rows are readable")
-        if await count(pool, None, table) != 0:
-            failures.append(f"{table}: rows are readable with no tenant set")
+        if table not in CROSS_TENANT_READS:
+            if await count(pool, tenant, table) != 1:
+                failures.append(f"{table}: a tenant sees rows that are not its own")
+            if await count(pool, tenant, table, "tenant_id = %s", (other_tenant,)) != 0:
+                failures.append(f"{table}: another tenant's rows are readable")
+            if await count(pool, None, table) != 0:
+                failures.append(f"{table}: rows are readable with no tenant set")
         try:
             async with tenant_transaction(pool, tenant) as conn:
                 await conn.execute(seed, {"t": third})
@@ -203,7 +212,7 @@ def test_app_role_has_exactly_the_privileges_a_table_allows(db: TestDatabase, ta
     assert held == set(PRIVILEGES[table].split())
 
 
-@pytest.mark.parametrize("table", ["audit_events", "usage_events"])
+@pytest.mark.parametrize("table", ["audit_events", "usage_events", "tenant_payload_keys"])
 @pytest.mark.parametrize(
     "change", ["UPDATE {table} SET tenant_id = tenant_id", "DELETE FROM {table}"]
 )
@@ -216,7 +225,7 @@ async def test_app_role_cannot_change_or_delete_a_recorded_row(
     with pytest.raises(errors.InsufficientPrivilege):
         async with tenant_transaction(pool, tenant) as conn:
             await conn.execute(change.format(table=table))
-    assert await count(pool, tenant, table) == 1
+    assert await count(pool, tenant, table, "tenant_id = %s", (tenant,)) == 1
 
 
 @pytest.mark.parametrize(
@@ -376,6 +385,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "switch_off",
                 "switch_on",
                 "webhook_token",
+                "payload_key",
             )
         ],
     ],

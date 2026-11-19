@@ -47,7 +47,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | Row-level security | built | `scripts/init_db.sql`, migrations, `tests/pg/` | Run against a real Postgres by the `pg` test tier |
 | Tenants in Postgres with live reload | built | `tenant_store.py` | |
 | Retention per tenant, nightly | built | `retention.py`, `workflows/retention.py` | Audit and usage rows exempt |
-| Temporal payload encryption | partial | `payload_codec.py`, `crypto_keys.py`, `tenant_keys.py` | Local versioned key files or host variables (`AGENTOS_KEY_SOURCE=env`) with rotation; no KMS. Patch marker records are outside the codec |
+| Temporal payload encryption | partial | `payload_codec.py`, `crypto_keys.py`, `tenant_keys.py` | Local versioned key files, host variables (`AGENTOS_KEY_SOURCE=env`), or database-stored keys wrapped by a master key (`db`) with rotation; no KMS. Patch marker records are outside the codec |
 | Credential vault, per-tenant key from a KMS, crypto-shredding | target | none | Secrets are environment variables named in the tenant's settings; the Notion webhook token is stored encrypted per tenant in the database |
 | `tenant_id` search attribute | target | none | |
 | Per-tenant rate limits | partial | `connectors/notion_limiter.py` | Notion calls only, per tenant per worker process; none for Slack or the model |

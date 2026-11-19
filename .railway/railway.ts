@@ -34,7 +34,6 @@ export default defineRailway(() => {
 
   const postgres = service("postgres", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/postgres" }),
-    build: { builder: "DOCKERFILE" },
     deploy: {
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
@@ -54,7 +53,6 @@ export default defineRailway(() => {
 
   const temporal = service("temporal", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/temporal" }),
-    build: { builder: "DOCKERFILE" },
     start: "temporal server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db",
     deploy: {
       restartPolicyType: "ON_FAILURE",
@@ -72,7 +70,6 @@ export default defineRailway(() => {
 
   const ollama = service("ollama", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/ollama" }),
-    build: { builder: "DOCKERFILE" },
     // The entrypoint reads PORT and OLLAMA_MODELS from the environment.
     start: "/bin/sh /entrypoint.sh",
     deploy: {

@@ -1,0 +1,20 @@
+# Allow-list: the build context holds only what the Dockerfile copies.
+# Everything else (version control, local tools, tests, docs) never reaches an image.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!src/
+!config/
+!scripts/migrate.py
+!scripts/migrations/
+!scripts/init_db.sql
+
+# Inside the allowed paths: caches, and local overrides or secrets.
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+config/agents.local.yaml
+**/.env
+**/.env.*

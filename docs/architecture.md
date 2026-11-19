@@ -27,7 +27,7 @@ flowchart LR
   Sync[Indexing workflows] --> VDB
 ```
 
-Target, not in the diagram because it does not exist: a credential vault between the connector runtime and the systems it calls (tenant connector secrets are environment variables named in the tenant's settings), and Confluence and Google Drive behind the connector runtime.
+Target, not in the diagram because it does not exist: a credential vault between the connector runtime and the systems it calls (tenant connector secrets are environment variables named in the tenant's settings), and Google Drive (read and write) behind the connector runtime.
 
 | Component | Responsibility |
 |---|---|
@@ -322,7 +322,7 @@ Where in code: `src/agentos/connectors/manifest.py`, `NotionConnector.my_items` 
 
 ## 6. Knowledge retrieval
 
-Status: **built** for Notion pages. Target: Confluence spaces, Google Drive folders and a company-wide scope the admin makes available to every agent.
+Status: **built** for Notion pages. Target: Google Drive folders and a company-wide scope the admin makes available to every agent.
 
 Agents answer from documents their creator granted, and every answer cites its sources.
 
@@ -354,7 +354,7 @@ Where in code: `src/agentos/knowledge/`, `src/agentos/workflows/indexing.py`, `s
 
 ## 7. Connectors
 
-Status: **partial**. Built: the Notion connector (knowledge, one create action, one comment action) and a manifest that classifies each call. Target: MCP as the connector contract (deferred, D-28), an OpenAPI adapter, certified and custom tiers, Confluence and Google Drive.
+Status: **partial**. Built: the Notion connector (knowledge, one create action, one comment action) and a manifest that classifies each call. Target: MCP as the connector contract (deferred, D-28), an OpenAPI adapter, certified and custom tiers, and Google Drive (knowledge and writes).
 
 ### What the manifest does today
 
@@ -379,7 +379,7 @@ Not built, kept as the design:
 - **MCP as the connector contract** (D-08, deferred): each connector an MCP server describing its tools with JSON Schema; our runtime the MCP client inside activities, adding credential injection, grant enforcement, risk class, idempotency, audit and per-tenant rate limits.
 - **Generic adapters** (D-15): any MCP server, or any REST API with an OpenAPI spec, without connector-specific code, described by a manifest that also carries `source`, `grant_scopes`, `attribution`, `watch` (webhook, poll fallback, done condition) and `index` blocks.
 - **Two tiers:** certified (by us, integration-tested against a real instance: exactly-once writes, follow-up tracking, attribution) and custom (v2, by tenant admins, for any MCP server or OpenAPI spec: all writes default to `write_irreversible` with approval, **writes are never retried automatically** without a declared idempotency method, no follow-up tracking unless `watch` is declared, and a sandbox with no network access beyond the declared host).
-- Certified connectors planned for v1: Confluence, Google Drive (knowledge), Notion (knowledge and the first write action). Only Notion exists.
+- Certified connectors planned for v1: Notion (knowledge and the first write action) and Google Drive (knowledge and writes). Only Notion exists. Confluence and Jira are out of scope; Linear comes later.
 
 ## 8. Safety
 

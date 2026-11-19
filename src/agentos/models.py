@@ -382,8 +382,9 @@ ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 WEBHOOK_AUDIT_KINDS = ("webhook_token",)
 # A tenant's payload key, created or rotated in the database by a host command.
 PAYLOAD_KEY_AUDIT_KINDS = ("payload_key",)
-# A tenant created by the Slack OAuth install, or its bot token replaced by a reinstall.
-INSTALL_AUDIT_KINDS = ("install",)
+# A tenant created by the Slack OAuth install, its bot token replaced by a reinstall,
+# or its app uninstalled (the tenant disabled and its Slack credential deleted).
+INSTALL_AUDIT_KINDS = ("install", "uninstall")
 # An agent's grant check flipping its health: the agent and the version checked.
 HEALTH_AUDIT_KINDS = ("agent_health",)
 # A tenant's Notion workspace connected or disconnected in the console; never the token.
@@ -428,7 +429,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, connector, tenant settings
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, uninstall, connector, tenant settings
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"

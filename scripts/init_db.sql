@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 036 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 037 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -153,7 +153,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
   ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install'),
-  ('agent_health'), ('connector'), ('tenant_settings'), ('feedback')
+  ('uninstall'), ('agent_health'), ('connector'), ('tenant_settings'), ('feedback')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
              'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
-             'payload_key', 'install', 'connector', 'tenant_settings')
+             'payload_key', 'install', 'uninstall', 'connector', 'tenant_settings')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -1122,5 +1122,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037')
 ON CONFLICT DO NOTHING;

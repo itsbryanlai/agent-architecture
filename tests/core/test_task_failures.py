@@ -6,6 +6,7 @@ non-retryable one (404, item moved out of the grant) or a trashed item posts one
 posts one failure line and ends cleanly. The watch poll carries only IDs.
 """
 
+import asyncio
 import uuid
 from datetime import timedelta
 
@@ -172,6 +173,58 @@ async def test_reminder_failure_does_not_stop_the_wait(harness):
     _fail(h.slack, "update_message", RuntimeError("slack is down"))
 
     assert await handle.result() == "expired"
+
+
+# --- uninstalled tenant -------------------------------------------------------------
+
+
+def _uninstall(h):
+    """The runtime stops serving the tenant and reports it disabled, as the sync does."""
+    h.acts.registry.remove(TENANT)
+    h.acts.registry.set_disabled({TENANT})
+
+
+async def test_submit_on_an_uninstalled_tenant_ends_cleanly(harness):
+    """Fails if a Submit after the uninstall retries, writes to Notion, posts to Slack or
+    leaves the task's end unrecorded."""
+    h = harness
+    handle = await _start(h)
+    posts_before = len(h.slack.posts())
+    _uninstall(h)
+
+    # No virtual time may pass on its own: a retry's backoff timer would never fire,
+    # so the result arriving proves the end took no retry.
+    with h.wf_env.auto_time_skipping_disabled():
+        await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+        assert await asyncio.wait_for(handle.result(), timeout=10) == "cancelled"
+
+    assert len(h.slack.posts()) == posts_before
+    assert h.slack.updates() == []
+    assert h.notion.count("create_page") == 0
+    row = await h.acts.tasks.get(TENANT, handle.id)
+    assert row.state == "cancelled"
+
+
+async def test_watch_on_an_uninstalled_tenant_ends_cleanly(harness):
+    """Fails if a watch after the uninstall keeps polling, reads Notion, posts to Slack or
+    leaves the task's end unrecorded."""
+    h = harness
+    handle, _ = await _watching(h)
+    posts_before = len(h.slack.posts())
+    updates_before = len(h.slack.updates())
+    polls_before = h.notion.count("retrieve_page")
+    _uninstall(h)
+
+    with h.wf_env.auto_time_skipping_disabled():
+        await h.wf_env.sleep(timedelta(minutes=16))  # the next poll lands
+        await _state(handle, "cancelled")
+
+    assert await handle.result() == "cancelled"
+    assert len(h.slack.posts()) == posts_before
+    assert len(h.slack.updates()) == updates_before
+    assert h.notion.count("retrieve_page") == polls_before
+    row = await h.acts.tasks.get(TENANT, handle.id)
+    assert row.state == "cancelled"
 
 
 @pytest.fixture(autouse=True)

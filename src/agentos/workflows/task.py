@@ -27,6 +27,10 @@ Rules this workflow keeps:
   the tracker. It never says nothing was filed after retries ran out.
 * A long watch continues as new, carrying a ``WatchState`` of IDs, times and flags, and a burst
   of pokes is answered at most once per ``POKE_GAP``.
+* An uninstalled tenant ends the task cleanly: the runtime reports it disabled (a
+  non-retryable refusal), and the task stops with no Slack post — the token is deleted —
+  recording its final state for ``my_tasks``. A tenant not loaded yet stays retryable.
+  Behind the ``tenant-disabled`` marker; older histories replay without it.
 * Logs carry IDs only, never the comment, the title or the details.
 * History stays small and free of content: after creation the workflow keeps only the item's
   page ID and last status. The lines posted in the thread that name the title, the comment
@@ -68,9 +72,11 @@ with workflow.unsafe.imports_passed_through():
         RECONCILE_INTERVAL,
         RECONCILE_TRIES,
         RETRY,
+        TENANT_DISABLED_PATCH,
         WATCH_HISTORY_BOUND,
         WRITE_HEARTBEAT_TIMEOUT,
         WRITE_TIMEOUT,
+        is_tenant_disabled,
     )
 
 MAX_EDITS = 5
@@ -219,6 +225,8 @@ class TaskWorkflow:
             if self._state not in ("drafted", "awaiting_approval"):
                 raise
             task_id = workflow.info().workflow_id
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
             if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
                 # The activity's message is the fixed unavailable reply, built from the
                 # agent's name: a clean stop, not a failure. Nothing was written.
@@ -361,7 +369,9 @@ class TaskWorkflow:
             # paused or an audience changed since the card was shown stops the write here.
             try:
                 stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
-            except ActivityError:
+            except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    return await self._stop_for_tenant_disabled(spec, task_id)
                 # The check could not be completed: fail closed, take the buttons off.
                 stopped = UNCHECKED_CARD_TEXT
             if stopped is not None:
@@ -384,6 +394,8 @@ class TaskWorkflow:
                 AgentActivities.create_notion_item, spec, task_id
             )
         except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent.name)
             if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
@@ -511,6 +523,11 @@ class TaskWorkflow:
                     item.page_id,
                 )
             except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    # The app was uninstalled: the watch ends here, with no post.
+                    return await self._stop_for_tenant_disabled(
+                        self._spec, task_id, last_status or ""
+                    )
                 if _is_agent_off(err):
                     # An admin turned the agent off: the watch ends here, with no post.
                     self._state = "cancelled"
@@ -562,6 +579,25 @@ class TaskWorkflow:
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
 
+    async def _stop_for_tenant_disabled(
+        self, spec: TaskSpec, task_id: str, status: str = ""
+    ) -> str:
+        """The tenant's app was uninstalled: end cleanly with no Slack post.
+
+        The token is deleted, so no card redraw or thread line can land; the task's
+        final state is still recorded for ``my_tasks``. A write in flight when the
+        uninstall landed cannot be confirmed either way (the runtime is gone); the
+        task says nothing rather than claim it was not filed.
+        """
+        workflow.logger.info(
+            "task ended: tenant uninstalled tenant_id=%s task_id=%s",
+            spec.ctx.tenant_id,
+            task_id,
+        )
+        self._state = "cancelled"
+        await self._record(status)
+        return self._state
+
     async def _stop_for_agent_off(
         self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
     ) -> str:
@@ -603,6 +639,8 @@ class TaskWorkflow:
         try:
             await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
             if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):

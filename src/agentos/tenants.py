@@ -42,6 +42,15 @@ class UnknownTenant(Exception):
     """The tenant ID names no configured tenant."""
 
 
+class TenantDisabled(UnknownTenant):
+    """The tenant is stored but disabled: its app was uninstalled.
+
+    Distinct from a tenant not loaded yet: pending work for a disabled tenant ends
+    cleanly (its Slack token is gone), while an unknown tenant's work retries until
+    a refresh picks it up.
+    """
+
+
 @dataclass
 class TenantRuntime:
     """One tenant's settings and the clients that act for it, and only it.
@@ -80,15 +89,19 @@ def runtime_for(
 
 
 class TenantRegistry:
-    """Looks tenants up by ID. An unknown ID raises ``UnknownTenant``."""
+    """Looks tenants up by ID. An unknown ID raises ``UnknownTenant``; an ID the sync
+    marked disabled raises ``TenantDisabled``, so its pending work ends cleanly."""
 
     def __init__(self, runtimes: dict[str, TenantRuntime]):
         self._runtimes = dict(runtimes)
+        self._disabled: set[str] = set()
 
     def get(self, tenant_id: str) -> TenantRuntime:
         try:
             return self._runtimes[tenant_id]
         except KeyError:
+            if tenant_id in self._disabled:
+                raise TenantDisabled(f"tenant '{tenant_id}' is disabled (uninstalled)") from None
             raise UnknownTenant(f"unknown tenant '{tenant_id}'") from None
 
     def tenants(self) -> list[str]:
@@ -96,6 +109,15 @@ class TenantRegistry:
 
     def set(self, tenant_id: str, runtime: TenantRuntime) -> None:
         self._runtimes[tenant_id] = runtime
+        self._disabled.discard(tenant_id)
+
+    def set_disabled(self, tenant_ids: set[str]) -> None:
+        """Replace the disabled marks with the directory's stored-but-disabled tenants.
+
+        The sync calls this every pass, so a reinstall (the tenant enabled again) or a
+        deleted row clears the mark, and a worker restart re-marks from the database.
+        """
+        self._disabled = set(tenant_ids)
 
     def remove(self, tenant_id: str) -> None:
         self._runtimes.pop(tenant_id, None)
@@ -115,9 +137,12 @@ class RegistrySync:
     changed settings, rebuilds a client whose credential was replaced, and drops a
     tenant that was disabled or removed, so the worker serves a tenant without a
     restart. A dropped tenant is passed to ``on_drop`` (the resolver forgets its cached
-    token). A new tenant that cannot be admitted (its Slack token is unavailable, or
-    ``admit`` returns a reason) is left out and reported once per reason; the next
-    ``sync`` tries again. A tenant with no Notion token is served Slack-only.
+    token). A stored-but-disabled tenant is also marked in the registry, so its pending
+    work ends cleanly instead of retrying as not-yet-loaded; the mark follows the
+    directory every pass. A new tenant that cannot be admitted (its Slack token is
+    unavailable, or ``admit`` returns a reason) is left out and reported once per
+    reason; the next ``sync`` tries again. A tenant with no Notion token is served
+    Slack-only.
     """
 
     def __init__(
@@ -160,6 +185,7 @@ class RegistrySync:
                 if self._on_drop is not None:
                     self._on_drop(tenant_id)
                 log.info("tenant_id=%s no longer served (disabled or removed)", tenant_id)
+        self._registry.set_disabled(set(await self._directory.disabled_tenants()))
         added = []
         for tenant_id, config in wanted.items():
             try:

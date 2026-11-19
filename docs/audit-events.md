@@ -9,7 +9,7 @@ Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tool
 [Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
 [Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) ·
-[Connector](#connector) · [Tenant settings](#tenant-settings) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
+[Uninstall](#uninstall) · [Connector](#connector) · [Tenant settings](#tenant-settings) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
 [How to read it](#how-to-read-it) · [What you see in a live run](#what-you-see-in-a-live-run)
 
 ## Columns
@@ -186,7 +186,23 @@ allowlist, a failed code exchange) writes nothing. The bot token is never in the
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
+| `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token (and re-enables it after an uninstall) | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
+
+## Uninstall
+
+Written by the gateway's Slack event handler (`app_uninstalled`, or `tokens_revoked`
+naming bot tokens), in the same transaction as the tenant disable and the deletion of
+its `slack_bot` credential. The Notion credential is kept. A retry of an event already
+handled records and changes nothing, even after a reinstall (its audit key is checked
+first); an out-of-order event records nothing: the tenant is already disabled with no
+credential. An event for
+an unknown workspace, or a `tokens_revoked` naming no bot token, records nothing. No
+user acts: the event comes from Slack, so the requester and identity are the system
+marker. The row never holds a token.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `uninstall` | The workspace uninstalls the app or its bot tokens are revoked: the tenant is disabled and its Slack credential deleted | `system:uninstall` for both | none | `app_uninstalled` or `tokens_revoked` | the Slack team ID | `ok` | `<tenant>:audit:control:uninstall:<Slack event ID>`: a Slack retry records nothing |
 
 ## Connector
 

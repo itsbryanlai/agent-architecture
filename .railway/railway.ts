@@ -81,6 +81,9 @@ export default defineRailway(() => {
     env: {
       PORT: "11434",
       OLLAMA_MODELS: "/data/models",
+      // Keep bge-m3 loaded: a cold load takes about 12 s, longer than an
+      // embedding call waits, so the first search after 5 idle minutes failed once.
+      OLLAMA_KEEP_ALIVE: "24h",
     },
     volumeMounts: { "/data": ollamaModels },
   });

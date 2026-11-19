@@ -12,6 +12,7 @@ object means the defaults below. What is purged:
   than the limit, so a thread is never cut in the middle;
 * tool outputs, tool inputs and model steps (what the model replied, kept until it was shown):
   older than the tool-output limit, in a conversation with no newer message;
+* answer feedback (a person's 👍/👎 and its optional reason), older than the tool-output limit;
 * inbound events already delivered to their workflow, and the saved Edit forms among them, older
   than the idempotency limit (an event not yet delivered is never purged);
 * the drafts of a task whose newest revision is older than the tool-output limit;
@@ -192,6 +193,7 @@ class PurgeCounts:
     task_drafts: int = 0
     threads: int = 0
     owner_pings: int = 0
+    answer_feedback: int = 0
 
     def add(self, other: PurgeCounts) -> None:
         self.messages += other.messages
@@ -204,6 +206,7 @@ class PurgeCounts:
         self.task_drafts += other.task_drafts
         self.threads += other.threads
         self.owner_pings += other.owner_pings
+        self.answer_feedback += other.answer_feedback
 
     def kinds(self) -> dict[str, int]:
         """The rows deleted, per kind, for a log line or the command line."""
@@ -289,6 +292,18 @@ class PostgresRetentionStore:
                 {"t": tenant_id, "cutoff": cutoff("tool_outputs_days"), "limit": limit},
             )
             counts.task_drafts = cur.rowcount
+            # A vote outlives its answer's text only as long as the tool-output limit:
+            # the reason is the only free text it holds, and it goes with the row.
+            cur = await conn.execute(
+                """
+                DELETE FROM answer_feedback
+                WHERE (tenant_id, conversation_id, answer_ts, voter) IN (
+                  SELECT tenant_id, conversation_id, answer_ts, voter FROM answer_feedback
+                  WHERE tenant_id = %(t)s AND at < %(cutoff)s LIMIT %(limit)s)
+                """,
+                {"t": tenant_id, "cutoff": cutoff("tool_outputs_days"), "limit": limit},
+            )
+            counts.answer_feedback = cur.rowcount
             cur = await conn.execute(
                 """
                 DELETE FROM inbound_events

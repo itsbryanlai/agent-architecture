@@ -74,6 +74,12 @@ def audit_notice_key(conversation_id: str, tool: str, marker: str) -> str:
     return f"{conversation_id}:audit:notice:{tool}:{marker}"
 
 
+def audit_feedback_key(conversation_id: str, answer_ts: str, voter: str, vote: str) -> str:
+    """One person's vote on one answer: a repeated identical click records once, a changed
+    vote records again. The reason text is never part of the event."""
+    return f"{conversation_id}:audit:feedback:{answer_ts}:{voter}:{vote}"
+
+
 def audit_hand_off_key(tenant: str, event_id: str) -> str:
     return f"{tenant}:audit:hand-off:{event_id}"
 

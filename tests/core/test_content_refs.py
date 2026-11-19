@@ -27,7 +27,7 @@ from agentos import ids
 from agentos.audit import canonical_sha256
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.gateway import app as gateway_app
-from agentos.gateway.app import TRY_AGAIN, create_app
+from agentos.gateway.app import APPROVAL_ACTIONS, EDIT_ACTION, TRY_AGAIN, create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.models import (
     CUT_SHORT,
@@ -135,11 +135,23 @@ class Gateway:
 
 
 def card_value(h, which: int = -1) -> dict:
-    """The task ID and nonce on the newest approval card (or an update that redrew it)."""
+    """The task ID and nonce on the newest approval card (or an update that redrew it).
+
+    An answer's feedback buttons are actions too, so only a message with task buttons counts.
+    """
     shown = [p["blocks"] for p in h.slack.posts() if p["blocks"]] + [
         u["blocks"] for u in h.slack.updates() if u["blocks"]
     ]
-    actions = next(b for b in shown[which] if b["type"] == "actions")
+    task_actions = set(APPROVAL_ACTIONS) | {EDIT_ACTION}
+    cards = [
+        blocks
+        for blocks in shown
+        if any(
+            b["type"] == "actions" and {e["action_id"] for e in b["elements"]} & task_actions
+            for b in blocks
+        )
+    ]
+    actions = next(b for b in cards[which] if b["type"] == "actions")
     return json.loads(actions["elements"][0]["value"])
 
 

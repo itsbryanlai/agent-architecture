@@ -20,6 +20,7 @@ from agentos.agent_health import (
 from agentos.audience_pauses import InMemoryPauseStore, PostgresPauseStore
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore
 from agentos.budgets import BudgetNotFound, InMemoryBudgetStore, PostgresBudgetStore
+from agentos.feedback import AnswerFeedback, InMemoryFeedbackStore, PostgresFeedbackStore
 from agentos.grant_picks import InMemoryGrantPickStore, PickedObject, PostgresGrantPickStore
 from agentos.members import (
     InMemoryMemberStore,
@@ -510,3 +511,44 @@ async def test_the_thread_lookup_finds_the_askers_newest_watching_task(tasks, te
     assert await tasks.watching_in_thread(tenant, "C1", "1.1", "u1") == newer
     assert await tasks.watching_in_thread(tenant, "C1", "1.1", "u3") is None
     assert await tasks.watching_in_thread(tenant, "C9", "1.1", "u1") is None
+
+
+# --- answer feedback ------------------------------------------------------------------
+
+
+@pytest.fixture
+def feedback(store_pool):
+    return twin(store_pool, InMemoryFeedbackStore, PostgresFeedbackStore)
+
+
+async def test_a_vote_is_one_per_person_and_answer_and_a_second_click_replaces_it(
+    feedback, tenant: str, other_tenant: str
+):
+    """Fails if a second vote by the same person adds a row or keeps the first vote and reason,
+    another person's vote is merged, a reason attaches to a 👍, or a tenant reads another's votes."""
+    conv = f"{tenant}:conv:C1:1.1"
+    await feedback.record_vote(AnswerFeedback(tenant, conv, "1.2", "U1", "aa", 1, "up", None, NOW))
+    await feedback.record_vote(
+        AnswerFeedback(tenant, conv, "1.2", "U1", "aa", 1, "down", None, NOW + timedelta(hours=1))
+    )
+    await feedback.record_vote(AnswerFeedback(tenant, conv, "1.2", "U2", "aa", 1, "up", None, NOW))
+    assert await feedback.set_reason(tenant, conv, "1.2", "U1", "cited the wrong page") is True
+
+    mine = await feedback.get(tenant, conv, "1.2", "U1")
+    assert (mine.vote, mine.reason, mine.at) == (
+        "down",
+        "cited the wrong page",
+        NOW + timedelta(hours=1),
+    )
+    assert (mine.agent_id, mine.agent_version) == ("aa", 1)
+    assert (await feedback.get(tenant, conv, "1.2", "U2")).vote == "up"
+    assert await feedback.set_reason(tenant, conv, "1.2", "U2", "not for an upvote") is False
+    assert (await feedback.get(tenant, conv, "1.2", "U2")).reason is None
+
+    # A changed vote replaces the reason too; a 👍 carries none.
+    await feedback.record_vote(
+        AnswerFeedback(tenant, conv, "1.2", "U1", "aa", 1, "up", None, NOW + timedelta(hours=2))
+    )
+    assert (await feedback.get(tenant, conv, "1.2", "U1")).reason is None
+    assert await feedback.get(other_tenant, conv, "1.2", "U1") is None
+    assert await feedback.set_reason(other_tenant, conv, "1.2", "U1", "x") is False

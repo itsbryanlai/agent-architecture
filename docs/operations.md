@@ -1103,6 +1103,22 @@ A scope whose granted page is gone is reported to the agent's creator; to delete
 than three nightly runs, run `uv run python -m agentos.index_knowledge --confirm-gone` (add
 `--tenant` for one tenant).
 
+### Search log and the Searched line
+
+Every `search_knowledge` call logs one line, `search_knowledge returned`, with the tenant
+and agent IDs, the number of granted scopes (`scopes`), the candidate hits (`hits`), how
+many the distance cut-off dropped (`dropped`), how many passages were kept (`kept`), and
+each kept page's ID and best distance (`pages=<page id>:<distance>,…`). It carries no
+titles or passage text. It tells a search that found nothing from one whose passages the
+answer did not cite.
+
+An answer that cites its passages gets the Sources line. When a turn's searches returned
+passages but the answer cites none of them, the reply instead shows a Searched line naming
+up to three of those pages, nearest first, built from the same stored page metadata and
+only scopes still granted to the agent. A turn whose searches returned nothing shows no
+footer. The Searched line is behind the `searched-footer` patch marker, so histories
+recorded before it replay unchanged.
+
 ### Upgrading an existing index
 
 Migration `021_knowledge_health.sql` adds what each page row records (embedding model,

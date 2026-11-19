@@ -665,8 +665,10 @@ gateway or the console; three infrastructure images live under `deploy/`.
 `.railway/railway.ts` declares all six services, their volumes and their
 non-secret variables. Apply it with the Railway CLI (`railway config plan`,
 then `railway config apply`); a deploy does not read the file. Secrets are
-never in the file: each `preserve()` entry keeps the value set in that
-service's Railway variables.
+never in the file: each is a project shared variable, set once, and a service
+gets only the secrets it references as `${{shared.NAME}}`. The two optional
+ones (`ANTHROPIC_API_KEY`, `NOTION_WEBHOOK_VERIFICATION_TOKEN`) are `preserve()`
+entries in that one service's variables, unset unless needed.
 
 **The hosted runbook** — the maintainer follows these steps once, from a checkout
 of this repository. Every `railway` command is the Railway CLI's
@@ -686,10 +688,9 @@ that documents it.
    plan`, read the changes (variable values are redacted), and `railway config
    apply` ([config](https://docs.railway.com/cli/config)). This creates the six
    services and the three volumes; it does not deploy them.
-3. **Set the secret variables** the table below lists, per service, in the
-   dashboard's Variables tab or typed by the maintainer as `railway variable set
-   KEY=value --service <name>`
-   ([variable](https://docs.railway.com/cli/variable)). For `acme`'s existing
+3. **Set the secret variables** the table below lists, once each, as project
+   shared variables (dashboard: Project Settings → Shared Variables); the
+   services already reference them. For `acme`'s existing
    payload key, the value to paste is the key file's content: the file already
    holds the base64 of the 32 bytes. The maintainer prints it themselves —
    `cat ~/.agentos/keys/acme.key` (the file under their `AGENTOS_KEY_DIR`) — and
@@ -750,9 +751,10 @@ reach each other at `<service>.railway.internal` over `http://` (the private
 network is encrypted); postgres, temporal, ollama and the worker have no public
 domain. Generate the gateway's and console's domains in the dashboard.
 
-Variables, by service (names only; a secret is set in the service's Railway
-variables and kept by `preserve()`). `${{VAR}}` is Railway's reference syntax,
-resolved from the same service's variables.
+Variables, by service (names only; a secret is a project shared variable that
+the service references as `${{shared.NAME}}`). `${{VAR}}` is Railway's
+reference syntax; `POSTGRES_PASSWORD` references the shared
+`AGENTOS_OWNER_DB_PASSWORD`.
 
 | Variable | Services | Value shape |
 |---|---|---|

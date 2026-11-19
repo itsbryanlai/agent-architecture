@@ -1,9 +1,11 @@
 // The whole hosted project as code: three app processes from the root
 // Dockerfile, three infrastructure images from deploy/. Apply with the Railway
 // CLI (railway config plan, then railway config apply); deploys do not read
-// this file. Secrets are never written here: every preserve() keeps the value
-// set in that service's Railway variables. Non-secret values and references
-// are declared below; ${{VAR}} inside a string is Railway's reference syntax,
+// this file. Secrets are never written here: each is a project shared
+// variable, set once in the dashboard, and a service gets only the ones it
+// references as ${{shared.NAME}}. preserve() keeps an optional value set in
+// that one service's variables (unset unless needed). Non-secret values and
+// references are declared below; ${{VAR}} inside a string is Railway's reference syntax,
 // resolved from the same service's variables at run time.
 //
 // Public domains for gateway and console are generated in the dashboard (a
@@ -14,9 +16,9 @@ import { defineRailway, github, preserve, project, service, volume } from "railw
 
 const REPO = "itsbryanlai/agent-architecture";
 
-// The app role's URL; the password is the service's own AGENTOS_APP_DB_PASSWORD.
+// The app role's URL; the password is the shared AGENTOS_APP_DB_PASSWORD.
 const APP_DATABASE_URL =
-  "postgresql://agentos_app:${{AGENTOS_APP_DB_PASSWORD}}@postgres.railway.internal:5432/agentos";
+  "postgresql://agentos_app:${{shared.AGENTOS_APP_DB_PASSWORD}}@postgres.railway.internal:5432/agentos";
 const TEMPORAL_ADDRESS = "temporal.railway.internal:7233";
 
 export default defineRailway(() => {
@@ -35,7 +37,7 @@ export default defineRailway(() => {
       POSTGRES_USER: "agentos",
       POSTGRES_DB: "agentos",
       // The owner role's password; set it in the service's variables.
-      POSTGRES_PASSWORD: preserve(),
+      POSTGRES_PASSWORD: "${{shared.AGENTOS_OWNER_DB_PASSWORD}}",
       PORT: "5432",
     },
     volumeMounts: { "/var/lib/postgresql/data": postgresData },
@@ -94,28 +96,28 @@ export default defineRailway(() => {
     },
     env: {
       AGENTOS_DATABASE_URL: APP_DATABASE_URL,
-      AGENTOS_APP_DB_PASSWORD: preserve(),
+      AGENTOS_APP_DB_PASSWORD: "${{shared.AGENTOS_APP_DB_PASSWORD}}",
       // Read only by the pre-deploy command, never by the worker process.
       AGENTOS_OWNER_DATABASE_URL:
-        "postgresql://agentos:${{AGENTOS_OWNER_DB_PASSWORD}}@postgres.railway.internal:5432/agentos",
-      AGENTOS_OWNER_DB_PASSWORD: preserve(),
+        "postgresql://agentos:${{shared.AGENTOS_OWNER_DB_PASSWORD}}@postgres.railway.internal:5432/agentos",
+      AGENTOS_OWNER_DB_PASSWORD: "${{shared.AGENTOS_OWNER_DB_PASSWORD}}",
       AGENTOS_TEMPORAL_ADDRESS: TEMPORAL_ADDRESS,
       AGENTOS_EMBED_BASE_URL: "http://ollama.railway.internal:11434/v1",
       AGENTOS_EMBED_MODEL: "bge-m3",
       // Per-tenant payload keys come from variables, the same in the gateway
       // (docs/operations.md, Payload keys on a host without files).
       AGENTOS_KEY_SOURCE: "env",
-      AGENTOS_PAYLOAD_KEY_ACME_V1: preserve(),
+      AGENTOS_PAYLOAD_KEY_ACME_V1: "${{shared.AGENTOS_PAYLOAD_KEY_ACME_V1}}",
       // The hosted chat model is Qwen qwen3.7-plus; the model must have an
       // entry in config/prices.yaml or the worker refuses to start. Anthropic
       // is supported too: AGENTOS_LLM_PROVIDER=anthropic with ANTHROPIC_API_KEY.
       AGENTOS_LLM_PROVIDER: "qwen",
       AGENTOS_MODEL: "qwen3.7-plus",
       ANTHROPIC_API_KEY: preserve(),
-      QWEN_API_KEY: preserve(),
-      QWEN_BASE_URL: preserve(),
-      SLACK_BOT_TOKEN: preserve(),
-      NOTION_TOKEN: preserve(),
+      QWEN_API_KEY: "${{shared.QWEN_API_KEY}}",
+      QWEN_BASE_URL: "${{shared.QWEN_BASE_URL}}",
+      SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
+      NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
     },
   });
 
@@ -133,15 +135,15 @@ export default defineRailway(() => {
     },
     env: {
       AGENTOS_DATABASE_URL: APP_DATABASE_URL,
-      AGENTOS_APP_DB_PASSWORD: preserve(),
+      AGENTOS_APP_DB_PASSWORD: "${{shared.AGENTOS_APP_DB_PASSWORD}}",
       AGENTOS_TEMPORAL_ADDRESS: TEMPORAL_ADDRESS,
       // The same payload keys as the worker; the Notion webhook token is
       // encrypted with them in the database, so the gateway needs no volume.
       AGENTOS_KEY_SOURCE: "env",
-      AGENTOS_PAYLOAD_KEY_ACME_V1: preserve(),
-      SLACK_SIGNING_SECRET: preserve(),
-      SLACK_BOT_TOKEN: preserve(),
-      NOTION_TOKEN: preserve(),
+      AGENTOS_PAYLOAD_KEY_ACME_V1: "${{shared.AGENTOS_PAYLOAD_KEY_ACME_V1}}",
+      SLACK_SIGNING_SECRET: "${{shared.SLACK_SIGNING_SECRET}}",
+      SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
+      NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
       // Optional local override; leave unset so the token lives in the
       // database (docs/operations.md, Notion webhook).
       NOTION_WEBHOOK_VERIFICATION_TOKEN: preserve(),
@@ -162,18 +164,18 @@ export default defineRailway(() => {
     },
     env: {
       AGENTOS_DATABASE_URL: APP_DATABASE_URL,
-      AGENTOS_APP_DB_PASSWORD: preserve(),
+      AGENTOS_APP_DB_PASSWORD: "${{shared.AGENTOS_APP_DB_PASSWORD}}",
       // Sign-in with Slack is required to bind beyond loopback; all three
       // must be set. The console's Host and Origin allowlists are built from
       // AGENTOS_CONSOLE_URL, so it must be the exact public base URL.
-      SLACK_CLIENT_ID: preserve(),
-      SLACK_CLIENT_SECRET: preserve(),
+      SLACK_CLIENT_ID: "${{shared.SLACK_CLIENT_ID}}",
+      SLACK_CLIENT_SECRET: "${{shared.SLACK_CLIENT_SECRET}}",
       AGENTOS_CONSOLE_URL: "https://${{RAILWAY_PUBLIC_DOMAIN}}",
-      NOTION_TOKEN: preserve(),
-      SLACK_BOT_TOKEN: preserve(),
+      NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
+      SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
       // Optional: the "Choose from Notion" grant picker.
-      NOTION_OAUTH_CLIENT_ID: preserve(),
-      NOTION_OAUTH_CLIENT_SECRET: preserve(),
+      NOTION_OAUTH_CLIENT_ID: "${{shared.NOTION_OAUTH_CLIENT_ID}}",
+      NOTION_OAUTH_CLIENT_SECRET: "${{shared.NOTION_OAUTH_CLIENT_SECRET}}",
     },
   });
 

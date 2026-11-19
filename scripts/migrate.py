@@ -32,6 +32,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import psycopg
@@ -45,6 +46,10 @@ INIT_DB = Path(__file__).resolve().parent / "init_db.sql"
 _FILE = re.compile(r"(\d{3})_[a-z0-9_]+\.sql")
 # The migration that creates schema_migrations. It runs before the table can be read.
 BOOTSTRAP = "000"
+# A database still starting (a hosted redeploy) gets about two minutes.
+CONNECT_ATTEMPTS = 24
+CONNECT_WAIT_SECONDS = 5.0
+CONNECT_TIMEOUT_SECONDS = 5
 
 
 class MigrateError(Exception):
@@ -156,6 +161,29 @@ def migrate(
     return applied
 
 
+def connect(
+    url: str,
+    attempts: int = CONNECT_ATTEMPTS,
+    wait: float = CONNECT_WAIT_SECONDS,
+    sleep=time.sleep,
+    log=print,
+) -> psycopg.Connection:
+    """Connect as the owner, waiting for a database that is still starting.
+
+    A hosted deploy can run this while Postgres restarts; a refused or timed-out
+    connection is tried again ``attempts`` times in all before the error stands.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg.connect(url, autocommit=True, connect_timeout=CONNECT_TIMEOUT_SECONDS)
+        except psycopg.OperationalError:
+            if attempt == attempts:
+                raise
+            log(f"the database is not answering yet; trying again ({attempt}/{attempts})")
+            sleep(wait)
+    raise AssertionError("unreachable")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -175,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         files = migration_files()
-        with psycopg.connect(url, autocommit=True) as conn:
+        with connect(url) as conn:
             role = ensure_app_role(conn, os.environ.get(APP_PASSWORD_VAR), args.set_app_password)
             print(f"role {APP_ROLE}: {role}")
             applied = migrate(conn, files, args.baseline)

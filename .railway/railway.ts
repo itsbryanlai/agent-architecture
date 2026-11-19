@@ -16,8 +16,8 @@ import { defineRailway, github, preserve, project, service, volume } from "railw
 
 const REPO = "itsbryanlai/agent-architecture";
 // Services deploy only from this branch. Work merges into main; a release moves
-// deployment/prod forward to a main commit (docs/operations.md, Releases).
-const DEPLOY_BRANCH = "deployment/prod";
+// deploy/prod forward to a main commit (docs/operations.md, Releases).
+const DEPLOY_BRANCH = "deploy/prod";
 
 // The app role's URL; the password is the shared AGENTOS_APP_DB_PASSWORD.
 const APP_DATABASE_URL =
@@ -34,7 +34,6 @@ export default defineRailway(() => {
 
   const postgres = service("postgres", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/postgres" }),
-    build: { builder: "DOCKERFILE" },
     deploy: {
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
@@ -42,6 +41,9 @@ export default defineRailway(() => {
     env: {
       POSTGRES_USER: "agentos",
       POSTGRES_DB: "agentos",
+      // A Railway volume's root holds lost+found, and initdb refuses a non-empty
+      // directory: the cluster lives in a subdirectory of the mount.
+      PGDATA: "/var/lib/postgresql/data/pgdata",
       // The owner role's password; set it in the service's variables.
       POSTGRES_PASSWORD: "${{shared.AGENTOS_OWNER_DB_PASSWORD}}",
       PORT: "5432",
@@ -51,7 +53,6 @@ export default defineRailway(() => {
 
   const temporal = service("temporal", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/temporal" }),
-    build: { builder: "DOCKERFILE" },
     start: "temporal server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db",
     deploy: {
       restartPolicyType: "ON_FAILURE",
@@ -69,7 +70,6 @@ export default defineRailway(() => {
 
   const ollama = service("ollama", {
     source: github(REPO, { branch: DEPLOY_BRANCH, rootDirectory: "deploy/ollama" }),
-    build: { builder: "DOCKERFILE" },
     // The entrypoint reads PORT and OLLAMA_MODELS from the environment.
     start: "/bin/sh /entrypoint.sh",
     deploy: {

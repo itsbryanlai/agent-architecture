@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import psycopg
 import pytest
 
 from agentos.models import AUDIT_KINDS
@@ -157,3 +158,26 @@ def test_migrate_builds_an_empty_database_from_init_db(
         assert versions == list(EXPECTED_VERSIONS)
         with db.owner() as reference:
             assert catalog.difference(catalog.dump(reference), catalog.dump(conn)) == []
+
+
+def test_migrate_waits_for_a_database_that_is_not_answering_then_gives_up(
+    databases: Databases,
+):
+    """Fails if a refused connection is not tried again before the error stands, or a live one waits."""
+    migrate = load_migrate()
+    waits: list[float] = []
+    lines: list[str] = []
+    refused = "postgresql://nobody@127.0.0.1:1/none"
+
+    with pytest.raises(psycopg.OperationalError):
+        migrate.connect(refused, attempts=3, wait=7.0, sleep=waits.append, log=lines.append)
+    assert waits == [7.0, 7.0]
+    assert lines == [
+        "the database is not answering yet; trying again (1/3)",
+        "the database is not answering yet; trying again (2/3)",
+    ]
+
+    waits.clear()
+    with migrate.connect(databases.create().owner_url, attempts=3, sleep=waits.append) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    assert waits == []

@@ -804,6 +804,7 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `AGENTOS_OWNER_DB_PASSWORD` | worker (pre-deploy only) | secret: the owner role's password |
 | `POSTGRES_PASSWORD` | postgres | secret: the owner role's password, same as above |
 | `POSTGRES_USER`, `POSTGRES_DB` | postgres | `agentos`, `agentos` |
+| `PGDATA` | postgres | `/var/lib/postgresql/data/pgdata`: a subdirectory, because the volume's root holds `lost+found` and `initdb` refuses a non-empty directory |
 | `AGENTOS_TEMPORAL_ADDRESS` | worker, gateway | `temporal.railway.internal:7233` |
 | `AGENTOS_EMBED_BASE_URL` | worker | `http://ollama.railway.internal:11434/v1` |
 | `AGENTOS_EMBED_MODEL` | worker | `bge-m3` |
@@ -871,10 +872,9 @@ import` and `python -m agentos.agent_store import`.
 
 ### Releases
 
-Every service deploys from the `deployment/prod` branch, never from `main`, so
-merging work into `main` deploys nothing. The first release creates the branch
-on GitHub (Branches, New branch, `deployment/prod` from `main`). Each later
-release is a pull request from `main` into `deployment/prod`, merged on GitHub;
+Every service deploys from the `deploy/prod` branch, never from `main`, so
+merging work into `main` deploys nothing. Each release is a pull request from
+`main` into `deploy/prod`, merged on GitHub;
 every service then builds and deploys that commit. The local pre-push hook
 allows only feature branches, so the branch is never pushed from a checkout.
 

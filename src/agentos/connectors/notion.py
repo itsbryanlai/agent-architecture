@@ -123,7 +123,11 @@ class NotionAPI(Protocol):
         ...
 
     async def retrieve_database(self, database_id: str) -> dict:
-        """The database object: its ``title`` and ``parent`` (read only)."""
+        """The database object: its ``title``, ``parent`` and ``data_sources`` (read only)."""
+        ...
+
+    async def retrieve_data_source(self, data_source_id: str) -> dict:
+        """The data source object: its ``title`` is the name people see in Notion."""
         ...
 
     async def list_child_blocks(self, block_id: str) -> list[dict]:
@@ -234,6 +238,9 @@ class RealNotionAPI:
 
     async def retrieve_database(self, database_id: str) -> dict:
         return await self._client.databases.retrieve(database_id=database_id)
+
+    async def retrieve_data_source(self, data_source_id: str) -> dict:
+        return await self._client.data_sources.retrieve(data_source_id=data_source_id)
 
     async def list_child_blocks(self, block_id: str) -> list[dict]:
         blocks: list[dict] = []
@@ -395,11 +402,22 @@ class FakeNotionAPI:
     def add_database(self, database_id: str) -> None:
         self.databases.setdefault(normalize_id(database_id), {})
 
-    def set_database_info(self, database_id: str, title: str, parent: dict | None = None) -> None:
-        """Set what ``retrieve_database`` returns for a database: its title and parent."""
+    def set_database_info(
+        self,
+        database_id: str,
+        title: str,
+        parent: dict | None = None,
+        data_source_title: str | None = None,
+    ) -> None:
+        """Set what ``retrieve_database`` returns for a database: its title and parent.
+
+        With ``data_source_title`` the database has one data source of that title, as in
+        Notion's 2025 model: the container and its single source can be named differently.
+        """
         self.database_info[normalize_id(database_id)] = {
             "title": title,
             "parent": parent or {"type": "workspace", "workspace": True},
+            "data_source_title": data_source_title,
         }
 
     def set_schema(self, database_id: str, schema: dict[str, dict]) -> None:
@@ -591,11 +609,25 @@ class FakeNotionAPI:
         if key not in self.databases and key not in self.database_info:
             raise FakeNotFound(database_id)
         info = self.database_info.get(key, {"title": "", "parent": {"type": "workspace"}})
-        return {
+        obj = {
             "object": "database",
             "id": database_id,
             "title": [_rich({"text": {"content": info["title"]}})],
             "parent": copy.deepcopy(info["parent"]),
+        }
+        if info.get("data_source_title") is not None:
+            obj["data_sources"] = [{"id": f"ds-{key}", "name": info["data_source_title"]}]
+        return obj
+
+    async def retrieve_data_source(self, data_source_id: str) -> dict:
+        self.calls.append(("retrieve_data_source", {"data_source_id": data_source_id}))
+        info = self.database_info.get(data_source_id.removeprefix("ds-"))
+        if info is None or info.get("data_source_title") is None:
+            raise FakeNotFound(data_source_id)
+        return {
+            "object": "data_source",
+            "id": data_source_id,
+            "title": [_rich({"text": {"content": info["data_source_title"]}})],
         }
 
     async def list_child_blocks(self, block_id: str) -> list[dict]:
@@ -956,11 +988,25 @@ async def _parent_label(api: NotionAPI, parent: dict) -> str:
 async def describe_object(api: NotionAPI, kind: str, object_id: str) -> LiveObject:
     """Fetch the live title and first parent of a granted database (``kind`` ``database``)
     or page. An object or parent Notion refuses to show (403, 404) leaves that field None
-    or says so; any other failure propagates for the caller to judge."""
+    or says so; any other failure propagates for the caller to judge.
+
+    A database's live title is its single data source's title when it has one: in Notion's
+    2025 model the container and its data sources are named separately, and the data
+    source's title is the name people see as the database name. One extra read, only for
+    a single-source database; a source Notion refuses to show leaves the container's title.
+    """
     try:
         if kind == "database":
             obj = await api.retrieve_database(object_id)
             title = _plain(obj.get("title", []))
+            sources = obj.get("data_sources") or []
+            if len(sources) == 1:
+                try:
+                    source = await api.retrieve_data_source(sources[0]["id"])
+                    title = _plain(source.get("title", [])) or title
+                except Exception as err:
+                    if not is_unreachable(err):
+                        raise
         else:
             obj = await api.retrieve_page(object_id)
             title = _page_title(obj)

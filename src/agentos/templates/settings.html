@@ -70,6 +70,29 @@
   <div class="actions"><button type="submit">Save routing</button></div>
 </form>
 
+<h2>Agent health</h2>
+<p class="muted">Each published agent's Notion access, as the worker's last check found it. An unavailable agent answers with one fixed reply until a check passes; the reason names the grant and the problem. Read-only here: fix the grant in Notion or the agent's definition, and the next check marks it available again.</p>
+<table>
+  <tr><th>Agent</th><th>Status</th><th>Reason</th><th>Last checked</th></tr>
+  {% for a in view.published %}
+  {% set row = view.health.get(a.agent_id) %}
+  <tr>
+    <td>{{ a.name }} ({{ a.agent_id }})</td>
+    {% if row %}
+    <td>{% if row.status == "unavailable" %}<span class="error">unavailable</span>{% else %}available{% endif %}</td>
+    <td>{{ row.reason or "" }}</td>
+    <td>{{ row.checked_at | stamp }}</td>
+    {% else %}
+    <td>never checked</td>
+    <td></td>
+    <td></td>
+    {% endif %}
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">No published agents yet.</td></tr>
+  {% endfor %}
+</table>
+
 <h2>Notion</h2>
 {% if not picker_enabled %}
 <p class="muted">Connecting Notion is not set up on this console. The operator configures the public Notion integration (<code>NOTION_OAUTH_CLIENT_ID</code> and <code>NOTION_OAUTH_CLIENT_SECRET</code>); it is the same integration "Choose from Notion" uses.</p>

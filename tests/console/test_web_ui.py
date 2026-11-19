@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from agentos.agent_health import AVAILABLE, UNAVAILABLE, AgentHealth
 from agentos.config import parse_agent
 from agentos.web_ui import SKELETON, definition_text, parse_definition
 from tests.conftest import DB_ID, GLOBEX, TENANT, default_schema
@@ -84,6 +85,17 @@ async def test_the_agents_page_links_the_admin_pages_and_offers_a_new_agent(h):
     assert f'href="{UI}/members"' in page.text and f'href="{UI}/audit"' in page.text
     assert "New agent" in page.text
     assert 'name="request_id"' in page.text
+
+
+@pytest.mark.parametrize("status", [UNAVAILABLE, AVAILABLE], ids=["unavailable", "available"])
+async def test_the_agents_list_badges_an_unavailable_agent(h, status):
+    """Fails if the agents list does not badge an unavailable agent, or badges an available one."""
+    await make_pending(h)
+    await h.health.record(AgentHealth(TENANT, "it-helper", 1, status, None, h.clock()))
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(f"{UI}/agents")).text
+    assert ('<span class="status">unavailable</span>' in page) is (status == UNAVAILABLE)
 
 
 async def test_the_agent_page_lists_its_pending_version_and_its_creator(h):

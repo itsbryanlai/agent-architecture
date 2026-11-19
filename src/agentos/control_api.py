@@ -680,6 +680,7 @@ async def _real_lifespan(app: FastAPI):
     """Build the real dependencies when the server starts, not at import."""
     from psycopg_pool import AsyncConnectionPool
 
+    from agentos.agent_health import PostgresAgentHealthStore
     from agentos.agent_store import PostgresAgentStore
     from agentos.audience import SlackAudienceInspector
     from agentos.audience_pauses import PostgresPauseStore
@@ -781,6 +782,7 @@ async def _real_lifespan(app: FastAPI):
             tenant_store=tenant_store,
             webhook_tokens=webhook_tokens,
             slack_for=slack_for,
+            health=PostgresAgentHealthStore(pool),
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:

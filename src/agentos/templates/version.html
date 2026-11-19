@@ -104,6 +104,9 @@
   </td></tr>
   <tr><th>Guests</th><td>{% if eff.guests %}allowed{% else %}not allowed{% endif %}. People from other Slack workspaces are never let in.</td></tr>
 </table>
+{% if eff.explicit and not eff.dm_everyone and not eff.dm_user_groups %}
+<p class="warn">Direct messages: nobody (add <code>dm: everyone</code> to keep them open).</p>
+{% endif %}
 {% if audience.summary %}
 {% set sm = audience.summary %}
 <p><strong>{{ sm.total }} people</strong> can reach this agent: {{ sm.guests }} guest{{ "" if sm.guests == 1 else "s" }}, {{ sm.external }} from another workspace. Counted from Slack just now.</p>

@@ -11,6 +11,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audience_pauses import InMemoryPauseStore
 from agentos.audit import InMemoryAuditStore
@@ -130,6 +131,7 @@ class ConsoleHarness:
         self.budgets = InMemoryBudgetStore()
         self.pauses = InMemoryPauseStore()
         self.switches = InMemorySwitchStore()
+        self.health = InMemoryAgentHealthStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -165,6 +167,7 @@ class ConsoleHarness:
             tenant_store=tenant_store,
             webhook_tokens=webhook_tokens,
             slack_for=slack_for,
+            health=self.health,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

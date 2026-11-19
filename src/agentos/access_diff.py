@@ -7,7 +7,8 @@ messages opened wider, guests let in. A widening publish needs the approver's
 acknowledgement (``ControlPlane.publish_version``), which names the published version the
 diff was computed against. With no published version to compare with, everything the version
 grants and every place it answers is new, so a first publish widens whenever it grants or
-reaches anything.
+reaches anything. An audience that closes direct messages to nobody says so plainly, with
+the way to keep them open; that is a narrowing, not a widening.
 """
 
 from __future__ import annotations
@@ -100,7 +101,16 @@ def diff_access(
         changes.append(AccessChange("removed", f"channel {channel}", False))
     if new_audience.any_unmapped_channel and not old_audience.any_unmapped_channel:
         changes.append(AccessChange("added", "every channel the tenant file does not map", True))
-    if new_audience.dm_everyone != old_audience.dm_everyone:
+    dm_closed = not new_audience.dm_everyone and not new_audience.dm_user_groups
+    if dm_closed and (old_audience.dm_everyone or old_audience.dm_user_groups or not baseline):
+        # An audience that omits dm closes direct messages to nobody; say so plainly,
+        # with the way to keep them open, rather than as a technical comparison.
+        changes.append(
+            AccessChange(
+                "changed", "direct messages: nobody (add dm: everyone to keep them open)", False
+            )
+        )
+    elif new_audience.dm_everyone != old_audience.dm_everyone:
         wider = new_audience.dm_everyone
         changes.append(
             AccessChange(

@@ -107,6 +107,34 @@ class TenantStore(Protocol):
 
     async def set_enabled(self, tenant_id: str, enabled: bool) -> None: ...
 
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        """Store the default agent and the channel map an admin set in the console.
+
+        ``conn`` joins the change to a unit of work, as ``insert`` does. The directory
+        notices the moved change time on its next refresh, with no restart.
+        """
+        ...
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        """Store the connected Notion workspace (or clear it with None).
+
+        A workspace another tenant already uses raises ``ConfigError``: one Notion
+        workspace belongs to one tenant, as the import and the install require.
+        """
+        ...
+
 
 def _secret_env(config: AgentsConfig) -> dict[str, str]:
     return config.secrets.names()
@@ -117,6 +145,7 @@ def _config_from_row(
     slack_team_id: str,
     default_agent: str,
     notion_workspace_id: str | None,
+    notion_workspace_name: str | None,
     channels: dict,
     admins: list,
     secret_env: dict,
@@ -133,6 +162,7 @@ def _config_from_row(
         agents={},
         default_agent=default_agent,
         notion_workspace_id=notion_workspace_id,
+        notion_workspace_name=notion_workspace_name,
         secrets=TenantSecrets(**secret_env),
         channels={str(k): str(v) for k, v in channels.items()},
         admins=tuple(str(a) for a in admins),
@@ -165,7 +195,7 @@ class PostgresTenantStore:
             cur = await conn.execute(
                 """
                 SELECT tenant_id, slack_team_id, default_agent, notion_workspace_id,
-                       channels, admins, secret_env, enabled, updated_at
+                       notion_workspace_name, channels, admins, secret_env, enabled, updated_at
                 FROM tenants WHERE tenant_id = %s
                 """,
                 (tenant_id,),
@@ -173,7 +203,7 @@ class PostgresTenantStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return TenantRow(_config_from_row(*row[:7]), row[7], row[8])
+        return TenantRow(_config_from_row(*row[:8]), row[8], row[9])
 
     async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         try:
@@ -181,8 +211,9 @@ class PostgresTenantStore:
                 cur = await db.execute(
                     """
                     INSERT INTO tenants (tenant_id, slack_team_id, default_agent,
-                                         notion_workspace_id, channels, admins, secret_env)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                         notion_workspace_id, notion_workspace_name,
+                                         channels, admins, secret_env)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tenant_id) DO NOTHING
                     RETURNING tenant_id
                     """,
@@ -191,6 +222,7 @@ class PostgresTenantStore:
                         config.slack_team_id,
                         config.default_agent,
                         config.notion_workspace_id,
+                        config.notion_workspace_name,
                         Jsonb(config.channels),
                         Jsonb(list(config.admins)),
                         Jsonb(_secret_env(config)),
@@ -209,6 +241,39 @@ class PostgresTenantStore:
                 "UPDATE tenants SET enabled = %s, updated_at = now() WHERE tenant_id = %s",
                 (enabled, tenant_id),
             )
+
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await db.execute(
+                "UPDATE tenants SET default_agent = %s, channels = %s WHERE tenant_id = %s",
+                (default_agent, Jsonb(channels), tenant_id),
+            )
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        try:
+            async with joined_transaction(self._pool, tenant_id, conn) as db:
+                await db.execute(
+                    "UPDATE tenants SET notion_workspace_id = %s, notion_workspace_name = %s "
+                    "WHERE tenant_id = %s",
+                    (workspace_id, workspace_name, tenant_id),
+                )
+        except UniqueViolation as err:
+            raise ConfigError(
+                f"tenant '{tenant_id}': another tenant already uses Notion workspace "
+                f"'{workspace_id}'"
+            ) from err
 
 
 # --- In memory (tests) --------------------------------------------------------
@@ -267,6 +332,42 @@ class InMemoryTenantStore:
 
     async def set_enabled(self, tenant_id: str, enabled: bool) -> None:
         self._put(self._rows[tenant_id].config, enabled)
+
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        row = self._rows[tenant_id]
+        self._put(
+            replace(row.config, default_agent=default_agent, channels=dict(channels)), row.enabled
+        )
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        if workspace_id:
+            for other_id, row in self._rows.items():
+                if other_id != tenant_id and row.config.notion_workspace_id == workspace_id:
+                    raise ConfigError(
+                        f"tenant '{tenant_id}': another tenant already uses Notion workspace "
+                        f"'{workspace_id}'"
+                    )
+        row = self._rows[tenant_id]
+        self._put(
+            replace(
+                row.config,
+                notion_workspace_id=workspace_id,
+                notion_workspace_name=workspace_name,
+            ),
+            row.enabled,
+        )
 
     def replace_config(self, config: AgentsConfig) -> None:
         """Test hook: change a stored tenant's settings, as an admin tool will."""

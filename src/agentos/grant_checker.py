@@ -19,7 +19,8 @@ tenant-level credentials.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
@@ -185,7 +186,7 @@ class _ReadErrors:
 
 
 class NotionGrantChecker:
-    def __init__(self, api_for: Callable[[str], NotionAPI]):
+    def __init__(self, api_for: Callable[[str], NotionAPI | Awaitable[NotionAPI]]):
         self._api_for = api_for
 
     async def check(self, tenant_id: str, agent: AgentVersion) -> list[GrantReport]:
@@ -195,6 +196,8 @@ class NotionGrantChecker:
             return []
         # Outside the try: a missing key is a setup error, not a Notion outage.
         api = self._api_for(tenant_id)
+        if inspect.isawaitable(api):
+            api = await api
         try:
             return await self._reports(api, grants, pages)
         except Exception as err:

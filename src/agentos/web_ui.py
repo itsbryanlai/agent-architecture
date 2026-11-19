@@ -126,6 +126,11 @@ NOTICES = {
     "budget-removed": "Budget removed.",
     "switch-off": "Turned off. It takes effect on the next step.",
     "switch-on": "Turned back on.",
+    "routing-saved": "Routing saved. Every process picks it up on its next refresh.",
+    "notion-connected": "Notion connected.",
+    "notion-disconnected": "Notion disconnected.",
+    "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
+    "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
 }
 
 # What the version page shows after a refused publish. Like NOTICES, the redirect
@@ -308,6 +313,14 @@ class WebUI:
         self.route("GET", base + "/switches", self.switches)
         self.route("POST", base + "/switches/off", self.turn_off)
         self.route("POST", base + "/switches/on", self.turn_on)
+        self.route("GET", base + "/settings", self.settings)
+        self.route("POST", base + "/settings/routing", self.set_routing)
+        self.route("POST", base + "/settings/notion/start", self.notion_connect_start)
+        self.route("POST", base + "/settings/notion/disconnect", self.notion_disconnect)
+        self.route("POST", base + "/settings/webhook/reveal", self.webhook_reveal)
+        self.route("POST", base + "/settings/webhook/confirm", self.webhook_confirm)
+        self.route("POST", base + "/settings/webhook/clear", self.webhook_clear)
+        app.add_route("/static/console.js", self.console_js, methods=["GET"])
         if self.deps.console is not None:
             # Public pages: the install runs before any tenant (or session) exists.
             app.add_route(INSTALL_PATH, self.install_page, methods=["GET"])
@@ -871,6 +884,8 @@ class WebUI:
         )
         if not mine or flow is None:
             return _message("Could not sign in", "That Notion sign-in is not valid.", 400)
+        if flow.purpose == "connect":
+            return await self.notion_connect_callback(request, flow)
         back = self.version_url_for(flow)
         code = request.query_params.get("code", "")
         if request.query_params.get("error") or not code:
@@ -1093,6 +1108,178 @@ class WebUI:
         )
         return _redirect(self.base(ctx) + "/switches?done=switch-on")
 
+    # --- tenant settings --------------------------------------------------------
+
+    async def settings(self, request: Request, ctx: Ctx) -> Response:
+        return await self.settings_page(request, ctx, notice=self.notice(request))
+
+    async def settings_page(
+        self,
+        request: Request,
+        ctx: Ctx,
+        status: int = 200,
+        error: str | None = None,
+        notice: str | None = None,
+        webhook_token: str | None = None,
+    ) -> Response:
+        """The admin settings page. ``webhook_token`` is shown once, after a reveal."""
+        view = await ctx.plane.tenant_settings(ctx.tenant_id, ctx.principal)
+        return _page(
+            "settings.html",
+            status,
+            ctx=ctx,
+            view=view,
+            picker_enabled=self.deps.picker is not None,
+            webhook_token=webhook_token,
+            error=error,
+            notice=notice,
+            base=self.base(ctx),
+        )
+
+    async def set_routing(self, request: Request, ctx: Ctx) -> Response:
+        """The routing form: a select per mapped channel, one row to add a mapping."""
+        try:
+            channels = {
+                name[len("route_") :]: value
+                for name, value in ctx.form.items()
+                if name.startswith("route_") and value
+            }
+            new_channel = ctx.get("new_channel").strip()
+            if new_channel:
+                new_agent = ctx.get("new_agent").strip()
+                if not new_agent:
+                    raise ConfigError("pick an agent for the channel you are adding")
+                if new_channel in channels:
+                    raise ConfigError(
+                        f"channel '{new_channel}' is already mapped; change it in the table"
+                    )
+                channels[new_channel] = new_agent
+            await ctx.plane.set_tenant_routing(
+                ctx.tenant_id,
+                ctx.user_id,
+                ctx.get("default_agent").strip() or None,
+                channels,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=routing-saved")
+
+    async def notion_connect_start(self, request: Request, ctx: Ctx) -> Response:
+        """Begin Connect Notion: the picker's state mechanism, purpose ``connect``."""
+        picker = self.deps.picker
+        if picker is None:
+            return _message(
+                "Not available", "Connecting Notion is not set up on this console.", 404, ctx
+            )
+        await ctx.plane.require_settings_admin(ctx.tenant_id, ctx.principal)
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        token = parsed[1] if parsed else ""
+        flow = Flow(ctx.tenant_id, ctx.user_id, session_hash(token), "", 0, purpose="connect")
+        state = picker.sessions.begin(flow, ctx.now)
+        return _redirect(
+            notion_authorize_url(picker.config, self.deps.console.sign_in, state, owner="workspace")
+        )
+
+    async def notion_connect_callback(self, request: Request, flow: Flow) -> Response:
+        """Notion sent the browser back from a workspace authorization."""
+        back = f"/ui/{quote(flow.tenant_id, safe='')}/settings"
+        query = request.query_params
+        code = query.get("code", "")
+        if query.get("error") or not code or len(code) > 1024:
+            return _redirect(back)
+        picker = self.deps.picker
+        try:
+            grant = await picker.oauth.connect_workspace(
+                code, picker.config.redirect_uri(self.deps.console.sign_in)
+            )
+        except NotionPickerError as err:
+            log.warning("notion connect failed tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Notion unavailable",
+                "Couldn't connect Notion just now. Nothing was changed; try again.",
+                page_status(502),
+                back=back,
+            )
+        try:
+            await self.deps.plane.connect_notion(flow.tenant_id, flow.user_id, grant)
+        except Forbidden as err:
+            return _message("Not allowed", str(err), 403, back=back)
+        except ConfigError as err:
+            return _message("Not possible now", str(err), 409, back=back)
+        except TenantKeyError as err:
+            log.warning("notion connect refused tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Not available",
+                "This organisation's encryption key is not available yet. Try again in a moment.",
+                503,
+                back=back,
+            )
+        return _redirect(back + "?done=notion-connected")
+
+    async def notion_disconnect(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            changed = await ctx.plane.disconnect_notion(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.settings_page(request, ctx, 409, "Notion is not connected.")
+        return _redirect(self.base(ctx) + "/settings?done=notion-disconnected")
+
+    async def webhook_reveal(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            token = await ctx.plane.reveal_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return await self.settings_page(request, ctx, webhook_token=token)
+
+    async def webhook_confirm(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            await ctx.plane.confirm_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=webhook-confirmed")
+
+    async def webhook_clear(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            await ctx.plane.clear_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=webhook-cleared")
+
+    async def console_js(self, request: Request) -> Response:
+        """The one script the pages use (the Copy button). Served from our own origin,
+        which the Content-Security-Policy allows; the pages carry no inline script."""
+        return Response(CONSOLE_JS, media_type="application/javascript; charset=utf-8")
+
     async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
         """The page's aggregates as a download. It only reads, so it is a GET."""
         month = request.query_params.get("month") or None
@@ -1105,6 +1292,28 @@ class WebUI:
 
 
 NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
+
+# The Copy button on the settings page: copy the named element's text, or select it
+# when the clipboard is not available (plain http on a non-loopback host).
+CONSOLE_JS = """\
+document.addEventListener("click", function (event) {
+  var button = event.target.closest("[data-copy]");
+  if (!button) { return; }
+  var source = document.getElementById(button.getAttribute("data-copy"));
+  if (!source) { return; }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(source.textContent).then(function () {
+      button.textContent = "Copied";
+    });
+  } else {
+    var range = document.createRange();
+    range.selectNodeContents(source);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+});
+"""
 
 _TITLES = {
     403: "Not allowed",

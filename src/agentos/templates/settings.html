@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% from "macros.html" import post_button %}
+{% block title %}Settings{% endblock %}
+{% block body %}
+<h1>Settings</h1>
+<p class="muted">Organisation settings, for admins. Every change is recorded in the audit log and picked up by every process on its next refresh, with no restart.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+{% if view.default_agent is none %}
+<div class="warn">
+  <p><strong>This organisation is not set up yet.</strong> Slack messages get a fixed "not set up" reply until a default agent is chosen. Steps left:</p>
+  <ol>
+    <li><a href="{{ base }}/agents">Create an agent</a> (or ask a creator to).</li>
+    <li>Submit it, then publish it as an admin.</li>
+    <li>Choose it as the default agent below.</li>
+    <li>Connect Notion below, if the agent reads or writes Notion.</li>
+  </ol>
+</div>
+{% endif %}
+
+<h2>Default agent and channel routing</h2>
+<p class="muted">Direct messages and mentions in unmapped channels go to the default agent. A mapped channel goes to its agent, which must list the channel in its audience — the same rule as the tenant file. Only published agents can be chosen.</p>
+<form method="post" action="{{ base }}/settings/routing">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <label for="default_agent">Default agent</label>
+  <select name="default_agent" id="default_agent">
+    <option value="">— not set —</option>
+    {% for a in view.published %}
+    <option value="{{ a.agent_id }}" {% if a.agent_id == view.default_agent %}selected{% endif %}>{{ a.name }} ({{ a.agent_id }})</option>
+    {% endfor %}
+  </select>
+  {% if not view.published %}<p class="muted">No published agents yet. Create one on the <a href="{{ base }}/agents">Agents</a> page and publish it.</p>{% endif %}
+  <table>
+    <tr><th>Channel</th><th>Agent</th></tr>
+    {% for channel, agent_id in view.channels.items() %}
+    {% set matches = (view.slack_channels or []) | selectattr("id", "equalto", channel) | list %}
+    <tr>
+      <td><code>{{ channel }}</code>{% if matches %} <span class="muted">#{{ matches[0].name }}</span>{% endif %}</td>
+      <td>
+        <select name="route_{{ channel }}">
+          <option value="">— remove —</option>
+          {% for a in view.published %}
+          <option value="{{ a.agent_id }}" {% if a.agent_id == agent_id %}selected{% endif %}>{{ a.name }} ({{ a.agent_id }})</option>
+          {% endfor %}
+        </select>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="2" class="muted">No channels mapped. The default agent answers everywhere.</td></tr>
+    {% endfor %}
+  </table>
+  {% if view.slack_channels is not none %}
+  <label>Add a channel the app is in</label>
+  <select name="new_channel">
+    <option value="">— pick a channel —</option>
+    {% for c in view.slack_channels if c.id not in view.channels %}
+    <option value="{{ c.id }}">#{{ c.name }}</option>
+    {% endfor %}
+  </select>
+  <select name="new_agent">
+    <option value="">— pick an agent —</option>
+    {% for a in view.published %}
+    <option value="{{ a.agent_id }}">{{ a.name }} ({{ a.agent_id }})</option>
+    {% endfor %}
+  </select>
+  {% elif view.slack_problem %}
+  <p class="error">Couldn't read the workspace's channels: {{ view.slack_problem }}. Existing mappings can still be changed.</p>
+  {% endif %}
+  <div class="actions"><button type="submit">Save routing</button></div>
+</form>
+
+<h2>Notion</h2>
+{% if not picker_enabled %}
+<p class="muted">Connecting Notion is not set up on this console. The operator configures the public Notion integration (<code>NOTION_OAUTH_CLIENT_ID</code> and <code>NOTION_OAUTH_CLIENT_SECRET</code>); it is the same integration "Choose from Notion" uses.</p>
+{% elif view.notion_connected %}
+<p>Connected to <strong>{{ view.notion_workspace_name or view.notion_workspace_id }}</strong>{% if view.notion_workspace_name %} <code>{{ view.notion_workspace_id }}</code>{% endif %}.</p>
+{% if view.notion_connected_by %}<p class="muted">Connected by {{ view.notion_connected_by }}, {{ view.notion_connected_at | stamp }}.</p>{% endif %}
+<div class="actions">
+  {{ post_button(base ~ "/settings/notion/start", ctx.csrf, "Reconnect") }}
+  {{ post_button(base ~ "/settings/notion/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
+</div>
+<p class="muted">Reconnect replaces the stored token (a workspace admin signs in again). Disconnect removes it: agents with Notion grants stop reading and writing until Notion is connected again. The token is stored encrypted for this organisation only, and is never shown.</p>
+{% else %}
+<p class="muted">Not connected. A Notion workspace admin signs in and authorizes the integration for the workspace; the returned token is stored encrypted for this organisation only. Agents still use only the pages and databases they are granted.</p>
+{{ post_button(base ~ "/settings/notion/start", ctx.csrf, "Connect Notion") }}
+{% endif %}
+
+<h2>Notion webhook verification</h2>
+{% if view.webhook_state is none %}
+<p class="muted">No verification token yet. Add the webhook subscription in the Notion integration, pointing at this deployment's gateway (<code>POST /notion/webhook/{{ ctx.tenant_id }}</code>); the handshake stores a token here, pending confirmation. The webhook is optional: polling and the nightly index work without it.</p>
+{% elif view.webhook_state == "pending" %}
+<p>A verification token is <strong>pending</strong>. Reveal it, paste it into the Notion integration's verify box to finish subscribing, then confirm it here. Only a confirmed token accepts events; a pending one never does.</p>
+{% if webhook_token %}
+<pre id="webhook-token">{{ webhook_token }}</pre>
+<div class="actions"><button type="button" data-copy="webhook-token">Copy</button></div>
+<p class="muted">Shown once: reload the page and it is hidden again. The reveal is recorded in the audit log; the token itself never is.</p>
+{% else %}
+{{ post_button(base ~ "/settings/webhook/reveal", ctx.csrf, "Reveal token", {"request_id": new_token()}) }}
+{% endif %}
+<div class="actions">
+  {{ post_button(base ~ "/settings/webhook/confirm", ctx.csrf, "Confirm", {"request_id": new_token()}) }}
+  {{ post_button(base ~ "/settings/webhook/clear", ctx.csrf, "Clear", {"request_id": new_token()}) }}
+</div>
+{% else %}
+<p>The verification token is <strong>confirmed</strong>; signed events are accepted.</p>
+{{ post_button(base ~ "/settings/webhook/clear", ctx.csrf, "Clear", {"request_id": new_token()}) }}
+<p class="muted">To re-subscribe (a new subscription sends a new token), clear the token first, then let the new handshake arrive.</p>
+{% endif %}
+<script src="/static/console.js" defer></script>
+{% endblock %}

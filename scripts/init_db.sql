@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 033 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 034 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -153,7 +153,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
   ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install'),
-  ('agent_health')
+  ('agent_health'), ('connector'), ('tenant_settings')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
              'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
-             'payload_key', 'install')
+             'payload_key', 'install', 'connector', 'tenant_settings')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -660,6 +660,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   -- NULL for a tenant installed from Slack with no agent yet (migration 032).
   default_agent       text,
   notion_workspace_id text        UNIQUE,
+  -- The connected Notion workspace's name, for display (migration 034).
+  notion_workspace_name text,
   channels            jsonb       NOT NULL DEFAULT '{}'::jsonb,   -- channel ID -> agent ID
   admins              jsonb       NOT NULL DEFAULT '[]'::jsonb,   -- Slack user IDs
   secret_env          jsonb       NOT NULL DEFAULT '{}'::jsonb,   -- field -> env var NAME
@@ -1000,10 +1002,12 @@ DROP POLICY IF EXISTS key_insert ON tenant_payload_keys;
 CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
--- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as migration 032.
+-- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as
+-- migrations 032 and 034: the kinds are 'slack_bot' and 'notion', and Disconnect removes
+-- a row, so the app role may DELETE too.
 CREATE TABLE IF NOT EXISTS tenant_credentials (
   tenant_id   text        NOT NULL,
-  kind        text        NOT NULL CHECK (kind IN ('slack_bot')),
+  kind        text        NOT NULL CHECK (kind IN ('slack_bot', 'notion')),
   ciphertext  bytea       NOT NULL,
   key_version integer     NOT NULL CHECK (key_version >= 1),
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -1011,7 +1015,7 @@ CREATE TABLE IF NOT EXISTS tenant_credentials (
 );
 
 REVOKE ALL ON tenant_credentials FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON tenant_credentials TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_credentials TO agentos_app;
 
 ALTER TABLE tenant_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_credentials FORCE ROW LEVEL SECURITY;
@@ -1057,5 +1061,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034')
 ON CONFLICT DO NOTHING;

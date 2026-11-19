@@ -492,6 +492,8 @@ class AgentsConfig:
     default_agent: str | None
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
+    # The connected workspace's name, for display; set by Connect Notion, not the YAML file.
+    notion_workspace_name: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
     # Slack channel ID to the agent that answers mentions there.
     channels: dict[str, str] = field(default_factory=dict)

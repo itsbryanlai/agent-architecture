@@ -25,7 +25,7 @@ from agentos.config import (
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
-from agentos.credentials import SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
 from agentos.gateway.app import create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
@@ -60,7 +60,7 @@ from tests.conftest import (
 from tests.helpers.console_harness import ROOT, ConsoleHarness, using
 from tests.helpers.control_api import BASE, JSON, StandIn
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
-from tests.helpers.keys import CountingKeyStore
+from tests.helpers.keys import CountingKeyStore, RefreshableKeyStore
 
 
 @pytest.fixture
@@ -458,6 +458,57 @@ async def test_changed_settings_reach_the_worker_without_new_clients(monkeypatch
 
     assert registry.get(TENANT).config.channels == {"C9": "it-helper"}
     assert built["slack"] == ["slack-ACME"]
+
+
+async def test_the_notion_client_follows_the_resolved_credential(monkeypatch):
+    """Fails if the worker keeps the env Notion token when a credential row exists, keeps a
+    stale client when Connect Notion replaces the row, or does not fall back to the env
+    variable once Disconnect removes it."""
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    credentials = TenantCredentials(credential_store, keys)
+    set_secrets(monkeypatch, "ACME")
+    built, slack, notion = fake_factories()
+    registry = await build_registry(
+        await startup_tenants(directory),
+        Settings(),
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+    )
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+    )
+    # No row yet: the env variable builds the client.
+    assert built["notion"] == ["notion-ACME"]
+
+    row_token = "ntn-workspace-row-token"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, row_token.encode()), 1
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token]
+
+    # An unchanged row builds nothing new.
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token]
+
+    await credential_store.delete(TENANT, NOTION)
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token, "notion-ACME"]
 
 
 async def test_a_new_tenant_with_an_unset_variable_waits_and_is_reported_once(monkeypatch, caplog):

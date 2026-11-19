@@ -1,20 +1,24 @@
 """Per-tenant connector credentials, encrypted in the database with the tenant's payload key.
 
-One row per tenant and kind (``slack_bot`` now; a later ticket adds ``notion``). The
-value is stored as nonce || AES-256-GCM under the tenant's key version, with the tenant
-ID as associated data — the same cipher the Temporal payloads and the Notion webhook
-token use — so a credential stored for one tenant does not decrypt for another. The
-credential itself never appears in a log, an error or a ``repr``.
+One row per tenant and kind (``slack_bot`` and ``notion``). The value is stored as
+nonce || AES-256-GCM under the tenant's key version, with the tenant ID as associated
+data — the same cipher the Temporal payloads and the Notion webhook token use — so a
+credential stored for one tenant does not decrypt for another. The credential itself
+never appears in a log, an error or a ``repr``.
 
-``TenantCredentials.slack_bot_token`` is the one resolver every process reads a tenant's
-Slack bot token through: the credential row first, and when no row exists the environment
-variable the tenant's settings name (a local single-tenant run keeps working unchanged).
-A key the store has not loaded triggers one refresh before refusing, so a tenant installed
-seconds ago is served without a restart. A row that cannot be decrypted is a ``ConfigError``
-naming the tenant and the key version, never a value: the caller reports it and tries again
-on its next pass, rather than silently falling back to another token.
+``TenantCredentials.slack_bot_token`` and ``notion_token`` are the resolvers every process
+reads a tenant's connector tokens through: the credential row first, and when no row
+exists the environment variable the tenant's settings name (a local single-tenant run
+keeps working unchanged). Slack needs a token, so no row and no variable is a
+``ConfigError``; a tenant without a Notion token is served Slack-only, so its resolver
+returns None then. A key the store has not loaded triggers one refresh before refusing,
+so a tenant installed seconds ago is served without a restart. A row that cannot be
+decrypted is a ``ConfigError`` naming the tenant and the key version, never a value: the
+caller reports it and tries again on its next pass, rather than silently falling back to
+another token.
 
-A reinstall replaces the row (``put`` upserts); nothing here deletes a credential.
+A reinstall or a Notion reconnect replaces the row (``put`` upserts); Disconnect removes
+the Notion row (``delete``), the only flow that deletes a credential.
 """
 
 from __future__ import annotations
@@ -26,13 +30,14 @@ from typing import Any, Protocol
 from cryptography.exceptions import InvalidTag
 from psycopg_pool import AsyncConnectionPool
 
-from agentos.config import AgentsConfig, ConfigError
+from agentos.config import AgentsConfig, ConfigError, read_secret
 from agentos.crypto_keys import KeyStore, TenantKeyError
-from agentos.payload_codec import decrypt_for_tenant, encrypt_with_tenant_key
+from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant, encrypt_with_tenant_key
 from agentos.stores import joined_transaction, tenant_transaction
 from agentos.tenants import require_tenant_secret
 
 SLACK_BOT = "slack_bot"
+NOTION = "notion"
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,10 @@ class CredentialStore(Protocol):
         """
         ...
 
+    async def delete(self, tenant_id: str, kind: str, conn: Any = None) -> bool:
+        """Remove the tenant's row for this kind. False when there was none."""
+        ...
+
 
 class InMemoryCredentialStore:
     """The same behaviour as Postgres, minus the database: one row per tenant and kind."""
@@ -86,6 +95,9 @@ class InMemoryCredentialStore:
         self._rows[(tenant_id, kind)] = Credential(
             tenant_id, kind, ciphertext, key_version, self._tick
         )
+
+    async def delete(self, tenant_id: str, kind: str, conn: Any = None) -> bool:
+        return self._rows.pop((tenant_id, kind), None) is not None
 
 
 _COLUMNS = "tenant_id, kind, ciphertext, key_version, updated_at"
@@ -117,9 +129,18 @@ class PostgresCredentialStore:
                 (tenant_id, kind, ciphertext, key_version),
             )
 
+    async def delete(self, tenant_id: str, kind: str, conn: Any = None) -> bool:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
+                "DELETE FROM tenant_credentials WHERE tenant_id = %s AND kind = %s "
+                "RETURNING tenant_id",
+                (tenant_id, kind),
+            )
+            return await cur.fetchone() is not None
+
 
 class TenantCredentials:
-    """Store a tenant's credential encrypted, and resolve its Slack bot token.
+    """Store a tenant's credentials encrypted, and resolve its Slack and Notion tokens.
 
     The row is read afresh on every resolve; only the decryption is cached, keyed by the
     exact ciphertext and version it came from, so a replaced credential is never served
@@ -130,6 +151,13 @@ class TenantCredentials:
         self._store = store
         self._keys = keys
         self._cache: dict[tuple[str, str], tuple[tuple[int, bytes], str]] = {}
+
+    def snapshot(self) -> Any:
+        """The store's rows as they are now, for ``InMemoryUnitOfWork``."""
+        return self._store.snapshot()
+
+    def restore(self, state: Any) -> None:
+        self._store.restore(state)
 
     async def store_secret(
         self,
@@ -149,12 +177,34 @@ class TenantCredentials:
         blob = encrypt_with_tenant_key(tenant_id, key, value.encode())
         await self._store.put(tenant_id, kind, blob, key_version, conn=conn)
 
-    def forget(self, tenant_id: str) -> None:
-        """Drop the tenant's cached decryption, as when a sync stops serving the tenant.
+    async def store_with_current_key(
+        self, tenant_id: str, kind: str, value: str, conn: Any = None
+    ) -> None:
+        """Encrypt ``value`` under the tenant's newest loaded key and store it.
 
-        The row itself stays; the next resolve reads it and decrypts it again.
+        For a credential whose tenant already has a key (Connect Notion): a key the
+        store has not loaded triggers one refresh before refusing, as the webhook
+        handshake does. The value is never logged.
         """
-        self._cache.pop((tenant_id, SLACK_BOT), None)
+        try:
+            blob, version = encrypt_for_tenant(self._keys, tenant_id, value.encode())
+        except TenantKeyError:
+            await self._keys.refresh()
+            blob, version = encrypt_for_tenant(self._keys, tenant_id, value.encode())
+        await self._store.put(tenant_id, kind, blob, version, conn=conn)
+
+    async def delete(self, tenant_id: str, kind: str, conn: Any = None) -> bool:
+        """Remove the tenant's credential and its cached decryption. False when none."""
+        self._cache.pop((tenant_id, kind), None)
+        return await self._store.delete(tenant_id, kind, conn=conn)
+
+    def forget(self, tenant_id: str) -> None:
+        """Drop the tenant's cached decryptions, as when a sync stops serving the tenant.
+
+        The rows themselves stay; the next resolve reads them and decrypts again.
+        """
+        for kind in (SLACK_BOT, NOTION):
+            self._cache.pop((tenant_id, kind), None)
 
     async def slack_bot_token(self, config: AgentsConfig) -> str:
         """The tenant's Slack bot token: the credential row first, else its env variable.
@@ -162,15 +212,37 @@ class TenantCredentials:
         Raises ``ConfigError`` naming the variable (no row, unset variable) or the tenant
         and key version (a row that cannot be decrypted) — never a value.
         """
-        row = await self._store.get(config.tenant_id, SLACK_BOT)
-        if row is None:
+        token = await self._resolve(config, SLACK_BOT)
+        if token is None:
             return require_tenant_secret(config, "slack_bot_token_env")
+        return token
+
+    async def notion_token(self, config: AgentsConfig) -> str | None:
+        """The tenant's Notion token: the credential row first, else its env variable.
+
+        None when neither exists: the tenant is served Slack-only. A row that cannot be
+        decrypted raises ``ConfigError`` naming the tenant and key version, never a
+        value, and never falls back to the variable.
+        """
+        token = await self._resolve(config, NOTION)
+        if token is None:
+            return read_secret(config.secrets.notion_token_env) or None
+        return token
+
+    async def notion_connected(self, tenant_id: str) -> bool:
+        """Whether the tenant has a stored Notion credential. Reads no token value."""
+        return await self._store.get(tenant_id, NOTION) is not None
+
+    async def _resolve(self, config: AgentsConfig, kind: str) -> str | None:
+        row = await self._store.get(config.tenant_id, kind)
+        if row is None:
+            return None
         source = (row.key_version, row.ciphertext)
-        entry = self._cache.get((config.tenant_id, SLACK_BOT))
+        entry = self._cache.get((config.tenant_id, kind))
         if entry is not None and entry[0] == source:
             return entry[1]
-        token = await self._decrypt(config.tenant_id, SLACK_BOT, row)
-        self._cache[(config.tenant_id, SLACK_BOT)] = (source, token)
+        token = await self._decrypt(config.tenant_id, kind, row)
+        self._cache[(config.tenant_id, kind)] = (source, token)
         return token
 
     async def _decrypt(self, tenant_id: str, kind: str, row: Credential) -> str:

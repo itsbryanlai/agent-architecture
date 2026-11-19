@@ -124,7 +124,7 @@ PRIVILEGES = {
     "task_drafts": "SELECT INSERT DELETE",
     "notion_webhook_tokens": "SELECT INSERT UPDATE DELETE",
     "tenant_payload_keys": "SELECT INSERT",
-    "tenant_credentials": "SELECT INSERT UPDATE",
+    "tenant_credentials": "SELECT INSERT UPDATE DELETE",
     "agent_health": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
@@ -395,6 +395,8 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "webhook_token",
                 "payload_key",
                 "install",
+                "connector",
+                "tenant_settings",
             )
         ],
     ],

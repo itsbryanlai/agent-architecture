@@ -698,6 +698,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.grant_checker import NotionGrantChecker
     from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
+    from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
     from agentos.sessions import PostgresSessionStore
     from agentos.slack_client import RealSlackPoster
@@ -714,7 +715,8 @@ async def _real_lifespan(app: FastAPI):
     key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
-        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenant_store = PostgresTenantStore(pool)
+        directory = TenantDirectory(tenant_store)
         # A tenant with no Notion token is served Slack-only; its grant checks fail at
         # publish time with a message naming the variable, not at start-up.
         await startup_tenants(directory)
@@ -726,13 +728,22 @@ async def _real_lifespan(app: FastAPI):
         # refresh loads it (and every other new key) without a restart, as in the gateway.
         key_refresh = start_key_refresh(keys)
         credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
-        apis: dict[str, RealNotionAPI] = {}
+        webhook_tokens = WebhookTokens(PostgresWebhookTokenStore(pool), keys)
+        apis: dict[str, tuple[str, RealNotionAPI]] = {}
 
-        def notion_for(tenant_id: str) -> RealNotionAPI:
-            if tenant_id not in apis:
-                config = directory.latest().get(tenant_id)
-                apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
-            return apis[tenant_id]
+        async def notion_for(tenant_id: str) -> RealNotionAPI:
+            # Built on first use and rebuilt when the credential changes (Connect Notion,
+            # a reconnect), as the Slack client is; a tenant with no token fails its own
+            # publish with a message naming the variable, not the whole console.
+            config = directory.latest().get(tenant_id)
+            token = await credentials.notion_token(config) or require_tenant_secret(
+                config, "notion_token_env"
+            )
+            entry = apis.get(tenant_id)
+            if entry is None or entry[0] != token:
+                entry = (token, RealNotionAPI(token))
+                apis[tenant_id] = entry
+            return entry[1]
 
         slack_clients: dict[str, tuple[str, RealSlackPoster]] = {}
 
@@ -766,6 +777,10 @@ async def _real_lifespan(app: FastAPI):
             unit_of_work=PostgresUnitOfWork(pool),
             grant_picks=PostgresGrantPickStore(pool),
             require_grant_picker=settings.require_grant_picker,
+            credentials=credentials,
+            tenant_store=tenant_store,
+            webhook_tokens=webhook_tokens,
+            slack_for=slack_for,
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:

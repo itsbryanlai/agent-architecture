@@ -70,6 +70,14 @@ or all writes off and on; each change is audited as ``switch_off`` or ``switch_o
 admin reads every switch. A creator reads the state of the agents they created and the
 tenant-wide switches that stop them, and never changes one.
 
+Tenant settings (the admin settings page, ``tenant_settings``): an admin sets the default
+agent and the channel routing, validated like the YAML import (a published agent, channels
+inside the agent's audience), audited as ``tenant_settings``; connects the tenant's Notion
+workspace (the OAuth workspace bot token stored encrypted as the ``notion`` credential,
+audited as ``connector``, never the token) and disconnects it; and reveals, confirms or
+clears the Notion webhook verification token exactly as the host command does, audited as
+``webhook_token`` as the user instead of the operator.
+
 Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
 title and parent of each granted object, the creator's label and any mismatch, and the
 problems. A creator gets ok or a problem category per grant and nothing else (no property
@@ -93,10 +101,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from cryptography.exceptions import InvalidTag
 
 from agentos import ids
 from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
@@ -130,8 +140,16 @@ from agentos.budgets import (
     month_spend,
     parse_amount,
 )
-from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
+from agentos.config import (
+    _CHANNEL_ID,
+    AgentVersion,
+    ConfigError,
+    TenantsConfig,
+    channel_audience_problems,
+)
 from agentos.connectors.notion import normalize_id
+from agentos.credentials import NOTION, TenantCredentials
+from agentos.crypto_keys import TenantKeyError
 from agentos.grant_checker import (
     GrantChecker,
     GrantCheckUnavailable,
@@ -156,7 +174,10 @@ from agentos.members import (
     MemberStore,
 )
 from agentos.models import AuditEvent
-from agentos.slack_client import SlackLookupError
+from agentos.notion_picker import WorkspaceGrant
+from agentos.notion_webhook import PENDING as WEBHOOK_PENDING
+from agentos.notion_webhook import WebhookTokenError, WebhookTokens
+from agentos.slack_client import SlackChannel, SlackLookupError, SlackPoster
 from agentos.switches import (
     InMemorySwitchStore,
     SwitchesView,
@@ -164,7 +185,7 @@ from agentos.switches import (
     read_state,
     set_switch,
 )
-from agentos.tenant_store import TenantSource, as_source
+from agentos.tenant_store import TenantSource, TenantStore, as_source
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import (
     InMemoryUsageStore,
@@ -226,6 +247,29 @@ class PausedChannel:
     pause: PauseRecord
     summary: AudienceSummary | None = None
     problem: str | None = None
+
+
+@dataclass
+class TenantSettingsView:
+    """What the admin settings page shows: routing, the Notion connection, the webhook token.
+
+    ``published`` are the agents a default or a channel may name. ``slack_channels`` is
+    None when Slack could not be read (``slack_problem`` says why); the page still renders.
+    ``notion_connected_by``/``at`` come from the latest ``connector`` connect event within
+    the audit page read; a very busy tenant may show the connection without them.
+    """
+
+    default_agent: str | None
+    channels: dict[str, str]
+    published: list[AgentVersion]
+    slack_channels: list[SlackChannel] | None = None
+    slack_problem: str | None = None
+    notion_connected: bool = False
+    notion_workspace_id: str | None = None
+    notion_workspace_name: str | None = None
+    notion_connected_by: str | None = None
+    notion_connected_at: datetime | None = None
+    webhook_state: str | None = None
 
 
 def _slack_problem(err: Exception) -> str:
@@ -291,6 +335,10 @@ class ControlPlane:
         unit_of_work: UnitOfWork | None = None,
         grant_picks: GrantPickStore | None = None,
         require_grant_picker: bool = False,
+        credentials: TenantCredentials | None = None,
+        tenant_store: TenantStore | None = None,
+        webhook_tokens: WebhookTokens | None = None,
+        slack_for: Callable[[str], Awaitable[SlackPoster]] | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
         self._require_picker = require_grant_picker
@@ -305,10 +353,23 @@ class ControlPlane:
         self._audit = audit
         self._tenants = as_source(tenants)
         self._grant_checker = grant_checker
+        # Tenant settings: None leaves the settings page's writes unconfigured.
+        self._credentials = credentials
+        self._tenant_store = tenant_store
+        self._webhook_tokens = webhook_tokens
+        self._slack_for = slack_for
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
+        settings_stores = [s for s in (credentials, tenant_store, webhook_tokens) if s is not None]
         self._uow = (
             InMemoryUnitOfWork(
-                agents, members, audit, self._budgets, self._switches, self._pauses, self._picks
+                agents,
+                members,
+                audit,
+                self._budgets,
+                self._switches,
+                self._pauses,
+                self._picks,
+                *settings_stores,
             )
             if unit_of_work is None
             else unit_of_work
@@ -1132,6 +1193,265 @@ class ControlPlane:
             request_id=request_id,
             uow=self._uow,
         )
+
+    # --- tenant settings -----------------------------------------------------
+
+    async def require_settings_admin(self, tenant_id: str, actor: Actor) -> None:
+        """Raise ``Forbidden`` unless the actor is an admin of the tenant."""
+        await self._require_role(tenant_id, actor, ADMIN)
+
+    async def tenant_settings(self, tenant_id: str, actor: Actor) -> TenantSettingsView:
+        """The settings page's reads, for an admin. A Slack read failure is reported, not fatal."""
+        await self._require(tenant_id, actor, ADMIN)
+        config = await self._tenants.get(tenant_id)
+        if config is None:
+            raise ConfigError(f"tenant '{tenant_id}' is not available")
+        published = sorted(
+            (await self._agents.published_all(tenant_id)).values(), key=lambda a: a.agent_id
+        )
+        slack_channels: list[SlackChannel] | None = None
+        slack_problem: str | None = None
+        if self._slack_for is not None:
+            try:
+                slack = await self._slack_for(tenant_id)
+                slack_channels = await slack.list_channels()
+            except (SlackLookupError, ConfigError) as err:
+                slack_problem = _slack_problem(err)
+        connected = False
+        connected_by: str | None = None
+        connected_at: datetime | None = None
+        if self._credentials is not None:
+            connected = await self._credentials.notion_connected(tenant_id)
+            if connected:
+                events = await self._audit.list(tenant_id, 200)
+                event = next(
+                    (e for e in events if e.kind == "connector" and e.tool == "connect"), None
+                )
+                if event is not None:
+                    connected_by, connected_at = event.requester_user_id, event.at
+        webhook_state = (
+            None if self._webhook_tokens is None else await self._webhook_tokens.state(tenant_id)
+        )
+        return TenantSettingsView(
+            default_agent=config.default_agent,
+            channels=dict(config.channels),
+            published=published,
+            slack_channels=slack_channels,
+            slack_problem=slack_problem,
+            notion_connected=connected,
+            notion_workspace_id=config.notion_workspace_id,
+            notion_workspace_name=config.notion_workspace_name,
+            notion_connected_by=connected_by,
+            notion_connected_at=connected_at,
+            webhook_state=webhook_state,
+        )
+
+    async def set_tenant_routing(
+        self,
+        tenant_id: str,
+        actor: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        request_id: str | None = None,
+    ) -> None:
+        """Set the default agent and the channel map. Only an admin.
+
+        Validated like the YAML import: the default and every mapped agent must have a
+        published version, and a mapped channel must be inside its agent's audience.
+        Setting what is already in force changes nothing and records nothing. The
+        directory refresh picks the change up without a restart.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._tenant_store is None:
+            raise ConfigError("tenant settings cannot be changed on this console")
+        config = await self._tenants.get(tenant_id)
+        if config is None:
+            raise ConfigError(f"tenant '{tenant_id}' is not available")
+        published = await self._agents.published_all(tenant_id)
+        default_agent = default_agent or None
+        if default_agent is not None and default_agent not in published:
+            raise ConfigError(f"default agent '{default_agent}' has no published version")
+        for channel, agent_id in channels.items():
+            if not _CHANNEL_ID.fullmatch(channel):
+                raise ConfigError(f"'{channel}' is not a Slack channel ID")
+            if agent_id not in published:
+                raise ConfigError(
+                    f"channel '{channel}': agent '{agent_id}' has no published version"
+                )
+        if problems := channel_audience_problems(channels, published):
+            raise ConfigError(problems[0])
+        if default_agent == config.default_agent and channels == config.channels:
+            return
+        mapping = ",".join(f"{c}->{a}" for c, a in sorted(channels.items()))
+        async with self._uow.begin(tenant_id) as conn:
+            await self._tenant_store.set_routing(tenant_id, default_agent, channels, conn=conn)
+            await self._record(
+                "tenant_settings",
+                tenant_id,
+                actor,
+                tool="routing",
+                target=f"default={default_agent or '-'}; {mapping}"[:300],
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def connect_notion(
+        self,
+        tenant_id: str,
+        actor: str,
+        grant: WorkspaceGrant,
+        request_id: str | None = None,
+    ) -> None:
+        """Store the workspace bot token ``grant`` carries, encrypted. Only an admin.
+
+        The token, the workspace on the tenant row and the ``connector`` event commit in
+        one unit of work; a workspace another tenant already uses refuses the whole
+        change. A reconnect replaces the credential and the workspace, and records again.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._credentials is None or self._tenant_store is None:
+            raise ConfigError("Notion cannot be connected on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            await self._credentials.store_with_current_key(
+                tenant_id, NOTION, grant.token, conn=conn
+            )
+            await self._tenant_store.set_notion_workspace(
+                tenant_id, grant.workspace_id, grant.workspace_name, conn=conn
+            )
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="connect",
+                target=grant.workspace_id,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def disconnect_notion(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Remove the tenant's Notion credential and workspace. Only an admin.
+
+        False, and nothing changes or is recorded, when Notion is not connected.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._credentials is None or self._tenant_store is None:
+            raise ConfigError("Notion cannot be connected on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            deleted = await self._credentials.delete(tenant_id, NOTION, conn=conn)
+            if not deleted:
+                return False
+            await self._tenant_store.set_notion_workspace(tenant_id, None, None, conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="disconnect",
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    def _require_webhook_tokens(self) -> WebhookTokens:
+        if self._webhook_tokens is None:
+            raise ConfigError("the webhook token cannot be managed on this console")
+        return self._webhook_tokens
+
+    @staticmethod
+    def _webhook_nonce(command: str, request_id: str | None) -> str:
+        # The host command's key shape, so a console step and a command step read alike.
+        return f"{command}:{request_id or uuid.uuid4().hex}"
+
+    async def reveal_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> str:
+        """The pending webhook token, shown once to an admin, audited as the CLI's ``show``.
+
+        Refused when there is no pending token or it cannot be decrypted; a refusal
+        records nothing. The token goes to the page only, never to a log or the audit.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        state = await tokens.state(tenant_id)
+        if state is None:
+            raise WebhookTokenError(
+                f"no webhook token for tenant '{tenant_id}'; a handshake stores one"
+            )
+        if state != WEBHOOK_PENDING:
+            raise WebhookTokenError(
+                f"the webhook token of tenant '{tenant_id}' is already confirmed; "
+                "clear it and re-subscribe for a new one"
+            )
+        try:
+            token = await tokens.pending(tenant_id)
+        except InvalidTag:
+            raise WebhookTokenError(
+                f"the webhook token of tenant '{tenant_id}' cannot be decrypted; "
+                "clear it and re-subscribe"
+            ) from None
+        except TenantKeyError as err:
+            raise WebhookTokenError(str(err)) from None
+        if token is None:
+            raise WebhookTokenError(
+                f"no webhook token for tenant '{tenant_id}'; a handshake stores one"
+            )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._record(
+                "webhook_token",
+                tenant_id,
+                actor,
+                tool="show",
+                request_id=self._webhook_nonce("show", request_id),
+                conn=conn,
+            )
+        return token
+
+    async def confirm_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Make the pending webhook token active, audited as the CLI's ``confirm``.
+
+        Refused, and nothing recorded, when there is no pending token.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        async with self._uow.begin(tenant_id) as conn:
+            changed = await tokens.confirm(tenant_id, self._clock(), conn=conn)
+            if changed:
+                await self._record(
+                    "webhook_token",
+                    tenant_id,
+                    actor,
+                    tool="confirm",
+                    request_id=self._webhook_nonce("confirm", request_id),
+                    conn=conn,
+                )
+        if not changed:
+            raise WebhookTokenError(f"nothing to confirm for tenant '{tenant_id}'")
+
+    async def clear_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Remove the webhook token so a new handshake is accepted, audited as ``clear``.
+
+        Refused, and nothing recorded, when there is no token.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        async with self._uow.begin(tenant_id) as conn:
+            changed = await tokens.clear(tenant_id, conn=conn)
+            if changed:
+                await self._record(
+                    "webhook_token",
+                    tenant_id,
+                    actor,
+                    tool="clear",
+                    request_id=self._webhook_nonce("clear", request_id),
+                    conn=conn,
+                )
+        if not changed:
+            raise WebhookTokenError(f"nothing to clear for tenant '{tenant_id}'")
 
     # --- members -------------------------------------------------------------
 

@@ -386,6 +386,10 @@ PAYLOAD_KEY_AUDIT_KINDS = ("payload_key",)
 INSTALL_AUDIT_KINDS = ("install",)
 # An agent's grant check flipping its health: the agent and the version checked.
 HEALTH_AUDIT_KINDS = ("agent_health",)
+# A tenant's Notion workspace connected or disconnected in the console; never the token.
+CONNECTOR_AUDIT_KINDS = ("connector",)
+# A tenant's default agent and channel routing, set by an admin in the console.
+TENANT_SETTINGS_AUDIT_KINDS = ("tenant_settings",)
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -400,6 +404,8 @@ AUDIT_KINDS = (
     + PAYLOAD_KEY_AUDIT_KINDS
     + INSTALL_AUDIT_KINDS
     + HEALTH_AUDIT_KINDS
+    + CONNECTOR_AUDIT_KINDS
+    + TENANT_SETTINGS_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -419,7 +425,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, connector, tenant settings
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -450,6 +456,8 @@ class AuditEvent:
             + WEBHOOK_AUDIT_KINDS
             + PAYLOAD_KEY_AUDIT_KINDS
             + INSTALL_AUDIT_KINDS
+            + CONNECTOR_AUDIT_KINDS
+            + TENANT_SETTINGS_AUDIT_KINDS
         )
         if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
             if not self.agent_id:

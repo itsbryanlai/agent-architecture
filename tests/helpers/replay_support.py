@@ -65,6 +65,8 @@ from agentos.usage import InMemoryUsageStore, UsageEvent
 from agentos.workflows.conversation import (
     EMPTY_MESSAGE_REPLY,
     OUT_OF_STEPS,
+    PROGRESS_AFTER,
+    PROGRESS_GAP,
     TURN_FAILED,
     ConversationWorkflow,
 )
@@ -822,6 +824,46 @@ async def task_card_update_failure(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id)]
 
 
+async def progress(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(202 if stored else 201)
+    scope = ids.knowledge_scope(ROOT_A)
+    await r.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, scope, ROOT_A.replace("-", "")],
+        id=ids.index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    r.llm.queue(
+        tool_turn(ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"})),
+        tool_turn(ToolCall("tu_i", "search_items", {"query": "laptop"})),
+        answer("The portal [1] resets it."),
+    )
+    # Each step is held open past the two-second mark so its label shows; the second
+    # step's label also waits out the three-second gap from the first.
+    search_hang = r.notion.hang_next_read("retrieve_page")
+    items_hang = r.notion.hang_next_read("query_database")
+    await start_conversation(
+        r, "it-helper", thread, "vpn reset and any laptop requests?", stored=stored
+    )
+    await search_hang.reached.wait()
+    await r.env.sleep(PROGRESS_AFTER)
+    await eventually(
+        lambda: [u for u in r.slack.updates() if u["text"] == "Searching IT wiki…"], timeout=30
+    )
+    search_hang.release()
+    await items_hang.reached.wait()
+    await r.env.sleep(PROGRESS_AFTER + PROGRESS_GAP)
+    await eventually(
+        lambda: [u for u in r.slack.updates() if u["text"] == "Reading Notion…"], timeout=30
+    )
+    items_hang.release()
+    await replies(r, 3)
+    texts = [u["text"] for u in r.slack.updates()]
+    assert texts[:2] == ["Searching IT wiki…", "Reading Notion…"]
+    assert len(texts) == 3 and texts[2].startswith("The portal")
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 def _both(fn):
     return {
         False: lambda r: fn(r, False),
@@ -838,6 +880,7 @@ for _name, _fn in {
     "hand_off_notice": hand_off_notice,
     "knowledge_answer": knowledge_answer,
     "knowledge_two_searches": knowledge_two_searches,
+    "progress": progress,
     "audience_refusal": audience_refusal,
     "hand_off_refused": hand_off_refused,
     "failed_turn": failed_turn,

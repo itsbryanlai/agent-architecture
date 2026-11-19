@@ -336,6 +336,7 @@ class FakeNotionAPI:
         # Injection points for the failures a write meets in production. See the methods.
         self._fail_after_write = {"create": 0, "comment": 0}
         self._hang_after_write: dict[str, list[Hang]] = {"create": [], "comment": []}
+        self._hang_reads: list[tuple[str | None, Hang]] = []
         self._visibility_delay = 0
         self._hidden: dict[str, int] = {}
         self._hidden_comments: dict[str, int] = {}
@@ -354,6 +355,21 @@ class FakeNotionAPI:
         hang = Hang()
         self._hang_after_write[kind].append(hang)
         return hang
+
+    def hang_next_read(self, method: str | None = None) -> Hang:
+        """The next read waits until the returned ``Hang`` is released, as a slow Notion
+        read does. ``method`` names ``query_database`` or ``retrieve_page``; None hangs
+        the next read of either. Other reads run normally."""
+        hang = Hang()
+        self._hang_reads.append((method, hang))
+        return hang
+
+    def _take_read_hang(self, method: str) -> Hang | None:
+        for i, (want, hang) in enumerate(self._hang_reads):
+            if want is None or want == method:
+                del self._hang_reads[i]
+                return hang
+        return None
 
     def delay_visibility(self, calls: int) -> None:
         """A page or comment created from now on is left out of the next ``calls`` queries
@@ -514,6 +530,9 @@ class FakeNotionAPI:
 
     async def query_database(self, database_id: str, filter: dict | None) -> list[dict]:
         self.calls.append(("query_database", {"database_id": database_id, "filter": filter}))
+        hang = self._take_read_hang("query_database")
+        if hang is not None:
+            await hang.wait()
         if self._fail_next_query is not None:
             error, self._fail_next_query = self._fail_next_query, None
             raise error
@@ -548,6 +567,9 @@ class FakeNotionAPI:
 
     async def retrieve_page(self, page_id: str) -> dict:
         self.calls.append(("retrieve_page", {"page_id": page_id}))
+        hang = self._take_read_hang("retrieve_page")
+        if hang is not None:
+            await hang.wait()
         for pages in self.databases.values():
             for stored_id, page in pages.items():
                 if normalize_id(stored_id) == normalize_id(page_id):

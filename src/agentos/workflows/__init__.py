@@ -7,6 +7,11 @@ from temporalio.common import RetryPolicy
 # Activity timeouts: every activity call passes one of these explicitly.
 ACTIVITY_TIMEOUT = timedelta(seconds=30)
 LLM_TIMEOUT = timedelta(seconds=90)
+# A progress edit on the placeholder: short, and at most one retry. The workflow
+# awaits it inside the step and drops a failure, so it never delays the reply much
+# and never raises into the turn.
+PROGRESS_TIMEOUT = timedelta(seconds=5)
+PROGRESS_RETRY = RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=1))
 # An approved write to Notion: a few requests, each limited to REQUEST_TIMEOUT_MS. The
 # activity heartbeats between them, so an attempt that stops making progress is cancelled
 # after WRITE_HEARTBEAT_TIMEOUT instead of running on beside its retry. The lease in

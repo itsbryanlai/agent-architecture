@@ -379,6 +379,7 @@ NOT_GATED = {
     "append_history": "stores a message in the thread's history; no model, connector or post",
     "append_tool_results": "moves stored tool output into history; no connector call",
     "post_placeholder": "posts 'Thinking'; the fixed off notice replaces it, so it must still run",
+    "update_progress": "edits the placeholder to a fixed runtime progress label; the reply or off notice replaces it, so it must still run",
     "finalize_reply": "posts the reply or the fixed off notice that call_llm returned",
     "finalize_notice": "shows a fixed non-answer notice and records its audit row; no agent effect",
     "post_in_thread": "posts a fixed notice (reminder, refusal, failure); no agent effect",

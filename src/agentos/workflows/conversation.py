@@ -49,13 +49,19 @@ Rules this workflow keeps:
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
   workflow goes on to wait for the next message.
+* While a tool step runs long, the placeholder shows that step's label, fixed
+  runtime text built from the agent's grants and config, never the model's words
+  or a tool's input. Labels are throttled in workflow time, awaited inside the
+  step so none lands after the final reply, and a failed edit is dropped.
 * Workflow code is deterministic: no I/O, ``workflow.uuid4()`` for IDs.
 """
 
 import asyncio
 import json
 from collections import deque
-from datetime import timedelta
+from collections.abc import Awaitable
+from datetime import datetime, timedelta
+from typing import TypeVar
 
 from temporalio import workflow
 from temporalio.converter import value_to_type
@@ -93,7 +99,14 @@ with workflow.unsafe.imports_passed_through():
         TurnContext,
         check_field,
     )
-    from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY
+    from agentos.slack_format import escape_slack
+    from agentos.workflows import (
+        ACTIVITY_TIMEOUT,
+        LLM_TIMEOUT,
+        PROGRESS_RETRY,
+        PROGRESS_TIMEOUT,
+        RETRY,
+    )
     from agentos.workflows.task import TaskWorkflow
 
 IDLE_TIMEOUT = timedelta(days=7)
@@ -138,7 +151,52 @@ PATCH_DISCARD_INBOUND = "discard-unconsumed-inbound"
 PATCH_CONTIGUOUS_MARKERS = "contiguous-citation-markers"
 PATCH_NOTICE_AUDIT = "notice-audit"
 PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
+PATCH_PROGRESS = "progress"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
+
+_T = TypeVar("_T")
+
+# Progress on the placeholder: a step must run this long before its label shows,
+# and at most one label lands per this interval across the turn's steps. Both are
+# workflow time, never real time.
+PROGRESS_AFTER = timedelta(seconds=2)
+PROGRESS_GAP = timedelta(seconds=3)
+# The labels are fixed runtime text. Titles come from the agent's grants or what
+# the runtime already knows, never from the model or a tool's input.
+SEARCHING_SOURCES = "Searching the knowledge sources…"
+READING_NOTION = "Reading Notion…"
+DRAFTING_REQUEST = "Drafting the request…"
+HANDING_OVER = "Handing over to {agent}…"
+
+
+def progress_label(
+    name: str,
+    kind: str,
+    *,
+    source_titles: list[str] | None = None,
+    page_title: str = "",
+    agent_name: str = "",
+) -> str | None:
+    """The placeholder text while ``name`` runs, or None for a tool with no label.
+
+    ``source_titles`` are the agent's granted knowledge pages, ``page_title`` a page
+    the runtime already knows, ``agent_name`` the specialist a hand-off names. Each
+    is escaped for Slack mrkdwn here, once, at the point of use.
+    """
+    if name == "search_knowledge":
+        titles = source_titles or []
+        if len(titles) == 1:
+            return f"Searching {escape_slack(titles[0])}…"
+        return SEARCHING_SOURCES
+    if name == HAND_OFF_TOOL:
+        return HANDING_OVER.format(agent=escape_slack(agent_name))
+    if kind == READ_KIND:
+        if page_title:
+            return f"Reading {escape_slack(page_title)}…"
+        return READING_NOTION
+    if kind in EDITABLE_FIELDS:
+        return DRAFTING_REQUEST
+    return None
 
 
 class _TurnState:
@@ -158,6 +216,8 @@ class _TurnState:
         self.refs = False
         # True once ingest_message returned: it consumed the inbound row either way.
         self.ingested = False
+        # When the turn last showed a progress label; the throttle reads it.
+        self.last_progress: datetime | None = None
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -576,7 +636,9 @@ class ConversationWorkflow:
                 continue
             refused = self._refused_calls(agent, calls)
             if workflow.patched(PATCH_CONTIGUOUS_MARKERS):
-                outcomes = await self._run_calls(ctx, agent, conv_id, calls, refused, unavailable)
+                outcomes = await self._run_calls(
+                    ctx, state, agent, conv_id, calls, refused, unavailable
+                )
             else:
                 first_markers: list[int] = []
                 for call in calls:
@@ -585,7 +647,7 @@ class ConversationWorkflow:
                         self.next_marker += SEARCH_RESULTS
                 outcomes = await asyncio.gather(
                     *[
-                        self._dispatch(ctx, agent, conv_id, call, first_marker, unavailable)
+                        self._dispatch(ctx, state, agent, conv_id, call, first_marker, unavailable)
                         if i not in refused
                         else _resolved(refused[i])
                         for i, (call, first_marker) in enumerate(zip(calls, first_markers))
@@ -887,12 +949,19 @@ class ConversationWorkflow:
         new_ref = ConversationRef(ref.tenant_id, target, ref.channel, ref.thread_ts)
         ctx = self._turn_context(new_ref, specialist, m)
         # Audited before anything is shown, so a failure to record leaves the
-        # thread with the front door and nothing announced.
-        await workflow.execute_activity_method(
-            AgentActivities.record_hand_off,
-            args=[state.ctx, target, m.event_id],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
+        # thread with the front door and nothing announced. While the record runs
+        # long, the placeholder says who is taking over; the announcement below
+        # replaces that label, never the other way round.
+        await self._with_progress(
+            state.ctx,
+            state,
+            progress_label(HAND_OFF_TOOL, "", agent_name=specialist.name),
+            workflow.execute_activity_method(
+                AgentActivities.record_hand_off,
+                args=[state.ctx, target, m.event_id],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            ),
         )
         announcement = HAND_OFF_ANNOUNCEMENT.format(agent=specialist.name)
         if workflow.patched(PATCH_NOTICE_AUDIT):
@@ -946,6 +1015,7 @@ class ConversationWorkflow:
     async def _run_calls(
         self,
         ctx: TurnContext,
+        state: "_TurnState",
         agent: AgentVersion,
         conv_id: str,
         calls: list[ToolCall] | list[ToolCallRef],
@@ -967,7 +1037,9 @@ class ConversationWorkflow:
             elif call.name == "search_knowledge":
                 outcome = (
                     await asyncio.gather(
-                        self._dispatch(ctx, agent, conv_id, call, self.next_marker, unavailable),
+                        self._dispatch(
+                            ctx, state, agent, conv_id, call, self.next_marker, unavailable
+                        ),
                         return_exceptions=True,
                     )
                 )[0]
@@ -978,7 +1050,7 @@ class ConversationWorkflow:
                 parallel.append(i)
         rest = await asyncio.gather(
             *[
-                self._dispatch(ctx, agent, conv_id, calls[i], self.next_marker, unavailable)
+                self._dispatch(ctx, state, agent, conv_id, calls[i], self.next_marker, unavailable)
                 for i in parallel
             ],
             return_exceptions=True,
@@ -989,6 +1061,7 @@ class ConversationWorkflow:
     async def _dispatch(
         self,
         ctx: TurnContext,
+        state: "_TurnState",
         agent: AgentVersion,
         conv_id: str,
         call: ToolCall | ToolCallRef,
@@ -1005,6 +1078,22 @@ class ConversationWorkflow:
                 )
             return ToolResult(call.id, HAND_OFF_EXTRA, is_error=True)
         kind = self._kind(call)
+        label = progress_label(
+            call.name, kind, source_titles=[g.name for g in agent.grants.notion_pages]
+        )
+        return await self._with_progress(
+            ctx, state, label, self._run_call(ctx, agent, conv_id, call, kind, first_marker)
+        )
+
+    async def _run_call(
+        self,
+        ctx: TurnContext,
+        agent: AgentVersion,
+        conv_id: str,
+        call: ToolCall | ToolCallRef,
+        kind: str,
+        first_marker: int,
+    ) -> ToolResult:
         if kind == READ_KIND:
             return await workflow.execute_activity_method(
                 AgentActivities.run_stored_read_tool
@@ -1021,6 +1110,54 @@ class ConversationWorkflow:
             return await self._start_task(ctx, agent, call, kind)
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
+
+    async def _with_progress(
+        self,
+        ctx: TurnContext,
+        state: "_TurnState",
+        label: str | None,
+        coro: Awaitable[_T],
+    ) -> _T:
+        """Run one tool step; when it runs long, show its label on the placeholder.
+
+        The label shows only once the step has run ``PROGRESS_AFTER``, and at most one
+        edit lands per ``PROGRESS_GAP`` across the turn's steps. The edit is awaited
+        here, before the step's result returns, so it can never land after the final
+        reply; a failure is dropped. A step that finishes in time shows nothing.
+        """
+        if not workflow.patched(PATCH_PROGRESS) or label is None:
+            return await coro
+        task = asyncio.ensure_future(coro)
+        started = workflow.now()
+        try:
+            await workflow.wait_condition(lambda: task.done(), timeout=PROGRESS_AFTER)
+        except TimeoutError:
+            while not task.done():
+                eligible = started + PROGRESS_AFTER
+                if state.last_progress is not None:
+                    eligible = max(eligible, state.last_progress + PROGRESS_GAP)
+                now = workflow.now()
+                if now >= eligible:
+                    state.last_progress = now
+                    assert state.placeholder_ts is not None
+                    await self._progress_update(ctx, state.placeholder_ts, label)
+                    break
+                try:
+                    await workflow.wait_condition(lambda: task.done(), timeout=eligible - now)
+                except TimeoutError:
+                    pass
+        return await task
+
+    async def _progress_update(self, ctx: TurnContext, placeholder_ts: str, label: str) -> None:
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.update_progress,
+                args=[ctx, placeholder_ts, label],
+                start_to_close_timeout=PROGRESS_TIMEOUT,
+                retry_policy=PROGRESS_RETRY,
+            )
+        except ActivityError as err:
+            self._log_failure(self._ref(), err, "progress")
 
     async def _start_task(
         self, ctx: TurnContext, agent: AgentVersion, call: ToolCall, kind: str

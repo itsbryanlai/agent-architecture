@@ -343,6 +343,7 @@ class AgentActivities:
             self.append_tool_results,
             self.call_llm,
             self.post_placeholder,
+            self.update_progress,
             self.finalize_reply,
             self.finalize_notice,
             self.run_read_tool,
@@ -1105,6 +1106,18 @@ class AgentActivities:
         return await self._post_once(
             ctx.tenant_id, idem_key, ctx.channel, "Thinking…", ctx.thread_ts
         )
+
+    @activity.defn(name="update_progress")
+    async def update_progress(self, ctx: TurnContext, placeholder_ts: str, text: str) -> None:
+        """Edit the placeholder to a progress label while the turn runs.
+
+        The workflow awaits this inside the step, before the step's result returns, so
+        the edit never lands after the final reply, and drops a failure. Setting the
+        same text twice is the same edit, so a retry needs no lease.
+        """
+        self._log("update_progress", ctx.tenant_id, ctx.agent_id)
+        slack = self._runtime(ctx.tenant_id).slack
+        await slack.update_message(ctx.channel, placeholder_ts, text)
 
     @activity.defn(name="finalize_reply")
     async def finalize_reply(

@@ -7,7 +7,7 @@ table by `scripts/init_db.sql` and the migrations. A kind that is not in both ca
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
 [Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
-[Retention](#retention) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
+[Retention](#retention) · [Webhook token](#webhook-token) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
 [How to read it](#how-to-read-it) · [What you see in a live run](#what-you-see-in-a-live-run)
 
 ## Columns
@@ -125,6 +125,17 @@ changed: turning off what is off, or on what is on, records nothing.
 | `retention_set` | An owner sets a tenant's retention limits from the command line. | `operator:<OS login>` for both | none | `retention` | `kind=days` pairs, sorted, comma-separated | `ok` | `<tenant>:audit:control:retention_set:<random>`: a repeat run records again |
 
 Rows in `audit_events` are not subject to retention themselves.
+
+## Webhook token
+
+Written by the host command that manages a tenant's Notion webhook verification token
+(`python -m agentos.notion_webhook`), as `operator:<OS login>` (which names the requester too).
+Written only when the command did something: a show of an already-confirmed token, or a confirm
+or clear with nothing to change, records nothing. The token itself is never in the row.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `webhook_token` | The operator shows the pending token, confirms it, or clears it | `operator:<OS login>` for both | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<random>`: a repeat run records again |
 
 ## Access review
 

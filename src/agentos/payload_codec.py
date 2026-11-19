@@ -44,7 +44,7 @@ from temporalio.converter import (
 )
 
 from agentos.config import TENANT_ID_PATTERN
-from agentos.crypto_keys import LocalKeyStore, TenantKeyError, key_id, parse_key_id
+from agentos.crypto_keys import KeyStore, TenantKeyError, key_id, parse_key_id
 
 ENCRYPTED_ENCODING = b"binary/encrypted"
 KEY_ID_METADATA = "encryption-key-id"
@@ -79,10 +79,30 @@ def tenant_from_workflow_id(workflow_id: str | None) -> str | None:
     return tenant if TENANT_ID_PATTERN.fullmatch(tenant) else None
 
 
+def encrypt_for_tenant(keys: KeyStore, tenant_id: str, plaintext: bytes) -> tuple[bytes, int]:
+    """A small value under the tenant's newest key: (nonce || ciphertext, key version).
+
+    The same AES-256-GCM cipher the payloads use, with the tenant ID as the
+    associated data, so a value stored for one tenant does not decrypt for
+    another. For a secret kept outside Temporal (the Notion webhook token);
+    the value never appears in a log or an error.
+    """
+    version = keys.latest_version(tenant_id)
+    nonce = os.urandom(NONCE_BYTES)
+    data = AESGCM(keys.key(tenant_id, version)).encrypt(nonce, plaintext, tenant_id.encode())
+    return nonce + data, version
+
+
+def decrypt_for_tenant(keys: KeyStore, tenant_id: str, blob: bytes, version: int) -> bytes:
+    """The value ``encrypt_for_tenant`` stored, under the key version it names."""
+    nonce, data = blob[:NONCE_BYTES], blob[NONCE_BYTES:]
+    return AESGCM(keys.key(tenant_id, version)).decrypt(nonce, data, tenant_id.encode())
+
+
 class TenantPayloadCodec(PayloadCodec, WithSerializationContext):
     def __init__(
         self,
-        keys: LocalKeyStore,
+        keys: KeyStore,
         tenant_id: str | None = None,
         workflow_id: str | None = None,
         *,

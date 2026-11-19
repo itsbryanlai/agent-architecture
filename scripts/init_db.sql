@@ -152,7 +152,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
-  ('grant_pick'), ('widening_confirm')
+  ('grant_pick'), ('widening_confirm'), ('webhook_token')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
-             'switch_off', 'switch_on', 'usage_repriced', 'retention_set')
+             'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -953,6 +953,26 @@ CREATE POLICY tenant_isolation ON task_drafts
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- The Notion webhook verification token, encrypted per tenant. Same as migration 030.
+CREATE TABLE IF NOT EXISTS notion_webhook_tokens (
+  tenant_id    text        NOT NULL PRIMARY KEY,
+  state        text        NOT NULL CHECK (state IN ('pending', 'active')),
+  ciphertext   bytea       NOT NULL,
+  key_version  integer     NOT NULL CHECK (key_version >= 1),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  confirmed_at timestamptz
+);
+
+REVOKE ALL ON notion_webhook_tokens FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notion_webhook_tokens TO agentos_app;
+
+ALTER TABLE notion_webhook_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notion_webhook_tokens FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON notion_webhook_tokens;
+CREATE POLICY tenant_isolation ON notion_webhook_tokens
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -964,5 +984,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030')
 ON CONFLICT DO NOTHING;

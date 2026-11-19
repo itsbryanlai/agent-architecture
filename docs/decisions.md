@@ -32,11 +32,12 @@ Last reviewed 2026-11-16. What each decision means for the code today is in [sta
 | D-24 | Audience changes are watched only for a channel shared with another organisation. People joining a channel are not watched | Decided |
 | D-25 | Qwen is a second chat provider, and embeddings may come from any OpenAI-compatible endpoint, including a local Ollama model. The embedding vector size is fixed at 1024 | Decided |
 | D-26 | Chat and document content stays out of Temporal history: it lives in Postgres under IDs. Workflows that were running at the deploy keep their earlier shape until they end | Decided |
-| D-27 | Payload keys are local versioned files per tenant (`<tenant>/vN`), bound to the workflow ID, rotated by a command. Amends D-12: no KMS yet | Decided |
+| D-27 | Payload keys are local versioned files per tenant (`<tenant>/vN`), bound to the workflow ID, rotated by a command. Amends D-12: no KMS yet. **Amended by D-32:** keys may also come from host variables; the Notion webhook token is stored encrypted per tenant | Decided |
 | D-28 | MCP, OpenAPI adapters and the certified/custom connector tiers are **deferred, not decided against**. Notion is called directly behind a manifest. Amends D-08 and D-15 | Decided |
 | D-29 | A publish approves a content: the version carries the hash of the definition it was submitted with, and publishing a different hash is refused | Decided |
 | D-30 | A creator lists and reads only the agents they created; admins read every agent | Decided |
 | D-31 | Bounds on how long a task can live: an approval window of at most 168 hours, a follow-up watch of at most 60 days, and a retention floor of 68 days for the data a live task still needs | Decided |
+| D-32 | Payload keys may come from host variables (`AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>`) instead of local files, chosen once per process; the Notion webhook verification token is stored encrypted per tenant in the database (pending → confirmed by a host command). Amends D-27 | Decided |
 
 ## Context for the main decisions
 
@@ -140,6 +141,11 @@ Last reviewed 2026-11-16. What each decision means for the code today is in [sta
 - **Decision:** an agent definition may ask for an approval window of at most 168 hours (default 72) and a follow-up watch of at most 60 days (default 30). Retention for conversation messages, tool outputs and idempotency records is never shorter than the longest a task can live: 168 hours rounded up to 7 days, plus 60, plus 1, is 68 days. Setting a lower value is refused; the nightly job raises a lower stored one.
 - **Why:** nothing a live approval or follow-up still needs may be purged under it.
 - **Consequence:** audit and usage rows, external writes, task links and agent definitions are exempt from retention.
+
+### D-32 Keys from host variables, the webhook token in the database (amends D-27)
+- **Decision:** a process reads its payload keys either from the local key files (the default, `AGENTOS_KEY_SOURCE=files`) or from host variables named `AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` (`AGENTOS_KEY_SOURCE=env`): base64 of 32 bytes, `<TENANT>` the tenant ID upper-cased with `-` turned to `_`. Every process chooses through one factory (`agentos.crypto_keys.build_key_store`), so the worker, the gateway and the Temporal client agree. `python -m agentos.tenant_keys value` prints a new key value once, to paste into the host's variables; it never reads or prints an existing key. The Notion webhook verification token is stored encrypted per tenant in the database (the codec's AES-256-GCM cipher, the tenant ID as associated data): the handshake stores it pending and cannot replace a pending or active token; a host command (`python -m agentos.notion_webhook show|confirm|clear`) prints it once, confirms it, or removes it, each audited as the operator. Only a confirmed token accepts events. The tenant's environment variable stays as a local override: while it is set, events use it and the handshake is refused.
+- **Why:** a hosted deployment (Railway) has no operator laptop to hold owner-only files; service variables are the hosted equivalent of "exported in the terminal", and the database is already the tenant-scoped, backed-up store. The token no longer needs a gateway volume, nor a restart to export it.
+- **Consequence:** rotation on a variable host adds `_V2`, redeploys, and keeps `_V1`; moving a tenant from a key file to a variable is the operator copying the file's content themselves. Two variables claiming one tenant's key version are refused at start-up. Decided by the maintainer 2026-11-19.
 
 ## Open questions
 

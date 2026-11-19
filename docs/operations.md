@@ -2,7 +2,7 @@
 
 How to set up, configure and run the system. What the system does is in [architecture.md](architecture.md); the first-run summary is in the [README](../README.md); what is built is in [status.md](status.md).
 
-Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
+Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Payload keys on a host without files](#payload-keys-on-a-host-without-files) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
 
 Prerequisites: [uv](https://docs.astral.sh/uv/) (it installs Python 3.12 for you), Docker with Docker Compose, a tunnel tool (`cloudflared` or `ngrok`), a Slack workspace where you can create apps, a Notion workspace where you can create integrations, and an Anthropic API key (or Qwen, see Model provider).
 
@@ -99,33 +99,50 @@ signature it cannot check, so set it up in this order:
    `POST /notion/webhook/<tenant_id>` on the gateway. (`POST /notion/webhook`
    without a tenant works only while exactly one tenant is configured, so a
    subscription made before there were several tenants keeps working.)
-2. Notion sends a one-time handshake. The gateway writes the verification token
-   to a file readable only by you, and logs the path (never the token). The file
-   is `notion-webhook-verification-token-<tenant_id>` in `~/.agentos`, unless
-   you set `AGENTOS_NOTION_TOKEN_DIR`. While that file exists a second handshake
-   gets 409 and changes nothing: delete the file to subscribe again.
-3. Paste the token from that file into the Notion integration to finish
-   subscribing, then export it in the variable the tenant's config names
-   (`NOTION_WEBHOOK_VERIFICATION_TOKEN` by default), for example
-   `export NOTION_WEBHOOK_VERIFICATION_TOKEN='<token>'`, and restart the
-   gateway.
+2. Notion sends a one-time handshake. The gateway encrypts the verification
+   token with the tenant's payload key and stores it in the database as
+   **pending**, and logs that a token is pending (never the token). While a
+   token is pending or active a second handshake gets 409 and changes nothing.
+3. Print the pending token once, paste it into the Notion integration to finish
+   subscribing, then confirm it:
 
-The setup message is accepted only while no token is configured.
+   ```bash
+   uv run python -m agentos.notion_webhook show --tenant <tenant_id>
+   uv run python -m agentos.notion_webhook confirm --tenant <tenant_id>
+   ```
 
-Once the token is exported, the gateway refuses further handshakes (409) so the
-file cannot be overwritten; to re-subscribe, unset that tenant's webhook token
-variable and restart the gateway first.
+   Only a **confirmed** (active) token accepts events; a pending one never does.
+   Each command is audited as the operator (`operator:<OS login>`), and the
+   audit row never holds the token. `show` refuses once the token is confirmed.
+   The command reads the tenant's payload key from the same key source as the
+   gateway (`AGENTOS_KEY_SOURCE`), so run it where those keys are available.
 
-Until the token is exported, events get a 503. Events with a missing or wrong
-signature (a signature made with another tenant's token is wrong) get a 401. A
-path that names no tenant gets a 404. None of these reaches a workflow. If the
-tenant's config sets `notion_workspace_id`, a correctly signed event from any
-other Notion workspace is ignored (200, no action).
+To re-subscribe (a new subscription sends a new token), clear the stored token
+first, then let the new handshake arrive:
+
+```bash
+uv run python -m agentos.notion_webhook clear --tenant <tenant_id>
+```
+
+The handshake is also refused while the tenant's webhook token variable is set
+(409): the variable is a local override, and while it is set every event is
+verified against it instead of the database. Unset it and restart the gateway
+to use the database flow. A gateway built without a database keeps the older
+file flow: the handshake writes an owner-only token file
+(`notion-webhook-verification-token-<tenant_id>` in `~/.agentos`, unless
+`AGENTOS_NOTION_TOKEN_DIR` is set), the operator pastes it into Notion and
+exports it, and deleting the file reopens the handshake.
+
+Until a token is active (or exported), events get a 503. Events with a missing
+or wrong signature (a signature made with another tenant's token is wrong) get
+a 401. A path that names no tenant gets a 404. None of these reaches a
+workflow. If the tenant's config sets `notion_workspace_id`, a correctly signed
+event from any other Notion workspace is ignored (200, no action).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Notion's verification token for a tenant that has no `secrets` block (secret; export it, never save it in a dotenv file). Without it every webhook event for that tenant is refused. Other tenants name their own variable |
-| `AGENTOS_NOTION_TOKEN_DIR` | `~/.agentos` | Directory where the gateway writes each tenant's token file, `notion-webhook-verification-token-<tenant_id>`, at subscription time (mode `0600`, directory `0700`) |
+| `NOTION_WEBHOOK_VERIFICATION_TOKEN` | none | Local override: Notion's verification token for a tenant that has no `secrets` block (secret; export it, never save it in a dotenv file). While it is set, events are verified against it and the handshake is refused. Other tenants name their own variable |
+| `AGENTOS_NOTION_TOKEN_DIR` | `~/.agentos` | Directory where a gateway without a database writes each tenant's token file, `notion-webhook-verification-token-<tenant_id>`, at subscription time (mode `0600`, directory `0700`) |
 
 ## Front door and channels
 
@@ -297,12 +314,62 @@ read a history written before encryption existed, start that process with
 The Temporal web UI shows these payloads as encrypted until a codec server is
 added (a later change). Every process that connects to Temporal (worker,
 gateway, `index_knowledge`) goes through `agentos.temporal_client.build_temporal_client`,
-so each needs the keys it will use.
+so each needs the keys it will use. On a host without a key directory, the keys
+come from variables instead: see
+[Payload keys on a host without files](#payload-keys-on-a-host-without-files).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENTOS_KEY_DIR` | `~/.agentos/keys` | Directory of per-tenant key files, `<tenant_id>.key` and `<tenant_id>.v<N>.key` |
+| `AGENTOS_KEY_SOURCE` | `files` | Where payload keys come from: `files` (`AGENTOS_KEY_DIR`) or `env` (`AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>` variables) |
 | `AGENTOS_ALLOW_PLAINTEXT_PAYLOADS` | off | Accept payloads that were never encrypted (old histories only) |
+
+## Payload keys on a host without files
+
+A hosted deployment (for example Railway) keeps payload keys in the service's
+variables instead of a key directory. Set `AGENTOS_KEY_SOURCE=env` on every
+service that reads or writes Temporal payloads (worker, gateway, and any
+`index_knowledge` run); the default `files` keeps local runs unchanged. Each
+key version is one variable:
+
+```
+AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>=<base64 of 32 bytes>
+```
+
+`<TENANT>` is the tenant ID upper-cased with `-` turned to `_` (`acme` →
+`ACME`, `my-tenant` → `MY_TENANT`). A malformed or wrong-length value is
+refused at start-up with an error naming the variable and the tenant, never
+the value; two variables claiming one tenant's key version are refused too.
+
+**Create a key** for a new tenant:
+
+```bash
+uv run python -m agentos.tenant_keys value <tenant_id>
+```
+
+It prints one new value as `AGENTOS_PAYLOAD_KEY_<TENANT>_V1=<base64>` and a
+warning. Paste it into the host's variables (on Railway: the service's
+Variables tab) and redeploy. The value is shown once and the command stores it
+nowhere; if you lose it, that tenant's in-flight workflow data cannot be read
+again. The command never reads or prints an existing key, and writes no file.
+
+**Rotate a tenant's key**:
+
+```bash
+uv run python -m agentos.tenant_keys value <tenant_id> --next
+```
+
+It names the version after the tenant's newest, read from the key source the
+command's own environment selects. Add the printed `_V2` variable beside
+`_V1`, redeploy every service, and **keep `_V1`**: new payloads use the newest
+version, and every older version must stay while a history written under it is
+kept. Never delete an old version.
+
+**Move an existing tenant from a key file to a variable**: copy the key file's
+content yourself into `AGENTOS_PAYLOAD_KEY_<TENANT>_V1` (the command never
+reads a key file), set `AGENTOS_KEY_SOURCE=env`, and redeploy. The file already
+holds the base64 of the 32 bytes; paste it as-is. Keep the file as a backup
+until the hosted deployment has decoded existing histories.
 
 ## Model provider
 

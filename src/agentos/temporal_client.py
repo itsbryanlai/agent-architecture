@@ -8,11 +8,11 @@ from temporalio.client import Client
 from temporalio.converter import DataConverter, DefaultFailureConverterWithEncodedAttributes
 
 from agentos.config import Settings
-from agentos.crypto_keys import LocalKeyStore
+from agentos.crypto_keys import KeyStore, build_key_store
 from agentos.payload_codec import TenantPayloadCodec
 
 
-def tenant_data_converter(keys: LocalKeyStore, *, allow_plaintext: bool = False) -> DataConverter:
+def tenant_data_converter(keys: KeyStore, *, allow_plaintext: bool = False) -> DataConverter:
     """The default data converter with the per-tenant encrypting codec.
 
     Failures move their message and stack trace into encoded attributes, so
@@ -28,7 +28,7 @@ def tenant_data_converter(keys: LocalKeyStore, *, allow_plaintext: bool = False)
 
 
 async def build_temporal_client(settings: Settings) -> Client:
-    keys = LocalKeyStore(settings.key_dir)
+    keys = build_key_store(settings)
     return await Client.connect(
         settings.temporal_address,
         data_converter=tenant_data_converter(

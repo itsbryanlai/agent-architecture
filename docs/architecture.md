@@ -41,7 +41,7 @@ Target, not in the diagram because it does not exist: a credential vault between
 
 ## 2. Multi-tenancy
 
-Status: **partial**. Built: tenant ID in every workflow ID, row and log line, row-level security, per-tenant payload keys held as local files. Target: cells, KMS-held keys, crypto-shredding, `tenant_id` search attribute, per-tenant rate limits, model allowlist and bring-your-own key.
+Status: **partial**. Built: tenant ID in every workflow ID, row and log line, row-level security, per-tenant payload keys held as local files or host variables, and the Notion webhook token stored encrypted per tenant. Target: cells, KMS-held keys, crypto-shredding, `tenant_id` search attribute, per-tenant rate limits, model allowlist and bring-your-own key.
 
 Tenant = one company = one Slack workspace. Many tenants share one deployment (one Temporal namespace, one set of workers, one Postgres); the tenant list lives in the `tenants` table (see D-20 in [decisions.md](decisions.md)).
 

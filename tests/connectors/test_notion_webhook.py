@@ -1,20 +1,33 @@
 """The Notion webhook accepts only signed events and never logs the token."""
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import secrets
 import stat
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos.agent_store import seeded_agent_store
+from agentos.audit import InMemoryAuditStore, event_json
 from agentos.config import Settings, TenantsConfig
+from agentos.crypto_keys import EnvKeyStore, key_var_name
 from agentos.gateway.app import create_app
 from agentos.gateway.notion_signature import verify_notion_signature
+from agentos.notion_webhook import (
+    InMemoryWebhookTokenStore,
+    WebhookTokens,
+    build_parser,
+    execute,
+)
+from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant
 from agentos.stores import InMemoryTaskLinkStore
 from tests.conftest import TENANT
 from tests.helpers.gateway import FakeTemporalClient
@@ -22,6 +35,7 @@ from tests.helpers.gateway import FakeTemporalClient
 TOKEN = "secret_verification_token_abc123"
 PAGE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 TASK_ID = f"{TENANT}:task:t1"
+NOW = datetime(2026, 11, 19, 12, 0, tzinfo=UTC)
 
 
 def sign(body: bytes, token: str = TOKEN) -> str:
@@ -241,3 +255,111 @@ def test_the_signature_is_computed_even_for_a_header_that_cannot_match(header):
 
     assert not verify_notion_signature(b"{}", header, TOKEN, mac=counting_mac)
     assert len(calls) == 1
+
+
+# --- the token in the database ---------------------------------------------------------
+
+
+def make_db_app(agents, temporal, links, tmp_path, monkeypatch):
+    """A gateway whose webhook tokens live in the (fake) database, encrypted under a generated key."""
+    monkeypatch.delenv("NOTION_WEBHOOK_VERIFICATION_TOKEN", raising=False)
+    store = InMemoryWebhookTokenStore()
+    keys = EnvKeyStore(
+        {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+    )
+    settings = Settings(notion_token_dir=str(tmp_path / "sub"))
+    app = create_app(
+        settings,
+        TenantsConfig.of(agents),
+        temporal,
+        links,
+        SignatureVerifier("x"),
+        agents=seeded_agent_store(agents),
+        webhook_tokens=WebhookTokens(store, keys),
+    )
+    return app, store, keys
+
+
+def db_client(app) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+async def apost(client, payload: dict, signature: str | None):
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if signature is not None:
+        headers["X-Notion-Signature"] = signature
+    return await client.post("/notion/webhook", content=body, headers=headers)
+
+
+async def test_handshake_stores_a_pending_token_once(
+    agents, temporal, links, tmp_path, monkeypatch, caplog
+):
+    """Fails if a second handshake replaces the pending token, or the token reaches a log or a file."""
+    app, store, keys = make_db_app(agents, temporal, links, tmp_path, monkeypatch)
+    async with db_client(app) as client:
+        with caplog.at_level(logging.DEBUG):
+            assert (await apost(client, {"verification_token": TOKEN}, None)).status_code == 200
+            assert (
+                await apost(client, {"verification_token": "replacement-token"}, None)
+            ).status_code == 409
+    row = store.snapshot()[TENANT]
+    assert row.state == "pending"
+    assert decrypt_for_tenant(keys, TENANT, row.ciphertext, row.key_version) == TOKEN.encode()
+    assert TOKEN.encode() not in row.ciphertext
+    assert TOKEN not in caplog.text
+    assert "replacement-token" not in caplog.text
+    assert TENANT in caplog.text
+    assert not (tmp_path / "sub").exists()
+
+
+@pytest.mark.parametrize(
+    ("confirmed", "expected"), [(False, 503), (True, 200)], ids=["pending", "confirmed"]
+)
+async def test_an_event_is_verified_only_against_the_confirmed_token(
+    agents, temporal, links, tmp_path, monkeypatch, confirmed, expected
+):
+    """Fails if an event signed with the pending token is accepted, or one signed with the confirmed token is refused."""
+    app, store, _keys = make_db_app(agents, temporal, links, tmp_path, monkeypatch)
+    async with db_client(app) as client:
+        await apost(client, {"verification_token": TOKEN}, None)
+        if confirmed:
+            await store.confirm(TENANT, NOW)
+        body = json.dumps(page_event()).encode()
+        resp = await apost(client, page_event(), sign(body))
+    assert resp.status_code == expected
+    assert len(temporal.signals) == (1 if confirmed else 0)
+
+
+async def test_show_confirm_and_clear_manage_the_token_and_audit_the_operator(monkeypatch, capsys):
+    """Fails if show prints a confirmed token, confirm leaves it pending, clear keeps it, or an audit row names the token or misses the operator."""
+    store = InMemoryWebhookTokenStore()
+    audit = InMemoryAuditStore()
+    keys = EnvKeyStore(
+        {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+    )
+    blob, version = encrypt_for_tenant(keys, TENANT, TOKEN.encode())
+    await store.put_pending(TENANT, blob, version)
+    monkeypatch.setattr("agentos.notion_webhook.operator_identity", lambda: "operator:ops")
+
+    def args(command):
+        return build_parser().parse_args(["--tenant", TENANT, command])
+
+    assert await execute(args("show"), store, audit, keys, request_id="inv-1") == 0
+    assert capsys.readouterr().out.strip() == TOKEN
+    assert await execute(args("confirm"), store, audit, keys, request_id="inv-1") == 0
+    assert (await store.get(TENANT)).state == "active"
+    assert await execute(args("show"), store, audit, keys, request_id="inv-1") == 1
+    assert TOKEN not in capsys.readouterr().out
+    assert await execute(args("clear"), store, audit, keys, request_id="inv-1") == 0
+    assert await store.get(TENANT) is None
+    assert await execute(args("clear"), store, audit, keys, request_id="inv-1") == 1
+
+    rows = [(e.kind, e.tool, e.identity, e.requester_user_id) for e in audit.events]
+    assert rows == [
+        ("webhook_token", "show", "operator:ops", "operator:ops"),
+        ("webhook_token", "confirm", "operator:ops", "operator:ops"),
+        ("webhook_token", "clear", "operator:ops", "operator:ops"),
+    ]
+    for event in audit.events:
+        assert TOKEN not in event_json(event)

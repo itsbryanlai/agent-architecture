@@ -252,7 +252,7 @@ uv run python -m agentos.tenant_store import
   seconds, the worker every 5. The gateway serves a new tenant at once, because
   an event from a Slack workspace it does not know is looked up in the
   database. The worker builds the new tenant's Slack and Notion clients from its
-  variables (a tenant whose variable is unset or whose key file is unusable is
+  variables (a tenant whose variable is unset or whose payload key is unusable is
   skipped and logged once, and tried again on the next pass). A **disabled**
   tenant is dropped within that time: the gateway answers nothing for it, the
   worker no longer runs its activities, and the console refuses its sign-ins
@@ -290,7 +290,7 @@ data cannot be read again.**
 
 The worker and the gateway check every configured tenant's key before they
 connect, and refuse to start with a one-line summary naming each missing or
-unsafe key file and the command that creates it. Errors and failure messages in
+unsafe key file or key variable and the command that creates it. Errors and failure messages in
 the history are encrypted too.
 
 **Rotate a tenant's key** with:
@@ -329,7 +329,7 @@ come from variables instead: see
 A hosted deployment (for example Railway) keeps payload keys in the service's
 variables instead of a key directory. Set `AGENTOS_KEY_SOURCE=env` on every
 service that reads or writes Temporal payloads (worker, gateway, and any
-`index_knowledge` run); the default `files` keeps local runs unchanged. Each
+`index_knowledge` or `retention` run); the default `files` keeps local runs unchanged. Each
 key version is one variable:
 
 ```
@@ -340,6 +340,9 @@ AGENTOS_PAYLOAD_KEY_<TENANT>_V<n>=<base64 of 32 bytes>
 `ACME`, `my-tenant` → `MY_TENANT`). A malformed or wrong-length value is
 refused at start-up with an error naming the variable and the tenant, never
 the value; two variables claiming one tenant's key version are refused too.
+Every variable starting `AGENTOS_PAYLOAD_KEY_` must follow that name: one that
+does not (for example an old key renamed to `..._V1_OLD` to "disable" it) stops
+every service from starting, for all tenants.
 
 **Create a key** for a new tenant:
 

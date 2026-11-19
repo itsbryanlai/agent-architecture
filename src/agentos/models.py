@@ -407,7 +407,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a membership event, a tenant-wide budget or a tenant-wide switch
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"

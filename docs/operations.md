@@ -1105,12 +1105,13 @@ than three nightly runs, run `uv run python -m agentos.index_knowledge --confirm
 
 ### Search log and the Searched line
 
-Every `search_knowledge` call logs one line, `search_knowledge returned`, with the tenant
+Every completed `search_knowledge` call logs one line, `search_knowledge returned`, with the tenant
 and agent IDs, the number of granted scopes (`scopes`), the candidate hits (`hits`), how
 many the distance cut-off dropped (`dropped`), how many passages were kept (`kept`), and
 each kept page's ID and best distance (`pages=<page id>:<distance>,…`). It carries no
 titles or passage text. It tells a search that found nothing from one whose passages the
-answer did not cite.
+answer did not cite. `hits` can exceed `dropped + kept`: hits whose page fails the live
+re-check, or beyond the per-page and per-search passage caps, are not counted in either.
 
 An answer that cites its passages gets the Sources line. When a turn's searches returned
 passages but the answer cites none of them, the reply instead shows a Searched line naming

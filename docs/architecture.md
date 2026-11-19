@@ -417,7 +417,7 @@ Where in code: `src/agentos/switches.py`, `AgentActivities._gate` and `_gate_wri
 
 ## 9. Slack integration
 
-Status: **partial**. Built: Events API, interactivity, signed requests, per-tenant workspace mapping, Sign in with Slack for the console, progress updates on the placeholder. Target: a distributed app with OAuth install, Marketplace listing.
+Status: **partial**. Built: Events API, interactivity, signed requests, per-tenant workspace mapping, Sign in with Slack for the console, progress updates on the placeholder, a pilot OAuth install for allowlisted workspaces. Target: OAuth install for any workspace, Marketplace listing.
 
 - One Slack app per deployment (Events API and interactivity), installed by hand from `slack/app-manifest.yaml` or through the pilot OAuth install on the console (`/install/slack`, allowlisted workspaces only). Target: OAuth install for any workspace, and a Marketplace listing.
 - **Acknowledge first.** A message event is stored in Postgres and answered at once, whether or not Temporal is reachable; a Slack retry stores nothing, and if the event can't be stored the gateway answers with an error so Slack sends it again. Button clicks are not retried by Slack, so a click is handled before the reply, within 2.0 seconds; when Temporal or the database doesn't answer in time the person gets an ephemeral "That didn't go through. Please try again in a moment." (or an error on the form) and nothing is half done.

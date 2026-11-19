@@ -160,6 +160,9 @@ class Settings:
     notion_oauth_client_id: str | None = None
     notion_oauth_client_secret: str | None = field(default=None, repr=False)
     require_grant_picker: bool = False
+    # The pilot allowlist for the Slack OAuth install: the Slack team IDs that may
+    # install. Empty (the default) refuses every install.
+    install_allowed_teams: tuple[str, ...] = ()
     # Database connections per process (min and max of the pool) and how many activities the
     # worker runs at once. An activity holds a connection only while it runs a query, and a
     # model call makes about six, so a pool smaller than the activity count makes activities
@@ -209,6 +212,11 @@ def _parse_key_source(raw: str | None) -> str:
 
 def _parse_flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in _TRUE_VALUES
+
+
+def _parse_install_teams(raw: str | None) -> tuple[str, ...]:
+    """Comma-separated Slack team IDs; unset or empty means no team may install."""
+    return tuple(part.strip() for part in (raw or "").split(",") if part.strip())
 
 
 def _parse_distance(raw: str | None) -> float | None:
@@ -282,6 +290,7 @@ def load_settings() -> Settings:
         notion_oauth_client_id=env.get("NOTION_OAUTH_CLIENT_ID") or None,
         notion_oauth_client_secret=env.get("NOTION_OAUTH_CLIENT_SECRET") or None,
         require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
+        install_allowed_teams=_parse_install_teams(env.get("AGENTOS_INSTALL_ALLOWED_TEAMS")),
         db_pool_min=_parse_positive_int(env, "AGENTOS_DB_POOL_MIN", DEFAULT_DB_POOL_MIN),
         db_pool_max=_parse_positive_int(env, "AGENTOS_DB_POOL_MAX", DEFAULT_DB_POOL_MAX),
         max_concurrent_activities=_parse_positive_int(
@@ -478,7 +487,9 @@ class AgentsConfig:
     tenant_id: str
     slack_team_id: str
     agents: dict[str, AgentVersion]
-    default_agent: str
+    # None for a tenant installed from Slack that has no agent yet: the gateway
+    # answers its messages with the fixed not-set-up reply until an admin sets one.
+    default_agent: str | None
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)

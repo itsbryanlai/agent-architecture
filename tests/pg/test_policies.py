@@ -78,6 +78,8 @@ SEEDS = {
     "(tenant_id, state, ciphertext, key_version) VALUES (%(t)s, 'pending', '\\x00', 1)",
     "tenant_payload_keys": "INSERT INTO tenant_payload_keys "
     "(tenant_id, version, wrapped_key, master_version) VALUES (%(t)s, 1, '\\x00', 1)",
+    "tenant_credentials": "INSERT INTO tenant_credentials "
+    "(tenant_id, kind, ciphertext, key_version) VALUES (%(t)s, 'slack_bot', '\\x00', 1)",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
@@ -119,6 +121,7 @@ PRIVILEGES = {
     "task_drafts": "SELECT INSERT DELETE",
     "notion_webhook_tokens": "SELECT INSERT UPDATE DELETE",
     "tenant_payload_keys": "SELECT INSERT",
+    "tenant_credentials": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }
@@ -386,6 +389,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "switch_on",
                 "webhook_token",
                 "payload_key",
+                "install",
             )
         ],
     ],

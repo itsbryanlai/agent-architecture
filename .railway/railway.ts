@@ -150,6 +150,9 @@ export default defineRailway(() => {
       SLACK_SIGNING_SECRET: "${{shared.SLACK_SIGNING_SECRET}}",
       SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
       NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
+      // The console's public URL, named in the not-set-up reply the gateway posts
+      // for a tenant installed but not configured yet.
+      AGENTOS_CONSOLE_URL: "https://${{console.RAILWAY_PUBLIC_DOMAIN}}",
       // Optional local override; leave unset so the token lives in the
       // database (docs/operations.md, Notion webhook).
       NOTION_WEBHOOK_VERIFICATION_TOKEN: preserve(),
@@ -179,6 +182,12 @@ export default defineRailway(() => {
       AGENTOS_CONSOLE_URL: "https://${{RAILWAY_PUBLIC_DOMAIN}}",
       NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
       SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
+      // The install creates the tenant's key and encrypts its bot token in the database.
+      AGENTOS_KEY_SOURCE: "db",
+      AGENTOS_MASTER_KEY_V1: "${{shared.AGENTOS_MASTER_KEY_V1}}",
+      // The pilot allowlist for "Add to Slack": comma-separated Slack team IDs.
+      // Unset refuses every install (docs/operations.md, Slack OAuth install).
+      AGENTOS_INSTALL_ALLOWED_TEAMS: "${{shared.AGENTOS_INSTALL_ALLOWED_TEAMS}}",
       // Optional: the "Choose from Notion" grant picker.
       NOTION_OAUTH_CLIENT_ID: "${{shared.NOTION_OAUTH_CLIENT_ID}}",
       NOTION_OAUTH_CLIENT_SECRET: "${{shared.NOTION_OAUTH_CLIENT_SECRET}}",

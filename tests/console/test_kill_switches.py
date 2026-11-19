@@ -496,9 +496,12 @@ class Gateway:
             self.temporal,
             InMemoryTaskLinkStore(),
             SignatureVerifier(secret()),
-            slack_for=lambda tenant: self.slack,
+            slack_for=self._slack_for,
             switches=self.switches,
         )
+
+    async def _slack_for(self, tenant):
+        return self.slack
 
     async def click(self, action_id: str, task_id: str):
         payload = {

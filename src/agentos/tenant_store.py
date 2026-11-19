@@ -1,10 +1,12 @@
 """Tenants in the database, and the live view of them every process serves from.
 
-After a one-time import (``uv run python -m agentos.tenant_store import``) the
-``tenants`` table is the source of truth for tenant settings: the Slack workspace,
+The ``tenants`` table is the source of truth for tenant settings: the Slack workspace,
 whether the tenant is enabled, the default agent, channel routing, admins and the
-*names* of the environment variables that hold its secrets. A secret value is never
-stored here. Agents live in the agents table.
+*names* of the environment variables that hold its secrets. A tenant enters through
+the one-time import (``uv run python -m agentos.tenant_store import``) or through the
+Slack OAuth install (``agentos.slack_install``). A secret value is never stored here;
+connector credentials live encrypted in ``tenant_credentials``. Agents live in the
+agents table.
 
 Rules kept here:
 
@@ -29,7 +31,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
@@ -43,7 +45,7 @@ from agentos.config import (
     TenantSecrets,
     load_settings,
 )
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 
 log = logging.getLogger("agentos.tenants")
 
@@ -94,8 +96,13 @@ class TenantStore(Protocol):
         """One tenant's settings, read as that tenant."""
         ...
 
-    async def insert(self, config: AgentsConfig) -> bool:
-        """Store a tenant that is not stored yet. False, and nothing changes, if it is."""
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
+        """Store a tenant that is not stored yet. False, and nothing changes, if it is.
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``): the insert
+        then joins that transaction instead of opening its own, so the tenant row
+        commits with the unit's other writes or not at all.
+        """
         ...
 
     async def set_enabled(self, tenant_id: str, enabled: bool) -> None: ...
@@ -168,10 +175,10 @@ class PostgresTenantStore:
             return None
         return TenantRow(_config_from_row(*row[:7]), row[7], row[8])
 
-    async def insert(self, config: AgentsConfig) -> bool:
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         try:
-            async with tenant_transaction(self._pool, config.tenant_id) as conn:
-                cur = await conn.execute(
+            async with joined_transaction(self._pool, config.tenant_id, conn) as db:
+                cur = await db.execute(
                     """
                     INSERT INTO tenants (tenant_id, slack_team_id, default_agent,
                                          notion_workspace_id, channels, admins, secret_env)
@@ -216,6 +223,14 @@ class InMemoryTenantStore:
         for config in configs:
             self._put(config, True)
 
+    def snapshot(self) -> tuple[dict[str, TenantRow], datetime]:
+        """The rows as they are now, for ``InMemoryUnitOfWork``."""
+        return dict(self._rows), self._tick
+
+    def restore(self, state: tuple[dict[str, TenantRow], datetime]) -> None:
+        rows, tick = state
+        self._rows, self._tick = dict(rows), tick
+
     def _put(self, config: AgentsConfig, enabled: bool) -> None:
         self._tick += timedelta(microseconds=1)
         self._rows[config.tenant_id] = TenantRow(replace(config, agents={}), enabled, self._tick)
@@ -235,7 +250,7 @@ class InMemoryTenantStore:
     async def load(self, tenant_id: str) -> TenantRow | None:
         return self._rows.get(tenant_id)
 
-    async def insert(self, config: AgentsConfig) -> bool:
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         if config.tenant_id in self._rows:
             return False
         for row in self._rows.values():
@@ -422,21 +437,23 @@ class TenantDirectory:
 
 
 async def startup_tenants(directory: TenantDirectory) -> TenantsConfig:
-    """The enabled tenants a process starts with, or ``SystemExit`` saying what to do.
+    """The enabled tenants a process starts with; an inconsistent table is ``SystemExit``.
 
-    An empty table does not fall back to the YAML file: that would leave two sources
-    of truth. The operator runs the import once.
+    An empty table (or one where every tenant is disabled) starts the process serving
+    none: a tenant installed from Slack appears on the next directory refresh, without
+    a restart. There is no fallback to the YAML file — that would leave two sources of
+    truth; the one-time import stays the way a YAML tenant enters the database.
     """
     try:
         tenants = await directory.refresh()
     except ConfigError as err:
         raise SystemExit(f"tenants in the database are inconsistent: {err}") from err
-    if directory.stored_count == 0:
-        raise SystemExit(
-            f"the tenants table is empty. Import the tenant YAML files once with: {IMPORT_COMMAND}"
-        )
     if not tenants.tenants:
-        raise SystemExit("every tenant in the database is disabled; there is nothing to serve")
+        log.info(
+            "no enabled tenants in the database yet; serving none until a tenant is "
+            "installed or imported (stored rows: %d)",
+            directory.stored_count,
+        )
     return tenants
 
 

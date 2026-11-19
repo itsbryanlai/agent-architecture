@@ -7,7 +7,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `worker.py` | Temporal worker: runs every workflow and activity, builds one Slack and one Notion client per tenant. Refuses to start on a missing secret, key, price, grant check or an old schema | `core/test_config.py`, `core/test_pool_settings.py`, `connectors/test_grant_check.py` |
-| `gateway/app.py` | HTTP ingress for Slack events, button clicks and Notion webhooks. Verifies signatures, takes the tenant from the request (never from text), stores each event before answering, handles a click within 2.0 s | `core/test_gateway.py`, `connectors/test_notion_webhook.py`, `core/test_content_refs.py`, `core/test_front_door.py` |
+| `gateway/app.py` | HTTP ingress for Slack events, button clicks and Notion webhooks. Verifies signatures, takes the tenant from the request (never from text), stores each event before answering, handles a click within 2.0 s; a tenant with no default agent gets one fixed not-set-up reply per event | `core/test_gateway.py`, `connectors/test_notion_webhook.py`, `core/test_content_refs.py`, `core/test_front_door.py` |
 | `gateway/relay.py` | Signals conversation workflows with the events the gateway stored. At least once; one thread's messages are never delivered out of order | `core/test_content_refs.py` |
 | `gateway/notion_signature.py` | Checks Notion's webhook signature in constant time | `connectors/test_notion_webhook.py` |
 | `control_api.py` | The control-plane JSON API, a separate process from the gateway. Loopback only without sign-in; every request acts as one verified user | `console/test_control_api.py` |
@@ -47,8 +47,9 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `audit.py` | Append-only audit events: IDs and hashes only, one row per event key | `console/test_audit_log.py`, `pg/test_policies.py` |
 | `schema_version.py` | Start-up check that the database has every migration the code expects | `pg/test_schema.py` |
 | `sessions.py` | Console sessions kept server-side; only the SHA-256 of the session ID is stored | `console/test_web_ui.py`, `pg/test_stores.py` |
-| `tenant_store.py` | Tenants in the database: one-time import, narrow cross-tenant reads, and the cached live view every process serves from | `console/test_tenant_store.py` |
-| `tenants.py` | The tenants one process serves and each tenant's own Slack and Notion clients; an unknown tenant never falls back to another | `console/test_tenants.py` |
+| `tenant_store.py` | Tenants in the database: one-time import, narrow cross-tenant reads, and the cached live view every process serves from; an empty table starts serving none | `console/test_tenant_store.py` |
+| `tenants.py` | The tenants one process serves and each tenant's own Slack and Notion clients, built from the resolved credential (env fallback); a Slack-only tenant has no Notion client; an unknown tenant never falls back to another | `console/test_tenants.py` |
+| `credentials.py` | Per-tenant connector credentials, encrypted with the tenant's payload key; the one resolver for a tenant's Slack bot token (row first, env fallback, one key reload on a miss) | `connectors/test_credentials.py`, `pg/test_credential_store.py` |
 | `config.py` | Settings from the environment and agent definitions from YAML; the only module that reads environment variables. Validates every definition field and bound | `core/test_config.py`, `core/test_settings_env.py` |
 
 ## Agents, control and access
@@ -64,6 +65,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `notion_picker.py` | The creator's Notion sign-in, used once to list what they can see; no token stored | `console/test_grant_review.py` |
 | `access_diff.py` | What a version adds compared with the published one, and whether it widens access | `console/test_grant_review.py` |
 | `slack_signin.py` | Sign in with Slack (OpenID Connect) for the console and the session identity | `console/test_slack_sign_in.py` |
+| `slack_install.py` | The Slack OAuth install: the manifest's bot scopes, the code exchange, the pilot allowlist, and the unit of work that creates the tenant, key, encrypted token and first admin (a reinstall replaces the token only) | `console/test_slack_install.py` |
 
 ## Audience, budgets and cost
 

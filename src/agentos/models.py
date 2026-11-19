@@ -379,6 +379,8 @@ ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 WEBHOOK_AUDIT_KINDS = ("webhook_token",)
 # A tenant's payload key, created or rotated in the database by a host command.
 PAYLOAD_KEY_AUDIT_KINDS = ("payload_key",)
+# A tenant created by the Slack OAuth install, or its bot token replaced by a reinstall.
+INSTALL_AUDIT_KINDS = ("install",)
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -391,6 +393,7 @@ AUDIT_KINDS = (
     + ACCESS_AUDIT_KINDS
     + WEBHOOK_AUDIT_KINDS
     + PAYLOAD_KEY_AUDIT_KINDS
+    + INSTALL_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -410,7 +413,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -440,6 +443,7 @@ class AuditEvent:
             + RETENTION_AUDIT_KINDS
             + WEBHOOK_AUDIT_KINDS
             + PAYLOAD_KEY_AUDIT_KINDS
+            + INSTALL_AUDIT_KINDS
         )
         if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
             if not self.agent_id:

@@ -103,7 +103,8 @@ class SignInConfig:
         return self.console_url.startswith("https://")
 
 
-def _parse_console_url(raw: str) -> str:
+def parse_console_url(raw: str) -> str:
+    """The console's public base URL: scheme, host and port only, https (or local http)."""
     url = raw.strip()
     parts = urlsplit(url)
     if parts.scheme not in ("https", "http") or not parts.hostname:
@@ -143,7 +144,7 @@ def sign_in_from_settings(settings: Settings) -> SignInConfig | None:
     return SignInConfig(
         client_id=settings.slack_client_id or "",
         client_secret=settings.slack_client_secret or "",
-        console_url=_parse_console_url(settings.console_url or ""),
+        console_url=parse_console_url(settings.console_url or ""),
     )
 
 

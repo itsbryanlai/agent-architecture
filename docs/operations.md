@@ -230,8 +230,11 @@ export AGENTOS_CONFIG=config/tenants
 After the one-time import, the `tenants` table is the source of truth for
 tenant settings: the Slack workspace, whether the tenant is enabled, the
 default agent, the channel routing, the admins, the Notion workspace and the
-**names** of the secret variables. A secret value is never stored; secrets
-still come only from the environment. Agents are in their own table.
+**names** of the secret variables. A secret value is never stored in this
+table. A tenant's Slack bot token is read from its encrypted credential row
+first (`tenant_credentials`, see [Slack OAuth install](#slack-oauth-install-pilot));
+the environment variable its settings name is the fallback, so a local
+single-tenant run keeps working unchanged. Agents are in their own table.
 
 ```bash
 uv run python -m agentos.tenant_store import
@@ -245,15 +248,21 @@ uv run python -m agentos.tenant_store import
   the database. There is no console page for it yet, so for now that is SQL
   run as the owner role, for example `UPDATE tenants SET enabled = false WHERE tenant_id = 'acme'`. A trigger moves
   `updated_at` on every update, which is how the processes notice the change.
-- Every process starts only if the table has an enabled tenant. An empty table
-  stops it with a message that names the import; there is no silent fallback to
-  the YAML file.
+- Every process starts even when the table is empty or every tenant is
+  disabled: it logs once and serves none until a tenant is installed or
+  imported. There is no silent fallback to the YAML file. An inconsistent
+  table (two tenants sharing a workspace or a secret variable) still stops
+  start-up.
 - **No restart.** The gateway and the console re-read the table every 15
   seconds, the worker every 5. The gateway serves a new tenant at once, because
   an event from a Slack workspace it does not know is looked up in the
-  database. The worker builds the new tenant's Slack and Notion clients from its
-  variables (a tenant whose variable is unset or whose payload key is unusable is
-  skipped and logged once, and tried again on the next pass). A **disabled**
+  database. The worker builds the new tenant's Slack client from its resolved
+  token and its Notion client when it has a Notion token (a tenant whose Slack
+  token is unavailable or whose payload key is unusable is skipped and logged
+  once, and tried again on the next pass; a tenant with no Notion token is
+  served Slack-only). An activity for a tenant the worker does not know yet is
+  retried, not failed: the shared retry policy (5 attempts, 1 s doubling to
+  8 s, about 15 s) outlasts the 5 s refresh. A **disabled**
   tenant is dropped within that time: the gateway answers nothing for it, the
   worker no longer runs its activities, and the console refuses its sign-ins
   and sessions. Re-enabling it brings it back the same way.
@@ -265,6 +274,66 @@ uv run python -m agentos.tenant_store import
   that cross tenants (a Slack workspace to its tenant, and the list of tenants)
   go through two `SECURITY DEFINER` functions that return the tenant ID, the
   enabled flag and a change time only. The app role cannot delete a tenant.
+
+## Slack OAuth install (pilot)
+
+"Add to Slack" on the console creates a working tenant with no manual step:
+the tenant row, its payload key, its bot token (encrypted with that key) and
+its first admin, in one transaction, audited as `install`. The worker, the
+gateway and the console pick the tenant up on their next directory refresh —
+no restart, no variable to export, no key to create by hand.
+
+**In the Slack app** (api.slack.com/apps, the same app the gateway uses):
+
+1. OAuth & Permissions → Redirect URLs → add
+   `<AGENTOS_CONSOLE_URL>/install/slack/callback` and save.
+2. Manage Distribution → enable distribution (the app must be installable
+   into other workspaces; the pilot allowlist below decides which).
+3. The install requests exactly the bot scopes of `slack/app-manifest.yaml`;
+   keep the manifest and the app's Bot Token Scopes in step.
+
+**In the console's environment:**
+
+```bash
+export AGENTOS_INSTALL_ALLOWED_TEAMS=T0123ABCDEF,T0456GHIJKL   # the pilot workspaces
+```
+
+The allowlist is comma-separated Slack team IDs. **Unset or empty refuses
+every install**, with a clear page. The install also needs the sign-in trio
+(`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `AGENTOS_CONSOLE_URL`) and
+`AGENTOS_KEY_SOURCE=db` (the app generates each tenant's key, wrapped by the
+master key — see [Payload keys on a host without files](#payload-keys-on-a-host-without-files));
+with another key source the console starts but does not offer the install.
+
+**The flow.** A browser opens `<AGENTOS_CONSOLE_URL>/install/slack`, clicks
+"Add to Slack", approves the scopes in Slack, and lands back on the console:
+the installer becomes the tenant's first admin (the tenant row's `admins`
+list, like a YAML tenant's). The tenant ID is stable, built from the Slack
+team ID (`t-<team id lower-cased>`). A **reinstall** of a known workspace
+replaces the bot token (audited as a reinstall) and creates nothing else:
+settings, admins and key stay as they are, and every process rebuilds that
+tenant's Slack client from the new token on its next read.
+
+**A tenant with no agents yet.** An installed tenant has no agents and no
+Notion. Its `default_agent` is NULL until an admin sets one; until then the
+gateway answers every DM and mention with one fixed reply — "<app name> is
+installed but not set up yet. An admin can finish setup at
+`<AGENTOS_CONSOLE_URL>`." — with no model call and no Notion call. The app
+name is `display_information.name` from `slack/app-manifest.yaml` ("This app"
+when the manifest has no name). The reply is sent at most once per event: the
+event is stored delivered first, so a Slack retry posts nothing. Set
+`AGENTOS_CONSOLE_URL` in the gateway's environment too, so the reply names
+the console. A tenant with no Notion token is served Slack-only; connecting
+Notion and publishing agents is the admin's next step in the console.
+
+Errors render a page that names what went wrong (a Slack error code, the
+allowlist refusal, a conflicting tenant) and never a token. A tenant ID that
+already serves another workspace, and a workspace that already belongs to
+another tenant ID, are both refused with 409: an install never takes over
+another tenant's row. The bot token is
+stored only as ciphertext in `tenant_credentials` (migration `032`), under
+the tenant's payload key with the tenant ID as associated data; the audit row
+holds IDs only.
 
 ## Encrypted workflow data
 
@@ -1245,8 +1314,11 @@ uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
 The grant check ("Check Notion grants", and inside every publish) reads Notion with
 the tenant's own Notion key, so the process needs it too. The variable is the one the
 tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
-`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. The process
-refuses to start, naming the unset variable, when any tenant's is missing.
+`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. A tenant whose
+variable is unset is served Slack-only: the console starts, and that tenant's grant
+check fails at publish time with a message naming the variable, until Notion is
+connected. The console also serves the public "Add to Slack" page when the install is
+configured — see [Slack OAuth install](#slack-oauth-install-pilot).
 
 **Choose from Notion (optional).** A creator may grant only what their own Notion account
 can see. With the picker on, "Choose from Notion" on a draft signs the creator in to

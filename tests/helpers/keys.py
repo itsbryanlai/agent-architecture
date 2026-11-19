@@ -35,3 +35,15 @@ class RefreshableKeyStore:
             raise TenantKeyError(
                 f"no encryption key for tenant '{tenant_id}' version {version}"
             ) from None
+
+
+class CountingKeyStore(RefreshableKeyStore):
+    """Counts key reads, so a test can see whether a decryption was served from a cache."""
+
+    def __init__(self, source: dict[tuple[str, int], bytes]):
+        super().__init__(source)
+        self.reads = 0
+
+    def key(self, tenant_id: str, version: int = 1) -> bytes:
+        self.reads += 1
+        return super().key(tenant_id, version)

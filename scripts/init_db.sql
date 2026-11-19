@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 026 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 032 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -152,7 +152,7 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
-  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key')
+  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
              'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
-             'payload_key')
+             'payload_key', 'install')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -656,7 +656,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   tenant_id           text        PRIMARY KEY,
   slack_team_id       text        NOT NULL UNIQUE,
   enabled             boolean     NOT NULL DEFAULT true,
-  default_agent       text        NOT NULL,
+  -- NULL for a tenant installed from Slack with no agent yet (migration 032).
+  default_agent       text,
   notion_workspace_id text        UNIQUE,
   channels            jsonb       NOT NULL DEFAULT '{}'::jsonb,   -- channel ID -> agent ID
   admins              jsonb       NOT NULL DEFAULT '[]'::jsonb,   -- Slack user IDs
@@ -998,6 +999,28 @@ DROP POLICY IF EXISTS key_insert ON tenant_payload_keys;
 CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as migration 032.
+CREATE TABLE IF NOT EXISTS tenant_credentials (
+  tenant_id   text        NOT NULL,
+  kind        text        NOT NULL CHECK (kind IN ('slack_bot')),
+  ciphertext  bytea       NOT NULL,
+  key_version integer     NOT NULL CHECK (key_version >= 1),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, kind)
+);
+
+REVOKE ALL ON tenant_credentials FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON tenant_credentials TO agentos_app;
+
+ALTER TABLE tenant_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_credentials FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tenant_credentials;
+CREATE POLICY tenant_isolation ON tenant_credentials
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE tenants ALTER COLUMN default_agent DROP NOT NULL;
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1009,5 +1032,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032')
 ON CONFLICT DO NOTHING;

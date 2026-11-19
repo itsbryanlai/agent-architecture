@@ -381,6 +381,8 @@ WEBHOOK_AUDIT_KINDS = ("webhook_token",)
 PAYLOAD_KEY_AUDIT_KINDS = ("payload_key",)
 # A tenant created by the Slack OAuth install, or its bot token replaced by a reinstall.
 INSTALL_AUDIT_KINDS = ("install",)
+# An agent's grant check flipping its health: the agent and the version checked.
+HEALTH_AUDIT_KINDS = ("agent_health",)
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -394,6 +396,7 @@ AUDIT_KINDS = (
     + WEBHOOK_AUDIT_KINDS
     + PAYLOAD_KEY_AUDIT_KINDS
     + INSTALL_AUDIT_KINDS
+    + HEALTH_AUDIT_KINDS
 )
 AUDIT_OUTCOMES = ("ok", "error")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")

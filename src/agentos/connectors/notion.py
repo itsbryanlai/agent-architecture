@@ -803,8 +803,9 @@ class GrantCheck:
     """Result of checking one grant's property mapping against the live schema.
 
     ``resolved`` maps each role to the Notion property ID found for it.
-    ``problems`` stop the worker from starting; ``notes`` are worth knowing but
-    do not (a property renamed in Notion is still found by its ID).
+    ``problems`` make the agent unavailable (at publish, or at the worker's
+    health check); ``notes`` are worth knowing but do not (a property renamed
+    in Notion is still found by its ID).
     """
 
     resolved: dict[str, str] = field(default_factory=dict)

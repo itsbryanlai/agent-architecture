@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 032 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 033 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -152,7 +152,8 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
-  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install')
+  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install'),
+  ('agent_health')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -1021,6 +1022,30 @@ CREATE POLICY tenant_isolation ON tenant_credentials
 
 ALTER TABLE tenants ALTER COLUMN default_agent DROP NOT NULL;
 
+-- Agent health: the worker's grant check, one row per tenant and agent. Same as migration 033.
+CREATE TABLE IF NOT EXISTS agent_health (
+  tenant_id     text        NOT NULL,
+  agent_id      text        NOT NULL,
+  agent_version integer     NOT NULL CHECK (agent_version >= 1),
+  status        text        NOT NULL CHECK (status IN ('available', 'unavailable')),
+  reason        text,
+  checked_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, agent_id),
+  CONSTRAINT agent_health_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$'),
+  CONSTRAINT agent_health_reason_matches_status CHECK (
+    (status = 'unavailable') = (reason IS NOT NULL))
+);
+
+REVOKE ALL ON agent_health FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON agent_health TO agentos_app;
+
+ALTER TABLE agent_health ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_health FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON agent_health;
+CREATE POLICY tenant_isolation ON agent_health
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1032,5 +1057,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033')
 ON CONFLICT DO NOTHING;

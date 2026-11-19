@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -87,6 +88,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.helpers.agents import republish
+from tests.helpers.health import FlipsAfterReads
 from tests.helpers.llm_errors import StatusError
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "replay"
@@ -824,6 +826,38 @@ async def task_card_update_failure(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id)]
 
 
+async def task_unavailable_write(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(212 if stored else 211)
+    if stored:
+        task_id = ids.task_id(TENANT, f"replay-{thread}")
+        await r.acts.content.put_draft(
+            TENANT,
+            task_id,
+            1,
+            {"title": "New monitor", "details": "Mine flickers.", "database_id": DB_ID},
+        )
+        spec = dataclasses.replace(legacy_spec(thread), payload={}, draft_ref=task_id, revision=1)
+        handle = await r.client.start_workflow(
+            TaskWorkflow.run, spec, id=task_id, task_queue=TASK_QUEUE
+        )
+        await wait_state(handle, "awaiting_approval")
+    else:
+        handle = await start_legacy_task(r, thread)
+    # The card is posted; the pre-write check reads health once, and the write's own gate
+    # is the next read: the agent becomes unavailable between the check and the write.
+    r.acts.health = FlipsAfterReads(quiet_reads=1)
+    await approve(handle, "nonce-1")
+    assert await handle.result() == "cancelled"
+    assert not r.notion.all_pages(DB_ID)
+    history = await r.client.get_workflow_handle(handle.id).fetch_history()
+    assert any(
+        e.HasField("activity_task_scheduled_event_attributes")
+        and e.activity_task_scheduled_event_attributes.activity_type.name == "create_notion_item"
+        for e in history.events
+    ), "the flip landed before the write activity, not on it"
+    return [await current(r, "", handle.id)]
+
+
 async def progress(r: Rig, stored: bool) -> list[Recorded]:
     thread = thread_ts(202 if stored else 201)
     scope = ids.knowledge_scope(ROOT_A)
@@ -920,6 +954,7 @@ for _name, _fn in {
     "watch_done": watch_done,
     "task_hop": task_hop,
     "task_card_update_failure": task_card_update_failure,
+    "task_unavailable_write": task_unavailable_write,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

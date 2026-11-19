@@ -18,11 +18,15 @@ from psycopg_pool import AsyncConnectionPool
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.agent_health import (
+    AgentHealthChecker,
+    PostgresAgentHealthStore,
+    run_health_refresh,
+)
 from agentos.agent_store import (
     PostgresAgentStore,
     published_tenants,
     startup_agent_failure,
-    with_published_agents,
 )
 from agentos.audience_pauses import PostgresPauseStore
 from agentos.audience_watch import AudienceWatchActivities
@@ -39,7 +43,7 @@ from agentos.config import (
     load_settings,
     validate_worker_capacity,
 )
-from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.connectors.notion import RealNotionAPI
 from agentos.content_store import PostgresContentStore
 from agentos.credentials import PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import (
@@ -68,8 +72,9 @@ from agentos.stores import (
 from agentos.switches import PostgresSwitchStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
-from agentos.tenants import RegistrySync, build_registry, require_tenant_secret
+from agentos.tenants import RegistrySync, build_registry
 from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
+from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
@@ -149,76 +154,6 @@ async def warn_pages_without_model(store, tenant_ids, logger) -> int:
     return total
 
 
-async def check_grants_at_startup(
-    api: NotionAPI | None, agents: AgentsConfig, log: logging.Logger
-) -> str | None:
-    """Check every published agent's Notion grants against the live schemas.
-
-    ``agents`` carries the tenant's published agents (``with_published_agents``).
-
-    Returns None when all is well, or a one-line failure summary when any grant
-    has a problem (including a missing property ID); the caller must then exit
-    rather than run a half-working agent. Notes, such as a property renamed in
-    Notion but still found by its ID, are logged as warnings. Only the
-    granted databases' schemas are read, with the agent's own token, and the
-    agent never changes a schema. Logs name the tenant, agent and grant, and
-    never a token or page content. A Slack-only tenant (``api`` None) passes
-    while none of its agents grants Notion objects.
-    """
-    if api is None and any(
-        agent.grants.notion_databases or agent.grants.notion_pages
-        for agent in agents.agents.values()
-    ):
-        return (
-            f"tenant '{agents.tenant_id}': published agents grant Notion objects but the "
-            "tenant has no Notion token; connect Notion or remove the grants"
-        )
-    failed = 0
-    missing_ids = False
-    for agent in agents.agents.values():
-        for grant in agent.grants.notion_databases:
-            check = await check_grant(api, grant, require_ids=True)
-            for note in check.notes:
-                log.warning(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    grant.name,
-                    note,
-                )
-            for problem in check.problems:
-                log.error(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    grant.name,
-                    problem,
-                )
-            failed += bool(check.problems)
-            missing_ids = missing_ids or bool(grant.missing_property_ids())
-        for page_grant in agent.grants.notion_pages:
-            problems = await check_page_grant(api, page_grant)
-            for problem in problems:
-                log.error(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    page_grant.name,
-                    problem,
-                )
-            failed += bool(problems)
-    if not failed:
-        return None
-    summary = f"{failed} Notion grant(s) have problems; the worker will not start."
-    if missing_ids:
-        summary += (
-            " Property IDs are missing: run `uv run python -m agentos.check_grants"
-            " --tenant <tenant> --agent <agent>` on a draft and paste its property_ids"
-            " block into the definition."
-        )
-    return summary
-
-
 def startup_price_failure(
     prices: Prices, prices_path: str, models: list[str], at: datetime | None = None
 ) -> str | None:
@@ -246,28 +181,17 @@ TENANT_SYNC_SECONDS = 5.0
 async def admit_new_tenant(
     config: AgentsConfig,
     keys: KeyStore,
-    agent_store: PostgresAgentStore,
     log: logging.Logger,
 ) -> str | None:
     """The start-up work for a tenant that appears while the worker runs.
 
     Its encryption key must be usable, or it is not served until it is. Its published
-    agents' Notion grants are checked once and any problem is logged; a tenant that
-    has just been added normally has none yet, and every publish checks its grants.
+    agents' grants are checked by the health refresh once the tenant is served; a
+    broken grant disables that agent, never the tenant or the worker.
     """
     problems = check_keys(keys, [config.tenant_id])
     if problems:
         return "; ".join(problems)
-    published = await with_published_agents(agent_store, config)
-    if any(
-        agent.grants.notion_databases or agent.grants.notion_pages
-        for agent in published.agents.values()
-    ):
-        api = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
-        log.info("tenant_id=%s checking grants", config.tenant_id)
-        failure = await check_grants_at_startup(api, published, log)
-        if failure:
-            log.error("tenant_id=%s %s", config.tenant_id, failure)
     return None
 
 
@@ -311,17 +235,31 @@ async def main() -> None:
         registry = await build_registry(
             tenants, settings, RealSlackPoster, RealNotionAPI, credentials.slack_bot_token
         )
-        failures = []
+        audit_store = PostgresAuditStore(pool)
+        idempotency = PostgresIdempotencyStore(pool)
+        members = PostgresMemberStore(pool)
+        health = PostgresAgentHealthStore(pool)
+        health_checker = AgentHealthChecker(
+            registry,
+            agent_store,
+            health,
+            audit_store,
+            idempotency,
+            members,
+            uow=PostgresUnitOfWork(pool),
+        )
+        # A broken grant disables its agent with the reason; the worker starts and
+        # serves every other agent and tenant. Platform-wide problems above still exit.
+        # One tenant's check failing never skips the rest: it is logged, and the worker
+        # starts; the health refresh checks that tenant's agents again on its cadence.
         for tenant_id in registry.tenants():
-            runtime = registry.get(tenant_id)
             log.info("tenant_id=%s checking grants", tenant_id)
-            failure = await check_grants_at_startup(
-                runtime.notion_api, published.tenants[tenant_id], log
-            )
-            if failure:
-                failures.append(f"tenant '{tenant_id}': {failure}")
-        if failures:
-            raise SystemExit("\n".join(failures))
+            try:
+                await health_checker.check_tenant(tenant_id, published.tenants[tenant_id].agents)
+            except Exception as err:  # noqa: BLE001 - one tenant never stops start-up
+                log.error(
+                    "tenant_id=%s grant check failed error_type=%s", tenant_id, type(err).__name__
+                )
         # Provider and model name only; never a key.
         log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
         if embedder is not None:
@@ -341,8 +279,6 @@ async def main() -> None:
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         pauses = PostgresPauseStore(pool)
         switches = PostgresSwitchStore(pool)
-        audit_store = PostgresAuditStore(pool)
-        idempotency = PostgresIdempotencyStore(pool)
         activities = AgentActivities(
             settings=settings,
             registry=registry,
@@ -363,11 +299,12 @@ async def main() -> None:
             threads=PostgresThreadStore(pool),
             owner_pings=PostgresOwnerPingStore(pool),
             content=PostgresContentStore(pool),
+            health=health,
         )
         watch = AudienceWatchActivities(
             registry,
             agent_store,
-            PostgresMemberStore(pool),
+            members,
             pauses,
             audit_store,
             idempotency,
@@ -400,7 +337,7 @@ async def main() -> None:
             registry,
             RealSlackPoster,
             RealNotionAPI,
-            admit=lambda config: admit_new_tenant(config, keys, agent_store, log),
+            admit=lambda config: admit_new_tenant(config, keys, log),
             slack_token=credentials.slack_bot_token,
             on_drop=credentials.forget,
         )
@@ -413,17 +350,26 @@ async def main() -> None:
         )
         log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
         # A tenant added to, changed in or disabled in the database is picked up here,
-        # without a restart. Its own start-up work (key check, grant check) runs when
-        # it first appears; see ``admit_new_tenant``.
+        # without a restart. Its own start-up work (the key check) runs when it first
+        # appears; see ``admit_new_tenant``.
         key_refresh = start_key_refresh(keys)
         refresher = asyncio.create_task(tenant_sync.run(TENANT_SYNC_SECONDS))
+        # Unavailable agents are re-checked on the same cadence, bounded per agent, and
+        # a newly published version is checked at once: recovery needs no restart.
+        health_refresher = asyncio.create_task(
+            run_health_refresh(health_checker, registry, agent_store, health, TENANT_SYNC_SECONDS)
+        )
         try:
             await worker.run()
         finally:
             refresher.cancel()
+            health_refresher.cancel()
+            stopped = [health_refresher]
             if key_refresh is not None:
                 key_refresh.cancel()
-                await asyncio.gather(key_refresh, return_exceptions=True)
+                stopped.append(key_refresh)
+            # Gathered before the pool closes, whether or not a key refresh runs.
+            await asyncio.gather(*stopped, return_exceptions=True)
     finally:
         await pool.close()
 

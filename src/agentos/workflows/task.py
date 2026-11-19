@@ -46,6 +46,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 with workflow.unsafe.imports_passed_through():
     from agentos import task_notices
     from agentos.activities import AgentActivities
+    from agentos.agent_health import agent_unavailable_text
     from agentos.config import AgentVersion
     from agentos.connectors.notion import normalize_id
     from agentos.models import (
@@ -60,7 +61,6 @@ with workflow.unsafe.imports_passed_through():
         WatchState,
         check_field,
     )
-    from agentos.slack_format import escape_slack
     from agentos.switches import agent_off_card_text, agent_off_text
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
@@ -86,6 +86,10 @@ DRAFT_REFS_PATCH = "draft-refs"
 CONTINUE_AS_NEW_PATCH = "task-continue-as-new"
 # Histories recorded before a closed approval was audited close it with no audit row.
 PATCH_APPROVAL_CLOSED = "approval-closed-audit"
+# Histories recorded before agent health existed never see an unavailable agent; they
+# replay without its clean stop. A watch is not covered: an unavailable agent's poll
+# fails retryably, so the watch keeps polling with no workflow change.
+AGENT_UNAVAILABLE_PATCH = "agent-unavailable"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -205,13 +209,21 @@ class TaskWorkflow:
             workflow.patched(DRAFT_REFS_PATCH)
         try:
             return await self._run(spec)
-        except ActivityError:
+        except ActivityError as err:
             # Before approval nothing has been written, so a terminal failure
             # ends the task with one line. After it, the failure paths below
             # decide what to say, and anything else is raised.
             if self._state not in ("drafted", "awaiting_approval"):
                 raise
             task_id = workflow.info().workflow_id
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                # The activity's message is the fixed unavailable reply, built from the
+                # agent's name: a clean stop, not a failure. Nothing was written.
+                await self._act(
+                    AgentActivities.post_in_thread, spec.ctx, _reason(err), f"{task_id}:failed"
+                )
+                self._state = "cancelled"
+                return self._state
             await self._notice(task_notices.CARRY_ON_FAILED, f"{task_id}:failed", task_id)
             self._state = "failed"
             return self._state
@@ -243,7 +255,16 @@ class TaskWorkflow:
                     await self._act(
                         AgentActivities.post_in_thread,
                         ctx,
-                        agent_off_text(escape_slack(agent.name)),
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
                         f"{task_id}:failed",
                     )
                     self._state = "cancelled"
@@ -352,6 +373,8 @@ class TaskWorkflow:
         except ActivityError as err:
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent.name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent.name)
             found = None
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(AgentActivities.reconcile_notion_item, spec, task_id)
@@ -527,6 +550,20 @@ class TaskWorkflow:
         self._state = "cancelled"
         return self._state
 
+    async def _stop_for_agent_unavailable(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """The agent's grants broke after the approval and before the write: nothing was written."""
+        await self._try(
+            AgentActivities.update_card_line,
+            spec,
+            task_id,
+            card_ts,
+            agent_unavailable_text(agent_name),
+        )
+        self._state = "cancelled"
+        return self._state
+
     async def _run_comment(
         self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
     ) -> str:
@@ -539,6 +576,8 @@ class TaskWorkflow:
         except ActivityError as err:
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(
                     AgentActivities.reconcile_notion_comment, spec, task_id
@@ -725,6 +764,16 @@ def _is_agent_off(err: ActivityError) -> bool:
     """True when the activity refused because an admin turned the agent off."""
     cause = err.cause
     return isinstance(cause, ApplicationError) and cause.type == "AgentOff"
+
+
+def _is_agent_unavailable(err: ActivityError) -> bool:
+    """True when the activity refused because the agent's grant check failed.
+
+    A watch never matches this: its poll fails retryably, so the watch keeps polling
+    and resumes when a check passes. The draft, card and write paths stop clean.
+    """
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == "AgentUnavailable"
 
 
 def _reason(err: ActivityError) -> str:

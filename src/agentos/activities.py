@@ -68,8 +68,18 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from agentos import ids, task_notices
+from agentos.agent_health import (
+    UNAVAILABLE as HEALTH_UNAVAILABLE,
+)
+from agentos.agent_health import (
+    AgentUnavailable,
+    HealthStore,
+    InMemoryAgentHealthStore,
+    agent_unavailable_text,
+)
 from agentos.agent_store import AgentStore
 from agentos.audience import (
+    HEALTH,
     OFF,
     PAUSED,
     UNAVAILABLE,
@@ -303,6 +313,7 @@ class AgentActivities:
         threads: ThreadStore | None = None,
         owner_pings: OwnerPingStore | None = None,
         content: ContentStore | None = None,
+        health: HealthStore | None = None,
     ):
         self.settings = settings
         self.content = content or InMemoryContentStore()
@@ -316,12 +327,13 @@ class AgentActivities:
         self.visibility_interval = VISIBILITY_INTERVAL
         self._history_refusals_logged: set[tuple[str, str]] = set()
         self.switches = switches or InMemorySwitchStore()
+        self.health = health or InMemoryAgentHealthStore()
         self.usage = usage
         self.budgets = budgets
         self.registry = registry
         self.pauses = pauses or InMemoryPauseStore()
         self.audience = audience or AudienceChecker(
-            registry, agents, pauses=self.pauses, switches=self.switches
+            registry, agents, pauses=self.pauses, switches=self.switches, health=self.health
         )
         self.knowledge = knowledge
         self.embedder = embedder
@@ -462,15 +474,22 @@ class AgentActivities:
     async def _gate_refusal(
         self, tenant_id: str, agent_id: str, effect: Effect
     ) -> Exception | None:
-        """Why the agent may not do ``effect`` now, or None. The one place switches are read.
+        """Why the agent may not do ``effect`` now, or None. The one place the gate is read.
 
         Every activity that acts for an agent calls this (or ``_gate``) first, so one read
         of the switches applies the agent, writes and connector scopes that matter to the
-        effect. Read from the store now, never cached. An unreadable switch raises, so the
-        step fails and is retried rather than let through.
+        effect, and one read of the agent's health stops an agent whose grant check failed.
+        An admin's switch is checked first; health covers every effect. Read from the stores
+        now, never cached. An unreadable switch or health row raises, so the step fails and
+        is retried rather than let through.
         """
         state = await read_state(self.switches, tenant_id)
         refusal = state.refusal(agent_id, effect)
+        if refusal is None:
+            row = await self.health.get(tenant_id, agent_id)
+            if row is not None and row.status == HEALTH_UNAVAILABLE:
+                agent = await self._agent(tenant_id, agent_id)
+                refusal = AgentUnavailable(agent.name)
         if refusal is not None:
             log.info(
                 "%s refused tenant_id=%s agent_id=%s reason=%s",
@@ -916,6 +935,10 @@ class AgentActivities:
             return LLMResponse(
                 text=agent_off_text(agent.name), tool_calls=[], stop_reason=SWITCHED_OFF
             )
+        if isinstance(refusal, AgentUnavailable):
+            return LLMResponse(
+                text=agent_unavailable_text(agent.name), tool_calls=[], stop_reason=SWITCHED_OFF
+            )
         if self.budgets is not None:
             # Before any model call: a reached budget answers with a fixed text, bills nothing
             # and records no usage row.
@@ -1345,6 +1368,9 @@ class AgentActivities:
             # it can pass on; nothing is read.
             agent = await self._agent(ctx.tenant_id, ctx.agent_id)
             text, is_error = agent_off_text(agent.name), True
+        elif isinstance(refusal, AgentUnavailable):
+            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            text, is_error = agent_unavailable_text(agent.name), True
         elif refusal is not None:
             # Reading and searching Notion both go through the connector.
             text, is_error = connector_off_text("notion"), True
@@ -1592,6 +1618,8 @@ class AgentActivities:
         if refusal is not None:
             if isinstance(refusal, AgentOff):
                 return DraftOutcome(error=agent_off_text(agent.name))
+            if isinstance(refusal, AgentUnavailable):
+                return DraftOutcome(error=agent_unavailable_text(agent.name))
             raise _non_retryable(refusal)
         found, raw = await self.content.get_tool_input(ctx.tenant_id, conversation_id, call.id)
         if not found:
@@ -1857,8 +1885,14 @@ class AgentActivities:
         self, tenant_id: str, agent_id: str, page_id: str, refusal: Exception | None
     ) -> NotionItem:
         if isinstance(refusal, AgentOff):
-            # The agent is off: the task ends the watch, with no post. No Notion call is made.
+            # An admin turned the agent off: the task ends the watch. No Notion call is made.
             raise _non_retryable(refusal)
+        if isinstance(refusal, AgentUnavailable):
+            # Retryable on purpose, like a connector switched off: health is a recoverable
+            # state, so the task keeps watching and polls again once a check passes. The
+            # workflow treats a poll that fails after its retries as "still watching".
+            # No Notion call is made.
+            raise ApplicationError(str(refusal), type="AgentUnavailable")
         if refusal is not None:
             # Retryable on purpose: the task workflow treats a poll that fails after its
             # retries as "still watching" and polls again later, while a permanent
@@ -1996,6 +2030,9 @@ class AgentActivities:
             # An agent that is off is not available to anyone: the turn, or a hand-off to it,
             # is refused with the fixed "turned off" reply.
             return AudienceDecision(False, OFF)
+        if isinstance(refusal, AgentUnavailable):
+            # An agent whose grant check failed is not available to anyone either.
+            return AudienceDecision(False, HEALTH)
         agent = await self._pinned(ctx)
         decision = await self._audience_decision(ctx, agent)
         if not decision.allowed:
@@ -2018,10 +2055,11 @@ class AgentActivities:
         """Just before an approved write: may the agent still act for the requester here?
 
         None means go on. Otherwise the line the card shows, and nothing is to be written:
-        the agent was turned off, the agent's channel was paused, or the requester is no
-        longer in the audience of the agent's current published version. A switch that
-        covers the write itself (writes, the connector) is left to the write activity,
-        which says so in its own words. A lookup that fails for good fails the activity.
+        the agent was turned off, the agent is unavailable (its grant check failed), the
+        agent's channel was paused, or the requester is no longer in the audience of the
+        agent's current published version. A switch that covers the write itself (writes,
+        the connector) is left to the write activity, which says so in its own words. A
+        lookup that fails for good fails the activity.
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
@@ -2030,6 +2068,8 @@ class AgentActivities:
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         if isinstance(refusal, AgentOff):
             line = agent_off_card_text(agent.name)
+        elif isinstance(refusal, AgentUnavailable):
+            line = agent_unavailable_text(agent.name)
         elif not (await self._audience_decision(ctx, agent)).allowed:
             line = no_longer_act_text(agent.name)
         else:

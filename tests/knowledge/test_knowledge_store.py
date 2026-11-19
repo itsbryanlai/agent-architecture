@@ -1,7 +1,5 @@
 """Knowledge grants, ids, the store and the embedder."""
 
-import logging
-
 import pytest
 
 from agentos import ids
@@ -11,9 +9,9 @@ from agentos.config import (
     parse_agents_config,
 )
 from agentos.connectors.notion import check_page_grant
+from agentos.grant_checker import NotionGrantChecker
 from agentos.knowledge.embedder import BATCH_SIZE, OpenAICompatibleEmbedder
-from agentos.worker import check_grants_at_startup
-from tests.conftest import agents_dict, make_fake_notion
+from tests.conftest import TENANT, agents_dict, make_fake_notion
 
 ROOT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 ROOT_PLAIN = "aaaaaaaabbbbccccddddeeeeeeeeeeee"
@@ -76,16 +74,20 @@ async def test_qwen_embedder_batches_and_checks_dimensions():
         await bad.embed(["a"])
 
 
-async def test_grant_check_flags_trashed_page(caplog):
+async def test_grant_check_flags_trashed_page():
+    """Fails if a trashed granted page passes the per-agent check the worker's health runs."""
     api = make_fake_notion()
     api.add_free_page(ROOT, "IT wiki")
     cfg = with_pages([{"id": ROOT, "name": "IT wiki"}])
-    grant = cfg.agents["it-helper"].grants.notion_pages[0]
+    agent = cfg.agents["it-helper"]
+    grant = agent.grants.notion_pages[0]
+    checker = NotionGrantChecker(lambda _t: api)
 
     assert await check_page_grant(api, grant) == []
-    assert await check_grants_at_startup(api, cfg, logging.getLogger("t")) is None
+    assert all(report.ok for report in await checker.check(TENANT, agent))
 
     api.add_free_page(ROOT, "IT wiki", in_trash=True)
     problems = await check_page_grant(api, grant)
     assert len(problems) == 1 and "IT wiki" in problems[0]
-    assert await check_grants_at_startup(api, cfg, logging.getLogger("t"))
+    reports = await checker.check(TENANT, agent)
+    assert [p for r in reports for p in r.problems if "IT wiki" in p]

@@ -12,6 +12,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.audience import decision_text
 from agentos.config import TASK_QUEUE
 from agentos.models import ApprovalDecision, TaskSpec, ToolCall, TurnContext
@@ -287,6 +288,21 @@ async def test_a_pre_write_check_that_cannot_finish_fails_closed_and_clears_the_
         last["text"] == "I couldn't confirm you can still make this request; nothing was changed."
     )
     assert all(b["type"] == "section" for b in last["blocks"])
+
+
+async def test_an_unreadable_health_row_fails_the_step_so_temporal_retries(harness):
+    """Fails if an unreadable health row lets the step act instead of failing it for a retry."""
+    h = harness
+
+    class Broken(InMemoryAgentHealthStore):
+        async def get(self, tenant_id, agent_id):
+            raise ConnectionError("down")
+
+    h.acts.health = Broken()
+
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(h.acts.call_llm, ctx(), f"{TENANT}:conv:C:1")
+    assert h.llm.calls == []
 
 
 # --- a draft_ref refusal replaces the card in place ---------------------------------------------

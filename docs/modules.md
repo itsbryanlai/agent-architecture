@@ -6,7 +6,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
-| `worker.py` | Temporal worker: runs every workflow and activity, builds one Slack and one Notion client per tenant. Refuses to start on a missing secret, key, price, grant check or an old schema | `core/test_config.py`, `core/test_pool_settings.py`, `connectors/test_grant_check.py` |
+| `worker.py` | Temporal worker: runs every workflow and activity, builds one Slack and one Notion client per tenant. Refuses to start on a missing secret, key, price or an old schema; a broken grant disables its agent (`agent_health.py`), never the worker | `core/test_config.py`, `core/test_pool_settings.py`, `core/test_agent_health.py` |
 | `gateway/app.py` | HTTP ingress for Slack events, button clicks and Notion webhooks. Verifies signatures, takes the tenant from the request (never from text), stores each event before answering, handles a click within 2.0 s; a tenant with no default agent gets one fixed not-set-up reply per event | `core/test_gateway.py`, `connectors/test_notion_webhook.py`, `core/test_content_refs.py`, `core/test_front_door.py` |
 | `gateway/relay.py` | Signals conversation workflows with the events the gateway stored. At least once; one thread's messages are never delivered out of order | `core/test_content_refs.py` |
 | `gateway/notion_signature.py` | Checks Notion's webhook signature in constant time | `connectors/test_notion_webhook.py` |
@@ -61,6 +61,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `control_errors.py` | Maps control-plane refusals to HTTP statuses, once | `console/test_web_ui.py` |
 | `members.py` | Stored admins and creators; config-file admins are not rows | `console/test_control_plane.py` |
 | `grant_checker.py` | Checks a version's Notion grants against the live objects before publish | `connectors/test_grant_check.py` |
+| `agent_health.py` | A broken grant disables one agent, never the worker: the health row, the start-up and refresh checks, the fixed reply's refusal, and the once-per-transition audit and DMs. A transient Notion failure changes no health | `core/test_agent_health.py`, `pg/test_store_contracts.py` |
 | `grant_picks.py` | Which granted objects were picked from the creator's own Notion account | `console/test_grant_review.py` |
 | `notion_picker.py` | The creator's Notion sign-in, used once to list what they can see; no token stored | `console/test_grant_review.py` |
 | `access_diff.py` | What a version adds compared with the published one, and whether it widens access | `console/test_grant_review.py` |

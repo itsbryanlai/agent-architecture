@@ -1,4 +1,3 @@
-import logging
 from dataclasses import replace
 
 import httpx
@@ -10,7 +9,6 @@ from agentos.check_grants import check_published
 from agentos.config import ConfigError, NotionDatabaseGrant, TenantsConfig, parse_agents_config
 from agentos.connectors.notion import NotionConnector, check_grant
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker, is_transient
-from agentos.worker import check_grants_at_startup
 from tests.conftest import DB_ID, TENANT, agents_dict, default_schema, make_fake_notion
 from tests.helpers.agents import helper_block, make_published
 
@@ -140,32 +138,6 @@ def test_config_parses_property_ids(agents):
     del db["property_ids"]
     parsed = parse_agents_config(raw)
     assert parsed.agents["it-helper"].grants.notion_databases[0].title_prop_id is None
-
-
-async def test_worker_refuses_to_start_on_problems(agents):
-    api = make_fake_notion()
-    schema = default_schema()
-    schema["Agent request ID"] = {"id": "reqid1", "type": "people"}
-    api.set_schema(DB_ID, schema)
-    failure = await check_grants_at_startup(api, agents, logging.getLogger("test"))
-    assert failure is not None
-    assert "will not start" in failure
-
-
-async def test_worker_starts_when_grants_are_clean(agents):
-    api = make_fake_notion()
-    assert await check_grants_at_startup(api, agents, logging.getLogger("test")) is None
-
-
-async def test_worker_refuses_to_start_without_ids(agents):
-    api = make_fake_notion()
-    raw = agents_dict()
-    del raw["agents"]["it-helper"]["grants"]["notion"]["databases"][0]["property_ids"]
-    failure = await check_grants_at_startup(
-        api, parse_agents_config(raw), logging.getLogger("test")
-    )
-    assert failure is not None
-    assert "agentos.check_grants" in failure
 
 
 def test_connector_rejects_grant_without_ids(agents):

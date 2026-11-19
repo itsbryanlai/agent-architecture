@@ -260,7 +260,10 @@ uv run python -m agentos.tenant_store import
   token and its Notion client when it has a Notion token (a tenant whose Slack
   token is unavailable or whose payload key is unusable is skipped and logged
   once, and tried again on the next pass; a tenant with no Notion token is
-  served Slack-only). An activity for a tenant the worker does not know yet is
+  served Slack-only). The new tenant's published agents' grants are checked by
+  the health refresh once it is served; a broken grant disables that agent, not
+  the tenant or the worker (see [Run](#what-stops-start-up-and-what-only-disables-an-agent)).
+  An activity for a tenant the worker does not know yet is
   retried, not failed: the shared retry policy (5 attempts, 1 s doubling to
   8 s, about 15 s) outlasts the 5 s refresh. A **disabled**
   tenant is dropped within that time: the gateway answers nothing for it, the
@@ -764,6 +767,43 @@ uv run uvicorn agentos.gateway.app:app --port 8000     # terminal 2
 Keep your tunnel pointed at port 8000. The Temporal web UI is at
 <http://localhost:8233>. DM the bot, or @mention it in a channel it has been
 invited to.
+
+### What stops start-up, and what only disables an agent
+
+Platform-wide problems stop the worker: no usable master key or tenant key, a
+database behind the code's migrations, a chat or embedding model with no price
+in effect today, an inconsistent tenants table, or routing that names an
+unpublished agent or a channel its audience leaves out. The message names what
+to fix; nothing is served until it is.
+
+A broken Notion grant disables **only its agent** (D-35). At start-up and on
+the directory refresh the worker checks each published agent's grants with the
+same read-only check a publish runs. An agent whose database or page is missing
+or not shared, whose property mapping no longer matches, whose property IDs are
+missing, or whose tenant has no Notion token is marked unavailable in
+`agent_health` with the reason. A message to it gets one fixed reply —
+"<name> is unavailable right now: an admin needs to fix its access. Nothing was
+changed." — with no model call and no Notion call, and a write waiting for
+approval is refused at Submit with the same reason. Every other agent and
+tenant keeps running. The agent's creator and the tenant's admins get one Slack
+DM per transition, and each transition is audited as `agent_health`. The DM is
+best-effort: a crash or a Slack failure at the transition loses that one notice;
+the health state and the audit row are unaffected. A watch on an unavailable
+agent keeps polling and reports the status change once the agent recovers; a
+write whose agent becomes unavailable between the pre-write check and the write
+stops with the same fixed reply on the card — nothing changed, no failure line.
+
+Recovery needs no restart: an unavailable agent is re-checked at most once
+every five minutes, a newly published version is checked at once, and a passing
+check marks the agent available again (audited, and the creator is told). Fix
+the grant in Notion, or publish a corrected version. A transient Notion failure
+(a network error, rate limit or server error) changes no health; the next check
+tries again. A check that cannot run never stops the worker: a permanent
+connector problem (a granted database with no data source) marks its agent
+unavailable; any other unexpected error is logged and changes no health; one
+agent's or tenant's failed check never skips the rest. An admin's kill switch
+is separate: it is checked first, and turning an agent off is not a health
+transition.
 
 ## Railway (hosted)
 

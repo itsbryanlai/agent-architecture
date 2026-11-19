@@ -14,7 +14,7 @@ from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, DB_ID, TENANT, default_schema, eventually
 from tests.helpers.agents import republish
-from tests.helpers.tasks import approve, spec, start_task, wait_state
+from tests.helpers.tasks import ClosesTaskOnLookup, approve, spec, start_task, wait_state
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -65,6 +65,40 @@ async def test_my_tasks_is_offered_only_to_an_agent_with_a_write_grant(harness, 
     assert ("my_tasks" in names) is offered
 
 
+async def test_an_invented_my_tasks_call_without_a_write_grant_is_a_tool_error(harness):
+    """Fails if an agent without a database grant lists tasks from a my_tasks call it was never offered."""
+    h = harness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(grants={}))
+    await h.acts.tasks.record(
+        TaskRecord(
+            tenant_id=TENANT,
+            task_id=ids.task_id(TENANT, "alice-1"),
+            requester_user_id=ALICE,
+            agent_id="it-helper",
+            title="New monitor",
+            url="https://www.notion.so/monitor",
+            page_id="p-1",
+            state="watching",
+            last_status="To do",
+            updated_at=NOW,
+            channel=CHANNEL,
+            thread_ts=THREAD,
+        )
+    )
+    agent = await h.agent_store.published(TENANT, "it-helper")
+    ctx = TurnContext(TENANT, "it-helper", agent.version, ALICE, CHANNEL, THREAD, "channel")
+    conv = ids.conversation_id(TENANT, CHANNEL, THREAD)
+
+    result = await ActivityEnvironment().run(
+        h.acts.run_read_tool, ctx, conv, ToolCall("tu_x", "my_tasks", {}), 1
+    )
+
+    assert result.is_error and result.stored
+    stored, is_error = (await h.tool_outputs.get_many(TENANT, conv, ["tu_x"]))["tu_x"]
+    assert is_error
+    assert "New monitor" not in stored
+
+
 async def _inbound(h, event_id: str, text: str, channel: str, thread: str, kind: str) -> None:
     await h.acts.content.put_inbound(
         TENANT,
@@ -104,25 +138,30 @@ def _my_tasks_turn(tool_use_id: str, reply: str) -> tuple[LLMResponse, LLMRespon
     )
 
 
-async def test_my_tasks_in_the_task_thread_pokes_the_watch_and_respects_the_gap(harness):
-    """Fails if a question in the task's thread lists a stale status, or forces a poll sooner than POKE_GAP."""
-    h = harness
+async def _task_recorded(h, task_id: str) -> bool:
+    return await h.acts.tasks.get(TENANT, task_id) is not None
+
+
+async def _watching_task_after_first_poll(h):
+    """A watching task whose first scheduled poll has landed: the record is the watching
+    report, stale by more than POKE_GAP, and the watch's last poll is a minute old."""
     schema = default_schema()
     schema["Status"]["options"] = ["To do", "In progress", "Done"]
     h.notion.set_schema(DB_ID, schema)
     handle = await start_task(h)
     await approve(h, handle)
     await wait_state(handle, "watching")
-    page = h.notion.all_pages(DB_ID)[0]
-
-    # The watching report lands, then the first poll: the watch has a last poll the
-    # gap is measured from.
-    async def recorded():
-        return await h.acts.tasks.get(TENANT, handle.id) is not None
-
-    await eventually(recorded)
+    await eventually(lambda: _task_recorded(h, handle.id))
     await h.wf_env.sleep(timedelta(minutes=16))
     await eventually(lambda: h.notion.count("retrieve_page") >= 1)
+    return handle
+
+
+async def test_a_question_in_the_task_thread_pokes_the_watch_and_lists_the_fresh_status(harness):
+    """Fails if a question in the task's thread lists a stale status instead of the poke's fresh report."""
+    h = harness
+    handle = await _watching_task_after_first_poll(h)
+    page = h.notion.all_pages(DB_ID)[0]
     conv = ids.conversation_id(TENANT, CHANNEL, THREAD)
 
     # The poke's poll is owed, but not before POKE_GAP: the answer waits for it and
@@ -139,12 +178,26 @@ async def test_my_tasks_in_the_task_thread_pokes_the_watch_and_respects_the_gap(
     output = (await h.tool_outputs.get_many(TENANT, conv, ["tu_t"]))["tu_t"][0]
     assert 'state="watching"' in output
     assert 'status="In progress"' in output
+    assert await handle.query(TaskWorkflow.state) == "watching"
 
-    # A second question right after that poll must not force another within the gap.
-    # The wait gives up quickly here; the gap has not elapsed, so no poll may run.
+
+async def test_a_question_right_after_a_report_does_not_poke_the_watch(harness):
+    """Fails if a question asked within POKE_GAP of the task's last report pokes the watch again."""
+    h = harness
+    handle = await _watching_task_after_first_poll(h)
+    page = h.notion.all_pages(DB_ID)[0]
+    conv = ids.conversation_id(TENANT, CHANNEL, THREAD)
+    h.notion.set_status(page["id"], "Status", "In progress")
+    h.llm.queue(*_my_tasks_turn("tu_t", "It is in progress."))
+    await _start_ask(h, "EvP1", "where is my request?", CHANNEL, THREAD)
+    await eventually(lambda: len(h.llm.calls) >= 2, timeout=30)
+
+    # The poke-answered poll just reported: a second question right after is fresh
+    # already, so it sends no poke and leaves none pending. No virtual time may pass
+    # on its own between the two turns, or the next scheduled poll would muddy the count.
     h.acts.refresh_wait_seconds = 2
-    polls = h.notion.count("retrieve_page")
     with h.wf_env.auto_time_skipping_disabled():
+        polls = h.notion.count("retrieve_page")
         h.llm.queue(*_my_tasks_turn("tu_t2", "Still in progress."))
         await _inbound(h, "EvP2", "and now?", CHANNEL, THREAD, "channel")
         await h.client.get_workflow_handle(conv).signal(
@@ -155,11 +208,96 @@ async def test_my_tasks_in_the_task_thread_pokes_the_watch_and_respects_the_gap(
             lambda: any(u["text"] == "Still in progress." for u in h.slack.updates()), timeout=30
         )
         assert h.notion.count("retrieve_page") == polls
+        await h.wf_env.sleep(POKE_GAP + timedelta(seconds=5))
+        assert h.notion.count("retrieve_page") == polls
     assert await handle.query(TaskWorkflow.state) == "watching"
 
-    # The poke is still pending: once the gap elapses, the watch answers it with one poll.
-    await h.wf_env.sleep(POKE_GAP + timedelta(seconds=5))
-    await eventually(lambda: h.notion.count("retrieve_page") == polls + 1, timeout=10)
+
+async def test_two_my_tasks_calls_in_one_turn_poke_and_wait_only_once(harness):
+    """Fails if a second my_tasks call in the same turn refreshes the thread's task again."""
+    h = harness
+    schema = default_schema()
+    schema["Status"]["options"] = ["To do", "In progress", "Done"]
+    h.notion.set_schema(DB_ID, schema)
+    handle = await start_task(h)
+    await approve(h, handle)
+    await wait_state(handle, "watching")
+    await eventually(lambda: _task_recorded(h, handle.id))
+    # Half a minute past the first poll: the record is stale, so the first call pokes,
+    # but the watch answers the poke only after POKE_GAP from that poll. The wait gives
+    # up quickly, so the record stays stale for the second call.
+    await h.wf_env.sleep(timedelta(minutes=15, seconds=30))
+    await eventually(lambda: h.notion.count("retrieve_page") >= 1)
+    conv = ids.conversation_id(TENANT, CHANNEL, THREAD)
+
+    with h.wf_env.auto_time_skipping_disabled():
+        h.acts.refresh_wait_seconds = 2
+        h.llm.queue(
+            LLMResponse(
+                text=None, tool_calls=[ToolCall("tu_1", "my_tasks", {})], stop_reason="tool_use"
+            ),
+            LLMResponse(
+                text=None, tool_calls=[ToolCall("tu_2", "my_tasks", {})], stop_reason="tool_use"
+            ),
+            LLMResponse(text="Both checked.", tool_calls=[], stop_reason="end_turn"),
+        )
+        await _start_ask(h, "EvO1", "where is my request?", CHANNEL, THREAD)
+        await eventually(
+            lambda: any(u["text"] == "Both checked." for u in h.slack.updates()), timeout=30
+        )
+        outputs = await h.tool_outputs.get_many(TENANT, conv, ["tu_1", "tu_2"])
+        assert not outputs["tu_1"][1] and not outputs["tu_2"][1]
+        assert "New monitor" in outputs["tu_1"][0] and "New monitor" in outputs["tu_2"][0]
+
+        # One poke reached the task, and one wait ran in the turn.
+        task_history = await handle.fetch_history()
+        pokes = sum(
+            1
+            for e in task_history.events
+            if e.HasField("workflow_execution_signaled_event_attributes")
+            and e.workflow_execution_signaled_event_attributes.signal_name == "external_update"
+        )
+        assert pokes == 1
+        conv_history = await h.client.get_workflow_handle(conv).fetch_history()
+        waits = sum(
+            1
+            for e in conv_history.events
+            if e.HasField("activity_task_scheduled_event_attributes")
+            and e.activity_task_scheduled_event_attributes.activity_type.name == "wait_task_refresh"
+        )
+        assert waits == 1
+
+        # The one poke is still pending: once the gap elapses, the watch answers it
+        # with exactly one poll.
+        polls = h.notion.count("retrieve_page")
+        assert polls == 1
+        await h.wf_env.sleep(POKE_GAP + timedelta(seconds=5))
+        assert h.notion.count("retrieve_page") == polls + 1
+    assert await handle.query(TaskWorkflow.state) == "watching"
+
+
+async def test_a_task_that_closed_between_the_lookup_and_the_poke_still_answers(harness):
+    """Fails if a task that closed between the lookup and the poke fails the turn instead of answering from the store."""
+    h = harness
+    handle = await start_task(h)
+    await approve(h, handle)
+    await wait_state(handle, "watching")
+    await eventually(lambda: _task_recorded(h, handle.id))
+    h.acts.tasks = ClosesTaskOnLookup(h.acts.tasks, h, handle)
+    h.llm.queue(*_my_tasks_turn("tu_t", "Here is where it stands."))
+
+    await _start_ask(h, "EvC1", "where is my request?", CHANNEL, THREAD)
+
+    await eventually(lambda: len(h.llm.calls) >= 2, timeout=30)
+    conv = ids.conversation_id(TENANT, CHANNEL, THREAD)
+    output, is_error = (await h.tool_outputs.get_many(TENANT, conv, ["tu_t"]))["tu_t"]
+    assert not is_error
+    assert 'state="done"' in output
+    assert 'status="Done"' in output
+    await eventually(
+        lambda: any(u["text"] == "Here is where it stands." for u in h.slack.updates()), timeout=30
+    )
+    assert await handle.result() == "done"
 
 
 async def test_my_tasks_in_a_fresh_dm_answers_from_the_store_without_a_notion_search(harness):

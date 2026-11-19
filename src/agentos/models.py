@@ -61,7 +61,7 @@ class ApprovalDecision:
 @dataclass
 class ExternalUpdate:
     page_id: str
-    source: str  # "notion_webhook"
+    source: str  # "notion_webhook" (the gateway) or "my_tasks" (the in-thread poke)
 
 
 @dataclass

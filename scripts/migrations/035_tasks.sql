@@ -7,7 +7,7 @@
 -- (a state change, a status change, or a poke-answered poll). The requester index serves
 -- the listing (open first, newest first); the thread index serves the in-thread poke.
 -- The app role can SELECT, INSERT and UPDATE; nothing deletes a task row here.
--- Run as the owner role, after 033. Safe to run more than once.
+-- Run as the owner role, after 034. Safe to run more than once.
 
 CREATE TABLE IF NOT EXISTS tasks (
   tenant_id         text        NOT NULL,

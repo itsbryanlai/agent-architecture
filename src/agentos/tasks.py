@@ -21,7 +21,7 @@ uses, so the watch's ``POKE_GAP`` spacing still applies.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from psycopg_pool import AsyncConnectionPool
@@ -243,7 +243,7 @@ def format_task_list(records: list[TaskRecord], *, team_id: str) -> str:
     lines = []
     for r in records:
         thread = f"https://slack.com/app_redirect?team={team_id}&channel={r.channel}"
-        updated = r.updated_at.strftime("%Y-%m-%d %H:%M UTC")
+        updated = r.updated_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
         lines.append(
             f'<item url="{escape_attribute(r.url)}" state="{escape_attribute(r.state)}" '
             f'status="{escape_attribute(r.last_status or "none")}" '

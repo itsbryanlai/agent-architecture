@@ -162,6 +162,7 @@ from agentos.stores import (
     ToolOutputStore,
 )
 from agentos.switches import (
+    NOTION,
     SWITCHED_OFF,
     AgentOff,
     Effect,
@@ -246,6 +247,16 @@ def _item_from_ref(ref: str) -> NotionItem:
 
 def _non_retryable(err: Exception) -> ApplicationError:
     return ApplicationError(str(err), type=type(err).__name__, non_retryable=True)
+
+
+def _tool_connector(name: str) -> str:
+    """The manifest connector of a tool, for the gate's connector scope.
+
+    A name no manifest declares answers to the Notion switch, as every read did before
+    the platform manifest existed; the call itself is refused as unknown either way.
+    """
+    spec = TOOLS.get(name)
+    return spec.connector if spec is not None and spec.connector else NOTION
 
 
 def _is_client_error(err: Exception) -> bool:
@@ -500,19 +511,20 @@ class AgentActivities:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
 
     async def _gate_refusal(
-        self, tenant_id: str, agent_id: str, effect: Effect
+        self, tenant_id: str, agent_id: str, effect: Effect, connector: str = NOTION
     ) -> Exception | None:
         """Why the agent may not do ``effect`` now, or None. The one place the gate is read.
 
         Every activity that acts for an agent calls this (or ``_gate``) first, so one read
         of the switches applies the agent, writes and connector scopes that matter to the
         effect, and one read of the agent's health stops an agent whose grant check failed.
-        An admin's switch is checked first; health covers every effect. Read from the stores
-        now, never cached. An unreadable switch or health row raises, so the step fails and
-        is retried rather than let through.
+        An admin's switch is checked first; health covers every effect. The connector scope
+        covers the tool's own connector (``_tool_connector``), Notion by default. Read from
+        the stores now, never cached. An unreadable switch or health row raises, so the step
+        fails and is retried rather than let through.
         """
         state = await read_state(self.switches, tenant_id)
-        refusal = state.refusal(agent_id, effect)
+        refusal = state.refusal(agent_id, effect, connector)
         if refusal is None:
             row = await self.health.get(tenant_id, agent_id)
             if row is not None and row.status == HEALTH_UNAVAILABLE:
@@ -1461,7 +1473,9 @@ class AgentActivities:
         ``search_knowledge`` uses it, and it returns the citations it numbered.
         """
         self._log("run_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
-        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        refusal = await self._gate_refusal(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(call.name)
+        )
         return await self._run_read(ctx, conversation_id, call, first_marker, refusal)
 
     @activity.defn(name="run_stored_read_tool")
@@ -1470,7 +1484,9 @@ class AgentActivities:
     ) -> ToolResult:
         """``run_read_tool`` for a call whose input is stored by tool-use ID, not passed in."""
         self._log("run_stored_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
-        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        refusal = await self._gate_refusal(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(call.name)
+        )
         found, tool_input = await self.content.get_tool_input(
             ctx.tenant_id, conversation_id, call.id
         )
@@ -1499,8 +1515,8 @@ class AgentActivities:
             agent = await self._agent(ctx.tenant_id, ctx.agent_id)
             text, is_error = agent_unavailable_text(agent.name), True
         elif refusal is not None:
-            # Reading and searching Notion both go through the connector.
-            text, is_error = connector_off_text("notion"), True
+            # A connector switch: the refusal names the connector the tool reads through.
+            text, is_error = str(refusal), True
         elif call.name == "search_knowledge":
             text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
         elif call.name == MY_TASKS_TOOL:
@@ -1592,7 +1608,13 @@ class AgentActivities:
         """The asker's tasks from the platform's store: no connector call, no Notion search.
 
         The requester is the runtime's, never a model argument; the store filters by it.
+        The write grant is checked here too, not only where the tool is offered: a model
+        can invent a call it was never offered, and an agent that cannot start tasks has
+        none to list.
         """
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        if not agent.grants.notion_databases:
+            return "This agent has no write access, so it has no requests to list.", True
         records = await self.tasks.list_for_requester(ctx.tenant_id, ctx.requester_user_id)
         team_id = self._runtime(ctx.tenant_id).config.slack_team_id
         return format_task_list(records, team_id=team_id), False

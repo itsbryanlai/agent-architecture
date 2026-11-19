@@ -921,6 +921,105 @@ async def my_tasks(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id), await current(r, "conversation", conv)]
 
 
+async def my_tasks_once(r: Rig, stored: bool) -> list[Recorded]:
+    """Two my_tasks calls in one turn refresh once; a question right after the report
+    finds the task fresh and sends no poke. Records the once-per-turn patch's path."""
+    thread = thread_ts(242 if stored else 241)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce)
+    await wait_state(handle, "watching")
+    # The first poll lands, so the record the question finds is the watching report,
+    # stale by more than POKE_GAP: the turn's first call pokes and waits.
+    await r.env.sleep(timedelta(minutes=16))
+    page = r.notion.all_pages(DB_ID)[0]["id"]
+    r.notion.set_status(page, "Status", "In progress")
+    r.llm.queue(
+        tool_turn(ToolCall("tu_m1", "my_tasks", {})),
+        tool_turn(ToolCall("tu_m2", "my_tasks", {})),
+        answer("Both checked."),
+        tool_turn(ToolCall("tu_m3", "my_tasks", {})),
+        answer("Still in progress."),
+    )
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    expected = 5 if stored else 3
+    # No virtual time may pass on its own between the turns, or the next scheduled
+    # poll would make the second question's record stale again.
+    with r.env.auto_time_skipping_disabled():
+        event_id = f"Ev-{thread}-2"
+        if stored:
+            await r.acts.content.put_inbound(
+                TENANT,
+                event_id,
+                {
+                    "kind": "message",
+                    "agent_id": "it-helper",
+                    "user_id": ALICE,
+                    "text": "where is my request?",
+                    "channel": "C_GENERAL",
+                    "thread_ts": thread,
+                    "channel_kind": "channel",
+                },
+            )
+            await r.client.get_workflow_handle(conv).signal(
+                ConversationWorkflow.message,
+                InboundMessage(
+                    event_id, ALICE, "", "C_GENERAL", thread, "channel", text_stored=True
+                ),
+            )
+        else:
+            await start_conversation(
+                r, "it-helper", thread, "where is my request?", event_id=event_id
+            )
+        for _ in range(30):
+            if len(r.llm.calls) >= expected:
+                break
+            await r.env.sleep(timedelta(seconds=10))
+        await eventually(lambda: len(r.llm.calls) >= expected, timeout=30)
+        outputs = await r.acts.tool_outputs.get_many(TENANT, conv, ["tu_m1", "tu_m2"])
+        assert 'status="In progress"' in outputs["tu_m1"][0]
+        assert 'status="In progress"' in outputs["tu_m2"][0]
+        polls = r.notion.count("retrieve_page")
+
+        event_id = f"Ev-{thread}-3"
+        if stored:
+            await r.acts.content.put_inbound(
+                TENANT,
+                event_id,
+                {
+                    "kind": "message",
+                    "agent_id": "it-helper",
+                    "user_id": ALICE,
+                    "text": "and now?",
+                    "channel": "C_GENERAL",
+                    "thread_ts": thread,
+                    "channel_kind": "channel",
+                },
+            )
+        await r.client.get_workflow_handle(conv).signal(
+            ConversationWorkflow.message,
+            InboundMessage(
+                event_id,
+                ALICE,
+                "" if stored else "and now?",
+                "C_GENERAL",
+                thread,
+                "channel",
+                text_stored=stored,
+            ),
+        )
+        await eventually(lambda: len(r.llm.calls) >= expected + 2, timeout=30)
+        outputs = await r.acts.tool_outputs.get_many(TENANT, conv, ["tu_m3"])
+        assert 'status="In progress"' in outputs["tu_m3"][0]
+        assert r.notion.count("retrieve_page") == polls
+    row = await r.acts.tasks.get(TENANT, handle.id)
+    assert row.last_status == "In progress"
+    return [await current(r, "", handle.id), await current(r, "conversation", conv)]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1088,6 +1187,7 @@ for _name, _fn in {
     "task_unavailable_write": task_unavailable_write,
     "task_recorded": task_recorded,
     "my_tasks": my_tasks,
+    "my_tasks_once": my_tasks_once,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

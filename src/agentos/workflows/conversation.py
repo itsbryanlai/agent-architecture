@@ -111,6 +111,7 @@ with workflow.unsafe.imports_passed_through():
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         LLM_TIMEOUT,
+        POKE_GAP,
         PROGRESS_RETRY,
         PROGRESS_TIMEOUT,
         RETRY,
@@ -164,6 +165,9 @@ PATCH_PROGRESS_DROPPED = "progress-dropped"
 PATCH_SEARCHED_FOOTER = "searched-footer"
 # The my_tasks tool and its in-thread poke: a call no older history ever made.
 PATCH_MY_TASKS = "my-tasks"
+# One refresh per turn, and no poke for a task that just reported: a my-tasks history
+# recorded before this patch pokes and waits on every call, even a second in the turn.
+PATCH_MY_TASKS_ONCE = "my-tasks-once-per-turn"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -237,6 +241,9 @@ class _TurnState:
         # The citations this turn's searches kept, so the reply can name the pages it
         # searched even when the answer cites none of them. References only, like citations.
         self.searched: list[Citation] = []
+        # True once this turn refreshed the thread's task, or found it fresh enough: a
+        # second my_tasks call lists the store without another poke and wait.
+        self.task_refreshed = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -1140,12 +1147,13 @@ class ConversationWorkflow:
             call.name, kind, source_titles=[g.name for g in agent.grants.notion_pages]
         )
         return await self._with_progress(
-            ctx, state, label, self._run_call(ctx, agent, conv_id, call, kind, first_marker)
+            ctx, state, label, self._run_call(ctx, state, agent, conv_id, call, kind, first_marker)
         )
 
     async def _run_call(
         self,
         ctx: TurnContext,
+        state: "_TurnState",
         agent: AgentVersion,
         conv_id: str,
         call: ToolCall | ToolCallRef,
@@ -1154,7 +1162,7 @@ class ConversationWorkflow:
     ) -> ToolResult:
         if kind == READ_KIND:
             if call.name == MY_TASKS_TOOL and workflow.patched(PATCH_MY_TASKS):
-                await self._refresh_thread_task(ctx)
+                await self._refresh_thread_task(ctx, state)
             return await workflow.execute_activity_method(
                 AgentActivities.run_stored_read_tool
                 if isinstance(call, ToolCallRef)
@@ -1171,7 +1179,7 @@ class ConversationWorkflow:
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
 
-    async def _refresh_thread_task(self, ctx: TurnContext) -> None:
+    async def _refresh_thread_task(self, ctx: TurnContext, state: "_TurnState") -> None:
         """Poke the watch of the asker's task in this thread, then wait for its report.
 
         The poke is the webhook's own ``external_update`` signal, so the watch answers
@@ -1179,7 +1187,15 @@ class ConversationWorkflow:
         wait is bounded and best-effort; a task that does not report in time is listed
         as it was last recorded. A task that closed between the lookup and the poke
         already recorded its final state, so a failed signal changes nothing.
+
+        A turn refreshes at most once: a second my_tasks call lists the store as it is.
+        A task that reported within ``POKE_GAP`` is fresh already, so its poke and wait
+        are skipped. Histories recorded before the once-per-turn patch keep the original
+        poke and wait on every call.
         """
+        once = workflow.patched(PATCH_MY_TASKS_ONCE)
+        if once and state.task_refreshed:
+            return
         record: TaskRecord | None = await workflow.execute_activity_method(
             AgentActivities.task_in_thread,
             args=[ctx.tenant_id, ctx.channel, ctx.thread_ts, ctx.requester_user_id],
@@ -1188,6 +1204,10 @@ class ConversationWorkflow:
         )
         if record is None or not record.page_id:
             return
+        if once:
+            state.task_refreshed = True
+            if workflow.now() - record.updated_at < POKE_GAP:
+                return
         try:
             await workflow.get_external_workflow_handle(record.task_id).signal(
                 "external_update", ExternalUpdate(page_id=record.page_id, source="my_tasks")

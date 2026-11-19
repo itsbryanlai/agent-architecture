@@ -5,13 +5,23 @@
 console call ``require_current_schema`` at start-up, so a process never runs against a
 table or column that a migration it has not had would add.
 
+``python -m agentos.schema_version`` is the read-only check for a hosted status run:
+it connects with ``AGENTOS_DATABASE_URL`` (the app role), prints
+``schema current (latest <NNN>)`` and exits 0, or prints the missing migration numbers
+and exits 1. It prints no URL and no password.
+
 A new migration adds its number to ``EXPECTED_VERSIONS``; a test in ``tests/pg`` fails
 when the list and ``scripts/migrations`` disagree.
 """
 
 from __future__ import annotations
 
-from psycopg_pool import AsyncConnectionPool
+import argparse
+import asyncio
+import os
+
+import psycopg
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 EXPECTED_VERSIONS = (
     "000",
@@ -48,6 +58,7 @@ EXPECTED_VERSIONS = (
 )
 
 MIGRATE_COMMAND = "uv run python scripts/migrate.py"
+DATABASE_URL_VAR = "AGENTOS_DATABASE_URL"
 
 
 async def missing_versions(pool: AsyncConnectionPool) -> list[str]:
@@ -70,3 +81,42 @@ async def require_current_schema(pool: AsyncConnectionPool) -> None:
             f"the database is behind the code: migration(s) {', '.join(missing)} not applied. "
             f"Run '{MIGRATE_COMMAND}' as the owner role (see the README), then start again."
         )
+
+
+async def check_schema(url: str) -> int:
+    """Print the schema state of the database at ``url``: 0 when current, 1 when behind."""
+    pool = AsyncConnectionPool(
+        url, open=False, min_size=1, max_size=1, kwargs={"connect_timeout": 5}
+    )
+    await pool.open(wait=True, timeout=10)
+    try:
+        missing = await missing_versions(pool)
+    finally:
+        await pool.close()
+    if missing:
+        print(f"schema behind: migration(s) {', '.join(missing)} not applied")
+        return 1
+    print(f"schema current (latest {EXPECTED_VERSIONS[-1]})")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m agentos.schema_version",
+        description="Check the database schema against the code's migrations, read-only.",
+    )
+    parser.parse_args(argv)
+    url = os.environ.get(DATABASE_URL_VAR)
+    if not url:
+        print(f"{DATABASE_URL_VAR} is not set. Export the app role's URL in this shell.")
+        return 2
+    try:
+        return asyncio.run(check_schema(url))
+    except (psycopg.Error, PoolTimeout):
+        # The exception text can echo the connection string; name the variable only.
+        print(f"cannot check the schema: the database did not answer on {DATABASE_URL_VAR}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

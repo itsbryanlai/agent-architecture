@@ -666,7 +666,74 @@ gateway or the console; three infrastructure images live under `deploy/`.
 non-secret variables. Apply it with the Railway CLI (`railway config plan`,
 then `railway config apply`); a deploy does not read the file. Secrets are
 never in the file: each `preserve()` entry keeps the value set in that
-service's Railway variables. The full hosted runbook is still to be written.
+service's Railway variables.
+
+**The hosted runbook** — the maintainer follows these steps once, from a checkout
+of this repository. Every `railway` command is the Railway CLI's
+([docs.railway.com/cli](https://docs.railway.com/cli)); each step names the page
+that documents it.
+
+1. **Install and sign in.** `brew install railway` (other installers:
+   [CLI](https://docs.railway.com/cli)), then `railway login`
+   ([login](https://docs.railway.com/cli/login)). The first `railway ssh` asks to
+   register an SSH key ([ssh](https://docs.railway.com/cli/ssh)); the schema check
+   in step 9 needs it.
+2. **Create the project and apply the config.** `railway init --name
+   agent-architecture` creates the project and links this directory
+   ([init](https://docs.railway.com/cli/init)). Install the authoring SDK the CLI
+   evaluates `.railway/railway.ts` with: `npm install railway`
+   ([IaC](https://docs.railway.com/infrastructure-as-code)). Then `railway config
+   plan`, read the changes (variable values are redacted), and `railway config
+   apply` ([config](https://docs.railway.com/cli/config)). This creates the six
+   services and the three volumes; it does not deploy them.
+3. **Set the secret variables** the table below lists, per service, in the
+   dashboard's Variables tab or typed by the maintainer as `railway variable set
+   KEY=value --service <name>`
+   ([variable](https://docs.railway.com/cli/variable)). For `acme`'s existing
+   payload key, the value to paste is the key file's content: the file already
+   holds the base64 of the 32 bytes. The maintainer prints it themselves —
+   `cat ~/.agentos/keys/acme.key` (the file under their `AGENTOS_KEY_DIR`) — and
+   pastes it as `AGENTOS_PAYLOAD_KEY_ACME_V1` into the worker and the gateway; no
+   agent runs that command. A new tenant's key comes from `python -m
+   agentos.tenant_keys value <tenant_id>` (see [Payload keys on a host without
+   files](#payload-keys-on-a-host-without-files)).
+4. **Generate the public domains.** `railway domain --service gateway` and
+   `railway domain --service console` each create a fixed `<name>.up.railway.app`
+   domain ([domain](https://docs.railway.com/cli/domain)). The console's
+   `AGENTOS_CONSOLE_URL` is declared as `https://${{RAILWAY_PUBLIC_DOMAIN}}` and
+   resolves to its domain on its own; check it matches the console URL Slack will
+   redirect to.
+5. **Deploy in order:** postgres, temporal, ollama (its first start pulls
+   `bge-m3`, which takes a few minutes), worker (its pre-deploy command migrates;
+   on the empty database it builds the whole schema), gateway, console. Trigger
+   each service's deploy from the dashboard, or with `railway up --service
+   <name>` from the directory it builds from: the repository root for worker,
+   gateway and console, `deploy/<name>` for the three infrastructure services
+   ([up](https://docs.railway.com/cli/up)).
+6. **Import the tenants and agents once**, inside the worker service
+   ([ssh](https://docs.railway.com/cli/ssh)):
+
+   ```bash
+   railway ssh --service worker -- python -m agentos.tenant_store import
+   railway ssh --service worker -- python -m agentos.agent_store import
+   ```
+
+   `config/agents.yaml` ships in the image for these imports; afterwards the
+   database is the source of truth.
+7. **Point the Slack app at the fixed URLs**, once: Event Subscriptions
+   `https://<gateway domain>/slack/events`, Interactivity & Shortcuts
+   `https://<gateway domain>/slack/interactivity`, OAuth redirect
+   `https://<console domain>/auth/slack/callback`. Reinstall the app if its
+   scopes changed. Step 9 prints all three.
+8. **Notion webhook (optional).** Follow [Notion webhook](#notion-webhook-optional)
+   against the fixed gateway URL, once. The `show` and `confirm` commands run
+   where the tenant's payload key variables are set — inside the worker:
+   `railway ssh --service worker -- python -m agentos.notion_webhook show --tenant
+   <tenant_id>` (and `confirm`).
+9. **Check.** `scripts/railway-status.sh` prints one line per check — the six
+   deployments, both `/healthz` endpoints, the schema version inside the worker —
+   and the Slack URLs to compare. Exit 0 means every check passed; 2 means the
+   CLI is missing or not logged in.
 
 | Service | Built from | Start command | Port | Volume mount | Public domain |
 |---|---|---|---|---|---|
@@ -758,6 +825,69 @@ The hosted services do not read the agent YAML at run time: tenants and agents
 come from the database. `config/agents.yaml` ships in the image (the default of
 `AGENTOS_CONFIG`) for the one-time imports, `python -m agentos.tenant_store
 import` and `python -m agentos.agent_store import`.
+
+### Logs
+
+`railway logs --service <name> --lines 200` prints one service's recent runtime
+logs without streaming; `--build` shows the build logs and `--latest` the latest
+deployment even when it failed ([logs](https://docs.railway.com/cli/logs)).
+
+### Backups
+
+**Postgres, logical.** `pg_dump` runs inside the postgres container and streams
+to a local file; no password is printed
+([ssh](https://docs.railway.com/cli/ssh)):
+
+```bash
+railway ssh --service postgres -- pg_dump -U agentos -d agentos --no-owner --no-privileges > "agentos-$(date +%F).sql"
+```
+
+Restore into an empty `agentos` database (a fresh postgres service or volume):
+
+```bash
+railway ssh --service postgres -- psql -U agentos -d agentos -v ON_ERROR_STOP=1 < agentos-YYYY-MM-DD.sql
+```
+
+The dump holds tenant data: keep it access-controlled, and never commit it.
+
+**Volumes.** Railway backs up mounted volumes: the service settings' Backups tab
+schedules daily (kept 6 days), weekly (27) or monthly (89) backups and lists
+manual ones ([backups](https://docs.railway.com/volumes/backups)). Enable daily
+backups on `postgres-data` and `temporal-data`; `ollama-models` holds only
+re-pullable models. Restore from the same tab: Restore stages a new volume
+mounted at the same path, and Deploy completes it. A restore stays within the
+same project and environment, and wiping a volume deletes its backups.
+
+**Temporal, portable copy.** The dev server's state is the SQLite file
+`/data/temporal.db`. The volume backups above cover it (the feature explicitly
+includes SQLite files). For a local copy, stop the service first so the file is
+not being written:
+
+```bash
+railway down --service temporal        # removes the latest deployment; the service stays
+railway volume files --volume temporal-data download /temporal.db "./temporal-$(date +%F).db"
+railway redeploy --service temporal
+```
+
+([down](https://docs.railway.com/cli/down),
+[volume](https://docs.railway.com/cli/volume),
+[redeploy](https://docs.railway.com/cli/redeploy)).
+
+### Cost
+
+`railway usage` shows the workspace's current and estimated bill; `railway usage
+projects --project agent-architecture` breaks it down per service (CPU, memory,
+egress, volume, backup) ([usage](https://docs.railway.com/cli/usage); the
+dashboard view: [project usage](https://docs.railway.com/projects/project-usage)).
+What dominates: Ollama's memory (the `bge-m3` model stays loaded), the Postgres
+and Temporal volumes, and six always-on services. A spend alert and a hard
+limit: `railway usage limit set --target workspace --soft 75 --hard 125`.
+
+### Local runs
+
+The quick-tunnel steps stay only for local runs: see [Slack tunnel and live
+checks](#slack-tunnel-and-live-checks) and [local-run.md](local-run.md). Hosted,
+the gateway and console URLs are fixed, so the Slack settings are entered once.
 
 ## Tests
 

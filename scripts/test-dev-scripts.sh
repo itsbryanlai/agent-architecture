@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Runs dev-up.sh, dev-status.sh and dev-down.sh against stub commands in a temp directory.
-# No real docker, cloudflared, uv, Ollama or Python process is used, and nothing is started
-# on this machine except `sleep`. Sentinel values stand in for secrets.
+# Runs dev-up.sh, dev-status.sh, dev-down.sh and railway-status.sh against stub commands
+# in a temp directory. No real docker, cloudflared, uv, Ollama, Railway or Python process
+# is used, and nothing is started on this machine except `sleep`. Sentinel values stand
+# in for secrets.
 #
 #   bash scripts/test-dev-scripts.sh
 
@@ -32,7 +33,7 @@ lacks() { ! grep -qF -- "$2" "$1"; }
 # --- the stub world ----------------------------------------------------------
 
 mkdir -p "$T/repo/scripts" "$T/repo/.venv/bin" "$T/bin"
-cp "$SRC"/dev-lib.sh "$SRC"/dev-up.sh "$SRC"/dev-down.sh "$SRC"/dev-status.sh "$T/repo/scripts/"
+cp "$SRC"/dev-lib.sh "$SRC"/dev-up.sh "$SRC"/dev-down.sh "$SRC"/dev-status.sh "$SRC"/railway-status.sh "$T/repo/scripts/"
 : >"$T/calls.log"
 
 cat >"$T/bin/docker" <<STUB
@@ -66,6 +67,30 @@ url="\${@: -1}"
 base="\${url%/healthz}"
 grep -qxF "\$base" "$T/dead-urls" 2>/dev/null && exit 22
 echo '{"ok":true}'
+STUB
+# railway: a logged-in CLI in a linked project. Every service's latest deployment is
+# SUCCESS unless STUB_RAILWAY_BAD_SERVICE names it; domains are <service>-stub.up.railway.app.
+cat >"$T/bin/railway" <<STUB
+#!/usr/bin/env bash
+echo "railway \$*" >>"$T/calls.log"
+svc=""
+prev=""
+for a in "\$@"; do
+  [[ "\$prev" == --service ]] && svc="\$a"
+  prev="\$a"
+done
+case "\$1" in
+  whoami | status) exit 0 ;;
+  deployment)
+    if [[ "\$svc" == "\${STUB_RAILWAY_BAD_SERVICE:-}" ]]; then
+      echo "  stub-deployment-id | FAILED | 2026-01-01 00:00:00 UTC"
+    else
+      echo "  stub-deployment-id | SUCCESS | 2026-01-01 00:00:00 UTC"
+    fi ;;
+  domain) echo "\$svc-stub.up.railway.app" ;;
+  ssh) echo "schema current (latest 030)" ;;
+  *) exit 0 ;;
+esac
 STUB
 cat >"$T/repo/.venv/bin/python" <<STUB
 #!/usr/bin/env bash
@@ -330,6 +355,14 @@ check "--shell says what it is and opens the shell with the values" \
 clear_vars
 feed 'OwnerSentinel1\np@a\np@b\np@c\n'; rc=$?
 check "three rejected tries exit non-zero naming the variable" bash -c "[[ $rc -ne 0 ]] && grep -q 'AGENTOS_APP_DB_PASSWORD: three tries failed' '$OUT'"
+
+# --- railway-status.sh: a failed deployment is named and fails the run ---------
+
+good_env; export STUB_RAILWAY_BAD_SERVICE=ollama
+(cd / && bash "$T/repo/scripts/railway-status.sh") >"$OUT" 2>&1; rc=$?
+check "railway-status names a failed deployment and exits non-zero" \
+  bash -c "[[ $rc -ne 0 ]] && grep -q 'deploy ollama: FAILED' '$OUT'"
+unset STUB_RAILWAY_BAD_SERVICE
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

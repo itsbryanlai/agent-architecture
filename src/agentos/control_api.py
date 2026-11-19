@@ -26,6 +26,7 @@ route parameters' type aliases at definition time.
 """
 
 import argparse
+import asyncio
 import hashlib
 import logging
 import re
@@ -691,6 +692,7 @@ async def _real_lifespan(app: FastAPI):
         TenantKeyError,
         build_key_store,
         master_keys_from_env,
+        start_key_refresh,
         tenant_key_material,
     )
     from agentos.grant_checker import NotionGrantChecker
@@ -709,6 +711,7 @@ async def _real_lifespan(app: FastAPI):
     settings = load_settings()
     pool = AsyncConnectionPool(settings.require("database_url"), open=False, **settings.pool_args())
     await pool.open()
+    key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
         directory = TenantDirectory(PostgresTenantStore(pool))
@@ -719,6 +722,9 @@ async def _real_lifespan(app: FastAPI):
             keys = await build_key_store(settings, pool)
         except TenantKeyError as err:
             raise SystemExit(str(err)) from err
+        # The install creates a tenant's key while the console runs; the periodic
+        # refresh loads it (and every other new key) without a restart, as in the gateway.
+        key_refresh = start_key_refresh(keys)
         credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
         apis: dict[str, RealNotionAPI] = {}
 
@@ -785,6 +791,9 @@ async def _real_lifespan(app: FastAPI):
                     )
         yield
     finally:
+        if key_refresh is not None:
+            key_refresh.cancel()
+            await asyncio.gather(key_refresh, return_exceptions=True)
         await pool.close()
 
 

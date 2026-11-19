@@ -173,9 +173,12 @@ def test_oversized_webhook_body_is_refused_before_anything_else(client, route, c
     assert resp.status_code == 413
 
 
-async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(agents, temporal, secret):
+@pytest.mark.parametrize("app_name", ["This app", "Acme Helper"], ids=["fallback", "named"])
+async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(
+    agents, temporal, secret, app_name
+):
     """Fails if a message in a tenant with no default agent starts a workflow, or is answered
-    with anything but the fixed not-set-up text, once per event."""
+    with anything but the fixed not-set-up text naming the app, once per event."""
     fresh = replace(
         agents,
         tenant_id="newco",
@@ -197,6 +200,7 @@ async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(agents, te
         InMemoryTaskLinkStore(),
         SignatureVerifier(secret),
         slack_for=slack_for,
+        app_name=app_name,
     )
     client = TestClient(app)
     event = im_event()
@@ -211,7 +215,7 @@ async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(agents, te
     assert len(slack.posts()) == 1
     post = slack.posts()[0]
     assert post["text"] == (
-        "This app is installed but not set up yet. "
+        f"{app_name} is installed but not set up yet. "
         "An admin can finish setup at https://console.example.com."
     )
     assert (post["channel"], post["thread_ts"]) == ("D123", "1700000000.000200")

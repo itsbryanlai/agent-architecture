@@ -149,6 +149,13 @@ class TenantCredentials:
         blob = encrypt_with_tenant_key(tenant_id, key, value.encode())
         await self._store.put(tenant_id, kind, blob, key_version, conn=conn)
 
+    def forget(self, tenant_id: str) -> None:
+        """Drop the tenant's cached decryption, as when a sync stops serving the tenant.
+
+        The row itself stays; the next resolve reads it and decrypts it again.
+        """
+        self._cache.pop((tenant_id, SLACK_BOT), None)
+
     async def slack_bot_token(self, config: AgentsConfig) -> str:
         """The tenant's Slack bot token: the credential row first, else its env variable.
 

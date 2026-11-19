@@ -2,6 +2,7 @@
 a tenant added, changed or disabled without a restart (gateway, worker, console)."""
 
 import logging
+import secrets as token_source
 from dataclasses import replace
 
 import httpx
@@ -24,11 +25,13 @@ from agentos.config import (
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
+from agentos.credentials import SLACK_BOT, InMemoryCredentialStore, TenantCredentials
 from agentos.gateway.app import create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from agentos.models import TurnContext
+from agentos.payload_codec import encrypt_with_tenant_key
 from agentos.slack_client import FakeSlack
 from agentos.slack_signin import SlackSession
 from agentos.stores import (
@@ -45,7 +48,7 @@ from agentos.tenant_store import (
     import_tenant,
     startup_tenants,
 )
-from agentos.tenants import RegistrySync, UnknownTenant, build_registry
+from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry, runtime_for
 from tests.conftest import (
     ALICE,
     GLOBEX,
@@ -57,6 +60,7 @@ from tests.conftest import (
 from tests.helpers.console_harness import ROOT, ConsoleHarness, using
 from tests.helpers.control_api import BASE, JSON, StandIn
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
+from tests.helpers.keys import CountingKeyStore
 
 
 @pytest.fixture
@@ -405,6 +409,43 @@ async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):
     with pytest.raises(UnknownTenant):
         registry.get(GLOBEX)
     assert registry.tenants() == [TENANT]
+
+
+async def test_a_sync_that_drops_a_tenant_forgets_its_cached_token():
+    """Fails if a tenant the sync drops keeps its decrypted token in the resolver cache."""
+    store, clock = InMemoryTenantStore(globex()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = CountingKeyStore({(GLOBEX, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    await credential_store.put(
+        GLOBEX, SLACK_BOT, encrypt_with_tenant_key(GLOBEX, key, b"xoxb-made-up"), 1
+    )
+    credentials = TenantCredentials(credential_store, keys)
+    config = globex()
+    token = await credentials.slack_bot_token(config)
+    registry = TenantRegistry({GLOBEX: runtime_for(config, FakeSlack(), slack_token=token)})
+    _built, slack, notion = fake_factories()
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        on_drop=credentials.forget,
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert keys.reads == 1  # the sync's own resolve was served from the cache
+
+    await store.set_enabled(GLOBEX, False)
+    clock.advance(6)
+    await sync.sync()
+
+    assert registry.tenants() == []
+    assert await credentials.slack_bot_token(config) == token
+    assert keys.reads == 2  # forgotten: the still-stored row was decrypted again
 
 
 async def test_changed_settings_reach_the_worker_without_new_clients(monkeypatch):

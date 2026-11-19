@@ -17,7 +17,7 @@ import yaml
 from agentos import ids
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
-from agentos.config import ConfigError
+from agentos.config import AgentsConfig, ConfigError
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app
@@ -34,8 +34,10 @@ from agentos.slack_install import (
     InstallConfig,
     Installer,
     SlackInstallError,
+    app_name_from_manifest,
     bot_scopes_from_manifest,
     grant_from_response,
+    installed_tenant_secrets,
 )
 from agentos.slack_signin import Console, SignInConfig, SlackSession
 from agentos.tenant_store import InMemoryTenantStore, TenantDirectory
@@ -189,26 +191,79 @@ def test_the_scopes_come_from_the_manifest(tmp_path, valid):
 # --- the callback -----------------------------------------------------------------
 
 
+def stored_tenant(tenant_id: str, team_id: str) -> AgentsConfig:
+    """A tenant already in the table, as a YAML import would have left it."""
+    return AgentsConfig(
+        tenant_id=tenant_id,
+        slack_team_id=team_id,
+        agents={},
+        default_agent=None,
+        notion_workspace_id=None,
+        secrets=installed_tenant_secrets(tenant_id),
+        channels={},
+        admins=("U_SEED_ADMIN",),
+    )
+
+
 @pytest.mark.parametrize(
     "case",
-    ["allowlisted team", "team not allowlisted", "bad state", "reused state", "reinstall"],
-    ids=["success", "not-allowlisted", "bad-state", "reused-state", "reinstall"],
+    [
+        "allowlisted team",
+        "team not allowlisted",
+        "bad state",
+        "reused state",
+        "reinstall",
+        "id collision",
+        "same team different tenant",
+        "error parameter",
+        "no state cookie",
+        "reinstall by another user",
+    ],
+    ids=[
+        "success",
+        "not-allowlisted",
+        "bad-state",
+        "reused-state",
+        "reinstall",
+        "id-collision",
+        "same-team-other-tenant",
+        "error-param",
+        "no-cookie",
+        "reinstall-other-user",
+    ],
 )
 async def test_the_install_callback(h, case):
     """Fails if an allowed install does not create the tenant, key, token and first admin with
-    one install audit, a refused one writes anything, or a reinstall creates a second tenant."""
+    one install audit, a refused or conflicting one writes anything, or a reinstall creates a
+    second tenant or changes the admins."""
     if case == "team not allowlisted":
         h = InstallHarness(allowed=("T_OTHER",))
         await h.keys.refresh()
+    if case == "id collision":
+        await h.tenants.insert(stored_tenant(h.tenant_id, "T_OTHER_WS"))
+    if case == "same team different tenant":
+        await h.tenants.insert(stored_tenant("otherco", NEW_TEAM))
     async with h.client() as c:
-        state = await start_install(c)
-        response = await callback(c, state + "tampered" if case == "bad state" else state)
+        if case == "no state cookie":
+            # Another browser: a well-formed state, but no cookie was ever set here.
+            response = await callback(c, "a" * 40)
+        else:
+            state = await start_install(c)
+            if case == "error parameter":
+                response = await c.get(
+                    INSTALL_CALLBACK_PATH,
+                    params={"code": "made-up-code", "state": state, "error": "access_denied"},
+                )
+            else:
+                response = await callback(c, state + "tampered" if case == "bad state" else state)
         if case == "reused state":
             assert response.status_code == 200
             response = await callback(c, state)
-        if case == "reinstall":
+        if case in ("reinstall", "reinstall by another user"):
             assert response.status_code == 200
             h.oauth.body["access_token"] = REPLACEMENT_TOKEN
+            if case == "reinstall by another user":
+                h.oauth.body["authed_user"] = {"id": "U_SECOND"}
             response = await callback(c, await start_install(c))
 
     if case == "team not allowlisted":
@@ -219,9 +274,21 @@ async def test_the_install_callback(h, case):
         assert await h.credential_store.get(h.tenant_id, SLACK_BOT) is None
         assert h.key_calls == []
         return
-    if case == "bad state":
+    if case in ("bad state", "error parameter", "no state cookie"):
         assert response.status_code == 400
         assert await h.tenants.list_refs() == []
+        assert h.audit.events == []
+        assert await h.credential_store.get(h.tenant_id, SLACK_BOT) is None
+        assert h.key_calls == []
+        return
+    if case in ("id collision", "same team different tenant"):
+        assert response.status_code == 409
+        assert "already" in response.text
+        refs = await h.tenants.list_refs()
+        assert [r.tenant_id for r in refs] == [h.tenant_id if case == "id collision" else "otherco"]
+        kept = await h.tenants.load(refs[0].tenant_id)
+        assert kept.config.admins == ("U_SEED_ADMIN",)
+        assert kept.config.slack_team_id == ("T_OTHER_WS" if case == "id collision" else NEW_TEAM)
         assert h.audit.events == []
         assert await h.credential_store.get(h.tenant_id, SLACK_BOT) is None
         assert h.key_calls == []
@@ -244,11 +311,13 @@ async def test_the_install_callback(h, case):
         (INSTALLER,),
         None,
     )
-    if case == "reinstall":
+    if case in ("reinstall", "reinstall by another user"):
         assert await h.credentials.slack_bot_token(row.config) == REPLACEMENT_TOKEN
         assert [e.tool for e in h.audit.events] == ["install", "reinstall"]
         assert row.config.admins == (INSTALLER,)
         assert (await h.credential_store.get(h.tenant_id, SLACK_BOT)).key_version == 1
+        if case == "reinstall by another user":
+            assert h.audit.events[1].requester_user_id == "U_SECOND"
     else:
         assert h.key_calls == [h.tenant_id]
         assert await h.credentials.slack_bot_token(row.config) == BOT_TOKEN
@@ -332,3 +401,46 @@ def test_only_a_bot_grant_naming_a_workspace_and_an_installer_is_accepted(body, 
     else:
         with pytest.raises(SlackInstallError):
             grant_from_response(body)
+
+
+@pytest.mark.parametrize("team_known", [True, False], ids=["team known", "team unknown"])
+async def test_an_install_refusal_logs_the_tenant_when_the_team_is_known(h, caplog, team_known):
+    """Fails if a refusal after Slack named the workspace logs no tenant ID, or a refusal
+    before that logs one."""
+    if team_known:
+        h = InstallHarness(allowed=("T_OTHER",))
+        await h.keys.refresh()
+    else:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": False, "error": "invalid_code"})
+        )
+        h.installer.oauth = HttpSlackOAuth(CLIENT_ID, "made-up-client-secret", transport)
+    async with h.client() as c:
+        state = await start_install(c)
+        response = await callback(c, state)
+
+    assert response.status_code == (403 if team_known else 503)
+    assert "install refused" in caplog.text
+    if team_known:
+        assert f"tenant_id={h.tenant_id}" in caplog.text
+    else:
+        assert "tenant_id=" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        ({"display_information": {"name": "Acme Helper"}}, "Acme Helper"),
+        ({"display_information": {}}, "This app"),
+        (None, "This app"),
+    ],
+    ids=["name", "no name", "no file"],
+)
+def test_the_app_name_comes_from_the_manifest(tmp_path, manifest, expected):
+    """Fails if the not-set-up reply's app name comes from anywhere but the manifest's
+    display_information.name, or a missing name or file raises instead of falling back."""
+    path = tmp_path / "manifest.yaml"
+    if manifest is not None:
+        path.write_text(yaml.safe_dump(manifest))
+
+    assert app_name_from_manifest(str(path)) == expected

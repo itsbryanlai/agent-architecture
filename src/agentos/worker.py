@@ -402,6 +402,7 @@ async def main() -> None:
             RealNotionAPI,
             admit=lambda config: admit_new_tenant(config, keys, agent_store, log),
             slack_token=credentials.slack_bot_token,
+            on_drop=credentials.forget,
         )
         worker = Worker(
             client,

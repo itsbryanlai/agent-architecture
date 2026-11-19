@@ -128,6 +128,8 @@ class GatewayDeps:
     # The Notion webhook verification tokens, encrypted per tenant. None keeps the
     # local file flow for a gateway built without a database.
     webhook_tokens: WebhookTokens | None = None
+    # The app's name from the manifest, for the not-set-up reply; "This app" without one.
+    app_name: str = "This app"
 
 
 def create_app(
@@ -142,6 +144,7 @@ def create_app(
     switches: SwitchStore | None = None,
     content: ContentStore | None = None,
     webhook_tokens: WebhookTokens | None = None,
+    app_name: str = "This app",
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
@@ -157,6 +160,7 @@ def create_app(
             switches,
             content or InMemoryContentStore(),
             webhook_tokens=webhook_tokens,
+            app_name=app_name,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -784,13 +788,16 @@ async def _tell_writes_off(d: GatewayDeps, tenant: str, payload: dict) -> None:
         )
 
 
-def not_set_up_text(console_url: str | None) -> str:
+def not_set_up_text(console_url: str | None, app_name: str = "This app") -> str:
     """The fixed reply of a tenant that is installed but has no agent yet."""
     if console_url:
         return (
-            f"This app is installed but not set up yet. An admin can finish setup at {console_url}."
+            f"{app_name} is installed but not set up yet. "
+            f"An admin can finish setup at {console_url}."
         )
-    return "This app is installed but not set up yet. An admin can finish setup in the web console."
+    return (
+        f"{app_name} is installed but not set up yet. An admin can finish setup in the web console."
+    )
 
 
 async def _tell_not_set_up(d: GatewayDeps, tenant: str, channel: str, thread_ts: str) -> None:
@@ -800,7 +807,7 @@ async def _tell_not_set_up(d: GatewayDeps, tenant: str, channel: str, thread_ts:
     try:
         slack = await d.slack_for(tenant)
         await slack.post_message(
-            channel, not_set_up_text(d.settings.console_url), thread_ts=thread_ts
+            channel, not_set_up_text(d.settings.console_url, d.app_name), thread_ts=thread_ts
         )
     except Exception as err:  # noqa: BLE001 - the event is already answered; the notice may fail
         log.warning(
@@ -843,6 +850,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
     from agentos.slack_client import RealSlackPoster
+    from agentos.slack_install import DEFAULT_MANIFEST_PATH, app_name_from_manifest
     from agentos.stores import PostgresTaskLinkStore
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
@@ -906,6 +914,7 @@ async def _real_lifespan(app: FastAPI):
             content=content,
             on_inbound=relay.wake,
             webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
+            app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

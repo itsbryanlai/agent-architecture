@@ -108,7 +108,8 @@ class RegistrySync:
     the resolver returns, or the variables its settings name without one), swaps in
     changed settings, rebuilds a client whose credential was replaced, and drops a
     tenant that was disabled or removed, so the worker serves a tenant without a
-    restart. A new tenant that cannot be admitted (its Slack token is unavailable, or
+    restart. A dropped tenant is passed to ``on_drop`` (the resolver forgets its cached
+    token). A new tenant that cannot be admitted (its Slack token is unavailable, or
     ``admit`` returns a reason) is left out and reported once per reason; the next
     ``sync`` tries again. A tenant with no Notion token is served Slack-only.
     """
@@ -121,6 +122,7 @@ class RegistrySync:
         notion_factory: Callable[[str], NotionAPI],
         admit: Callable[[AgentsConfig], Awaitable[str | None]] | None = None,
         slack_token: Callable[[AgentsConfig], Awaitable[str]] | None = None,
+        on_drop: Callable[[str], None] | None = None,
     ):
         self._directory = directory
         self._registry = registry
@@ -130,6 +132,8 @@ class RegistrySync:
         # Resolves a tenant's Slack bot token (credential row first, env fallback).
         # None reads only the environment variable the tenant's settings name.
         self._slack_token = slack_token
+        # Called with a dropped tenant's ID, so the resolver forgets its cached token.
+        self._on_drop = on_drop
         self._reported: set[tuple[str, str]] = set()
 
     def _report(self, tenant_id: str, reason: str) -> None:
@@ -143,6 +147,8 @@ class RegistrySync:
         for tenant_id in self._registry.tenants():
             if tenant_id not in wanted:
                 self._registry.remove(tenant_id)
+                if self._on_drop is not None:
+                    self._on_drop(tenant_id)
                 log.info("tenant_id=%s no longer served (disabled or removed)", tenant_id)
         added = []
         for tenant_id, config in wanted.items():

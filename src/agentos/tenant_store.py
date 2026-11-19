@@ -31,7 +31,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
@@ -45,7 +45,7 @@ from agentos.config import (
     TenantSecrets,
     load_settings,
 )
-from agentos.stores import tenant_transaction
+from agentos.stores import joined_transaction, tenant_transaction
 
 log = logging.getLogger("agentos.tenants")
 
@@ -96,8 +96,13 @@ class TenantStore(Protocol):
         """One tenant's settings, read as that tenant."""
         ...
 
-    async def insert(self, config: AgentsConfig) -> bool:
-        """Store a tenant that is not stored yet. False, and nothing changes, if it is."""
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
+        """Store a tenant that is not stored yet. False, and nothing changes, if it is.
+
+        ``conn`` is the connection of a unit of work (``unit_of_work.py``): the insert
+        then joins that transaction instead of opening its own, so the tenant row
+        commits with the unit's other writes or not at all.
+        """
         ...
 
     async def set_enabled(self, tenant_id: str, enabled: bool) -> None: ...
@@ -170,10 +175,10 @@ class PostgresTenantStore:
             return None
         return TenantRow(_config_from_row(*row[:7]), row[7], row[8])
 
-    async def insert(self, config: AgentsConfig) -> bool:
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         try:
-            async with tenant_transaction(self._pool, config.tenant_id) as conn:
-                cur = await conn.execute(
+            async with joined_transaction(self._pool, config.tenant_id, conn) as db:
+                cur = await db.execute(
                     """
                     INSERT INTO tenants (tenant_id, slack_team_id, default_agent,
                                          notion_workspace_id, channels, admins, secret_env)
@@ -245,7 +250,7 @@ class InMemoryTenantStore:
     async def load(self, tenant_id: str) -> TenantRow | None:
         return self._rows.get(tenant_id)
 
-    async def insert(self, config: AgentsConfig) -> bool:
+    async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         if config.tenant_id in self._rows:
             return False
         for row in self._rows.values():

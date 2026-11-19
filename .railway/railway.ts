@@ -182,6 +182,9 @@ export default defineRailway(() => {
       AGENTOS_CONSOLE_URL: "https://${{RAILWAY_PUBLIC_DOMAIN}}",
       NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
       SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
+      // The install creates the tenant's key and encrypts its bot token in the database.
+      AGENTOS_KEY_SOURCE: "db",
+      AGENTOS_MASTER_KEY_V1: "${{shared.AGENTOS_MASTER_KEY_V1}}",
       // The pilot allowlist for "Add to Slack": comma-separated Slack team IDs.
       // Unset refuses every install (docs/operations.md, Slack OAuth install).
       AGENTOS_INSTALL_ALLOWED_TEAMS: "${{shared.AGENTOS_INSTALL_ALLOWED_TEAMS}}",

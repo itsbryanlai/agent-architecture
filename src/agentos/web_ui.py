@@ -35,6 +35,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from agentos import ids
 from agentos.access_diff import WideningNotAcknowledged
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError
@@ -568,18 +569,28 @@ class WebUI:
             return refused("The install could not be verified. Start again.")
         if "error" in query or not code or len(code) > 1024:
             return refused("Slack did not complete the install.")
+        team_id = ""
+
+        def log_refused(err: Exception) -> None:
+            if team_id:
+                log.warning(
+                    "install refused tenant_id=%s: %s", ids.tenant_for_slack_team(team_id), err
+                )
+            else:
+                log.warning("install refused: %s", err)
+
         try:
             body = await install.oauth.exchange_code(code, config.redirect_uri)
             team_id, bot_token, installer = grant_from_response(body)
             result = await install.install(team_id, bot_token, installer)
         except SlackInstallError as err:
-            log.warning("install refused: %s", err)
+            log_refused(err)
             return refused(str(err), err.status)
         except ConfigError as err:
-            log.warning("install refused: %s", err)
+            log_refused(err)
             return refused(str(err), 409)
         except TenantKeyError as err:
-            log.warning("install refused: %s", err)
+            log_refused(err)
             return refused(str(err), 503)
         if result.created:
             text = (

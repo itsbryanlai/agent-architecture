@@ -110,6 +110,21 @@ def bot_scopes_from_manifest(path: str) -> tuple[str, ...]:
     return tuple(bot)
 
 
+def app_name_from_manifest(path: str = DEFAULT_MANIFEST_PATH) -> str:
+    """The app's name for the not-set-up reply: ``display_information.name``, else "This app".
+
+    The manifest is already in the image (the install reads its scopes); a missing file
+    or name falls back rather than refusing, since the reply still names the console.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+    except OSError:
+        return "This app"
+    name = ((manifest or {}).get("display_information") or {}).get("name")
+    return name if isinstance(name, str) and name.strip() else "This app"
+
+
 def install_from_settings(
     settings: Settings, manifest_path: str = DEFAULT_MANIFEST_PATH
 ) -> InstallConfig | None:
@@ -258,6 +273,10 @@ class InstallResult:
 class Installer:
     """Creates the tenant of an allowed workspace, or replaces its bot token.
 
+    A tenant ID that already serves another workspace, and a workspace that already
+    belongs to another tenant ID, are both refused with 409: an install never takes
+    over another tenant's row.
+
     ``ensure_key`` returns the tenant's (key version, key bytes), creating version 1 when
     it has none; production passes ``crypto_keys.tenant_key_material`` over the database
     pool and master keys, reading on the unit of work's connection so the key created
@@ -302,7 +321,19 @@ class Installer:
         )
         invocation = uuid.uuid4().hex
         async with self._uow.begin(tenant_id) as conn:
-            created = await self._tenants.insert(config)
+            try:
+                created = await self._tenants.insert(config, conn=conn)
+            except ConfigError as err:
+                # The workspace already belongs to another tenant ID.
+                raise SlackInstallError(str(err), 409) from err
+            if not created:
+                existing = await self._tenants.load(tenant_id)
+                if existing is None or existing.config.slack_team_id != team_id:
+                    raise SlackInstallError(
+                        f"tenant '{tenant_id}' already serves another Slack workspace; "
+                        "the install was refused",
+                        409,
+                    )
             key_version, key = await self._ensure_key(tenant_id, conn)
             await self._credentials.store_secret(
                 tenant_id, SLACK_BOT, bot_token, key_version, key, conn=conn

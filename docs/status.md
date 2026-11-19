@@ -22,7 +22,7 @@ The design is in [architecture.md](architecture.md), the reasons in [decisions.m
 | "No movement" follow-up | partial | `workflows/task.py`, `task_notices.py` | One notice; no nudge offer and no action |
 | Notion connector (read, create item, comment) | built | `connectors/notion.py` | |
 | Connector manifest: risk, idempotency, requester scoping | built | `connectors/manifest.py`, `connectors/manifests/notion.yaml` | Risk class is read; no admin adjustment |
-| Confluence and Google Drive connectors | target | none | In the v1 scope in product.md |
+| Google Drive connector (read and write) | target | none | In the v1 scope in product.md; Confluence and Jira are out of scope |
 | MCP client, OpenAPI adapter, certified and custom tiers | target | none | Deferred, not decided against (D-28) |
 | Admin-adjustable approval policy, risk-class ceiling, second approver | target | none | Requester is the only approver (Q-5 closed) |
 | Per-action approver chosen by the creator | target | none | |

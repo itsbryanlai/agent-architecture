@@ -1,6 +1,6 @@
 # Product
 
-Status: draft · Last updated 2026-11-06 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (Confluence and Google Drive, the nudge offer, admin-adjustable approval policy and risk classes, the console's connectors page) are marked `target` there; this document's scope and roadmap are unchanged.
+Status: draft · Last updated 2026-11-19 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (Google Drive, the nudge offer, admin-adjustable approval policy and risk classes, the console's connectors page) are marked `target` there.
 
 ## One-line pitch
 
@@ -56,12 +56,13 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 
 - Slack only (one Slack app installed per workspace, which is one tenant).
 - A front-door assistant plus agents built by approved creators.
-- Read connectors: Notion, Confluence, and Google Drive (knowledge).
-- **One write action:** add an item to a Notion database (such as a request tracker) or comment on one, with approval, followed by durable follow-up until its status reaches done.
+- Read connectors: Notion and Google Drive (knowledge).
+- **Write actions in two systems, with approval:** add an item to a Notion database (such as a request tracker) or comment on one, followed by durable follow-up until its status reaches done; and in Google Drive, comment on a file, append a row to a granted Sheet, create a Doc from a template, or replace a marked section of a granted Doc.
 - Admin console: connectors, creator roles, approval policy, audit log, usage and cost.
 - Multi-tenant SaaS.
 
 ### Out of scope for v1
+- Confluence and Jira (not planned); Linear comes after v1.
 - Microsoft Teams, Telegram, web chat.
 - Self-serve agent creation for every employee.
 - Agents that run on schedules or external events without a user starting them.
@@ -72,7 +73,7 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 | Phase | Theme | Items |
 |---|---|---|
 | v1 | Prove agents can do work | See v1 scope above |
-| v2 | More actions, more systems | More write connectors (Jira, ServiceNow, Workday/HRIS, Google Calendar); approvals by other people (manager approves an employee's request); multi-step actions that are undone if a later step fails (sagas); MCP-based custom connectors added by tenant admins; **connector health**: failures sorted by cause, writes paused automatically on a broken connector, failure reports to the admin |
-| v3 | Proactive agents | Scheduled agents ("every Monday, summarize open P1s"); agents triggered by events (new Jira ticket, new hire in HRIS); agents that hand work to each other; **connector self-repair**: a sandboxed coding agent proposes fixes for connector failures, and a human approves before deploy |
+| v2 | More actions, more systems | More write connectors (Linear, ServiceNow, Workday/HRIS, Google Calendar); approvals by other people (manager approves an employee's request); multi-step actions that are undone if a later step fails (sagas); MCP-based custom connectors added by tenant admins; **connector health**: failures sorted by cause, writes paused automatically on a broken connector, failure reports to the admin |
+| v3 | Proactive agents | Scheduled agents ("every Monday, summarize open P1s"); agents triggered by events (new Linear issue, new hire in HRIS); agents that hand work to each other; **connector self-repair**: a sandboxed coding agent proposes fixes for connector failures, and a human approves before deploy |
 | v4 | Broader assistant | Front door grows into a full company assistant (shape 1) across all connected sources |
 | Later | Reach and deployment | Microsoft Teams, web portal, Telegram if a market needs it; self-serve agent creation with guardrails; dedicated or customer-hosted cells for regulated tenants; automatic deployment of connector fixes for low-risk changes once the track record supports it |

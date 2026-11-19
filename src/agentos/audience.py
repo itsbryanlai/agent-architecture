@@ -339,9 +339,9 @@ def decision_text(agent_name: str, decision: AudienceDecision) -> str:
     if decision.reason == PAUSED:
         return paused_text(agent_name)
     if decision.reason == OFF:
-        return agent_off_text(escape_slack(agent_name))
+        return agent_off_text(agent_name)
     if decision.reason == HEALTH:
-        return agent_unavailable_text(escape_slack(agent_name))
+        return agent_unavailable_text(agent_name)
     return refusal_text(agent_name, decision.owner, decision.notify_owner)
 
 

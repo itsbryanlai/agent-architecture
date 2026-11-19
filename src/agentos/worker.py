@@ -250,9 +250,16 @@ async def main() -> None:
         )
         # A broken grant disables its agent with the reason; the worker starts and
         # serves every other agent and tenant. Platform-wide problems above still exit.
+        # One tenant's check failing never skips the rest: it is logged, and the worker
+        # starts; the health refresh checks that tenant's agents again on its cadence.
         for tenant_id in registry.tenants():
             log.info("tenant_id=%s checking grants", tenant_id)
-            await health_checker.check_tenant(tenant_id, published.tenants[tenant_id].agents)
+            try:
+                await health_checker.check_tenant(tenant_id, published.tenants[tenant_id].agents)
+            except Exception as err:  # noqa: BLE001 - one tenant never stops start-up
+                log.error(
+                    "tenant_id=%s grant check failed error_type=%s", tenant_id, type(err).__name__
+                )
         # Provider and model name only; never a key.
         log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
         if embedder is not None:
@@ -357,9 +364,12 @@ async def main() -> None:
         finally:
             refresher.cancel()
             health_refresher.cancel()
+            stopped = [health_refresher]
             if key_refresh is not None:
                 key_refresh.cancel()
-                await asyncio.gather(key_refresh, health_refresher, return_exceptions=True)
+                stopped.append(key_refresh)
+            # Gathered before the pool closes, whether or not a key refresh runs.
+            await asyncio.gather(*stopped, return_exceptions=True)
     finally:
         await pool.close()
 

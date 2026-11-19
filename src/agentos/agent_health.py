@@ -15,7 +15,10 @@ on the directory refresh for agents that are due (an unavailable agent at most
 once every few minutes; a newly published version at once), and a passing check
 marks the agent available again. A transient Notion failure (network error,
 rate limit, server error) is not a grant problem: it changes no health, and the
-next check tries again.
+next check tries again. A check that cannot run never stops the pass: a permanent
+connector problem (a granted database with no data source) marks its agent
+unavailable with the problem, any other unexpected error is logged and changes no
+health, and one agent's or tenant's failure never skips the rest.
 
 Each transition — to unavailable, or back to available — is audited as
 ``agent_health`` and told to people once: the agent's creator and the tenant's
@@ -40,6 +43,7 @@ from agentos import ids
 from agentos.agent_store import AgentStore
 from agentos.audit import AuditStore, canonical_sha256
 from agentos.config import AgentVersion
+from agentos.connectors.notion import ConnectorError
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker
 from agentos.members import ADMIN, MemberStore
 from agentos.models import AuditEvent
@@ -62,9 +66,12 @@ HEALTH_RECHECK_SECONDS = 300.0
 
 
 def agent_unavailable_text(agent_name: str) -> str:
-    """The one fixed reply of an unavailable agent, for a message or a refused Submit."""
+    """The one fixed reply of an unavailable agent, for a message or a refused Submit.
+
+    The name is escaped here, once; callers pass it raw.
+    """
     return (
-        f"{agent_name} is unavailable right now: an admin needs to fix its access. "
+        f"{escape_slack(agent_name)} is unavailable right now: an admin needs to fix its access. "
         "Nothing was changed."
     )
 
@@ -204,9 +211,12 @@ def unavailable_reason(reports) -> str:
 
 
 def unavailable_notice_text(agent_name: str, reason: str) -> str:
-    """What the creator and admins are told when an agent goes unavailable."""
+    """What the creator and admins are told when an agent goes unavailable.
+
+    The name and the reason are escaped here, once; callers pass them raw.
+    """
     return (
-        f"{escape_slack(agent_name)} is unavailable right now: {reason}. "
+        f"{escape_slack(agent_name)} is unavailable right now: {escape_slack(reason)}. "
         "An admin needs to fix its access; the agent answers again once a check passes."
     )
 
@@ -251,11 +261,23 @@ class AgentHealthChecker:
         self._clock = clock
 
     async def check_tenant(self, tenant_id: str, agents: dict[str, AgentVersion]) -> None:
-        """Check each given published agent of the tenant and record its health."""
+        """Check each given published agent of the tenant and record its health.
+
+        One agent's check or record failing never skips the rest: the failure is
+        logged with IDs and the error type, and the pass goes on.
+        """
         runtime = self._registry.get(tenant_id)
         checker = NotionGrantChecker(lambda _t: runtime.notion_api)
         for agent in agents.values():
-            await self._check_one(tenant_id, runtime, checker, agent)
+            try:
+                await self._check_one(tenant_id, runtime, checker, agent)
+            except Exception as err:  # noqa: BLE001 - one agent never stops the pass
+                log.error(
+                    "tenant_id=%s agent_id=%s health check failed error_type=%s",
+                    tenant_id,
+                    agent.agent_id,
+                    type(err).__name__,
+                )
 
     async def _check_one(self, tenant_id, runtime, checker, agent: AgentVersion) -> None:
         grants = agent.grants.notion_databases or agent.grants.notion_pages
@@ -272,6 +294,20 @@ class AgentHealthChecker:
                 tenant_id,
                 agent.agent_id,
                 type(err.__cause__).__name__ if err.__cause__ else type(err).__name__,
+            )
+            return
+        except ConnectorError as err:
+            # A permanent problem with the granted object (a database with no data
+            # source): the grant cannot work until an admin fixes it. The connector's
+            # message names the problem and is fixed text, never document content.
+            await self._record(tenant_id, runtime, agent, UNAVAILABLE, str(err))
+            return
+        except Exception as err:  # noqa: BLE001 - an unexpected error is no statement about the grants
+            log.error(
+                "tenant_id=%s agent_id=%s health check failed error_type=%s",
+                tenant_id,
+                agent.agent_id,
+                type(err).__name__,
             )
             return
         for report in reports:
@@ -318,23 +354,45 @@ class AgentHealthChecker:
             people = await self._recipients(tenant_id, runtime.config.admins, agent.agent_id)
             text = unavailable_notice_text(agent.name, reason)
         else:
-            record = await self._agents.get_agent(tenant_id, agent.agent_id)
-            people = (
-                [record.created_by] if record is not None and _is_user_id(record.created_by) else []
-            )
+            creator = await self._creator(tenant_id, agent.agent_id)
+            people = [creator] if creator is not None and _is_user_id(creator) else []
             text = recovered_notice_text(agent.name)
         await self._notify(tenant_id, runtime, agent.agent_id, row.checked_at, people, text)
 
+    async def _creator(self, tenant_id: str, agent_id: str) -> str | None:
+        """The agent's creator, or None when the lookup fails: a notice is best-effort,
+        and a failed lookup never escapes into the health record."""
+        try:
+            record = await self._agents.get_agent(tenant_id, agent_id)
+        except Exception as err:  # noqa: BLE001 - the health state stands even if a lookup fails
+            log.warning(
+                "tenant_id=%s agent_id=%s creator lookup failed error_type=%s",
+                tenant_id,
+                agent_id,
+                type(err).__name__,
+            )
+            return None
+        return None if record is None else record.created_by
+
     async def _recipients(self, tenant_id: str, config_admins, agent_id: str) -> list[str]:
-        """The agent's creator and the tenant's admins, each once."""
+        """The agent's creator and the tenant's admins, each once.
+
+        A lookup that fails is logged and skipped; the people it could resolve are
+        still told, and the failure never escapes into the health record.
+        """
         people: list[str] = []
-        record = await self._agents.get_agent(tenant_id, agent_id)
-        if record is not None:
-            people.append(record.created_by)
+        creator = await self._creator(tenant_id, agent_id)
+        if creator is not None:
+            people.append(creator)
         people.extend(config_admins)
-        people.extend(
-            m.user_id for m in await self._members.list_members(tenant_id) if m.role == ADMIN
-        )
+        try:
+            members = await self._members.list_members(tenant_id)
+        except Exception as err:  # noqa: BLE001 - the health state stands even if a lookup fails
+            log.warning(
+                "tenant_id=%s member lookup failed error_type=%s", tenant_id, type(err).__name__
+            )
+            members = []
+        people.extend(m.user_id for m in members if m.role == ADMIN)
         return list(dict.fromkeys(p for p in people if _is_user_id(p)))
 
     async def _notify(self, tenant_id, runtime, agent_id, checked_at, people, text) -> None:
@@ -379,17 +437,26 @@ async def refresh_health_once(
     now: datetime,
     recheck_after: float = HEALTH_RECHECK_SECONDS,
 ) -> None:
-    """One refresh pass: check the agents of every served tenant that are due."""
+    """One refresh pass: check the agents of every served tenant that are due.
+
+    One tenant's pass failing never skips the rest: the failure is logged with the
+    tenant ID and the error type, and the pass goes on.
+    """
     for tenant_id in registry.tenants():
-        published = await agents.published_all(tenant_id)
-        rows = {h.agent_id: h for h in await health.list(tenant_id)}
-        due = {
-            agent_id: agent
-            for agent_id, agent in published.items()
-            if health_due(rows.get(agent_id), agent, now, recheck_after)
-        }
-        if due:
-            await checker.check_tenant(tenant_id, due)
+        try:
+            published = await agents.published_all(tenant_id)
+            rows = {h.agent_id: h for h in await health.list(tenant_id)}
+            due = {
+                agent_id: agent
+                for agent_id, agent in published.items()
+                if health_due(rows.get(agent_id), agent, now, recheck_after)
+            }
+            if due:
+                await checker.check_tenant(tenant_id, due)
+        except Exception as err:  # noqa: BLE001 - one tenant never stops the pass
+            log.error(
+                "tenant_id=%s health refresh failed error_type=%s", tenant_id, type(err).__name__
+            )
 
 
 async def run_health_refresh(

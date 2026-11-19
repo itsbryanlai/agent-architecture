@@ -54,6 +54,7 @@ from agentos.agent_store import AgentNotFound, AgentStore
 from agentos.audit import AuditStore
 from agentos.config import TENANT_ID_PATTERN
 from agentos.models import AuditEvent
+from agentos.slack_format import escape_slack
 from agentos.stores import joined_transaction, tenant_transaction
 from agentos.unit_of_work import InMemoryUnitOfWork, PostgresUnitOfWork, UnitOfWork
 from agentos.usage import utcnow
@@ -73,7 +74,9 @@ SWITCHED_OFF = "switched_off"
 
 
 def agent_off_text(agent_name: str) -> str:
-    return f"{agent_name} is turned off by an admin."
+    """The fixed reply of an agent an admin turned off. The name is escaped here, once;
+    callers pass it raw."""
+    return f"{escape_slack(agent_name)} is turned off by an admin."
 
 
 def agent_off_card_text(agent_name: str) -> str:

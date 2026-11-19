@@ -26,6 +26,7 @@ from agentos.agent_health import (
 from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
+from agentos.connectors.notion import ConnectorError
 from agentos.llm import ScriptedLLMClient
 from agentos.members import InMemoryMemberStore
 from agentos.models import ConversationRef, InboundMessage, LLMResponse, Usage
@@ -50,7 +51,8 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.helpers.agents import helper_block, make_published, republish
-from tests.helpers.tasks import approve, start_task
+from tests.helpers.health import FlipsAfterReads
+from tests.helpers.tasks import approve, start_task, thread_posts, wait_state
 
 NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 # Literal on purpose: the required text, not the production function's output.
@@ -59,11 +61,11 @@ FIXED_REPLY = (
 )
 
 
-def break_schema(notion) -> None:
+def break_schema(notion, database_id=DB_ID) -> None:
     """The Railway failure: the granted database's mapping no longer matches."""
     schema = default_schema()
     schema["Agent request ID"] = {"id": "reqid1", "type": "people"}
-    notion.set_schema(DB_ID, schema)
+    notion.set_schema(database_id, schema)
 
 
 class Down:
@@ -71,6 +73,23 @@ class Down:
 
     async def retrieve_schema(self, database_id):
         raise httpx.ConnectError("refused")
+
+
+class SchemaRaises:
+    """retrieve_schema raises for one database; every other call goes to the real fake."""
+
+    def __init__(self, inner, database_id, error):
+        self._inner = inner
+        self._database_id = database_id
+        self._error = error
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def retrieve_schema(self, database_id):
+        if database_id == self._database_id:
+            raise self._error
+        return await self._inner.retrieve_schema(database_id)
 
 
 class Clock:
@@ -132,10 +151,13 @@ async def published_store() -> InMemoryAgentStore:
         ("missing_ids", UNAVAILABLE, "no property ID configured"),
         ("no_token", UNAVAILABLE, "no Notion token"),
         ("transient", None, None),
+        ("connector_error", UNAVAILABLE, "no data source"),
+        ("unexpected_error", None, None),
     ],
 )
 async def test_startup_records_health_per_agent_and_never_stops(case, status, reason_part):
-    """Fails if a grant problem raises out of the start-up check, or health is not what the grants say."""
+    """Fails if a grant problem or a check error raises out of the start-up check, skips the
+    other agent, or health is not what the grants say."""
     notion = make_fake_notion()
     cfg = parse_agents_config(agents_dict())
     if case == "wrong_type":
@@ -146,6 +168,16 @@ async def test_startup_records_health_per_agent_and_never_stops(case, status, re
         cfg = parse_agents_config(raw)
     elif case == "transient":
         notion = Down()
+    elif case in ("connector_error", "unexpected_error"):
+        # A second agent beside the failing one: its check must still run.
+        cfg = two_agents_config()
+        notion.set_schema(OTHER_DB_ID, default_schema())
+        error = (
+            ConnectorError("The granted database has no data source.")
+            if case == "connector_error"
+            else RuntimeError("a bug in the check")
+        )
+        notion = SchemaRaises(notion, DB_ID, error)
     w = World(notion=None if case == "no_token" else notion, cfg=cfg)
 
     await w.check()
@@ -159,6 +191,8 @@ async def test_startup_records_health_per_agent_and_never_stops(case, status, re
         assert (row.reason is None) == (reason_part is None)
         if reason_part is not None:
             assert reason_part in row.reason
+    if case in ("connector_error", "unexpected_error"):
+        assert (await w.health.get(TENANT, "good-helper")).status == AVAILABLE
 
 
 def two_agents_config():
@@ -299,6 +333,51 @@ async def test_submit_on_a_now_unavailable_agent_refuses_with_the_fixed_reason(h
     assert h.audit.events[1].outcome == "error"
 
 
+async def test_submit_after_health_flips_between_the_check_and_the_write_shows_the_clean_line(
+    harness,
+):
+    """Fails if the write race shows "Failed: …" on the card instead of the fixed unavailable line."""
+    h = harness
+    handle = await start_task(h)
+    h.acts.health = FlipsAfterReads(quiet_reads=1)  # the pre-write check reads once
+
+    await approve(h, handle)
+
+    assert await handle.result() == "cancelled"
+    assert h.notion.count("create_page") == 0 and h.notion.all_pages(DB_ID) == []
+    assert h.slack.updates()[-1]["text"] == FIXED_REPLY
+
+
+async def test_a_watch_keeps_polling_while_unavailable_and_reports_the_change_after_recovery(
+    harness,
+):
+    """Fails if a watch ends or posts a stopped line while the agent is unavailable, or misses
+    the status change after recovery."""
+    h = harness
+    handle = await start_task(h)
+    await approve(h, handle)
+    await wait_state(handle, "watching")
+    page_id = h.notion.all_pages(DB_ID)[0]["id"]
+    await h.acts.health.record(
+        AgentHealth(TENANT, "it-helper", 1, UNAVAILABLE, "grant 'IT requests': problem", NOW)
+    )
+    reads_before = h.notion.count("retrieve_page")
+    h.notion.set_status(page_id, "Status", "Done")
+
+    await h.wf_env.sleep(timedelta(minutes=16))
+
+    assert h.notion.count("retrieve_page") == reads_before
+    assert await handle.query(TaskWorkflow.state) == "watching"
+    assert thread_posts(h, "was marked Done") == []
+    assert thread_posts(h, "stopped watching") == []
+
+    await h.acts.health.record(AgentHealth(TENANT, "it-helper", 1, AVAILABLE, None, NOW))
+    await h.wf_env.sleep(timedelta(minutes=16))
+
+    assert await handle.result() == "done"
+    assert len(thread_posts(h, "was marked Done")) == 1
+
+
 # --- recovery on the directory refresh, without a restart --------------------------------------
 
 
@@ -355,6 +434,36 @@ async def test_the_refresh_restores_an_agent_without_a_restart():
     assert (await w.health.get(TENANT, "it-helper")).status == AVAILABLE
     assert notion.count("retrieve_schema") > reads
     assert list(w.dms()) == ["D-U_EDITOR"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (ConnectorError("The granted database has no data source."), UNAVAILABLE),
+        (RuntimeError("a bug in the check"), None),
+    ],
+    ids=["connector_error", "unexpected_error"],
+)
+async def test_the_refresh_checks_the_other_agents_when_one_check_raises(error, status):
+    """Fails if one agent's check raising stops a later agent's recovery on the same refresh pass."""
+    notion = make_fake_notion()
+    notion.set_schema(OTHER_DB_ID, default_schema())
+    break_schema(notion, OTHER_DB_ID)
+    clock = Clock(NOW)
+    w = World(notion=SchemaRaises(notion, DB_ID, error), cfg=two_agents_config(), clock=clock)
+    await w.check()
+    assert (await w.health.get(TENANT, "good-helper")).status == UNAVAILABLE
+
+    notion.set_schema(OTHER_DB_ID, default_schema())
+    clock.now = NOW + timedelta(seconds=301)
+    await refresh_health_once(w.checker, w.registry, w.agents, w.health, clock.now)
+
+    assert (await w.health.get(TENANT, "good-helper")).status == AVAILABLE
+    row = await w.health.get(TENANT, "it-helper")
+    if status is None:
+        assert row is None
+    else:
+        assert row.status == status
 
 
 async def test_a_new_published_version_is_checked_at_once():

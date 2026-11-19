@@ -1884,9 +1884,15 @@ class AgentActivities:
     async def _poll_item(
         self, tenant_id: str, agent_id: str, page_id: str, refusal: Exception | None
     ) -> NotionItem:
-        if isinstance(refusal, (AgentOff, AgentUnavailable)):
-            # The agent is off or unavailable: the task ends the watch. No Notion call is made.
+        if isinstance(refusal, AgentOff):
+            # An admin turned the agent off: the task ends the watch. No Notion call is made.
             raise _non_retryable(refusal)
+        if isinstance(refusal, AgentUnavailable):
+            # Retryable on purpose, like a connector switched off: health is a recoverable
+            # state, so the task keeps watching and polls again once a check passes. The
+            # workflow treats a poll that fails after its retries as "still watching".
+            # No Notion call is made.
+            raise ApplicationError(str(refusal), type="AgentUnavailable")
         if refusal is not None:
             # Retryable on purpose: the task workflow treats a poll that fails after its
             # retries as "still watching" and polls again later, while a permanent

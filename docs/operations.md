@@ -821,7 +821,6 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `AGENTOS_CONSOLE_URL` | console | `https://${{RAILWAY_PUBLIC_DOMAIN}}`: the exact public base URL; the Host and Origin allowlists are built from it |
 | `NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET` | console | secrets, optional (the grant picker) |
 | `OLLAMA_MODELS` | ollama | `/data/models` |
-| `OLLAMA_KEEP_ALIVE` | ollama | `24h`: keeps `bge-m3` in memory (about 1 GB); a cold load (about 12 s) outlasts an embedding call's wait |
 | `RAILWAY_RUN_UID` | temporal | `0`: the only service that runs as root (see below) |
 
 **Payload keys** follow [Payload keys on a host without files](#payload-keys-on-a-host-without-files):

@@ -872,14 +872,11 @@ import` and `python -m agentos.agent_store import`.
 ### Releases
 
 Every service deploys from the `deployment/prod` branch, never from `main`, so
-merging work into `main` deploys nothing. A release moves `deployment/prod`
-forward to a commit already on `main` (a fast-forward), and each service then
-builds and deploys that commit. The maintainer does this, in their own terminal
-or on GitHub:
-
-```bash
-git push origin main:deployment/prod
-```
+merging work into `main` deploys nothing. The first release creates the branch
+on GitHub (Branches, New branch, `deployment/prod` from `main`). Each later
+release is a pull request from `main` into `deployment/prod`, merged on GitHub;
+every service then builds and deploys that commit. The local pre-push hook
+allows only feature branches, so the branch is never pushed from a checkout.
 
 Deploy the worker first when the release adds a migration (see step 5).
 

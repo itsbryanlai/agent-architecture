@@ -16,22 +16,16 @@ does. Activities, the read tools and the indexer all ask here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 
 from notion_client.errors import HTTPResponseError
 from temporalio.exceptions import ApplicationError
 
+from agentos.connectors.base import Entry
+
 # Longest wait taken from a Retry-After header, so one odd header cannot park an activity.
 MAX_RETRY_AFTER_SECONDS = 300
-
-
-@dataclass(frozen=True)
-class Entry:
-    retryable: bool
-    text: str  # what a read tool tells the model when the error is final
-
 
 _NOT_AVAILABLE = "That Notion database or page is not available to me right now."
 _KEY_REFUSED = "Notion refused the integration's access, so I can't read it right now."

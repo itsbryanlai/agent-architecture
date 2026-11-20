@@ -18,12 +18,14 @@ runtime, which got it from Slack. The LLM never supplies it.
 Notion has no idempotency key, so a write is made findable instead: every item
 the agent creates carries its key in a hidden text property, and every comment
 ends with a reference derived from its key. The connector offers the pieces
-(``find_item``, ``create_item``, ``find_comment``, ``create_comment``). The
-write activities in ``agentos.activities`` order them, behind a lease in
-Postgres, so that one attempt at a time writes and a retry finds what an
-earlier attempt made. Notion's search can lag behind a write by seconds, which
-is why the lease and the result stored under it, not the search alone, carry
-the guarantee.
+(``find_item``, ``create_item``, ``find_comment``, ``create_comment``);
+``read``, ``find_write`` and ``write`` dispatch the manifest's tool names and
+write kinds onto them, the one interface the runtime calls
+(``agentos.connectors.base``). The write activities in ``agentos.activities``
+order find and write, behind a lease in Postgres, so that one attempt at a time
+writes and a retry finds what an earlier attempt made. Notion's search can lag
+behind a write by seconds, which is why the lease and the result stored under
+it, not the search alone, carry the guarantee.
 """
 
 from __future__ import annotations
@@ -35,13 +37,16 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
 from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
+from agentos.connectors import notion_errors
+from agentos.connectors.base import ConnectorError, GrantDenied, UnknownItem, UnknownRequester
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
-from agentos.connectors.notion_limiter import NotionLimiter
+from agentos.connectors.notion_limiter import NotionLimiter, bulk_priority
 from agentos.models import NOTION_TEXT_MAX, SIGNATURE_NAME_MAX, NotionItem
 
 if TYPE_CHECKING:
@@ -52,22 +57,6 @@ LLM_TOOLS = ("search_items", "my_items", "create_item", "add_comment")
 # One Notion request may take this long. It stays under the activity timeouts, so a
 # slow Notion fails the attempt, and Temporal's retry policy decides what happens next.
 REQUEST_TIMEOUT_MS = 10_000
-
-
-class ConnectorError(Exception):
-    """Base for connector errors that retrying cannot fix."""
-
-
-class GrantDenied(ConnectorError):
-    """The call targets a database or page outside the agent's grants."""
-
-
-class UnknownRequester(ConnectorError):
-    """The requester's email matches no user in the target system."""
-
-
-class UnknownItem(ConnectorError):
-    """The link or ID does not name a Notion page the agent can open."""
 
 
 _DASHED_ID = re.compile(
@@ -88,6 +77,22 @@ def _page_id_from_ref(ref: str) -> str | None:
 def comment_ref(idem_key: str) -> str:
     """The reference a comment ends with: the whole digest of its key, never a prefix."""
     return "ref " + hashlib.sha256(idem_key.encode()).hexdigest()
+
+
+def nudge_comment_text(payload: dict) -> tuple[str, str | None]:
+    """The comment a nudge posts: its text and the Notion user to mention, if any.
+
+    A Slack-matched assignee is a real Notion mention (the user object, rendered as
+    their name); an assignee with no Slack match is a plain-name mention in the text;
+    no assignee means the text alone. The card previews exactly this. A payload
+    without assignee fields (a plain comment) comes back unchanged.
+    """
+    text = payload["comment"]
+    if payload.get("assignee_slack_id") and payload.get("assignee_notion_id"):
+        return text, payload["assignee_notion_id"]
+    if payload.get("assignee_notion_id") and payload.get("assignee_name"):
+        return f"@{payload['assignee_name']} {text}", None
+    return text, None
 
 
 def normalize_id(notion_id: str) -> str:
@@ -1167,6 +1172,8 @@ UNKNOWN_PAGE_TEXT = "I couldn't open that Notion page."
 
 
 class NotionConnector:
+    errors = notion_errors
+
     def __init__(
         self,
         api: NotionAPI,
@@ -1187,6 +1194,10 @@ class NotionConnector:
         self.users = users or NotionUserCache()
 
     @property
+    def name(self) -> str:
+        return self.manifest.connector
+
+    @property
     def grants(self) -> list[NotionDatabaseGrant]:
         return list(self._grants.values())
 
@@ -1204,6 +1215,30 @@ class NotionConnector:
         if grant is None:
             raise GrantDenied("This agent has not been granted access to that Notion database.")
         return grant
+
+    async def read(
+        self, tool: str, tool_input: dict, requester_email: str | None = None
+    ) -> list[NotionItem]:
+        """Run a manifest read tool by name.
+
+        The requester's email comes from the runtime, never from ``tool_input``:
+        a requester-scoped tool reads the person the runtime named, whatever the
+        model asked for.
+        """
+        if tool == "search_items":
+            query = tool_input.get("query")
+            if not isinstance(query, str) or not query.strip():
+                raise ConnectorError("search_items needs a non-empty 'query'.")
+            return await self.search_items(query.strip())
+        if tool == "my_items":
+            if not requester_email:
+                raise ConnectorError(
+                    "I couldn't read your Slack email, so I can't find your items."
+                )
+            return await self.my_items(requester_email)
+        if tool == "get_item":
+            return [await self.get_item(tool_input["page_id"])]
+        raise ConnectorError(f"Unknown tool '{tool}'.")
 
     async def search_items(self, query: str) -> list[NotionItem]:
         items: list[NotionItem] = []
@@ -1369,6 +1404,53 @@ class NotionConnector:
             )
         created = await self._api.create_comment(page_id, body, mention_user_id=mention_user_id)
         return created["id"]
+
+    async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:
+        """The marker lookup of a write kind: what an earlier attempt made under
+        ``idem_key``, if Notion shows it yet. The reconcile lookup is the same one.
+        """
+        if kind == "create_item":
+            return await self.find_item(target, idem_key)
+        if kind == "add_comment":
+            return await self.find_comment(target, idem_key)
+        raise ConnectorError(f"Unknown write kind '{kind}'.")
+
+    async def write(
+        self,
+        kind: str,
+        target: str,
+        payload: dict,
+        idem_key: str,
+        *,
+        agent_name: str,
+        requester: dict | None = None,
+    ) -> NotionItem | str:
+        """Make the write of ``kind``, marked so ``find_write`` can find it again.
+
+        It does not look for an earlier one: the write activity orders find and
+        write behind its lease. ``payload`` is the approved revision; ``requester``
+        is who asked, as the runtime resolved them for Notion.
+        """
+        if kind == "create_item":
+            requester = requester or {}
+            return await self.create_item(
+                target,
+                payload["title"],
+                payload["details"],
+                idem_key,
+                notion_user_id=requester.get("notion_user_id"),
+                requester_line=requester.get("line"),
+            )
+        if kind == "add_comment":
+            text, mention = nudge_comment_text(payload)
+            return await self.create_comment(
+                target, text, idem_key, agent_name, mention_user_id=mention
+            )
+        raise ConnectorError(f"Unknown write kind '{kind}'.")
+
+    def bulk_priority(self) -> AbstractContextManager[None]:
+        """Bulk reads (polling, indexing) queue behind interactive requests."""
+        return bulk_priority()
 
     async def _notion_user_id(self, email: str | None) -> str | None:
         return await self.users.user_id(self._api, email)

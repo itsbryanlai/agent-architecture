@@ -495,6 +495,30 @@ connector switch and the writes switch (Console → Switches) stop the write
 while off. The minted token now carries the full `drive` scope (reads
 included); no re-consent is needed — the accounts are service accounts.
 
+**Drive writes (append a row, D-48).** An agent granted a Sheet is offered
+`append_row`: it drafts a row for one named tab of that Sheet, and nothing is
+appended until the requester approves the card in Slack — an append always
+asks, never low-risk. To grant a Sheet, the creator adds it to the definition's
+`grants.drive.sheets` with the file's ID, a label and the tab name
+(`{id, name, tab}`); the file must be shared with the workspace's Drive address
+**as Editor** (Viewer is enough for reading, but appending writes cells). The
+creator names no columns: when the version is submitted, the platform reads the
+tab's header row once and stores it as the grant's `columns`, so the admin
+approves the columns the agent will write and the version page shows them. The
+card previews the row as a two-column table (column, value) with the Sheet's
+name, link and tab; Edit changes a cell and needs a fresh approval. The model
+sees the granted sheets and their columns in the tool's description, and a row
+may only use those columns. Just before the write the header is read again: if
+it changed since publish the append is refused with "The sheet's columns changed
+since this agent was published; ask the creator to republish" and nothing is
+written — the creator republishes (which re-reads the header) and the requester
+asks again. The row appends as the workspace's Drive account and carries
+invisible developer metadata (key `agentos-write`, the write key's hash) that
+moves with the row; the row and its metadata land in one atomic Sheets
+`batchUpdate`, and a retry searches that metadata before appending again, so an
+approved row appends once. There is no follow-up watch on an append. The Drive
+connector switch and the writes switch stop it while off.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,

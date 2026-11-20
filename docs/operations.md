@@ -1699,7 +1699,7 @@ Each stored question row carries the question's reference (conversation and mess
 beside the version — the seam a later "make a test case" action reads; there is no
 button yet. The reads are one indexed query per section over the rows the worker and
 the gateway already write (`audit_events`, `answer_feedback`, `conversation_messages`;
-migration `043` adds the per-agent indexes): no new data collection.
+migration `039` adds the per-agent indexes): no new data collection.
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or

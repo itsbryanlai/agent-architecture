@@ -845,6 +845,9 @@ async def _real_lifespan(app: FastAPI):
         if key_refresh is not None:
             key_refresh.cancel()
             await asyncio.gather(key_refresh, return_exceptions=True)
+        # The SDK's client has no close API; dropping the reference lets its bridge
+        # connection go with the console instead of outliving the lifespan.
+        test_client = None
         await pool.close()
 
 

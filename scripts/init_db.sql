@@ -1197,6 +1197,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
   status            text        NOT NULL CHECK (status IN ('running', 'done', 'failed')),
   started_by        text        NOT NULL,
   definition_sha256 text        NOT NULL CHECK (definition_sha256 ~ '^[0-9a-f]{64}$'),
+  cases_sha256      text        NOT NULL CHECK (cases_sha256 ~ '^[0-9a-f]{64}$'),
   started_at        timestamptz NOT NULL DEFAULT now(),
   finished_at       timestamptz,
   spend_usd         numeric(20, 8) NOT NULL DEFAULT 0 CHECK (spend_usd >= 0),

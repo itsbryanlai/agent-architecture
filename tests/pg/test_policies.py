@@ -43,9 +43,10 @@ SEEDS = {
     "(tenant_id, agent_id, version, case_id, question, expect, target, seq, created_by) "
     "VALUES (%(t)s, 'aa', 1, 'k', 'q', 'cite', 'n', 1, 'u')",
     "test_runs": "INSERT INTO test_runs "
-    "(tenant_id, run_id, agent_id, version, status, started_by, definition_sha256) "
+    "(tenant_id, run_id, agent_id, version, status, started_by, definition_sha256, cases_sha256) "
     "VALUES (%(t)s, 'k', 'aa', 1, 'running', 'u', "
-    "'0000000000000000000000000000000000000000000000000000000000000000')",
+    "'0000000000000000000000000000000000000000000000000000000000000000', "
+    "'1111111111111111111111111111111111111111111111111111111111111111')",
     "members": "INSERT INTO members (tenant_id, user_id, role, added_by) "
     "VALUES (%(t)s, 'u', 'admin', 'u')",
     "sessions": "INSERT INTO sessions (tenant_id, session_hash, user_id, csrf_secret, expires_at) "

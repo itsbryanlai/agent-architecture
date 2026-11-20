@@ -15,9 +15,10 @@ reason code, references only — the version page words them with ``REASON_TEXT`
 
 The judge (``judge_case``) is a pure function over what a turn observably did:
 the pages its final answer cites, the write it drafted, the agent it handed off
-to, or a refusal. A refusal is the provider's ``refusal`` stop reason or one of
-the runtime's fixed refusal texts; a model's plain-text refusal is not detected
-(see the decision log).
+to, or a refusal. A refusal is the provider's ``refusal`` stop reason only; a
+model's plain-text refusal is not detected (see the decision log). A platform
+stop — a reached budget, an agent switched off or unavailable — is not a refusal:
+the case ends as an error with its own fixed code.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from typing import Any, Protocol
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from agentos.audit import canonical_sha256
 from agentos.stores import joined_transaction, tenant_transaction
 from agentos.usage import utcnow
 
@@ -72,6 +74,11 @@ WRONG_HAND_OFF = "wrong_hand_off"
 CAP_REACHED = "cap"
 SPEND_UNKNOWN = "spend_unknown"
 CASE_ERROR = "error"
+# A platform stop ended the turn instead of the agent answering: an error, not a
+# refusal, so a REFUSE case does not pass on a reply the agent never chose.
+STOPPED_BY_BUDGET = "stopped_by_budget"
+AGENT_OFF = "agent_off"
+AGENT_UNAVAILABLE = "agent_unavailable"
 
 REASON_TEXT = {
     SOURCE_NOT_CITED: "the expected source was not cited",
@@ -81,6 +88,9 @@ REASON_TEXT = {
     CAP_REACHED: "not run: the run reached its spend cap",
     SPEND_UNKNOWN: "not run: the run's spend could not be measured",
     CASE_ERROR: "the case could not be run",
+    STOPPED_BY_BUDGET: "the turn was stopped by the agent's budget",
+    AGENT_OFF: "the agent is turned off by an admin",
+    AGENT_UNAVAILABLE: "the agent is unavailable: an admin needs to fix its access",
 }
 
 # The failure code of each expectation when the turn did something else.
@@ -161,6 +171,7 @@ class TestRun:
     status: str
     started_by: str
     definition_sha256: str
+    cases_sha256: str
     started_at: datetime | None = None
     finished_at: datetime | None = None
     spend_usd: Decimal = Decimal(0)
@@ -168,6 +179,17 @@ class TestRun:
 
     def count(self, outcome: str) -> int:
         return sum(r.outcome == outcome for r in self.results)
+
+
+def case_set_sha256(cases: list[TestCase] | list[CaseRef]) -> str:
+    """The hash of a version's case set: ids and expectations, never the questions.
+
+    A run records it beside the definition hash, so the console warns when either
+    the draft or its cases changed since the run.
+    """
+    return canonical_sha256(
+        [{"case_id": c.case_id, "expect": c.expect, "target": c.target} for c in cases]
+    )
 
 
 @dataclass(frozen=True)
@@ -201,15 +223,19 @@ def judge_case(
     drafted: DraftedWrite | None,
     hand_off: str | None,
     refused: bool,
+    stopped: str | None = None,
 ) -> CaseResult:
     """The verdict for one case from what its turn observably did.
 
     ``cited_pages`` are the normalized page IDs the final answer cites; ``drafted``
     the write the turn stopped at; ``hand_off`` the agent a hand-off named (None when
     none happened, "" when it named no valid agent); ``refused`` whether the turn
-    ended in a refusal. A case that was not run or errored is judged by the workflow,
-    not here.
+    ended in the provider's refusal; ``stopped`` the fixed code of a platform stop
+    that answered instead of the agent (a budget, a switch, the agent's health), or
+    None. A case that was not run or errored is judged by the workflow, not here.
     """
+    if stopped is not None:
+        return CaseResult(case_id, ERROR, stopped)
     if drafted is not None:
         if expect == WRITE and drafted.database_id and drafted.database_id == target:
             return CaseResult(case_id, PASS, tool=drafted.tool, target=drafted.database_id)
@@ -300,7 +326,7 @@ _CASE_COLUMNS = (
 )
 _RUN_COLUMNS = (
     "tenant_id, run_id, agent_id, version, status, started_by, definition_sha256, "
-    "started_at, finished_at, spend_usd, results"
+    "cases_sha256, started_at, finished_at, spend_usd, results"
 )
 
 
@@ -309,7 +335,7 @@ def _case(row) -> TestCase:
 
 
 def _run(row) -> TestRun:
-    return TestRun(*row[:10], results=[CaseResult(**r) for r in row[10]])
+    return TestRun(*row[:11], results=[CaseResult(**r) for r in row[11]])
 
 
 class PostgresTestSetStore:
@@ -415,7 +441,7 @@ class PostgresTestSetStore:
             await db.execute(
                 f"""
                 INSERT INTO test_runs ({_RUN_COLUMNS})
-                VALUES (%s, %s, %s, %s, %s, %s, %s, now(), NULL, 0, '[]')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), NULL, 0, '[]')
                 """,
                 (
                     run.tenant_id,
@@ -425,6 +451,7 @@ class PostgresTestSetStore:
                     run.status,
                     run.started_by,
                     run.definition_sha256,
+                    run.cases_sha256,
                 ),
             )
 
@@ -592,6 +619,7 @@ class InMemoryTestSetStore:
             run.status,
             run.started_by,
             run.definition_sha256,
+            run.cases_sha256,
             started_at=self._clock(),
         )
 
@@ -615,6 +643,7 @@ class InMemoryTestSetStore:
             status,
             run.started_by,
             run.definition_sha256,
+            run.cases_sha256,
             started_at=run.started_at,
             finished_at=self._clock(),
             spend_usd=spend,

@@ -75,7 +75,16 @@ from agentos.stores import (
 from agentos.switches import InMemorySwitchStore
 from agentos.temporal_client import tenant_data_converter
 from agentos.tenants import TenantRegistry, runtime_for
-from agentos.test_sets import CITE, REFUSE, RUNNING, WRITE, TestCase, TestRun
+from agentos.test_sets import (
+    CITE,
+    FAILED,
+    REFUSE,
+    RUNNING,
+    WRITE,
+    TestCase,
+    TestRun,
+    case_set_sha256,
+)
 from agentos.usage import InMemoryUsageStore, PriceEntry, Prices, UsageEvent, UsageRecorder
 from agentos.workflows.conversation import (
     EMPTY_MESSAGE_REPLY,
@@ -1618,6 +1627,7 @@ async def test_run(r: Rig) -> list[Recorded]:
             RUNNING,
             ADMIN,
             canonical_sha256(draft.definition),
+            case_set_sha256(cases),
         ),
     )
     r.llm.queue(
@@ -1640,6 +1650,71 @@ async def test_run(r: Rig) -> list[Recorded]:
     assert run.results[1].target == normalize_id(DB_ID)
     assert r.slack.posts() == [] and r.slack.updates() == []
     assert [n for n, _ in r.notion.calls if n in ("create_page", "create_comment")] == []
+    return [await current(r, "", run_id)]
+
+
+async def test_run_tenant_disabled(r: Rig) -> list[Recorded]:
+    """A run whose tenant is uninstalled mid-case: the read finishes, the next model step
+    is refused, and the run's row closes as failed with nothing posted."""
+    r.acts.usage = UsageRecorder(
+        r.usage,
+        Prices(
+            [
+                PriceEntry(
+                    Settings().model,
+                    date(2026, 1, 1),
+                    Decimal(0),
+                    Decimal(0),
+                    Decimal(0),
+                    Decimal(0),
+                )
+            ]
+        ),
+    )
+    draft = await r.acts.agents.create_draft(TENANT, "it-helper", ADMIN)
+    case = TestCase(
+        TENANT,
+        "it-helper",
+        draft.version,
+        f"{TENANT}:test-case:d1",
+        "any laptop requests?",
+        REFUSE,
+        created_by=ADMIN,
+    )
+    await r.acts.test_sets.add_case(TENANT, case)
+    run_id = ids.test_run_id(TENANT, "replay-disabled")
+    await r.acts.test_sets.start_run(
+        TENANT,
+        TestRun(
+            TENANT,
+            run_id,
+            "it-helper",
+            draft.version,
+            RUNNING,
+            ADMIN,
+            canonical_sha256(draft.definition),
+            case_set_sha256([case]),
+        ),
+    )
+    r.llm.queue(
+        tool_turn(ToolCall("tu_i", "search_items", {"query": "laptop"})),
+        answer("Back online."),  # never consumed: the next model step is refused
+    )
+    # The case is inside its read when the app is uninstalled: the read finishes (it
+    # holds the runtime it started with); the next model step is the one refused.
+    items_hang = r.notion.hang_next_read("query_database")
+    handle = await r.client.start_workflow(
+        TestRunWorkflow.run, args=[TENANT, run_id], id=run_id, task_queue=TASK_QUEUE
+    )
+    await items_hang.reached.wait()
+    with r.env.auto_time_skipping_disabled():
+        r.acts.registry.remove(TENANT)
+        r.acts.registry.set_disabled({TENANT})
+        items_hang.release()
+        assert await handle.result() == run_id
+    run = await r.acts.test_sets.get_run(TENANT, run_id)
+    assert (run.status, run.results) == (FAILED, [])
+    assert r.slack.posts() == [] and r.slack.updates() == []
     return [await current(r, "", run_id)]
 
 
@@ -1698,6 +1773,7 @@ SCENARIOS["creator_access_lost"] = creator_access_lost
 SCENARIOS["creator_access_tenant_disabled"] = creator_access_tenant_disabled
 # A test run carries references only: one shape, like the creator-access passes.
 SCENARIOS["test_run"] = test_run
+SCENARIOS["test_run_tenant_disabled"] = test_run_tenant_disabled
 
 
 # --- files --------------------------------------------------------------------------------

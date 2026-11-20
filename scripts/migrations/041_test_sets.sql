@@ -4,10 +4,10 @@
 -- database, refuse, or hand off to a listed specialist. '' is an expectation not chosen
 -- yet; a run refuses unset cases. Cases copy forward when a new draft is made, and go
 -- with a deleted draft (the foreign key). A run records its results as references and
--- fixed reason codes, its spend, and the definition hash it ran against, so the console
--- can warn when the draft changed since. test_case and test_run are the audit kinds;
--- both name the agent and version. Run as the owner role, after 040. Safe to run more
--- than once.
+-- fixed reason codes, its spend, and the definition and case-set hashes it ran against,
+-- so the console can warn when the draft or its cases changed since. test_case and
+-- test_run are the audit kinds; both name the agent and version. Run as the owner role,
+-- after 040. Safe to run more than once.
 
 CREATE TABLE IF NOT EXISTS test_cases (
   tenant_id   text        NOT NULL,
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
   status            text        NOT NULL CHECK (status IN ('running', 'done', 'failed')),
   started_by        text        NOT NULL,
   definition_sha256 text        NOT NULL CHECK (definition_sha256 ~ '^[0-9a-f]{64}$'),
+  cases_sha256      text        NOT NULL CHECK (cases_sha256 ~ '^[0-9a-f]{64}$'),
   started_at        timestamptz NOT NULL DEFAULT now(),
   finished_at       timestamptz,
   spend_usd         numeric(20, 8) NOT NULL DEFAULT 0 CHECK (spend_usd >= 0),

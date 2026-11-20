@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
+from temporalio.client import WorkflowHandle
 from temporalio.worker import Worker
 
 from agentos import ids
@@ -36,7 +37,7 @@ from agentos.stores import (
 )
 from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
-from agentos.test_sets import RUNNING, InMemoryTestSetStore, TestCase, TestRun
+from agentos.test_sets import RUNNING, InMemoryTestSetStore, TestCase, TestRun, case_set_sha256
 from agentos.usage import InMemoryUsageStore, PriceEntry, Prices, UsageRecorder
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.test_run import TestRunWorkflow
@@ -188,14 +189,18 @@ async def make_draft(h: RunHarness, agent: str = "it-helper", change=None) -> in
     return draft.version
 
 
-async def run_cases(
+async def start_run(
     h: RunHarness,
     cases: list[TestCase],
     agent: str = "it-helper",
     version: int = 2,
     started_by: str = ALICE,
-) -> TestRun:
-    """Store the cases, start the run workflow and wait for it; return the finished row."""
+) -> tuple[TestRun, WorkflowHandle]:
+    """Store the cases and the run's row and start the workflow; return both, not waiting.
+
+    A test that changes the world mid-run (an uninstall) holds the handle; one that
+    only wants the verdict awaits it, as ``run_cases`` does.
+    """
     for c in cases:
         await h.sets.add_case(TENANT, c)
     record = await h.agents.get_version(TENANT, agent, version)
@@ -207,12 +212,26 @@ async def run_cases(
         RUNNING,
         started_by,
         canonical_sha256(record.definition),
+        case_set_sha256(await h.sets.cases(TENANT, agent, version)),
     )
     await h.sets.start_run(TENANT, run)
-    await h.client.execute_workflow(
+    handle = await h.client.start_workflow(
         TestRunWorkflow.run,
         args=[TENANT, run.run_id],
         id=run.run_id,
         task_queue=TASK_QUEUE,
     )
+    return run, handle
+
+
+async def run_cases(
+    h: RunHarness,
+    cases: list[TestCase],
+    agent: str = "it-helper",
+    version: int = 2,
+    started_by: str = ALICE,
+) -> TestRun:
+    """Store the cases, start the run workflow and wait for it; return the finished row."""
+    run, handle = await start_run(h, cases, agent, version, started_by)
+    await handle.result()
     return await h.sets.get_run(TENANT, run.run_id)

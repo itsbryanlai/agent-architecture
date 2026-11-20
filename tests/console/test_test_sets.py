@@ -12,6 +12,7 @@ from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden
 from agentos.grant_checker import NotionGrantChecker
+from agentos.grant_picks import GrantNotPicked, PickedObject
 from agentos.members import InMemoryMemberStore
 from agentos.models import NO_ANSWER, AuditEvent
 from agentos.test_sets import (
@@ -28,6 +29,7 @@ from agentos.test_sets import (
     InMemoryTestSetStore,
     TestRun,
     TestSetError,
+    case_set_sha256,
 )
 from tests.conftest import DB_ID, ROOT_A, TENANT, make_fake_notion
 from tests.helpers.agents import helper_block
@@ -59,7 +61,7 @@ class Starter:
         self.started.append((tenant_id, run_id))
 
 
-async def make_plane(starter=None):
+async def make_plane(starter=None, require_grant_picker=False):
     agents, members, audit = InMemoryAgentStore(), InMemoryMemberStore(), InMemoryAuditStore()
     await members.add_member(TENANT, ADMIN2, "admin", ROOT)
     await members.add_member(TENANT, OWNER, "creator", ROOT)
@@ -73,6 +75,7 @@ async def make_plane(starter=None):
         NotionGrantChecker(lambda tenant_id: make_fake_notion()),
         test_sets=sets,
         start_test_run=starter,
+        require_grant_picker=require_grant_picker,
     )
     return plane, agents, sets, audit
 
@@ -188,6 +191,46 @@ async def test_a_run_needs_a_draft_with_chosen_cases(state):
         assert (starter.started if starter is not None else []) == []
 
 
+@pytest.mark.parametrize("picked", [False, True], ids=["not picked", "picked"])
+async def test_a_run_needs_a_new_grant_picked_as_a_submit_does(picked):
+    """Fails if a run reads with a grant new since the published version that the creator did not choose from their Notion."""
+    starter = Starter()
+    plane, _, _, _ = await make_plane(starter, require_grant_picker=True)
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await plane.add_test_case(TENANT, OWNER, "it-helper", 1, "q", REFUSE)
+    if picked:
+        await plane.record_grant_picks(
+            TENANT, OWNER, "it-helper", 1, [PickedObject(DB_ID, "database")]
+        )
+        run = await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+        assert starter.started == [(TENANT, run.run_id)]
+    else:
+        with pytest.raises(GrantNotPicked, match="run the tests again"):
+            await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+        assert starter.started == []
+
+
+@pytest.mark.parametrize(
+    "retry", ["new click", "same request"], ids=["double click", "same request_id"]
+)
+async def test_one_run_of_a_version_at_a_time_and_a_retry_returns_the_same_run(retry):
+    """Fails if a second start while a run is going makes another run, or a retry with the same request ID returns a different one."""
+    starter = Starter()
+    plane, _, sets, _ = await make_plane(starter)
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await plane.add_test_case(TENANT, OWNER, "it-helper", 1, "q", REFUSE)
+    first = await plane.run_tests(TENANT, OWNER, "it-helper", 1, request_id="req-1")
+    if retry == "new click":
+        with pytest.raises(TestSetError, match="A test run is already going on this version"):
+            await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+    else:
+        again = await plane.run_tests(TENANT, OWNER, "it-helper", 1, request_id="req-1")
+        assert again.run_id == first.run_id
+    # The second call is over (the settle point): one workflow start, one run row.
+    assert starter.started == [(TENANT, first.run_id)]
+    assert (await sets.latest_run(TENANT, "it-helper", 1)).run_id == first.run_id
+
+
 async def test_a_new_draft_carries_the_source_versions_cases():
     """Fails if a new draft does not carry the cases of the version it was copied from."""
     plane, _, sets, _ = await make_plane()
@@ -231,6 +274,7 @@ async def seed_run(h, definition_sha256: str):
         RUNNING,
         OWNER,
         definition_sha256,
+        case_set_sha256(await h.test_sets.cases(TENANT, "it-helper", 1)),
     )
     await h.test_sets.start_run(TENANT, run)
     await h.test_sets.finish_run(
@@ -242,7 +286,7 @@ async def seed_run(h, definition_sha256: str):
     )
 
 
-@pytest.mark.parametrize("state", ["none", "fresh", "stale"])
+@pytest.mark.parametrize("state", ["none", "fresh", "stale", "cases"])
 async def test_the_submit_view_shows_the_latest_run_and_warns_when_missing_or_stale(h, state):
     """Fails if the approving admin's pending view hides the latest run, or misses the no-run or stale warning."""
     await make_pending(h)
@@ -255,6 +299,11 @@ async def test_the_submit_view_shows_the_latest_run_and_warns_when_missing_or_st
         block["system_prompt"] = "Edited after the run."
         await h.plane.edit_draft(TENANT, OWNER, "it-helper", 1, block)
         await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+    if state == "cases":
+        # The definition is untouched; only the case set changes after the run.
+        await h.plane.withdraw_version(TENANT, OWNER, "it-helper", 1)
+        await h.plane.add_test_case(TENANT, OWNER, "it-helper", 1, "a new question", REFUSE)
+        await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
     c = await h.signed_in(ADMIN2)
     async with using(c):
         page = (await c.get(VERSION)).text
@@ -263,28 +312,41 @@ async def test_the_submit_view_shows_the_latest_run_and_warns_when_missing_or_st
     else:
         assert "1 passed" in page and "1 failed" in page
         assert "the expected source was not cited" in page
-        assert ("The draft was edited after its last test run" in page) is (state == "stale")
+        assert ("The draft or its test cases changed after its last test run" in page) is (
+            state in ("stale", "cases")
+        )
 
 
-@pytest.mark.parametrize("draft", ["existing", "created"])
-async def test_make_a_test_case_adds_the_question_to_the_next_draft(h, draft):
-    """Fails if the feedback button does not add the stored question to the next draft, making one from the published version when none exists."""
+@pytest.mark.parametrize(
+    ("draft", "tie", "role", "accepted"),
+    [
+        ("existing", "it-helper", "user", True),
+        ("created", "it-helper", "user", True),
+        ("created", "hr-helper", "user", False),
+        ("created", "it-helper", "assistant", False),
+    ],
+    ids=["existing draft", "draft created", "another agent's conversation", "an assistant message"],
+)
+async def test_make_a_test_case_takes_only_this_agents_stored_question(
+    h, draft, tie, role, accepted
+):
+    """Fails if the feedback button adds a question that is not this agent's stored user message, or does not add one that is."""
     await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
     await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
     await h.plane.publish_version(TENANT, ROOT, "it-helper", 1)
     if draft == "existing":
         await h.plane.new_draft(TENANT, OWNER, "it-helper")
     question = "how do I reset my password"
-    await h.history.append(TENANT, "c1", "c1:user", "user", [{"type": "text", "text": question}])
+    await h.history.append(TENANT, "c1", "c1:msg", role, [{"type": "text", "text": question}])
     h.audit.events.append(
         AuditEvent(
             tenant_id=TENANT,
             event_key=f"{TENANT}:seed:1",
             kind="answer",
-            agent_id="it-helper",
+            agent_id=tie,
             agent_version=1,
             requester_user_id="U_ASKER",
-            identity="agent:it-helper",
+            identity=f"agent:{tie}",
             conversation_id="c1",
             output_sha256=canonical_sha256(NO_ANSWER),
             at=datetime.now(UTC),
@@ -295,7 +357,8 @@ async def test_make_a_test_case_adds_the_question_to_the_next_draft(h, draft):
     c = await h.signed_in(OWNER)
     async with using(c):
         page = (await c.get(FEEDBACK)).text
-        assert "Make a test case" in page
+        if accepted:
+            assert "Make a test case" in page
         response = await post(
             c,
             f"{UI}/agents/it-helper/test-cases",
@@ -303,9 +366,14 @@ async def test_make_a_test_case_adds_the_question_to_the_next_draft(h, draft):
             conversation_id="c1",
             question_seq="1",
         )
-    assert response.status_code == 303
-    assert response.headers["location"].endswith("/versions/2?done=case-added")
-    cases = await h.plane.test_cases(TENANT, OWNER, "it-helper", 2)
-    assert [(x.question, x.expect) for x in cases] == [(question, "")]
     after = len(await h.plane.versions(TENANT, OWNER, "it-helper"))
-    assert (after == before + 1) is (draft == "created")
+    if accepted:
+        assert response.status_code == 303
+        assert response.headers["location"].endswith("/versions/2?done=case-added")
+        cases = await h.plane.test_cases(TENANT, OWNER, "it-helper", 2)
+        assert [(x.question, x.expect) for x in cases] == [(question, "")]
+        assert (after == before + 1) is (draft == "created")
+    else:
+        assert response.status_code == 409
+        assert after == before  # no draft was made for a refused question
+        assert await h.test_sets.cases(TENANT, "it-helper", 2) == []

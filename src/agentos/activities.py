@@ -79,7 +79,7 @@ from agentos.agent_health import (
     InMemoryAgentHealthStore,
     agent_unavailable_text,
 )
-from agentos.agent_store import AgentStore
+from agentos.agent_store import PUBLISHED, SUPERSEDED, AgentStore
 from agentos.approval_policy import (
     NO_APPROVAL,
     ApprovalPolicyStore,
@@ -196,7 +196,10 @@ from agentos.tasks import (
 )
 from agentos.tenants import TenantDisabled, TenantRegistry, TenantRuntime, UnknownTenant
 from agentos.test_sets import (
+    AGENT_OFF,
+    AGENT_UNAVAILABLE,
     RUN_CAP_USD,
+    STOPPED_BY_BUDGET,
     CaseRef,
     CaseResult,
     DraftedWrite,
@@ -220,8 +223,8 @@ log = logging.getLogger("agentos.activities")
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
 MY_TASKS_TOOL = "my_tasks"
-# Published versions are immutable, so one is kept per (tenant, agent, version). A worker
-# holds the versions its running turns use, and few of them.
+# Immutable versions (published, superseded) are kept per (tenant, agent, version). A
+# worker holds the versions its running turns use, and few of them; drafts are read fresh.
 VERSION_CACHE_SIZE = 256
 
 # An attempt that takes over from one that may have sent a write looks for the result
@@ -531,6 +534,10 @@ class AgentActivities:
         ``ctx.agent_version`` describe what actually ran. Activities that act with the agent's
         grants do not use this: they read the live published version (``_agent``), so a grant
         revoked after a turn started still stops what that turn proposed.
+
+        Only an immutable version (published or superseded) is cached. A draft is edited in
+        place and a pending one can be withdrawn and edited, so those are read fresh on every
+        call: a test run of a draft sees the prompt its creator last saved.
         """
         key = (ctx.tenant_id, ctx.agent_id, ctx.agent_version)
         cached = self._versions.get(key)
@@ -546,9 +553,10 @@ class AgentActivities:
                 non_retryable=True,
             )
         agent = record.agent()
-        self._versions[key] = agent
-        while len(self._versions) > VERSION_CACHE_SIZE:
-            self._versions.popitem(last=False)
+        if record.status in (PUBLISHED, SUPERSEDED):
+            self._versions[key] = agent
+            while len(self._versions) > VERSION_CACHE_SIZE:
+                self._versions.popitem(last=False)
         return agent
 
     def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
@@ -1913,12 +1921,15 @@ class AgentActivities:
         """Judge one case from its stored final step and the references the turn kept.
 
         The answer's text is read here, never passed through the workflow. A refusal is
-        the provider's ``refusal`` stop reason or one of the runtime's fixed refusal texts.
-        ``step_key`` None is a turn that ran out of steps without a final reply.
+        the provider's ``refusal`` stop reason only. A final reply that is one of the
+        platform's fixed stop texts (a reached budget, an agent switched off or
+        unavailable) is a stop, not a refusal: the case ends as an error with the stop's
+        fixed code. ``step_key`` None is a turn that ran out of steps without a final reply.
         """
         self._log("judge_test_case", ctx.tenant_id, ctx.agent_id)
         cited_pages: list[str] = []
         refused = False
+        stopped: str | None = None
         if step_key is not None:
             step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
             if step is None:
@@ -1927,12 +1938,13 @@ class AgentActivities:
                 )
             text = step.reply_text or ""
             agent = await self._pinned(ctx)
-            refused = step.stop_reason == "refusal" or text in (
-                agent_off_text(agent.name),
-                agent_unavailable_text(agent.name),
-                stop_text(agent.name),
-                unpriced_stop_text(agent.name),
-            )
+            refused = step.stop_reason == "refusal"
+            if text in (stop_text(agent.name), unpriced_stop_text(agent.name)):
+                stopped = STOPPED_BY_BUDGET
+            elif text == agent_off_text(agent.name):
+                stopped = AGENT_OFF
+            elif text == agent_unavailable_text(agent.name):
+                stopped = AGENT_UNAVAILABLE
             cited_pages = [c.page_id for c in cited_markers(text, citations)]
         return judge_case(
             case.case_id,
@@ -1942,6 +1954,7 @@ class AgentActivities:
             drafted=drafted,
             hand_off=hand_off,
             refused=refused,
+            stopped=stopped,
         )
 
     @activity.defn(name="test_run_spend")
@@ -1960,11 +1973,22 @@ class AgentActivities:
 
     @activity.defn(name="finish_test_run")
     async def finish_test_run(
-        self, tenant_id: str, run_id: str, results: list[CaseResult], spend: str
+        self,
+        tenant_id: str,
+        run_id: str,
+        results: list[CaseResult],
+        spend: str,
+        status: str,
     ) -> None:
-        """Store the run's results and spend, and close it."""
+        """Store the run's results and spend, and close it.
+
+        No runtime check here: a run that failed because its tenant was disabled must
+        still be able to close its row. ``status`` has no default: an activity that
+        receives fewer arguments than it declares loses its inputs' type conversion
+        (the results would arrive as plain dicts), so the workflow always names it.
+        """
         self._log("finish_test_run", tenant_id, "-")
-        await self.test_sets.finish_run(tenant_id, run_id, results, Decimal(spend))
+        await self.test_sets.finish_run(tenant_id, run_id, results, Decimal(spend), status=status)
 
     # --- task ------------------------------------------------------------------------
 

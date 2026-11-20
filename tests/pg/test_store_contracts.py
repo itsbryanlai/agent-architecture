@@ -797,21 +797,29 @@ async def test_cases_are_kept_per_version_chosen_removed_and_copied_forward(
 
 
 async def test_a_run_is_started_finished_and_the_newest_is_read_back(test_sets, tenant: str):
-    """Fails if a run's row, results or spend are lost, or the latest run of a version is not the newest."""
+    """Fails if a run's row, hashes, results or spend are lost, or the latest run of a version is not the newest."""
     assert await test_sets.latest_run(tenant, "aa", 1) is None
-    first = TestRun(tenant, "r1", "aa", 1, RUNNING, "u", "a" * 64)
+    first = TestRun(tenant, "r1", "aa", 1, RUNNING, "u", "a" * 64, "c" * 64)
     await test_sets.start_run(tenant, first)
     stored = await test_sets.get_run(tenant, "r1")
-    assert (stored.status, stored.started_by, stored.definition_sha256) == (RUNNING, "u", "a" * 64)
+    assert (stored.status, stored.started_by, stored.definition_sha256, stored.cases_sha256) == (
+        RUNNING,
+        "u",
+        "a" * 64,
+        "c" * 64,
+    )
     assert stored.started_at is not None
 
     results = [CaseResult("k1", PASS, tool="create_item", target="n")]
     await test_sets.finish_run(tenant, "r1", results, Decimal("0.12"))
     done = await test_sets.get_run(tenant, "r1")
     assert (done.status, done.spend_usd, done.results) == (DONE, Decimal("0.12"), results)
+    assert (done.definition_sha256, done.cases_sha256) == ("a" * 64, "c" * 64)
     assert done.finished_at is not None
 
-    await test_sets.start_run(tenant, TestRun(tenant, "r2", "aa", 1, RUNNING, "u", "b" * 64))
+    await test_sets.start_run(
+        tenant, TestRun(tenant, "r2", "aa", 1, RUNNING, "u", "b" * 64, "d" * 64)
+    )
     await test_sets.finish_run(tenant, "r2", [], Decimal(0))
     assert (await test_sets.latest_run(tenant, "aa", 1)).run_id == "r2"
     assert await test_sets.latest_run(tenant, "aa", 2) is None

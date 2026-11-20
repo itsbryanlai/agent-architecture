@@ -228,6 +228,7 @@ from agentos.test_sets import (
     TestRun,
     TestSetError,
     TestSetStore,
+    case_set_sha256,
 )
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import (
@@ -364,10 +365,11 @@ class VersionReview:
 
 @dataclass
 class TestRunReview:
-    """A version's latest test run, and whether the definition changed since it ran.
+    """A version's latest test run, and whether what it ran against changed since.
 
-    ``stale`` compares the hash the run ran against with the version's definition now:
-    an edit after the run (a withdraw, an edit, a resubmit) makes the results old.
+    ``stale`` compares the two hashes the run recorded with the version now: its
+    definition and its case set (ids and expectations). An edit of either after the
+    run makes the results old; a withdraw and resubmit alone changes neither.
     """
 
     run: TestRun | None
@@ -1033,9 +1035,15 @@ class ControlPlane:
             )
         return record
 
-    async def _require_picked(self, tenant_id: str, agent_id: str, version: int) -> None:
+    async def _require_picked(
+        self, tenant_id: str, agent_id: str, version: int, action: str = "submit again"
+    ) -> None:
         """With the picker required, a grant new since the published version must have been
-        chosen from the creator's own Notion. Grants an admin already approved are kept."""
+        chosen from the creator's own Notion. Grants an admin already approved are kept.
+
+        Checked at submit and again at a test run: a grant picked after the last submit
+        still needs its pick before a run reads with it. ``action`` names what to retry.
+        """
         if not self._require_picker:
             return
         record = await self._agents.get_version(tenant_id, agent_id, version)
@@ -1053,7 +1061,7 @@ class ControlPlane:
             names = ", ".join(f"'{label}' ({nid})" for nid, label in missing.items())
             raise GrantNotPicked(
                 f"not chosen from your Notion: {names}. Use 'Choose from Notion' on the "
-                "version page, then submit again."
+                f"version page, then {action}."
             )
 
     async def record_grant_picks(
@@ -1353,34 +1361,55 @@ class ControlPlane:
     ) -> TestRun:
         """Run a draft's cases against the draft definition. The agent's creator or an admin.
 
-        Every case needs an expectation first. The run's row and its audit event commit
-        before the workflow starts on its own task queue; a start that fails closes the
-        row as failed, so the console never shows a run that is not coming. The starter
-        is idempotent: a retried start of the same run finds it already started.
+        Every case needs an expectation first, and a grant new since the published version
+        must have been picked, as at submit. One run of a version at a time: a second start
+        while one is running is refused. With a ``request_id`` the call is idempotent: a
+        retry finds the event the first attempt recorded and returns that run. The checks
+        and the row's insert share the unit of work's tenant lock, so two starts never
+        interleave. The row and its audit event commit before the workflow starts on its
+        own task queue; a start that fails closes the row as failed, so the console never
+        shows a run that is not coming.
         """
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._draft_for_cases(tenant_id, agent_id, version)
-        cases = await self._test_sets.cases(tenant_id, agent_id, version)
-        if not cases:
-            raise TestSetError("this draft has no test cases yet")
-        unset = sum(not c.expect for c in cases)
-        if unset:
-            raise TestSetError(
-                f"{unset} test case(s) have no expected behaviour yet; "
-                "choose one for each before running"
-            )
-        if self._start_test_run is None:
-            raise TestSetError("test runs are not available in this console")
-        run = TestRun(
-            tenant_id,
-            ids.test_run_id(tenant_id, uuid.uuid4().hex),
-            agent_id,
-            version,
-            RUNNING,
-            actor,
-            canonical_sha256(record.definition),
-        )
         async with self._uow.begin(tenant_id) as conn:
+            if request_id is not None:
+                key = self._event_key(tenant_id, "test_run", request_id)
+                seen = await self._audit.get(tenant_id, key, conn=conn)
+                if seen is not None:
+                    first = (
+                        None
+                        if not seen.target
+                        else await self._test_sets.get_run(tenant_id, seen.target)
+                    )
+                    if first is None or first.agent_id != agent_id or first.version != version:
+                        raise TestSetError("this request ID was used for another change")
+                    return first
+            cases = await self._test_sets.cases(tenant_id, agent_id, version)
+            if not cases:
+                raise TestSetError("this draft has no test cases yet")
+            unset = sum(not c.expect for c in cases)
+            if unset:
+                raise TestSetError(
+                    f"{unset} test case(s) have no expected behaviour yet; "
+                    "choose one for each before running"
+                )
+            await self._require_picked(tenant_id, agent_id, version, "run the tests again")
+            if self._start_test_run is None:
+                raise TestSetError("test runs are not available in this console")
+            latest = await self._test_sets.latest_run(tenant_id, agent_id, version)
+            if latest is not None and latest.status == RUNNING:
+                raise TestSetError("A test run is already going on this version")
+            run = TestRun(
+                tenant_id,
+                ids.test_run_id(tenant_id, uuid.uuid4().hex),
+                agent_id,
+                version,
+                RUNNING,
+                actor,
+                canonical_sha256(record.definition),
+                case_set_sha256(cases),
+            )
             await self._test_sets.start_run(tenant_id, run, conn=conn)
             await self._record(
                 "test_run",
@@ -1404,13 +1433,17 @@ class ControlPlane:
         self, tenant_id: str, actor: Actor, agent_id: str, version: int
     ) -> TestRunReview:
         """The version's latest run for the version page and the approving admin's view:
-        the run itself, and whether the definition changed since it ran."""
+        the run itself, and whether the definition or the case set changed since it ran."""
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         run = await self._test_sets.latest_run(tenant_id, agent_id, version)
-        stale = run is not None and run.definition_sha256 != canonical_sha256(record.definition)
+        stale = run is not None and (
+            run.definition_sha256 != canonical_sha256(record.definition)
+            or run.cases_sha256
+            != case_set_sha256(await self._test_sets.cases(tenant_id, agent_id, version))
+        )
         return TestRunReview(run, stale)
 
     async def make_test_case_from_feedback(
@@ -1426,13 +1459,17 @@ class ControlPlane:
 
         The next draft is the agent's newest one; with none, a draft is made from the
         published version, carrying its cases forward. The question is read from stored
-        history; one retention has purged is refused. Returns the draft the case landed on.
+        history: a user message of a conversation an audit row ties to this agent. One
+        retention has purged, another agent's conversation, or a message that is not the
+        asker's is refused. Returns the draft the case landed on.
         """
         await self._require_editor(tenant_id, actor, agent_id)
         question = (
             None
             if self._feedback_reads is None
-            else await self._feedback_reads.question_text(tenant_id, conversation_id, question_seq)
+            else await self._feedback_reads.question_text(
+                tenant_id, agent_id, conversation_id, question_seq
+            )
         )
         if not question:
             raise TestSetError("that question is no longer stored, so it cannot become a test case")

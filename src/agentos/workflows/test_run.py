@@ -25,11 +25,15 @@ Rules this workflow keeps:
   the cap by its own cost, the bound the monthly budgets keep.
 * A failed case is recorded as an error and the run goes on, as a failed turn never
   ends a conversation. The run always finishes its row, so the console never waits on
-  a run that ended.
+  a run that ended: an uninstall (``TenantDisabled``) or a failure that ends the run
+  closes the row as failed, best-effort, before the workflow ends.
 * Workflow code is deterministic: no I/O, no clocks of its own.
 """
 
+from datetime import timedelta
+
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
@@ -47,7 +51,9 @@ with workflow.unsafe.imports_passed_through():
     from agentos.test_sets import (
         CAP_REACHED,
         CASE_ERROR,
+        DONE,
         ERROR,
+        FAILED,
         NOT_RUN,
         SPEND_UNKNOWN,
         CaseRef,
@@ -56,7 +62,12 @@ with workflow.unsafe.imports_passed_through():
         RunSpend,
         TestRunRef,
     )
-    from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY
+    from agentos.workflows import ACTIVITY_TIMEOUT, LLM_TIMEOUT, RETRY, is_tenant_disabled
+
+# The best-effort close of a failed run's row: one short attempt, so a store that
+# cannot be reached does not park the workflow on top of the failure it is reporting.
+CLOSE_TIMEOUT = timedelta(seconds=5)
+CLOSE_RETRY = RetryPolicy(maximum_attempts=1)
 
 # Fixed runtime texts the case's history keeps in place of a tool's effect.
 TEST_WRITE_DRAFTED = "Test run: the write was drafted and not run."
@@ -76,6 +87,34 @@ class _RunStopped(Exception):
 class TestRunWorkflow:
     @workflow.run
     async def run(self, tenant_id: str, run_id: str) -> str:
+        try:
+            return await self._run(tenant_id, run_id)
+        except Exception as err:
+            await self._close_failed(tenant_id, run_id)
+            if isinstance(err, ActivityError) and is_tenant_disabled(err):
+                # The app was uninstalled: the row is closed and the run ends cleanly,
+                # as a turn or a task does. No retry can serve a disabled tenant.
+                return run_id
+            raise
+
+    async def _close_failed(self, tenant_id: str, run_id: str) -> None:
+        """Close the run's row as failed, best-effort: one short attempt, and a close
+        that itself fails is logged, never raised over the failure being reported."""
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.finish_test_run,
+                args=[tenant_id, run_id, [], "0", FAILED],
+                start_to_close_timeout=CLOSE_TIMEOUT,
+                retry_policy=CLOSE_RETRY,
+            )
+        except Exception:  # noqa: BLE001 - the close is best-effort; the run's failure is what matters
+            workflow.logger.warning(
+                "test run row not closed tenant_id=%s workflow_id=%s",
+                tenant_id,
+                workflow.info().workflow_id,
+            )
+
+    async def _run(self, tenant_id: str, run_id: str) -> str:
         ref: TestRunRef = await workflow.execute_activity_method(
             AgentActivities.load_test_run,
             args=[tenant_id, run_id],
@@ -113,6 +152,8 @@ class TestRunWorkflow:
                 stopped = err.reason
                 results.append(CaseResult(case.case_id, NOT_RUN, stopped))
             except ActivityError as err:
+                if is_tenant_disabled(err):
+                    raise  # ends the run: the row is closed as failed, not done
                 workflow.logger.warning(
                     "test case failed tenant_id=%s agent_id=%s workflow_id=%s activity=%s",
                     tenant_id,
@@ -124,7 +165,7 @@ class TestRunWorkflow:
         spend = await self._spend(tenant_id, conv_ids)
         await workflow.execute_activity_method(
             AgentActivities.finish_test_run,
-            args=[tenant_id, run_id, results, spend.cost],
+            args=[tenant_id, run_id, results, spend.cost, DONE],
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

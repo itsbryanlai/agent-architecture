@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 038 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 043 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -188,6 +188,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 
 CREATE INDEX IF NOT EXISTS audit_events_by_time ON audit_events (tenant_id, at DESC, seq DESC);
+
+-- The feedback page reads one agent's rows in a time window. Same as migration 043.
+CREATE INDEX IF NOT EXISTS audit_events_by_agent
+  ON audit_events (tenant_id, agent_id, at DESC, seq DESC);
 
 CREATE OR REPLACE FUNCTION audit_events_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -1125,6 +1129,10 @@ CREATE TABLE IF NOT EXISTS answer_feedback (
   CONSTRAINT answer_feedback_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
 );
 
+-- The feedback page reads one agent's votes in a time window. Same as migration 043.
+CREATE INDEX IF NOT EXISTS answer_feedback_by_agent
+  ON answer_feedback (tenant_id, agent_id, at DESC);
+
 REVOKE ALL ON answer_feedback FROM agentos_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON answer_feedback TO agentos_app;
 
@@ -1146,5 +1154,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('043')
 ON CONFLICT DO NOTHING;

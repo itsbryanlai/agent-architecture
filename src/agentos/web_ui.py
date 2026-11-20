@@ -37,6 +37,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos import ids
 from agentos.access_diff import WideningNotAcknowledged
+from agentos.agent_feedback import FEEDBACK_DAYS
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
@@ -176,6 +177,11 @@ def recent_months(now: datetime, count: int = 12) -> list[str]:
     return [f"{(i // 12):04d}-{(i % 12) + 1:02d}" for i in range(index, index - count, -1)]
 
 
+def _feedback_days(raw: str) -> int:
+    """The feedback window the query asked for: one of the fixed choices, else the default."""
+    return int(raw) if raw.isdigit() and int(raw) in FEEDBACK_DAYS else FEEDBACK_DAYS[0]
+
+
 # --- definitions as YAML text ----------------------------------------------------------
 
 
@@ -296,6 +302,7 @@ class WebUI:
         self.route("GET", base + "/agents", self.agents)
         self.route("POST", base + "/agents", self.add_agent)
         self.route("GET", agent, self.agent)
+        self.route("GET", agent + "/feedback", self.feedback)
         self.route("POST", agent + "/channels/{channel}/resume", self.resume_channel)
         self.route("POST", agent + "/drafts", self.new_draft)
         self.route("GET", version, self.version)
@@ -720,6 +727,21 @@ class WebUI:
     @staticmethod
     async def paused_of(ctx: Ctx, agent_id: str):
         return await ctx.plane.paused_channels(ctx.tenant_id, ctx.principal, agent_id)
+
+    async def feedback(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
+        """The agent's feedback page: its creator and admins, never who asked or voted."""
+        days = _feedback_days(request.query_params.get("days", ""))
+        view = await ctx.plane.agent_feedback(ctx.tenant_id, ctx.principal, agent_id, days)
+        return _page(
+            "feedback.html",
+            ctx=ctx,
+            view=view,
+            agent_id=agent_id,
+            days=days,
+            days_choices=FEEDBACK_DAYS,
+            base=self.base(ctx),
+            agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
+        )
 
     async def resume_channel(self, request: Request, ctx: Ctx, agent_id: str, channel: str):
         try:

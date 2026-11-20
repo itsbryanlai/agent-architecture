@@ -23,6 +23,7 @@ from agentos.agent_health import (
     InMemoryAgentHealthStore,
     PostgresAgentHealthStore,
 )
+from agentos.agent_store import InMemoryAgentStore, PostgresAgentStore
 from agentos.approval_policy import (
     NO_APPROVAL,
     REQUESTER_APPROVAL,
@@ -62,9 +63,20 @@ from agentos.slack_client import FakeSlack
 from agentos.stores import InMemoryTaskLinkStore
 from agentos.switches import InMemorySwitchStore, PostgresSwitchStore
 from agentos.tasks import InMemoryTaskStore, PostgresTaskStore, TaskRecord
+from agentos.test_sets import (
+    DONE,
+    PASS,
+    RUNNING,
+    CaseResult,
+    InMemoryTestSetStore,
+    PostgresTestSetStore,
+    TestCase,
+    TestRun,
+)
 from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import InMemoryUsageStore, PostgresUsageStore, UsageEvent
 from tests.conftest import TEAM, agents_dict
+from tests.helpers.agents import helper_block
 from tests.helpers.gateway import FakeTemporalClient, signed_headers
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
@@ -220,6 +232,22 @@ async def test_one_tenants_usage_is_not_in_another_tenants_totals(
     [group] = await usage.totals(tenant, NOW - timedelta(days=1), NOW + timedelta(days=1))
 
     assert group.cost == Decimal(1)
+
+
+async def test_spend_for_conversations_sums_the_named_conversations_only(
+    usage, tenant: str, other_tenant: str
+):
+    """Fails if a run's spend read counts another conversation's or tenant's rows, or loses an unpriced one."""
+    await usage.record(usage_event(tenant, "a1", NOW, "0.15", conversation_id="run:case-a"))
+    await usage.record(usage_event(tenant, "a2", NOW, "0.10", conversation_id="run:case-a"))
+    await usage.record(usage_event(tenant, "b1", NOW, None, conversation_id="run:case-b"))
+    await usage.record(usage_event(tenant, "c1", NOW, "9", conversation_id="elsewhere"))
+    await usage.record(usage_event(other_tenant, "d1", NOW, "9", conversation_id="run:case-a"))
+
+    cost, unpriced = await usage.spend_for_conversations(tenant, ["run:case-a", "run:case-b"])
+
+    assert (cost, unpriced) == (Decimal("0.25"), 1)
+    assert await usage.spend_for_conversations(tenant, []) == (Decimal(0), 0)
 
 
 # --- budgets -----------------------------------------------------------------------
@@ -705,3 +733,94 @@ async def test_the_policy_reads_back_what_was_set_per_tenant_and_defaults_to_app
     await policies.set(tenant, "add_comment", REQUESTER_APPROVAL)
 
     assert await policies.get(tenant, "add_comment") == REQUESTER_APPROVAL
+
+
+# --- test sets ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def test_sets(store_pool):
+    return twin(store_pool, InMemoryTestSetStore, PostgresTestSetStore)
+
+
+def a_case(tenant: str, case_id: str, version: int = 1, **fields) -> TestCase:
+    base = {
+        "tenant_id": tenant,
+        "agent_id": "aa",
+        "version": version,
+        "case_id": case_id,
+        "question": "how do I reset my vpn?",
+        "expect": "cite",
+        "target": "n",
+        "created_by": "u",
+    }
+    return TestCase(**(base | fields))
+
+
+async def test_cases_are_kept_per_version_chosen_removed_and_copied_forward(
+    test_sets, store_pool, tenant: str, other_tenant: str
+):
+    """Fails if a case is lost, an expectation or removal does not take, versions share rows, or a copy forward drops a case."""
+    # The cases hang off agent versions (the real store's foreign key): make the parents.
+    agents = twin(store_pool, InMemoryAgentStore, PostgresAgentStore)
+    for t in (tenant, other_tenant):
+        await agents.create_agent(t, "aa", helper_block(), "u")
+    await agents.create_draft(tenant, "aa", "u", from_version=1)
+
+    await test_sets.add_case(tenant, a_case(tenant, "k1"))
+    await test_sets.add_case(tenant, a_case(tenant, "k2", expect="", target=""))
+    await test_sets.add_case(other_tenant, a_case(other_tenant, "k1"))
+
+    cases = await test_sets.cases(tenant, "aa", 1)
+    assert [c.case_id for c in cases] == ["k1", "k2"]
+    assert (cases[0].question, cases[0].expect, cases[0].target) == (
+        "how do I reset my vpn?",
+        "cite",
+        "n",
+    )
+    assert cases[1].expect == ""
+
+    assert await test_sets.set_expect(tenant, "aa", 1, "k2", "refuse", "") is True
+    assert (await test_sets.cases(tenant, "aa", 1))[1].expect == "refuse"
+    assert await test_sets.set_expect(tenant, "aa", 1, "gone", "refuse", "") is False
+
+    assert await test_sets.copy_cases(tenant, "aa", 1, 2) == 2
+    copied = await test_sets.cases(tenant, "aa", 2)
+    assert [(c.case_id, c.question, c.expect, c.seq) for c in copied] == [
+        (c.case_id, c.question, c.expect, c.seq) for c in await test_sets.cases(tenant, "aa", 1)
+    ]
+
+    assert await test_sets.remove_case(tenant, "aa", 2, "k1") is True
+    assert await test_sets.remove_case(tenant, "aa", 2, "k1") is False
+    assert [c.case_id for c in await test_sets.cases(tenant, "aa", 1)] == ["k1", "k2"]
+    assert [c.case_id for c in await test_sets.cases(other_tenant, "aa", 1)] == ["k1"]
+
+
+async def test_a_run_is_started_finished_and_the_newest_is_read_back(test_sets, tenant: str):
+    """Fails if a run's row, hashes, results or spend are lost, or the latest run of a version is not the newest."""
+    assert await test_sets.latest_run(tenant, "aa", 1) is None
+    first = TestRun(tenant, "r1", "aa", 1, RUNNING, "u", "a" * 64, "c" * 64)
+    await test_sets.start_run(tenant, first)
+    stored = await test_sets.get_run(tenant, "r1")
+    assert (stored.status, stored.started_by, stored.definition_sha256, stored.cases_sha256) == (
+        RUNNING,
+        "u",
+        "a" * 64,
+        "c" * 64,
+    )
+    assert stored.started_at is not None
+
+    results = [CaseResult("k1", PASS, tool="create_item", target="n")]
+    await test_sets.finish_run(tenant, "r1", results, Decimal("0.12"))
+    done = await test_sets.get_run(tenant, "r1")
+    assert (done.status, done.spend_usd, done.results) == (DONE, Decimal("0.12"), results)
+    assert (done.definition_sha256, done.cases_sha256) == ("a" * 64, "c" * 64)
+    assert done.finished_at is not None
+
+    await test_sets.start_run(
+        tenant, TestRun(tenant, "r2", "aa", 1, RUNNING, "u", "b" * 64, "d" * 64)
+    )
+    await test_sets.finish_run(tenant, "r2", [], Decimal(0))
+    assert (await test_sets.latest_run(tenant, "aa", 1)).run_id == "r2"
+    assert await test_sets.latest_run(tenant, "aa", 2) is None
+    assert await test_sets.get_run(tenant, "gone") is None

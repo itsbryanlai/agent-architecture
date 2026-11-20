@@ -29,16 +29,27 @@
 </table>
 {% else %}
 <table>
-  <tr><th>When</th><th>Version</th><th>What happened</th><th>Question</th></tr>
+  <tr><th>When</th><th>Version</th><th>What happened</th><th>Question</th><th></th></tr>
   {% for r in s.rows %}
   <tr{% if r.question %} data-conversation="{{ r.conversation_id }}" data-question-seq="{{ r.question_seq }}" data-agent-version="{{ r.agent_version }}"{% endif %}>
     <td>{{ r.at | stamp }}</td>
     <td>{% if r.agent_version is not none %}v{{ r.agent_version }}{% endif %}</td>
     <td>{{ r.detail }}</td>
     <td>{% if r.question %}{{ r.question | truncate(200, True) }}{% else %}<span class="muted">not stored</span>{% endif %}</td>
+    <td>
+      {% if r.question %}
+      <form method="post" action="{{ agent_url }}/test-cases">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
+        <input type="hidden" name="conversation_id" value="{{ r.conversation_id }}">
+        <input type="hidden" name="question_seq" value="{{ r.question_seq }}">
+        <button type="submit">Make a test case</button>
+      </form>
+      {% endif %}
+    </td>
   </tr>
   {% else %}
-  <tr><td colspan="4" class="muted">None in this window.</td></tr>
+  <tr><td colspan="5" class="muted">None in this window.</td></tr>
   {% endfor %}
 </table>
 {% endif %}

@@ -39,6 +39,7 @@ from agentos.config import (
     EMBED_DIMENSIONS,
     PROVIDER_QWEN,
     TASK_QUEUE,
+    TEST_TASK_QUEUE,
     AgentsConfig,
     ConfigError,
     Settings,
@@ -80,6 +81,7 @@ from agentos.tasks import PostgresTaskStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, TenantSource, startup_tenants
 from agentos.tenants import RegistrySync, TenantRegistry, build_registry
+from agentos.test_sets import PostgresTestSetStore
 from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
 from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
@@ -90,6 +92,7 @@ from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.retention import RetentionWorkflow
 from agentos.workflows.task import TaskWorkflow
+from agentos.workflows.test_run import TestRunWorkflow
 
 
 def build_llm(settings: Settings) -> LLMClient:
@@ -357,6 +360,7 @@ async def main() -> None:
             health=health,
             tasks=PostgresTaskStore(pool),
             policies=PostgresApprovalPolicyStore(pool),
+            test_sets=PostgresTestSetStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,
@@ -413,7 +417,22 @@ async def main() -> None:
             activities=all_activities,
             max_concurrent_activities=settings.max_concurrent_activities,
         )
-        log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
+        # Test runs poll their own queue, so a burst of them never parks the turns and
+        # tasks of the main queue. The same activities serve both; only TestRunWorkflow
+        # is registered here, and it calls no write activity.
+        test_worker = Worker(
+            client,
+            task_queue=TEST_TASK_QUEUE,
+            workflows=[TestRunWorkflow],
+            activities=all_activities,
+            max_concurrent_activities=settings.max_concurrent_activities,
+        )
+        log.info(
+            "tenants=%s worker started on %s and %s",
+            ",".join(registry.tenants()),
+            TASK_QUEUE,
+            TEST_TASK_QUEUE,
+        )
         # A tenant added to, changed in or disabled in the database is picked up here,
         # without a restart. Its own start-up work (the key check) runs when it first
         # appears; see ``admit_new_tenant``.
@@ -432,7 +451,7 @@ async def main() -> None:
             )
         )
         try:
-            await worker.run()
+            await asyncio.gather(worker.run(), test_worker.run())
         finally:
             refresher.cancel()
             health_refresher.cancel()

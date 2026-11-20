@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from psycopg.types.json import Jsonb
 
 from agentos.agent_feedback import NO_ANSWER_SHA256, PostgresAgentFeedbackStore
@@ -132,3 +133,43 @@ async def test_a_purged_question_leaves_the_count_and_date_not_the_text(pool, te
     assert {r.question for r in section.rows} == {None, "the recent question"}
     old_row = next(r for r in section.rows if r.question is None)
     assert (old_row.at, old_row.agent_version) == (old, 1)
+
+
+@pytest.mark.parametrize(
+    ("role", "audit_agent", "other", "stored", "expected"),
+    [
+        ("user", "aa", False, True, "the stored question"),
+        ("assistant", "aa", False, True, None),
+        ("user", "bb", False, True, None),
+        ("user", "aa", True, True, None),
+        ("user", "aa", False, False, None),
+    ],
+    ids=[
+        "a tied user question",
+        "an assistant message",
+        "another agent's conversation",
+        "another tenant's conversation",
+        "a purged question",
+    ],
+)
+async def test_question_text_reads_only_this_agents_stored_user_question(
+    pool, tenant, other_tenant, role, audit_agent, other, stored, expected
+):
+    """Fails if question_text returns a non-user message, another agent's or tenant's question, or one retention purged."""
+    conv = "c-question"
+    msg_tenant = other_tenant if other else tenant
+    async with tenant_transaction(pool, msg_tenant) as conn:
+        if stored:
+            await conn.execute(
+                "INSERT INTO conversation_messages (tenant_id, conversation_id, seq, role, content) "
+                "VALUES (%s, %s, 1, %s, %s)",
+                (msg_tenant, conv, role, Jsonb([{"type": "text", "text": "the stored question"}])),
+            )
+        await conn.execute(
+            "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, agent_version, "
+            "requester_user_id, identity, conversation_id, outcome) "
+            "VALUES (%s, %s, 'answer', %s, 1, 'u', %s, %s, 'ok')",
+            (msg_tenant, f"{msg_tenant}:q:1", audit_agent, f"agent:{audit_agent}", conv),
+        )
+    store = PostgresAgentFeedbackStore(pool)
+    assert await store.question_text(tenant, "aa", conv, 1) == expected

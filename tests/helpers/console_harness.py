@@ -37,6 +37,7 @@ from agentos.slack_signin import (
 from agentos.stores import InMemoryHistoryStore
 from agentos.switches import InMemorySwitchStore
 from agentos.tenant_store import TenantDirectory
+from agentos.test_sets import InMemoryTestSetStore
 from agentos.usage import InMemoryUsageStore
 from tests.conftest import (
     TEAM,
@@ -142,6 +143,7 @@ class ConsoleHarness:
         self.health = InMemoryAgentHealthStore()
         self.policies = InMemoryApprovalPolicyStore()
         self.sessions = InMemorySessionStore()
+        self.test_sets = InMemoryTestSetStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
         self.slack = FakeSlack(self.clock)
@@ -180,6 +182,7 @@ class ConsoleHarness:
             creator_access=creator_access,
             feedback_reads=self.feedback_reads,
             policies=self.policies,
+            test_sets=self.test_sets,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

@@ -71,6 +71,21 @@ def page_refresh_id(tenant: str, page_id: str) -> str:
     return f"{tenant}:page-refresh:{normalize_id(page_id)}"
 
 
+def test_case_id(tenant: str, uuid: str) -> str:
+    """One test case of one agent version."""
+    return f"{tenant}:test-case:{uuid}"
+
+
+def test_run_id(tenant: str, uuid: str) -> str:
+    """One test run of one agent version; also its workflow ID."""
+    return f"{tenant}:test-run:{uuid}"
+
+
+def test_conversation_id(run_id: str, case_id: str) -> str:
+    """The conversation one test case runs in. ``run_id`` carries the tenant."""
+    return f"{run_id}:conv:{case_id}"
+
+
 # Audit event keys. Each names one thing that happened, so an activity that
 # retries records it once. Every key starts with the tenant ID.
 

@@ -22,7 +22,12 @@ def test_there_are_fixtures_for_every_workflow_type_and_both_shapes():
         for n in NAMES
     }
 
-    assert started == {"ConversationWorkflow", "TaskWorkflow", "CreatorAccessWorkflow"}
+    assert started == {
+        "ConversationWorkflow",
+        "TaskWorkflow",
+        "CreatorAccessWorkflow",
+        "TestRunWorkflow",
+    }
     assert any("_inline" in n for n in NAMES) and any("_stored" in n for n in NAMES)
 
 

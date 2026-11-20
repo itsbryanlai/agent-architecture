@@ -108,6 +108,19 @@ class AgentFeedbackStore(Protocol):
         """The agent's sections and vote totals from ``since`` until now, newest first."""
         ...
 
+    async def question_text(
+        self, tenant_id: str, agent_id: str, conversation_id: str, seq: int
+    ) -> str | None:
+        """The stored question behind a feedback row's reference, or None.
+
+        What "Make a test case" reads: the text of the message at ``seq``, only when it
+        is a user message and an audit row ties this agent to the conversation. None
+        when retention no longer keeps the message, the message is not the asker's, or
+        the conversation is not this agent's — a case is made of this agent's own
+        questions, never another agent's or an answer.
+        """
+        ...
+
 
 def _detail(section: str, kind: str, tool: str | None) -> str:
     if section == "unanswered":
@@ -248,6 +261,28 @@ class PostgresAgentFeedbackStore:
             sections.append(FeedbackSection("votes", SECTION_TITLES["votes"], downs, rows))
         return AgentFeedbackView(agent_id, since, sections, ups, downs)
 
+    async def question_text(
+        self, tenant_id: str, agent_id: str, conversation_id: str, seq: int
+    ) -> str | None:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                """
+                SELECT (SELECT b ->> 'text' FROM jsonb_array_elements(m.content) b
+                        WHERE b ->> 'type' = 'text' LIMIT 1)
+                FROM conversation_messages m
+                WHERE m.tenant_id = %s AND m.conversation_id = %s AND m.seq = %s
+                  AND m.role = 'user'
+                  AND EXISTS (
+                    SELECT 1 FROM audit_events e
+                    WHERE e.tenant_id = m.tenant_id AND e.agent_id = %s
+                      AND e.conversation_id = m.conversation_id
+                  )
+                """,
+                (tenant_id, conversation_id, seq, agent_id),
+            )
+            row = await cur.fetchone()
+        return None if row is None else row[0]
+
 
 def _is_question(message: dict) -> bool:
     """The Python twin of ``stores.STARTS_A_TURN``: a user message with visible text
@@ -307,6 +342,31 @@ class InMemoryAgentFeedbackStore:
         ]
         sections.append(FeedbackSection("votes", SECTION_TITLES["votes"], downs, rows))
         return AgentFeedbackView(agent_id, since, sections, ups, downs)
+
+    async def question_text(
+        self, tenant_id: str, agent_id: str, conversation_id: str, seq: int
+    ) -> str | None:
+        tied = any(
+            e.tenant_id == tenant_id
+            and e.agent_id == agent_id
+            and e.conversation_id == conversation_id
+            for e in self._audit.events
+        )
+        if not tied:
+            return None
+        messages = self._history.messages.get((tenant_id, conversation_id), [])
+        if not 1 <= seq <= len(messages):
+            return None
+        message = messages[seq - 1]
+        if message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        return next(
+            (b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"),
+            None,
+        )
 
     def _audit_row(self, section: str, event) -> FeedbackRow:
         question, seq = None, None

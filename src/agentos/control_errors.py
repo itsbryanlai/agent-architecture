@@ -16,6 +16,7 @@ from agentos.grant_picks import GrantNotPicked
 from agentos.members import InvalidMember, MemberError, MemberNotFound
 from agentos.notion_webhook import WebhookTokenError
 from agentos.switches import InvalidSwitch, SwitchError
+from agentos.test_sets import TestSetError
 
 STATUS_BY_ERROR: dict[type[Exception], int] = {
     Forbidden: 403,
@@ -38,6 +39,7 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     WebhookTokenError: 409,
     WideningNotAcknowledged: 409,
     GrantNotPicked: 409,
+    TestSetError: 409,
 }
 
 REFUSALS = tuple(STATUS_BY_ERROR)

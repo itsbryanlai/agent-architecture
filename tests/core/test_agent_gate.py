@@ -425,6 +425,11 @@ NOT_GATED = {
     "task_in_thread": "reads the asker's task row to poke its watch; no model or connector",
     "wait_task_refresh": "reads the task row until the poke's poll reports; no model or connector",
     "comment_approval_policy": "reads the tenant's policy and the platform's task records; no model, connector or post",
+    "load_test_run": "reads the run's row and its cases' references; the workflow needs them to start",
+    "start_test_case": "moves the case's question from its row into the run's history; no model, connector or post",
+    "judge_test_case": "reads the case's stored final step to judge it; no model, connector or post",
+    "test_run_spend": "reads the run's usage rows for the cap; no model, connector or post",
+    "finish_test_run": "stores the run's results and spend; no model, connector or post",
 }
 
 

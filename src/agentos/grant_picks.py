@@ -22,7 +22,8 @@ from agentos.stores import joined_transaction
 
 
 class GrantNotPicked(Exception):
-    """A submit was refused because a new grant was not chosen from the creator's Notion."""
+    """A submit or test run was refused because a new grant was not chosen from the
+    creator's Notion."""
 
 
 @dataclass(frozen=True)

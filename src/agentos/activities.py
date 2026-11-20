@@ -62,6 +62,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import NoReturn, TypeVar
 
 from slack_sdk.errors import SlackApiError
@@ -78,7 +79,7 @@ from agentos.agent_health import (
     InMemoryAgentHealthStore,
     agent_unavailable_text,
 )
-from agentos.agent_store import AgentStore
+from agentos.agent_store import PUBLISHED, SUPERSEDED, AgentStore
 from agentos.approval_policy import (
     NO_APPROVAL,
     ApprovalPolicyStore,
@@ -95,7 +96,7 @@ from agentos.audience import (
 )
 from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
-from agentos.budgets import SPEND_UNKNOWN, BudgetGuard
+from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop_text
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors import notion_errors
@@ -194,6 +195,20 @@ from agentos.tasks import (
     listed_state,
 )
 from agentos.tenants import TenantDisabled, TenantRegistry, TenantRuntime, UnknownTenant
+from agentos.test_sets import (
+    AGENT_OFF,
+    AGENT_UNAVAILABLE,
+    RUN_CAP_USD,
+    STOPPED_BY_BUDGET,
+    CaseRef,
+    CaseResult,
+    DraftedWrite,
+    InMemoryTestSetStore,
+    RunSpend,
+    TestRunRef,
+    TestSetStore,
+    judge_case,
+)
 from agentos.threads import (
     InMemoryOwnerPingStore,
     InMemoryThreadStore,
@@ -208,8 +223,8 @@ log = logging.getLogger("agentos.activities")
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
 MY_TASKS_TOOL = "my_tasks"
-# Published versions are immutable, so one is kept per (tenant, agent, version). A worker
-# holds the versions its running turns use, and few of them.
+# Immutable versions (published, superseded) are kept per (tenant, agent, version). A
+# worker holds the versions its running turns use, and few of them; drafts are read fresh.
 VERSION_CACHE_SIZE = 256
 
 # An attempt that takes over from one that may have sent a write looks for the result
@@ -359,8 +374,10 @@ class AgentActivities:
         health: HealthStore | None = None,
         tasks: TaskStore | None = None,
         policies: ApprovalPolicyStore | None = None,
+        test_sets: TestSetStore | None = None,
     ):
         self.settings = settings
+        self.test_sets = test_sets or InMemoryTestSetStore()
         self.content = content or InMemoryContentStore()
         self.threads = threads or InMemoryThreadStore()
         self.owner_pings = owner_pings or InMemoryOwnerPingStore()
@@ -454,6 +471,13 @@ class AgentActivities:
             self.prepare_nudge,
             self.nudge_comment,
             self.nudge_dm,
+            self.load_test_run,
+            self.start_test_case,
+            self.run_test_read_tool,
+            self.record_test_write,
+            self.judge_test_case,
+            self.test_run_spend,
+            self.finish_test_run,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -510,6 +534,10 @@ class AgentActivities:
         ``ctx.agent_version`` describe what actually ran. Activities that act with the agent's
         grants do not use this: they read the live published version (``_agent``), so a grant
         revoked after a turn started still stops what that turn proposed.
+
+        Only an immutable version (published or superseded) is cached. A draft is edited in
+        place and a pending one can be withdrawn and edited, so those are read fresh on every
+        call: a test run of a draft sees the prompt its creator last saved.
         """
         key = (ctx.tenant_id, ctx.agent_id, ctx.agent_version)
         cached = self._versions.get(key)
@@ -525,9 +553,10 @@ class AgentActivities:
                 non_retryable=True,
             )
         agent = record.agent()
-        self._versions[key] = agent
-        while len(self._versions) > VERSION_CACHE_SIZE:
-            self._versions.popitem(last=False)
+        if record.status in (PUBLISHED, SUPERSEDED):
+            self._versions[key] = agent
+            while len(self._versions) > VERSION_CACHE_SIZE:
+                self._versions.popitem(last=False)
         return agent
 
     def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
@@ -1590,40 +1619,52 @@ class AgentActivities:
         call: ToolCall,
         first_marker: int,
         refusal: Exception | None,
+        pinned: AgentVersion | None = None,
+        audit: bool = True,
     ) -> ToolResult:
+        """``pinned`` reads with that version's grants instead of the live published ones
+        (a test run reads as its draft); ``audit=False`` keeps a test run's reads out of
+        the audit log the feedback page reads — the run's own row records them."""
         citations: list[Citation] = []
         if isinstance(refusal, AgentOff):
             # A call dispatched before the agent was turned off. The model gets an error
             # it can pass on; nothing is read.
-            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
             text, is_error = agent_off_text(agent.name), True
         elif isinstance(refusal, AgentUnavailable):
-            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
             text, is_error = agent_unavailable_text(agent.name), True
         elif refusal is not None:
             # A connector switch: the refusal names the connector the tool reads through.
             text, is_error = str(refusal), True
         elif call.name == "search_knowledge":
-            text, is_error, citations = await self._search_knowledge(ctx, call, first_marker)
+            text, is_error, citations = await self._search_knowledge(
+                ctx, call, first_marker, pinned
+            )
         elif call.name == MY_TASKS_TOOL:
-            text, is_error = await self._my_tasks(ctx)
+            text, is_error = await self._my_tasks(ctx, pinned)
         else:
-            text, is_error = await self._read_tool_output(ctx, call)
+            text, is_error = await self._read_tool_output(ctx, call, pinned)
         await self.tool_outputs.put(ctx.tenant_id, conversation_id, call.id, text, is_error)
-        await self._record(
-            ctx,
-            "tool_call",
-            ids.audit_tool_call_key(conversation_id, call.id),
-            outcome="error" if is_error else "ok",
-            conversation_id=conversation_id,
-            tool=call.name,
-            input_sha256=canonical_sha256(call.input),
-            output_sha256=canonical_sha256(text),
-        )
+        if audit:
+            await self._record(
+                ctx,
+                "tool_call",
+                ids.audit_tool_call_key(conversation_id, call.id),
+                outcome="error" if is_error else "ok",
+                conversation_id=conversation_id,
+                tool=call.name,
+                input_sha256=canonical_sha256(call.input),
+                output_sha256=canonical_sha256(text),
+            )
         return ToolResult(call.id, stored=True, is_error=is_error, citations=citations)
 
     async def _search_knowledge(
-        self, ctx: TurnContext, call: ToolCall, first_marker: int
+        self,
+        ctx: TurnContext,
+        call: ToolCall,
+        first_marker: int,
+        pinned: AgentVersion | None = None,
     ) -> tuple[str, bool, list[Citation]]:
         """Search the agent's own granted pages and number the passages found.
 
@@ -1634,7 +1675,7 @@ class AgentActivities:
         root) before it can reach the model. The numbered passages are stored as the tool output; only the
         citation numbers and page IDs go back to the workflow.
         """
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
         roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
         if not roots or self.knowledge is None or self.embedder is None:
             self._log_search(ctx, len(roots), 0, 0, [])
@@ -1690,7 +1731,9 @@ class AgentActivities:
             pages,
         )
 
-    async def _my_tasks(self, ctx: TurnContext) -> tuple[str, bool]:
+    async def _my_tasks(
+        self, ctx: TurnContext, pinned: AgentVersion | None = None
+    ) -> tuple[str, bool]:
         """The asker's tasks from the platform's store: no connector call, no Notion search.
 
         The requester is the runtime's, never a model argument; the store filters by it.
@@ -1698,16 +1741,22 @@ class AgentActivities:
         can invent a call it was never offered, and an agent that cannot start tasks has
         none to list.
         """
-        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
         if not agent.grants.notion_databases:
             return "This agent has no write access, so it has no requests to list.", True
         records = await self.tasks.list_for_requester(ctx.tenant_id, ctx.requester_user_id)
         team_id = self._runtime(ctx.tenant_id).config.slack_team_id
         return format_task_list(records, team_id=team_id), False
 
-    async def _read_tool_output(self, ctx: TurnContext, call: ToolCall) -> tuple[str, bool]:
+    async def _read_tool_output(
+        self, ctx: TurnContext, call: ToolCall, pinned: AgentVersion | None = None
+    ) -> tuple[str, bool]:
         """The tool's output text and whether it is an error."""
-        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        connector = (
+            self._connector_for(ctx.tenant_id, pinned)
+            if pinned is not None
+            else await self._connector(ctx.tenant_id, ctx.agent_id)
+        )
         try:
             if call.name == "search_items":
                 query = call.input.get("query")
@@ -1740,6 +1789,206 @@ class AgentActivities:
                 return notion_errors.entry_for(err).text, True
             _reraise(err)
         return _format_items(items), False
+
+    # --- test runs -------------------------------------------------------------------
+    # A test run (workflows/test_run.py) executes a draft's cases as turns: the same
+    # call_model and read path, pinned to the draft version, with no Slack post, no card
+    # and no task. A drafted write is recorded here and stops the case; nothing runs.
+
+    @activity.defn(name="load_test_run")
+    async def load_test_run(self, tenant_id: str, run_id: str) -> TestRunRef:
+        """The run's draft identity and its cases' references, snapshotted once at the start.
+
+        Cases added or changed after this read run next time, not in this run.
+        """
+        self._log("load_test_run", tenant_id, "-")
+        self._runtime(tenant_id)
+        run = await self.test_sets.get_run(tenant_id, run_id)
+        if run is None:
+            raise ApplicationError("the test run is missing", type="ValueError", non_retryable=True)
+        record = await self.agents.get_version(tenant_id, run.agent_id, run.version)
+        if record is None:
+            raise ApplicationError(
+                f"unknown version {run.version} of agent '{run.agent_id}'",
+                type="ValueError",
+                non_retryable=True,
+            )
+        cases = await self.test_sets.cases(tenant_id, run.agent_id, run.version)
+        return TestRunRef(
+            run.agent_id,
+            run.version,
+            run.started_by,
+            record.agent().max_steps,
+            [CaseRef(c.case_id, c.expect, c.target) for c in cases],
+        )
+
+    @activity.defn(name="start_test_case")
+    async def start_test_case(
+        self, tenant_id: str, conversation_id: str, run_id: str, case_id: str
+    ) -> None:
+        """Append the case's question to its conversation, as ingest_message appends a person's.
+
+        The text is read from the case row here; the workflow named only references. The
+        step key is fixed, so a retry appends nothing twice.
+        """
+        self._log("start_test_case", tenant_id, "-")
+        self._runtime(tenant_id)
+        run = await self.test_sets.get_run(tenant_id, run_id)
+        if run is None:
+            raise ApplicationError("the test run is missing", type="ValueError", non_retryable=True)
+        cases = await self.test_sets.cases(tenant_id, run.agent_id, run.version)
+        case = next((c for c in cases if c.case_id == case_id), None)
+        if case is None:
+            raise ApplicationError(
+                "the test case is missing", type="ValueError", non_retryable=True
+            )
+        await self.history.append(
+            tenant_id,
+            conversation_id,
+            f"{case_id}:user",
+            "user",
+            [{"type": "text", "text": case.question}],
+        )
+
+    @activity.defn(name="run_test_read_tool")
+    async def run_test_read_tool(
+        self, ctx: TurnContext, conversation_id: str, call: ToolCallRef, first_marker: int
+    ) -> ToolResult:
+        """``run_stored_read_tool`` with the pinned version's grants: a test run reads as
+        its draft, not as the published version, and its reads stay out of the audit log."""
+        self._log("run_test_read_tool", ctx.tenant_id, ctx.agent_id, tool=call.name)
+        refusal = await self._gate_refusal(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(call.name)
+        )
+        found, tool_input = await self.content.get_tool_input(
+            ctx.tenant_id, conversation_id, call.id
+        )
+        if not found:
+            raise ApplicationError(
+                "the tool call's input is missing", type="ValueError", non_retryable=True
+            )
+        full = ToolCall(call.id, call.name, tool_input if isinstance(tool_input, dict) else {})
+        agent = await self._pinned(ctx)
+        return await self._run_read(
+            ctx, conversation_id, full, first_marker, refusal, pinned=agent, audit=False
+        )
+
+    @activity.defn(name="record_test_write")
+    async def record_test_write(
+        self, ctx: TurnContext, conversation_id: str, call: ToolCallRef
+    ) -> DraftedWrite:
+        """The write a case's turn drafted: its task kind and target database. Nothing runs.
+
+        The target is resolved with the pinned version's grants as the task path resolves
+        it: a create aims at the first granted database, a comment at the item's own (one
+        connector read, gated like any read). No draft is stored, no card posted, no task
+        started; an unresolvable or refused target is empty.
+        """
+        self._log("record_test_write", ctx.tenant_id, ctx.agent_id, tool=call.kind)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, NOTION)
+        found, raw = await self.content.get_tool_input(ctx.tenant_id, conversation_id, call.id)
+        if not found:
+            raise ApplicationError(
+                "the tool call's input is missing", type="ValueError", non_retryable=True
+            )
+        tool_input = raw if isinstance(raw, dict) else {}
+        agent = await self._pinned(ctx)
+        if call.kind == "add_comment":
+            item = tool_input.get("item")
+            if refusal is None and isinstance(item, str) and item.strip():
+                connector = self._connector_for(ctx.tenant_id, agent)
+                try:
+                    resolved = await connector.resolve_item(item.strip())
+                except ConnectorError:
+                    return DraftedWrite(call.kind)
+                return DraftedWrite(call.kind, normalize_id(resolved.database_id))
+            return DraftedWrite(call.kind)
+        if agent.grants.notion_databases:
+            return DraftedWrite(call.kind, normalize_id(agent.grants.notion_databases[0].id))
+        return DraftedWrite(call.kind)
+
+    @activity.defn(name="judge_test_case")
+    async def judge_test_case(
+        self,
+        ctx: TurnContext,
+        conversation_id: str,
+        step_key: str | None,
+        case: CaseRef,
+        citations: list[Citation],
+        drafted: DraftedWrite | None,
+        hand_off: str | None,
+    ) -> CaseResult:
+        """Judge one case from its stored final step and the references the turn kept.
+
+        The answer's text is read here, never passed through the workflow. A refusal is
+        the provider's ``refusal`` stop reason only. A final reply that is one of the
+        platform's fixed stop texts (a reached budget, an agent switched off or
+        unavailable) is a stop, not a refusal: the case ends as an error with the stop's
+        fixed code. ``step_key`` None is a turn that ran out of steps without a final reply.
+        """
+        self._log("judge_test_case", ctx.tenant_id, ctx.agent_id)
+        cited_pages: list[str] = []
+        refused = False
+        stopped: str | None = None
+        if step_key is not None:
+            step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
+            if step is None:
+                raise ApplicationError(
+                    "the case's final step is missing", type="ValueError", non_retryable=True
+                )
+            text = step.reply_text or ""
+            agent = await self._pinned(ctx)
+            refused = step.stop_reason == "refusal"
+            if text in (stop_text(agent.name), unpriced_stop_text(agent.name)):
+                stopped = STOPPED_BY_BUDGET
+            elif text == agent_off_text(agent.name):
+                stopped = AGENT_OFF
+            elif text == agent_unavailable_text(agent.name):
+                stopped = AGENT_UNAVAILABLE
+            cited_pages = [c.page_id for c in cited_markers(text, citations)]
+        return judge_case(
+            case.case_id,
+            case.expect,
+            case.target,
+            cited_pages=cited_pages,
+            drafted=drafted,
+            hand_off=hand_off,
+            refused=refused,
+            stopped=stopped,
+        )
+
+    @activity.defn(name="test_run_spend")
+    async def test_run_spend(self, tenant_id: str, conversation_ids: list[str]) -> RunSpend:
+        """The run's spend so far, and whether its cap is reached.
+
+        Unknown spend stops the run too (D-21): a call with no price, or no recorder to
+        measure with, is not zero spend. One call may take the run past the cap by its
+        own cost, the same bound the monthly budgets keep.
+        """
+        self._log("test_run_spend", tenant_id, "-")
+        if self.usage is None:
+            return RunSpend("0", 1, True)
+        cost, unpriced = await self.usage.spend_for_conversations(tenant_id, conversation_ids)
+        return RunSpend(format(cost, "f"), unpriced, unpriced > 0 or cost >= RUN_CAP_USD)
+
+    @activity.defn(name="finish_test_run")
+    async def finish_test_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        results: list[CaseResult],
+        spend: str,
+        status: str,
+    ) -> None:
+        """Store the run's results and spend, and close it.
+
+        No runtime check here: a run that failed because its tenant was disabled must
+        still be able to close its row. ``status`` has no default: an activity that
+        receives fewer arguments than it declares loses its inputs' type conversion
+        (the results would arrive as plain dicts), so the workflow always names it.
+        """
+        self._log("finish_test_run", tenant_id, "-")
+        await self.test_sets.finish_run(tenant_id, run_id, results, Decimal(spend), status=status)
 
     # --- task ------------------------------------------------------------------------
 

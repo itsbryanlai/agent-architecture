@@ -53,6 +53,7 @@ from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, DB_ID, TENANT, eventually, make_fake_notion
 from tests.helpers.codec import all_payloads, is_sdk_patch_record
+from tests.helpers.tasks import wait_state
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -196,6 +197,7 @@ async def test_a_flow_with_its_content_in_postgres_decodes_under_the_production_
     )
     task = env.client.get_workflow_handle(value["task_id"])
     await eventually(lambda: slack.updates())
+    await wait_state(task, "awaiting_approval")
 
     await acts.content.put_inbound(
         TENANT,

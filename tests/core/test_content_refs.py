@@ -48,6 +48,7 @@ from tests.conftest import ALICE, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, 
 from tests.helpers.agents import helper_block, make_published
 from tests.helpers.conversation import stored_history
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event, signed_headers
+from tests.helpers.tasks import wait_state
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -269,6 +270,8 @@ async def test_a_task_and_its_edit_leave_no_payload_in_history_and_the_edit_is_w
     assert S_TASK in json.dumps(cards[0]["blocks"])
     value = card_value(h)
     task = h.client.get_workflow_handle(value["task_id"])
+    # The card is posted by an activity; the task accepts edits only once it is awaiting approval.
+    await wait_state(task, "awaiting_approval")
 
     await gateway.click("task_edit", value)
     assert (
@@ -296,7 +299,7 @@ async def test_a_task_and_its_edit_leave_no_payload_in_history_and_the_edit_is_w
         await replayer.replay_workflow(
             await h.client.get_workflow_handle(workflow_id).fetch_history()
         )
-    assert await task.query("state") == "watching"
+    await wait_state(task, "watching")
 
 
 # --- acknowledging Slack first ----------------------------------------------------------------
@@ -421,6 +424,8 @@ async def test_saving_an_edit_with_temporal_unavailable_keeps_the_form_open_with
     await gateway.say("order a monitor")
     await eventually(lambda: [p for p in h.slack.posts() if p["blocks"]])
     value = card_value(h)
+    task = h.client.get_workflow_handle(value["task_id"])
+    await wait_state(task, "awaiting_approval")
     await gateway.click("task_edit", value)
 
     down = DownTemporal()
@@ -442,6 +447,7 @@ async def test_the_write_reads_the_revision_that_was_approved_not_a_newer_one(ha
     await eventually(lambda: [p for p in h.slack.posts() if p["blocks"]])
     first = card_value(h)
     task = h.client.get_workflow_handle(first["task_id"])
+    await wait_state(task, "awaiting_approval")
 
     await h.acts.content.put_inbound(
         TENANT,

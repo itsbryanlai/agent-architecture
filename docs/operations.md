@@ -446,6 +446,26 @@ eventually consistent, so a delete takes a short while to finish. A second
 click a few minutes later connects, and the re-created account is a new
 identity: the old account's sharing and roles do not carry over.
 
+**Drive knowledge (read, D-46).** Anything shared with this address is
+available to every agent creator in this workspace; an admin approves each
+agent before it reads it. A creator grants a folder or file by picking it from
+what the account can see on the agent's version page — one click adds it, one
+click removes it; there is no per-creator Google sign-in. What gets indexed:
+Google Docs and Slides as plain text, and Sheets as CSV with each tab's name
+kept as a heading; other file types are skipped and counted. A granted folder
+is walked recursively. Changes show up on the **next nightly run** (03:00 UTC,
+the same schedule as Notion): the walk compares each file's Drive version and
+re-exports only what changed, and removes files no longer seen, trashed, or no
+longer readable. There is no Drive webhook in v1, so an edit is not reflected
+within seconds the way a Notion page event is. A scope whose root is gone or
+unreadable is kept for a few nightly runs before its index is deleted (the
+same guard as Notion), and the owner is told once. The walk's outcome updates
+the connection's status on the settings page. Before a Drive passage is cited
+it is re-checked live with the tenant's account; a file that is gone or no
+longer shared is dropped, and the citation links to the file. The Drive
+connector switch (Console → Switches) stops Drive indexing and the Drive part
+of knowledge search while it is off.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,

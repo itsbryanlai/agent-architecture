@@ -19,6 +19,10 @@ same tenant granted the same root page share one run. A run that is already
 going is not started twice. Schedules are planned and deleted per tenant, by
 that tenant's ID prefix, so one tenant's command never touches another's.
 
+The worker ensures every served tenant's schedules automatically, at start-up
+and when its grants change (``agentos.schedules``); ``--schedule`` is a manual
+repair.
+
 A scope whose root page is gone or unshared is not deleted by one run: the owner is told, and
 the index is deleted when three nightly runs in a row find the root gone. ``--confirm-gone``
 is the admin's way to delete it now. It changes nothing for a scope whose root page is back.

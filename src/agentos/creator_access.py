@@ -36,9 +36,10 @@ them to a role that does not create, deletes it in the same unit of work as the 
 change (``control.py``). A disabled (uninstalled) or unknown tenant's pass ends cleanly
 with zero counts, before any read. Each creator's Notion client is closed after the pass.
 
-Run ``uv run python -m agentos.creator_access --schedule`` to create or update one nightly
-schedule (05:00 UTC, after indexing and retention) per stored tenant; without ``--schedule``
-the command starts one pass per tenant on the worker and prints its counts.
+The worker ensures every served tenant's nightly schedule (05:00 UTC, after indexing and
+retention) automatically, at start-up and when a tenant is admitted (``agentos.schedules``).
+Run ``uv run python -m agentos.creator_access --schedule`` as a manual repair; without
+``--schedule`` the command starts one pass per tenant on the worker and prints its counts.
 """
 
 from __future__ import annotations

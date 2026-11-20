@@ -274,10 +274,18 @@ uv run python -m agentos.tenant_store import
   tenant is dropped within that time: the gateway answers nothing for it, the
   worker no longer runs its activities, and the console refuses its sign-ins
   and sessions. Re-enabling it brings it back the same way.
-- A tenant's index schedules are still created by `index_knowledge --schedule`,
-  which you run after adding a tenant. The worker decides at start-up whether
-  it runs the indexing workflows (some published agent has a page grant), so
-  restart it once when a deployment's first page grant is published.
+- A tenant's nightly schedules are automatic (D-42): the worker ensures every
+  served tenant's index schedules (03:00 UTC, one per granted scope), retention
+  schedule (04:00 UTC) and creator-access schedule (05:00 UTC) at start-up, and
+  on its 5-second refresh for a tenant just admitted, a reinstall, or a changed
+  page grant. An unchanged tenant causes no schedule call. A failure is logged
+  with the tenant ID and retried on the next pass; it never stops the worker or
+  serving the tenant. A disabled tenant's schedules are left as they are (its
+  runs end cleanly); a reinstall re-ensures. The `--schedule` commands of
+  `index_knowledge`, `retention` and `creator_access` remain as a manual repair.
+  The worker decides at start-up whether it runs the indexing workflows (some
+  published agent has a page grant), so restart it once when a deployment's
+  first page grant is published.
 - Row-level security hides every tenant's row from the others. The two reads
   that cross tenants (a Slack workspace to its tenant, and the list of tenants)
   go through two `SECURITY DEFINER` functions that return the tenant ID, the
@@ -767,10 +775,11 @@ retries the activity.
 ## Retention
 
 A nightly Temporal schedule (04:00 UTC) purges each tenant's expired rows in batches and logs
-counts only. Create or update the schedules once, after the worker is running:
+counts only. The worker creates or updates each served tenant's schedule automatically, at
+start-up and when a tenant is admitted or reinstalled (D-42); the command is a manual repair:
 
 ```bash
-uv run python -m agentos.retention --schedule            # every tenant
+uv run python -m agentos.retention --schedule            # repair: every tenant
 uv run python -m agentos.retention --tenant acme          # purge one tenant now, without Temporal
 ```
 
@@ -800,12 +809,13 @@ has not yet delivered is never purged.
 ## Creator access
 
 A nightly Temporal schedule (05:00 UTC, after indexing and retention) checks that each
-published agent's creator can still read every Notion object they picked for it. Create or
-update the schedules once, after the worker is running; without `--schedule` the command
-starts one pass per tenant on the worker and prints its counts:
+published agent's creator can still read every Notion object they picked for it. The worker
+creates or updates each served tenant's schedule automatically, at start-up and when a tenant
+is admitted or reinstalled (D-42); `--schedule` is a manual repair. Without `--schedule` the
+command starts one pass per tenant on the worker and prints its counts:
 
 ```bash
-uv run python -m agentos.creator_access --schedule       # every stored tenant
+uv run python -m agentos.creator_access --schedule       # repair: every stored tenant
 uv run python -m agentos.creator_access --tenant acme    # one pass now, through the worker
 ```
 
@@ -858,6 +868,10 @@ database behind the code's migrations, a chat or embedding model with no price
 in effect today, an inconsistent tenants table, or routing that names an
 unpublished agent or a channel its audience leaves out. The message names what
 to fix; nothing is served until it is.
+
+Ensuring the tenants' nightly schedules (D-42) is start-up work that never
+stops start-up: one tenant's schedule failure is logged with its ID and retried
+on the refresh, and every other tenant is ensured and served regardless.
 
 A broken Notion grant disables **only its agent** (D-35). At start-up and on
 the directory refresh the worker checks each published agent's grants with the
@@ -1175,10 +1189,12 @@ uv run python -m agentos.index_knowledge --confirm-gone  # see "A page that cann
 
 Indexing calls the embeddings endpoint, so it **spends embedding credit**;
 pages whose content has not changed since the last run are not embedded again.
-Two agents granted the same page share one run. `--schedule` creates or updates
-one schedule per granted page and deletes the schedules of pages that are no
-longer granted. Pages removed from the tree or trashed are removed from the
-index on the next run.
+Two agents granted the same page share one run. The worker ensures one nightly
+schedule (03:00 UTC) per granted page automatically, at start-up and on its
+refresh when a tenant's grants change (D-42); `--schedule` is a manual repair
+that creates or updates one schedule per granted page and deletes the schedules
+of pages that are no longer granted. Pages removed from the tree or trashed are
+removed from the index on the next run.
 
 What is indexed, how pages that cannot be read are treated, how a webhook refreshes a single page
 and how a search is checked and cited are in [architecture.md §6](architecture.md#6-knowledge-retrieval).
@@ -1218,7 +1234,8 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 ### Keeping the index fresh
 
 Set up the Notion webhook (above) to refresh a page within about 30 seconds of an edit. The
-nightly run (`--schedule`) remains the backstop for anything the webhook misses.
+nightly run (its schedule is ensured automatically, D-42) remains the backstop for anything
+the webhook misses.
 
 ### Local embeddings with Ollama
 
@@ -1261,11 +1278,12 @@ section of the YAML file changes nothing**: the database is the source.
 `--agent` on a draft to get a grant's property IDs before publishing (`--version`
 picks another version).
 
-Known gap: a version published after the worker started that adds a Notion page
-grant gets no index schedule and no startup grant check until the worker
-restarts, and a worker started with no page grants has no embedder until it
-restarts. Run `uv run python -m agentos.index_knowledge --schedule` after such a
-publish.
+A version published after the worker started that adds a Notion page grant
+needs no restart for its schedule or its grant check: the worker's refresh
+applies the index schedule on its next pass (about 5 seconds), and the health
+refresh checks the new version at once. Known gap: a worker started with no
+page grants has no embedder and does not run the indexing workflows until it
+restarts, so restart it once when a deployment's first page grant is published.
 
 ## Members and roles
 
@@ -1351,8 +1369,8 @@ publish without it is refused with 422. It runs the grant check next (with the t
 Notion token) and is refused with 409 and the problems while any database or page grant has one (a
 page must be readable and not in the trash). If Notion cannot be read right now
 (a network error, a rate limit, a server error) the answer is 502 and nothing is
-published. A new page grant still gets no index schedule until
-the worker restarts. The audit log is paged by `seq`: pass the previous page's
+published. A new page grant gets its index schedule on the worker's next refresh
+pass (about 5 seconds), with no restart (D-42). The audit log is paged by `seq`: pass the previous page's
 `next_before` as `before`; `limit` is capped at 200. A write may carry an
 `Idempotency-Key` header: a retry with the same key, path and body records one
 audit event (the change itself is refused the second time, with 409).

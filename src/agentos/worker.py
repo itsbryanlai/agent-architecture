@@ -64,6 +64,7 @@ from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
 from agentos.retention import PostgresRetentionStore, RetentionActivities
+from agentos.schedules import refresh_schedules_once, run_schedule_refresh
 from agentos.schema_version import require_current_schema
 from agentos.slack_client import RealSlackPoster, SlackPoster
 from agentos.stores import (
@@ -397,6 +398,12 @@ async def main() -> None:
                 idempotency,
             ).all()
         client = await build_temporal_client(settings, keys)
+        # Every served tenant's nightly schedules (index, retention, creator-access) are
+        # ensured here and kept current by the refresh below, so a tenant added by
+        # "Add to Slack" needs no operator command. One tenant's failure is logged with
+        # its ID and retried on the next pass; it never stops start-up or serving.
+        ensured_schedules: dict[str, tuple[tuple[str, str], ...]] = {}
+        await refresh_schedules_once(client, registry, agent_store, ensured_schedules)
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
@@ -415,12 +422,20 @@ async def main() -> None:
         health_refresher = asyncio.create_task(
             run_health_refresh(health_checker, registry, agent_store, health, TENANT_SYNC_SECONDS)
         )
+        # A newly admitted tenant, a reinstall or a changed page grant gets its schedules
+        # on this cadence too; an unchanged tenant causes no schedule call (fingerprint).
+        schedule_refresher = asyncio.create_task(
+            run_schedule_refresh(
+                client, registry, agent_store, ensured_schedules, TENANT_SYNC_SECONDS
+            )
+        )
         try:
             await worker.run()
         finally:
             refresher.cancel()
             health_refresher.cancel()
-            stopped = [health_refresher]
+            schedule_refresher.cancel()
+            stopped = [health_refresher, schedule_refresher]
             if key_refresh is not None:
                 key_refresh.cancel()
                 stopped.append(key_refresh)

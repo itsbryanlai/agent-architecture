@@ -1,5 +1,6 @@
 """Helpers that index a fake Notion tree and run knowledge-search conversations."""
 
+from temporalio.client import ScheduleAlreadyRunningError
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
@@ -110,7 +111,8 @@ class FakeScheduleHandle:
 
 class FakeScheduleClient:
     """Stands in for the Temporal client: the time-skipping test server does not
-    implement the schedule listing call, so apply_schedules runs against this."""
+    implement the schedule listing call, so apply_schedules runs against this.
+    Create fails when the schedule exists, as Temporal's does; update replaces it."""
 
     def __init__(self, existing=()):
         self.schedules = {i: None for i in existing}
@@ -124,6 +126,8 @@ class FakeScheduleClient:
         return gen()
 
     async def create_schedule(self, schedule_id, schedule):
+        if schedule_id in self.schedules:
+            raise ScheduleAlreadyRunningError()
         self.schedules[schedule_id] = schedule
         self.log.append(("create", schedule_id))
 

@@ -21,6 +21,9 @@ object means the defaults below. What is purged:
 * idempotency records older than the limit;
 * sessions, a number of days after they expired (a session is purged at login too).
 
+The worker ensures every served tenant's nightly schedule automatically, at start-up
+and when a tenant is admitted (``agentos.schedules``); ``--schedule`` is a manual repair.
+
 Never purged: audit and usage rows (append-only by design, and the app role has no DELETE on
 them), ``external_writes``, ``task_links`` and agent definitions. A limit is never below the longest task life a definition may hold: the
 largest approval window and the largest watch that validation allows (``config.py``), plus a

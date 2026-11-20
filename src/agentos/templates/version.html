@@ -18,6 +18,11 @@
   {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw", {"request_id": new_token()}) }}{% endif %}
   {% if ctx.is_admin and is_pending %}
     {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject", {"request_id": new_token()}) }}
+    {% if not run_review.run %}
+    <p class="warn">This version has no test run yet. Its creator can run the draft's test cases before you publish.</p>
+    {% elif run_review.stale %}
+    <p class="warn">The draft was edited after its last test run; the results below are older than this definition.</p>
+    {% endif %}
     <form method="post" action="{{ version_url }}/publish">
       <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
       <input type="hidden" name="request_id" value="{{ new_token() }}">
@@ -104,6 +109,95 @@
 {% else %}
 <p class="muted">This version has no Notion grants.</p>
 {% endif %}
+{% endif %}
+
+<h2>Test cases</h2>
+{% if editor and is_draft %}
+<p class="muted">Questions this draft should handle the right way. A run uses this draft, not the published version; it never writes anything and posts nothing to Slack. Every case needs an expected behaviour before a run.</p>
+<table>
+  <tr><th>Question</th><th>Expected behaviour</th><th></th></tr>
+  {% for c in cases %}
+  <tr>
+    <td>{{ c.question | truncate(200, True) }}</td>
+    <td>
+      {% if c.expect %}{{ expect_labels[c.expect] }}{% if c.target %} <code>{{ c.target }}</code>{% endif %}
+      {% else %}
+      <form method="post" action="{{ version_url }}/test-cases/{{ c.case_id }}/expect">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
+        <select name="expect">
+          <option value="">choose…</option>
+          {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
+        </select>
+        <input type="text" name="target" placeholder="page or database ID, or agent ID">
+        <button type="submit">Save</button>
+      </form>
+      {% endif %}
+    </td>
+    <td>{{ post_button(version_url ~ "/test-cases/" ~ c.case_id ~ "/remove", ctx.csrf, "Remove", {"request_id": new_token()}) }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="muted">No test cases yet.</td></tr>
+  {% endfor %}
+</table>
+<form method="post" action="{{ version_url }}/test-cases">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <p><label for="case-question">Question</label><br>
+  <textarea id="case-question" name="question" rows="2"></textarea></p>
+  <p><label for="case-expect">Expected behaviour</label>
+  <select id="case-expect" name="expect">
+    <option value="">choose later</option>
+    {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
+  </select>
+  <input type="text" name="target" placeholder="page or database ID, or agent ID">
+  <button type="submit">Add case</button></p>
+</form>
+{{ post_button(version_url ~ "/test-run", ctx.csrf, "Run tests", {"request_id": new_token()}) }}
+<span class="muted">One run spends at most $0.20, counted in this organisation's usage.</span>
+{% else %}
+<table>
+  <tr><th>Question</th><th>Expected behaviour</th></tr>
+  {% for c in cases %}
+  <tr>
+    <td>{{ c.question | truncate(200, True) }}</td>
+    <td>{% if c.expect %}{{ expect_labels[c.expect] }}{% if c.target %} <code>{{ c.target }}</code>{% endif %}{% else %}<span class="muted">not chosen</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="2" class="muted">No test cases.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if run_review.run %}
+{% set run = run_review.run %}
+<h2>Test run</h2>
+<p>
+  {{ run.count("pass") }} passed · {{ run.count("fail") }} failed
+  {%- if run.count("not_run") %} · {{ run.count("not_run") }} not run{% endif %}
+  {%- if run.count("error") %} · {{ run.count("error") }} errored{% endif %}
+  — {{ run.started_at | stamp }}, spend {{ run.spend_usd | usd }}
+  <span class="muted">run by {{ run.started_by }}</span>
+</p>
+{% if run.status == "running" %}<p class="muted">The run is still going; reload this page to see its results.</p>{% endif %}
+{% if run.status == "failed" %}<p class="error">This run could not start.</p>{% endif %}
+{% if run_review.stale %}<p class="warn">The draft was edited after this run; run the tests again.</p>{% endif %}
+{% set questions = {} %}
+{% for c in cases %}{% set _ = questions.update({c.case_id: c.question}) %}{% endfor %}
+<details{% if run.count("fail") or run.count("error") or run.count("not_run") %} open{% endif %}>
+  <summary>Per-case results</summary>
+  <table>
+    <tr><th>Question</th><th>Result</th><th>Reason</th><th>What the draft did</th></tr>
+    {% for r in run.results %}
+    <tr>
+      <td>{{ questions.get(r.case_id, r.case_id) | truncate(120, True) }}</td>
+      <td>{% if r.outcome == "fail" %}<span class="error">{{ r.outcome }}</span>{% else %}{{ r.outcome }}{% endif %}</td>
+      <td>{{ case_reason.get(r.reason, "") }}</td>
+      <td>{% if r.tool %}{{ r.tool }}{% endif %}{% if r.target %} <code>{{ r.target }}</code>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
 {% endif %}
 
 <h2>Audience</h2>

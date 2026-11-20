@@ -679,7 +679,13 @@ async def test_another_creator_cannot_submit_or_edit_an_agent_they_do_not_own(h)
         token = await csrf_token(c)
         edit = await post(c, f"{VERSION}/edit", token, definition=definition_text(helper_block()))
         submit = await post(c, f"{VERSION}/submit", token)
+        case = await post(c, f"{VERSION}/test-cases", token, question="q", expect="refuse")
+        run = await post(c, f"{VERSION}/test-run", token)
+        from_feedback = await post(
+            c, f"{UI}/agents/it-helper/test-cases", token, conversation_id="c1", question_seq="1"
+        )
     assert edit.status_code == 403 and submit.status_code == 403
+    assert case.status_code == 403 and run.status_code == 403 and from_feedback.status_code == 403
     assert await status_of_version(h) == "draft"
 
 
@@ -727,6 +733,9 @@ FORM_ROUTES = [
     ("settings/webhook/reveal", {}),
     ("settings/webhook/confirm", {}),
     ("settings/webhook/clear", {}),
+    ("agents/it-helper/versions/1/test-cases", {"question": "q"}),
+    ("agents/it-helper/versions/1/test-run", {}),
+    ("agents/it-helper/test-cases", {"conversation_id": "c1", "question_seq": "1"}),
 ]
 
 

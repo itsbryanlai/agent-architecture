@@ -86,6 +86,8 @@ from agentos.slack_signin import (
     read_session_cookie,
     session_cookie_value,
 )
+from agentos.test_sets import EXPECT_KINDS, EXPECT_LABELS
+from agentos.test_sets import REASON_TEXT as CASE_REASON_TEXT
 from agentos.usage import NO_TEAM
 
 log = logging.getLogger("agentos.web_ui")
@@ -135,6 +137,10 @@ NOTICES = {
     "notion-disconnected": "Notion disconnected.",
     "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
     "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
+    "case-added": "Test case added to the draft. Choose its expected behaviour.",
+    "case-expect": "Expected behaviour saved.",
+    "case-removed": "Test case removed.",
+    "test-run": "Test run started. Its results appear on this page when it finishes.",
 }
 
 # What the version page shows after a refused publish. Like NOTICES, the redirect
@@ -313,6 +319,11 @@ class WebUI:
         self.route("GET", version + "/pick", self.pick_page)
         self.route("POST", version + "/pick/choose", self.pick_choose)
         self.route("POST", version + "/pick/revoke", self.pick_revoke)
+        self.route("POST", version + "/test-cases", self.add_test_case)
+        self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
+        self.route("POST", version + "/test-cases/{case_id}/remove", self.remove_test_case)
+        self.route("POST", version + "/test-run", self.run_tests)
+        self.route("POST", agent + "/test-cases", self.case_from_feedback)
         app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
@@ -837,6 +848,10 @@ class WebUI:
             if may_see_access
             else False
         )
+        cases = await ctx.plane.test_cases(ctx.tenant_id, ctx.principal, agent_id, version)
+        run_review = await ctx.plane.test_run_review(
+            ctx.tenant_id, ctx.principal, agent_id, version
+        )
         return _page(
             "version.html",
             status,
@@ -857,6 +872,11 @@ class WebUI:
             notice=notice,
             reports=reports,
             grants_ok=None if reports is None else all(r.ok for r in reports),
+            cases=cases,
+            run_review=run_review,
+            expect_kinds=EXPECT_KINDS,
+            expect_labels=EXPECT_LABELS,
+            case_reason=CASE_REASON_TEXT,
             base=self.base(ctx),
             agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
             version_url=self.version_url(ctx, agent_id, version),
@@ -883,6 +903,108 @@ class WebUI:
 
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.version_url(ctx, agent_id, version, "saved"))
+
+    # --- test sets --------------------------------------------------------------------
+
+    async def add_test_case(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            await ctx.plane.add_test_case(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                ctx.get("question"),
+                ctx.get("expect"),
+                ctx.get("target"),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-added"))
+
+    async def set_case_expect(
+        self, request: Request, ctx: Ctx, agent_id: str, version: int, case_id: str
+    ):
+        try:
+            await ctx.plane.set_case_expect(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                case_id,
+                ctx.get("expect"),
+                ctx.get("target"),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-expect"))
+
+    async def remove_test_case(
+        self, request: Request, ctx: Ctx, agent_id: str, version: int, case_id: str
+    ):
+        try:
+            await ctx.plane.remove_test_case(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                case_id,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-removed"))
+
+    async def run_tests(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            await ctx.plane.run_tests(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "test-run"))
+
+    async def case_from_feedback(self, request: Request, ctx: Ctx, agent_id: str):
+        """The feedback page's "Make a test case": the row's question onto the next draft."""
+        raw = ctx.get("question_seq")
+        try:
+            draft = await ctx.plane.make_test_case_from_feedback(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                ctx.get("conversation_id"),
+                int(raw) if raw.isdigit() else 0,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+            return await self.failure(
+                request,
+                ctx,
+                err,
+                back=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}/feedback",
+            )
+        return _redirect(self.version_url(ctx, agent_id, draft.version, "case-added"))
 
     async def notion_down(
         self, request: Request, ctx: Ctx, agent_id: str, version: int

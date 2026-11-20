@@ -114,6 +114,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
@@ -128,6 +129,7 @@ from agentos.agent_feedback import (
 )
 from agentos.agent_health import AgentHealth, HealthStore
 from agentos.agent_store import (
+    DRAFT,
     PENDING,
     AgentNotFound,
     AgentRecord,
@@ -212,6 +214,21 @@ from agentos.switches import (
     set_switch,
 )
 from agentos.tenant_store import TenantSource, TenantStore, as_source
+from agentos.test_sets import (
+    CITE,
+    EXPECT_KINDS,
+    FAILED,
+    HAND_OFF,
+    QUESTION_MAX,
+    REFUSE,
+    RUNNING,
+    WRITE,
+    InMemoryTestSetStore,
+    TestCase,
+    TestRun,
+    TestSetError,
+    TestSetStore,
+)
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import (
     InMemoryUsageStore,
@@ -345,6 +362,18 @@ class VersionReview:
     picks: dict[str, PickRecord] = field(default_factory=dict)
 
 
+@dataclass
+class TestRunReview:
+    """A version's latest test run, and whether the definition changed since it ran.
+
+    ``stale`` compares the hash the run ran against with the version's definition now:
+    an edit after the run (a withdraw, an edit, a resubmit) makes the results old.
+    """
+
+    run: TestRun | None
+    stale: bool = False
+
+
 def _all_grant_ids(agent: AgentVersion) -> dict[str, str]:
     """Normalised ID -> label of every Notion grant of a version."""
     ids_: dict[str, str] = {}
@@ -378,9 +407,14 @@ class ControlPlane:
         creator_access: CreatorAccessStore | None = None,
         feedback_reads: AgentFeedbackStore | None = None,
         policies: ApprovalPolicyStore | None = None,
+        test_sets: TestSetStore | None = None,
+        start_test_run: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
         self._policies = InMemoryApprovalPolicyStore() if policies is None else policies
+        self._test_sets = InMemoryTestSetStore() if test_sets is None else test_sets
+        # Starts one run's workflow (tenant, run ID); idempotent. None leaves runs unavailable.
+        self._start_test_run = start_test_run
         self._creator_access = (
             InMemoryCreatorAccessStore() if creator_access is None else creator_access
         )
@@ -419,6 +453,7 @@ class ControlPlane:
                 self._pauses,
                 self._picks,
                 self._policies,
+                self._test_sets,
                 *settings_stores,
             )
             if unit_of_work is None
@@ -512,14 +547,16 @@ class ControlPlane:
         tool: str | None = None,
         request_id: str | None = None,
         conn: Any = None,
+        input_sha256: str | None = None,
     ) -> None:
         """One event, on the unit of work's connection. A definition is hashed, never stored.
 
         ``input_sha256`` is the hash the version was submitted (and so reviewed) with, or the
-        canonical hash of the definition while it is still a draft.
+        canonical hash of the definition while it is still a draft. A caller may name its
+        own hash instead (a test case's content, never the text).
         """
-        digest = None
-        if version is not None:
+        digest = input_sha256
+        if digest is None and version is not None:
             digest = version.definition_sha256 or canonical_sha256(version.definition)
         await self._audit.record(
             AuditEvent(
@@ -945,6 +982,16 @@ class ControlPlane:
             record = await self._agents.create_draft(
                 tenant_id, agent_id, actor, from_version, conn=conn
             )
+            # The new draft carries the source version's test cases, as it carries its
+            # definition. create_draft found a source, so there is one to copy from.
+            source = from_version
+            if source is None:
+                published = await self._agents.published(tenant_id, agent_id)
+                source = None if published is None else published.version
+            if source is not None:
+                await self._test_sets.copy_cases(
+                    tenant_id, agent_id, source, record.version, conn=conn
+                )
             await self._record(
                 "agent_draft", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
@@ -1175,6 +1222,266 @@ class ControlPlane:
                     conn=conn,
                 )
         return record
+
+    # --- test sets -------------------------------------------------------------
+
+    async def test_cases(
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
+    ) -> list[TestCase]:
+        """The version's test cases, in the order they were added. Editors and admins."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        return await self._test_sets.cases(tenant_id, agent_id, version)
+
+    async def add_test_case(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        question: str,
+        expect: str = "",
+        target: str = "",
+        request_id: str | None = None,
+    ) -> TestCase:
+        """Add one case to a draft. The expectation may be left unset (the feedback
+        page's "Make a test case" does), for the creator to choose on the version page."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        text = question.strip()
+        if not text or len(text) > QUESTION_MAX:
+            raise TestSetError(f"a test question must be 1 to {QUESTION_MAX} characters")
+        expect, target = self._validated_expectation(expect, target, record.agent())
+        case = TestCase(
+            tenant_id,
+            agent_id,
+            version,
+            ids.test_case_id(tenant_id, uuid.uuid4().hex),
+            text,
+            expect,
+            target,
+            created_by=actor,
+        )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._test_sets.add_case(tenant_id, case, conn=conn)
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="add",
+                target=case.case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256(
+                    {"question": text, "expect": expect, "target": target}
+                ),
+            )
+        return case
+
+    async def set_case_expect(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        case_id: str,
+        expect: str,
+        target: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Choose one case's expected behaviour: a kind and the object it names."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        expect, target = self._validated_expectation(expect, target, record.agent())
+        if not expect:
+            raise TestSetError("choose an expected behaviour for the case")
+        async with self._uow.begin(tenant_id) as conn:
+            found = await self._test_sets.set_expect(
+                tenant_id, agent_id, version, case_id, expect, target, conn=conn
+            )
+            if not found:
+                raise AgentNotFound(f"agent '{agent_id}' version {version} has no such test case")
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="expect",
+                target=case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256({"expect": expect, "target": target}),
+            )
+
+    async def remove_test_case(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        case_id: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Remove one case from a draft."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        async with self._uow.begin(tenant_id) as conn:
+            found = await self._test_sets.remove_case(
+                tenant_id, agent_id, version, case_id, conn=conn
+            )
+            if not found:
+                raise AgentNotFound(f"agent '{agent_id}' version {version} has no such test case")
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="remove",
+                target=case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256({"case_id": case_id}),
+            )
+
+    async def run_tests(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
+    ) -> TestRun:
+        """Run a draft's cases against the draft definition. The agent's creator or an admin.
+
+        Every case needs an expectation first. The run's row and its audit event commit
+        before the workflow starts on its own task queue; a start that fails closes the
+        row as failed, so the console never shows a run that is not coming. The starter
+        is idempotent: a retried start of the same run finds it already started.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        cases = await self._test_sets.cases(tenant_id, agent_id, version)
+        if not cases:
+            raise TestSetError("this draft has no test cases yet")
+        unset = sum(not c.expect for c in cases)
+        if unset:
+            raise TestSetError(
+                f"{unset} test case(s) have no expected behaviour yet; "
+                "choose one for each before running"
+            )
+        if self._start_test_run is None:
+            raise TestSetError("test runs are not available in this console")
+        run = TestRun(
+            tenant_id,
+            ids.test_run_id(tenant_id, uuid.uuid4().hex),
+            agent_id,
+            version,
+            RUNNING,
+            actor,
+            canonical_sha256(record.definition),
+        )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._test_sets.start_run(tenant_id, run, conn=conn)
+            await self._record(
+                "test_run",
+                tenant_id,
+                actor,
+                version=record,
+                target=run.run_id,
+                request_id=request_id,
+                conn=conn,
+            )
+        try:
+            await self._start_test_run(tenant_id, run.run_id)
+        except Exception as err:  # any start failure closes the row and is shown
+            await self._test_sets.finish_run(tenant_id, run.run_id, [], Decimal(0), status=FAILED)
+            raise TestSetError(
+                f"the test run could not start ({type(err).__name__}); try again"
+            ) from err
+        return run
+
+    async def test_run_review(
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
+    ) -> TestRunReview:
+        """The version's latest run for the version page and the approving admin's view:
+        the run itself, and whether the definition changed since it ran."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        run = await self._test_sets.latest_run(tenant_id, agent_id, version)
+        stale = run is not None and run.definition_sha256 != canonical_sha256(record.definition)
+        return TestRunReview(run, stale)
+
+    async def make_test_case_from_feedback(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        conversation_id: str,
+        question_seq: int,
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Add a stored feedback question to the agent's next draft, expectation unset.
+
+        The next draft is the agent's newest one; with none, a draft is made from the
+        published version, carrying its cases forward. The question is read from stored
+        history; one retention has purged is refused. Returns the draft the case landed on.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        question = (
+            None
+            if self._feedback_reads is None
+            else await self._feedback_reads.question_text(tenant_id, conversation_id, question_seq)
+        )
+        if not question:
+            raise TestSetError("that question is no longer stored, so it cannot become a test case")
+        versions = await self._agents.versions(tenant_id, agent_id)
+        draft = next((v for v in versions if v.status == DRAFT), None)
+        if draft is None:
+            draft = await self.new_draft(tenant_id, actor, agent_id, request_id=request_id)
+        await self.add_test_case(
+            tenant_id, actor, agent_id, draft.version, question, request_id=request_id
+        )
+        return draft
+
+    async def _draft_for_cases(
+        self, tenant_id: str, agent_id: str, version: int
+    ) -> AgentVersionRecord:
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        if record.status != DRAFT:
+            raise AgentStoreError(
+                f"agent '{agent_id}' version {version} is {record.status}; "
+                "test cases are written on a draft"
+            )
+        return record
+
+    @staticmethod
+    def _validated_expectation(expect: str, target: str, agent: AgentVersion) -> tuple[str, str]:
+        """The case's expectation as stored: a known kind, and a target this draft grants
+        (a page, a database) or lists (a specialist). Notion IDs are normalized."""
+        expect, target = expect.strip(), target.strip()
+        if expect and expect not in EXPECT_KINDS:
+            raise TestSetError(f"unknown expected behaviour '{expect}'")
+        if not expect or expect == REFUSE:
+            return expect, ""
+        if not target:
+            raise TestSetError("choose the source, database or agent this case expects")
+        if expect == CITE:
+            granted = {normalize_id(g.id) for g in agent.grants.notion_pages}
+            what = "a page granted to this draft"
+        elif expect == WRITE:
+            granted = {normalize_id(g.id) for g in agent.grants.notion_databases}
+            what = "a database granted to this draft"
+        else:
+            granted = set(agent.specialists)
+            what = "a specialist this draft lists"
+        normalized = target if expect == HAND_OFF else normalize_id(target)
+        if normalized not in granted:
+            raise TestSetError(f"'{target}' is not {what}")
+        return expect, normalized
 
     # --- budgets -------------------------------------------------------------
 

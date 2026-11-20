@@ -108,6 +108,13 @@ class AgentFeedbackStore(Protocol):
         """The agent's sections and vote totals from ``since`` until now, newest first."""
         ...
 
+    async def question_text(self, tenant_id: str, conversation_id: str, seq: int) -> str | None:
+        """One stored message's text, or None when retention no longer keeps it.
+
+        What "Make a test case" reads: the question behind a row's stored reference.
+        """
+        ...
+
 
 def _detail(section: str, kind: str, tool: str | None) -> str:
     if section == "unanswered":
@@ -248,6 +255,20 @@ class PostgresAgentFeedbackStore:
             sections.append(FeedbackSection("votes", SECTION_TITLES["votes"], downs, rows))
         return AgentFeedbackView(agent_id, since, sections, ups, downs)
 
+    async def question_text(self, tenant_id: str, conversation_id: str, seq: int) -> str | None:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                """
+                SELECT (SELECT b ->> 'text' FROM jsonb_array_elements(content) b
+                        WHERE b ->> 'type' = 'text' LIMIT 1)
+                FROM conversation_messages
+                WHERE tenant_id = %s AND conversation_id = %s AND seq = %s
+                """,
+                (tenant_id, conversation_id, seq),
+            )
+            row = await cur.fetchone()
+        return None if row is None else row[0]
+
 
 def _is_question(message: dict) -> bool:
     """The Python twin of ``stores.STARTS_A_TURN``: a user message with visible text
@@ -307,6 +328,18 @@ class InMemoryAgentFeedbackStore:
         ]
         sections.append(FeedbackSection("votes", SECTION_TITLES["votes"], downs, rows))
         return AgentFeedbackView(agent_id, since, sections, ups, downs)
+
+    async def question_text(self, tenant_id: str, conversation_id: str, seq: int) -> str | None:
+        messages = self._history.messages.get((tenant_id, conversation_id), [])
+        if not 1 <= seq <= len(messages):
+            return None
+        content = messages[seq - 1].get("content")
+        if not isinstance(content, list):
+            return None
+        return next(
+            (b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"),
+            None,
+        )
 
     def _audit_row(self, section: str, event) -> FeedbackRow:
         question, seq = None, None

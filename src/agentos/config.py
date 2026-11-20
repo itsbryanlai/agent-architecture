@@ -77,6 +77,9 @@ def embed_max_distance(model: str, override: float | None = None) -> float | Non
 
 
 TASK_QUEUE = "agentos-main"
+# Test runs poll their own queue, so a burst of them never parks the turns and tasks
+# of the main queue; the worker registers the test-run workflow on it.
+TEST_TASK_QUEUE = "agentos-tests"
 
 # Which model provider the worker uses. Anthropic is the default; Qwen is a
 # second provider selectable for testing.

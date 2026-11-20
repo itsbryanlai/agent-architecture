@@ -460,6 +460,9 @@ TENANT_SETTINGS_AUDIT_KINDS = ("tenant_settings",)
 POLICY_AUDIT_KINDS = ("policy_change",)
 # A person's 👍/👎 on an answer: the agent and version that answered, never the reason text.
 FEEDBACK_AUDIT_KINDS = ("feedback",)
+# A creator's test cases on a version, and a test run of them: references and hashes only,
+# never a question's text or a case's result detail.
+TEST_AUDIT_KINDS = ("test_case", "test_run")
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -478,6 +481,7 @@ AUDIT_KINDS = (
     + TENANT_SETTINGS_AUDIT_KINDS
     + POLICY_AUDIT_KINDS
     + FEEDBACK_AUDIT_KINDS
+    + TEST_AUDIT_KINDS
 )
 # 'policy' marks a write that ran under an admin's no-approval policy (D-43): it
 # succeeded, and no approval row precedes it.

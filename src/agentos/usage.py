@@ -319,6 +319,16 @@ class UsageStore(Protocol):
         """
         ...
 
+    async def spend_for_conversations(
+        self, tenant_id: str, conversation_ids: list[str]
+    ) -> tuple[Decimal, int]:
+        """The priced cost and the unpriced row count of these conversations' calls.
+
+        What a test run's cap check reads: the run's own spend, however the month's
+        rollup groups it. Adjustments made later are not counted here.
+        """
+        ...
+
 
 class InMemoryUsageStore:
     def __init__(self) -> None:
@@ -394,6 +404,19 @@ class InMemoryUsageStore:
             rolled.cost += g.cost
             rolled.unpriced_calls += g.unpriced_calls
         return list(groups.values())
+
+    async def spend_for_conversations(
+        self, tenant_id: str, conversation_ids: list[str]
+    ) -> tuple[Decimal, int]:
+        wanted = set(conversation_ids)
+        cost, unpriced = Decimal(0), 0
+        for e in self.events:
+            if e.tenant_id == tenant_id and e.conversation_id in wanted:
+                if e.cost is None:
+                    unpriced += 1
+                else:
+                    cost += e.cost
+        return cost, unpriced
 
 
 # The rollup row of a usage row: its UTC month, and the agent ('' when it has none).
@@ -575,6 +598,21 @@ class PostgresUsageStore:
             for (kind, agent_id, calls, cost, unpriced) in rows
         ]
 
+    async def spend_for_conversations(
+        self, tenant_id: str, conversation_ids: list[str]
+    ) -> tuple[Decimal, int]:
+        async with tenant_transaction(self._pool, tenant_id) as conn:
+            cur = await conn.execute(
+                """
+                SELECT COALESCE(sum(cost_usd), 0), count(*) FILTER (WHERE cost_usd IS NULL)
+                FROM usage_events
+                WHERE tenant_id = %s AND conversation_id = ANY(%s)
+                """,
+                (tenant_id, conversation_ids),
+            )
+            cost, unpriced = await cur.fetchone()
+        return Decimal(cost), int(unpriced)
+
 
 # --- recording ------------------------------------------------------------------------
 
@@ -617,6 +655,12 @@ class UsageRecorder:
         self.clock = clock
         self.listener = listener
         self.sleep = sleep
+
+    async def spend_for_conversations(
+        self, tenant_id: str, conversation_ids: list[str]
+    ) -> tuple[Decimal, int]:
+        """The store's read of these conversations' spend: what a test run's cap checks."""
+        return await self.store.spend_for_conversations(tenant_id, conversation_ids)
 
     async def llm_call(
         self,

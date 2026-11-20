@@ -90,6 +90,8 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
+| `connectors/base.py` | The connector interface: the `Connector` and `ConnectorErrors` protocols and the shared grant and error vocabulary; reads dispatch by manifest tool name, writes by kind (the marker lookup and the write) | `connectors/test_connector_contract.py` |
+| `connectors/registry.py` | The composition root: connectors keyed by the manifest's connector name; activities build a connector for an agent's grants and classify errors through it | `connectors/test_connector_contract.py`, `core/test_llm_errors.py` |
 | `connectors/notion.py` | The Notion connector. The agent's grants are checked before a call that names a database; an ungranted page is indistinguishable from a missing one | `connectors/test_notion_connector.py`, `knowledge/test_notion_reads.py`, `connectors/test_notion_transport.py` |
 | `connectors/manifest.py`, `connectors/manifests/` | Safety metadata per tool (risk, idempotency, requester scoping, input schema, the low-risk flag a comment action may carry) that the runtime reads | `connectors/test_manifest.py`, `connectors/test_notion_connector.py`, `core/test_task_actions.py` |
 | `connectors/notion_errors.py` | The one table that says whether a Notion error is worth retrying | `connectors/test_notion_transport.py` |

@@ -6,13 +6,14 @@ Rules kept here:
   ``TurnContext`` / ``TaskSpec`` tenant, or an explicit ``tenant_id``. It uses
   only that tenant's Slack and Notion clients, and an unknown tenant is a
   non-retryable failure, never a fallback to some other tenant.
-* The agent uses its own access. Notion calls go through a ``NotionConnector``
-  built from the grants of the agent's current published version, read from
-  the agent store at call time, which checks every call before it is sent. A
-  grant removed by a new published version applies to the next call, also for
-  a write that was approved earlier. A turn's model steps and audience check
-  read the version the turn started with instead (``_pinned``), so a publish
-  in the middle of a turn does not change its prompt or tools.
+* The agent uses its own access. Connector calls go through the registered
+  connector (``agentos.connectors.registry``) built from the grants of the
+  agent's current published version, read from the agent store at call time,
+  which checks every call before it is sent. A grant removed by a new published
+  version applies to the next call, also for a write that was approved earlier.
+  A turn's model steps and audience check read the version the turn started
+  with instead (``_pinned``), so a publish in the middle of a turn does not
+  change its prompt or tools.
 * The requester comes from ``TurnContext`` / ``TaskSpec``, which the runtime
   filled in from the Slack event. Requester-scoped tool fields (the person
   whose records are read) are filled in here, never by the LLM.
@@ -63,7 +64,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import NoReturn, TypeVar
+from typing import NoReturn, TypeVar, cast
 
 from slack_sdk.errors import SlackApiError
 from temporalio import activity
@@ -99,7 +100,7 @@ from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop_text
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
-from agentos.connectors import notion_errors
+from agentos.connectors.base import Connector, ConnectorError, Entry
 from agentos.connectors.manifest import (
     MANIFEST_DIR,
     TOOLS,
@@ -107,12 +108,8 @@ from agentos.connectors.manifest import (
     require_idempotency,
     screen,
 )
-from agentos.connectors.notion import (
-    ConnectorError,
-    NotionConnector,
-    normalize_id,
-)
-from agentos.connectors.notion_limiter import bulk_priority
+from agentos.connectors.notion import normalize_id, nudge_comment_text
+from agentos.connectors.registry import connector_for, error_classes
 from agentos.content_store import ContentStore, InMemoryContentStore, StoredStep
 from agentos.feedback import answer_blocks
 from agentos.history_view import prepare_for_model
@@ -275,6 +272,11 @@ def _item_from_ref(ref: str) -> NotionItem:
     return NotionItem(**json.loads(ref))
 
 
+def _write_ref(made: NotionItem | str) -> str:
+    """The stored reference of a write: an item's fields as JSON, a comment's ID as it is."""
+    return _item_ref(made) if isinstance(made, NotionItem) else made
+
+
 def _non_retryable(err: Exception) -> ApplicationError:
     return ApplicationError(str(err), type=type(err).__name__, non_retryable=True)
 
@@ -292,13 +294,16 @@ def _tool_connector(name: str) -> str:
 def _is_client_error(err: Exception) -> bool:
     """A 4xx (other than 408 and 429) will not succeed on retry.
 
-    A Notion API error is judged by its error code (``notion_errors``): a 409 conflict is
-    retried and a missing page is not. The Anthropic and OpenAI SDK errors carry the HTTP
-    status in ``status_code``, and anything else with a ``status`` is judged by it.
-    Timeouts (408) and rate limits (429) are transient, so they stay retryable.
+    A connector API error is judged by its own error table (the registry's error
+    classes): a 409 conflict is retried and a missing page is not. The Anthropic and
+    OpenAI SDK errors carry the HTTP status in ``status_code``, and anything else with
+    a ``status`` is judged by it. Timeouts (408) and rate limits (429) are transient,
+    so they stay retryable.
     """
-    if notion_errors.is_notion_error(err):
-        return notion_errors.is_final(err)
+    for errors in error_classes():
+        entry = errors.entry_for(err)
+        if entry is not None:
+            return not entry.retryable
     for attr in ("status", "status_code"):
         status = getattr(err, attr, None)
         if isinstance(status, int) and not isinstance(status, bool):
@@ -307,12 +312,22 @@ def _is_client_error(err: Exception) -> bool:
 
 
 def _reraise(err: Exception) -> NoReturn:
-    """Raise a retryable error for Temporal to retry: as it is, or, when Notion named how
-    long to wait (``Retry-After`` on a 429), as a failure that carries that wait."""
-    delayed = notion_errors.retry_failure(err)
-    if delayed is not None:
-        raise delayed from err
+    """Raise a retryable error for Temporal to retry: as it is, or, when the connector
+    named how long to wait (``Retry-After`` on a 429), as a failure that carries that wait."""
+    for errors in error_classes():
+        delayed = errors.retry_failure(err)
+        if delayed is not None:
+            raise delayed from err
     raise err
+
+
+def _final_entry(err: Exception) -> Entry | None:
+    """The user-facing entry of a connector error that retrying cannot fix, or None."""
+    for errors in error_classes():
+        entry = errors.entry_for(err)
+        if entry is not None and not entry.retryable:
+            return entry
+    return None
 
 
 def _activity_ref(fallback_workflow_id: str) -> tuple[str, str, str, int]:
@@ -559,14 +574,11 @@ class AgentActivities:
                 self._versions.popitem(last=False)
         return agent
 
-    def _connector_for(self, tenant_id: str, agent: AgentVersion) -> NotionConnector:
+    def _connector_for(self, tenant_id: str, agent: AgentVersion) -> Connector:
         """A connector limited to the grants of this version of the agent."""
-        runtime = self._runtime(tenant_id)
-        return NotionConnector(
-            runtime.notion_api, agent.grants.notion_databases, users=runtime.notion_users
-        )
+        return connector_for(NOTION, self._runtime(tenant_id), agent)
 
-    async def _connector(self, tenant_id: str, agent_id: str) -> NotionConnector:
+    async def _connector(self, tenant_id: str, agent_id: str) -> Connector:
         return self._connector_for(tenant_id, await self._agent(tenant_id, agent_id))
 
     async def _gate_refusal(
@@ -1758,27 +1770,21 @@ class AgentActivities:
             else await self._connector(ctx.tenant_id, ctx.agent_id)
         )
         try:
-            if call.name == "search_items":
-                query = call.input.get("query")
-                if not isinstance(query, str) or not query.strip():
-                    return "search_items needs a non-empty 'query'.", True
-                items = await connector.search_items(query.strip())
-            elif call.name == "my_items":
-                # The person is always the requester from the runtime; any
-                # person field in the LLM's input is ignored.
+            # The person is always the requester from the runtime; any
+            # person field in the LLM's input is ignored.
+            email = None
+            spec = connector.manifest.tools.get(call.name)
+            if spec is not None and spec.requester_scoped:
                 email = await self._runtime(ctx.tenant_id).slack.user_email(ctx.requester_user_id)
-                if not email:
-                    return "I couldn't read your Slack email, so I can't find your items.", True
-                items = await connector.my_items(email)
-            else:
-                return f"Unknown tool '{call.name}'.", True
+            items = await connector.read(call.name, call.input, requester_email=email)
         except ConnectorError as err:
             return str(err), True
-        except Exception as err:  # noqa: BLE001 - final Notion errors become a result, the rest re-raise
-            # Notion answered that it will not do this, now or on a retry (a revoked
+        except Exception as err:  # noqa: BLE001 - final connector errors become a result, the rest re-raise
+            # The connector answered that it will not do this, now or on a retry (a revoked
             # database, a refused key): the model gets an error result it can pass on and
             # the turn goes on. Anything retryable is raised for Temporal.
-            if notion_errors.is_final(err):
+            entry = _final_entry(err)
+            if entry is not None:
                 log.warning(
                     "read tool refused by notion tenant_id=%s agent_id=%s tool=%s code=%s",
                     ctx.tenant_id,
@@ -1786,7 +1792,7 @@ class AgentActivities:
                     call.name,
                     getattr(err, "code", None),
                 )
-                return notion_errors.entry_for(err).text, True
+                return entry.text, True
             _reraise(err)
         return _format_items(items), False
 
@@ -2303,18 +2309,22 @@ class AgentActivities:
         # since this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
-        text = payload["comment"]
         if not spec.under_policy:
             await self._record_approval(spec, payload, task_id, page_id)
         try:
             await connector.resolve_item(page_id)
-            comment_id = await self._write_once(
-                ctx.tenant_id,
-                idem_key,
-                find=lambda: connector.find_comment(page_id, idem_key),
-                write=lambda: connector.create_comment(page_id, text, idem_key, agent.name),
-                to_ref=lambda comment_id: comment_id,
-                from_ref=lambda ref: ref,
+            comment_id = cast(
+                str,
+                await self._write_once(
+                    ctx.tenant_id,
+                    idem_key,
+                    find=lambda: connector.find_write("add_comment", page_id, idem_key),
+                    write=lambda: connector.write(
+                        "add_comment", page_id, payload, idem_key, agent_name=agent.name
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=lambda ref: ref,
+                ),
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
@@ -2351,20 +2361,23 @@ class AgentActivities:
         try:
             connector.grant_for(database_id)
             requester = await self._requester(spec, task_id, agent)
-            item = await self._write_once(
-                ctx.tenant_id,
-                idem_key,
-                find=lambda: connector.find_item(database_id, idem_key),
-                write=lambda: connector.create_item(
-                    database_id,
-                    payload["title"],
-                    payload["details"],
+            item = cast(
+                NotionItem,
+                await self._write_once(
+                    ctx.tenant_id,
                     idem_key,
-                    notion_user_id=requester["notion_user_id"],
-                    requester_line=requester["line"],
+                    find=lambda: connector.find_write("create_item", database_id, idem_key),
+                    write=lambda: connector.write(
+                        "create_item",
+                        database_id,
+                        payload,
+                        idem_key,
+                        agent_name=agent.name,
+                        requester=requester,
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=_item_from_ref,
                 ),
-                to_ref=_item_ref,
-                from_ref=_item_from_ref,
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
@@ -2394,7 +2407,10 @@ class AgentActivities:
         item = (
             _item_from_ref(ref)
             if ref is not None
-            else await connector.find_item(payload["database_id"], idem_key)
+            else cast(
+                NotionItem | None,
+                await connector.find_write("create_item", payload["database_id"], idem_key),
+            )
         )
         if item is None:
             return None
@@ -2417,7 +2433,9 @@ class AgentActivities:
         comment_id = await self.writes.result(ctx.tenant_id, idem_key)
         if comment_id is None:
             await connector.resolve_item(page_id)
-            comment_id = await connector.find_comment(page_id, idem_key)
+            comment_id = cast(
+                str | None, await connector.find_write("add_comment", page_id, idem_key)
+            )
         if comment_id is None:
             return None
         await self._record_write(
@@ -2608,19 +2626,21 @@ class AgentActivities:
         # this write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
-        text, mention = _nudge_comment_text(payload)
         await self._record_approval(spec, payload, task_id, page_id)
         try:
             await connector.resolve_item(page_id)
-            comment_id = await self._write_once(
-                ctx.tenant_id,
-                idem_key,
-                find=lambda: connector.find_comment(page_id, idem_key),
-                write=lambda: connector.create_comment(
-                    page_id, text, idem_key, agent.name, mention_user_id=mention
+            comment_id = cast(
+                str,
+                await self._write_once(
+                    ctx.tenant_id,
+                    idem_key,
+                    find=lambda: connector.find_write("add_comment", page_id, idem_key),
+                    write=lambda: connector.write(
+                        "add_comment", page_id, payload, idem_key, agent_name=agent.name
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=lambda ref: ref,
                 ),
-                to_ref=lambda comment_id: comment_id,
-                from_ref=lambda ref: ref,
             )
         except Exception as err:
             if isinstance(err, ConnectorError) or _is_client_error(err):
@@ -2711,8 +2731,9 @@ class AgentActivities:
             raise ApplicationError(connector_off_text("notion"), type="ConnectorOff")
         try:
             connector = await self._connector(tenant_id, agent_id)
-            with bulk_priority():
-                return await connector.get_item(page_id)
+            with connector.bulk_priority():
+                items = await connector.read("get_item", {"page_id": page_id})
+            return items[0]
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -3091,21 +3112,6 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
     return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
 
 
-def _nudge_comment_text(payload: dict) -> tuple[str, str | None]:
-    """The comment a nudge posts: its text and the Notion user to mention, if any.
-
-    A Slack-matched assignee is a real Notion mention (the user object, rendered as
-    their name); an assignee with no Slack match is a plain-name mention in the text;
-    no assignee means the text alone. The card previews exactly this.
-    """
-    text = payload["comment"]
-    if payload.get("assignee_slack_id") and payload.get("assignee_notion_id"):
-        return text, payload["assignee_notion_id"]
-    if payload.get("assignee_notion_id") and payload.get("assignee_name"):
-        return f"@{payload['assignee_name']} {text}", None
-    return text, None
-
-
 def _nudge_dm_text(payload: dict) -> str:
     """The DM a nudge sends: who asked, the item and its link, the approved text.
 
@@ -3172,7 +3178,7 @@ def approval_card_blocks(
     if spec.tool_name == "nudge":
         # Both effects previewed exactly as they will run, built from the same approved
         # revision the write activities read: the comment with its mention, and the DM.
-        comment_text, mention = _nudge_comment_text(shown)
+        comment_text, mention = nudge_comment_text(shown)
         preview = f"@{shown['assignee_name']} {comment_text}" if mention else comment_text
         head = {
             "type": "section",

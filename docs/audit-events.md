@@ -65,13 +65,19 @@ Written when an approved write is carried out, as the agent. Requester is the pe
 the approver is the same person (only the requester can approve). Tool is the write tool's name
 (`add_comment` for a comment, otherwise the create tool the agent's connector declares). Target is the Notion database ID
 for a create or the page ID for a comment (after a create, the new page ID on success).
+A nudge (D-41) records one `approval` with tool `nudge` and one `write` per effect: tool
+`nudge_comment` (target the page ID) and, when the assignee matched a Slack user, `nudge_dm`
+(target the assignee's Slack user ID, out the hash of `{ts}`). A nudge with no DM records no
+`nudge_dm` row. A DM Slack refuses for good (a gone channel or user, an inactive account) records
+`write` with `error` and is not retried; a DM that failed after the comment with a transient error
+records no row (the thread line says so).
 `approval_closed` is the exception: it is written when no approved write is carried out (a decline
 or an expiry), with its own tool, target and approver as its row states.
 
 | Kind | Written when | in / out | Refused or failed | Event key |
 |---|---|---|---|---|
 | `approval` | The approved write starts, before anything is sent. Records the exact payload that was approved. | in: hash of the approved payload; out: - | Also written for a write refused later (switch, audience, idempotency method), because the approval did happen | `<task>:audit:approval:<approval nonce>` |
-| `write` | The write finished (or a reconciliation found it done): `ok`. Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}` or `{comment_id}` on `ok`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, or no connector manifest declares the idempotency method. Nothing was changed. | `<task>:<create or comment>:audit:write:<outcome>` |
+| `write` | The write finished (or a reconciliation found it done): `ok`. Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}`, `{comment_id}` or `{ts}` (a nudge DM) on `ok`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, Slack refused the nudge DM for good, or no connector manifest declares the idempotency method. Nothing was changed. | `<task>:<create, comment or dm>:audit:write:<outcome>` |
 | `approval_closed` | The approval closed without a write: the requester declined it, or it expired. Recorded before the card is updated. Tool is `declined` or `expired` (not the write tool's name); target is empty; the approver is the requester on a decline, empty on an expiry. | in: hash of the proposed payload (the revision the card named); out: - | Not written if the audit store stayed down through the activity's retries, or if the named draft revision is missing (non-retryable); either way the card still closes | `<task>:audit:approval-closed:<approval nonce>` |
 
 A write that is never approved (declined, expired) records one `approval_closed` event and no `approval` or `write`: nothing ran.

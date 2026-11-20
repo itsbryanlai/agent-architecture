@@ -140,8 +140,14 @@ class NotionAPI(Protocol):
         """The ID of the integration's own bot user (the author of its comments)."""
         ...
 
-    async def create_comment(self, page_id: str, text: str) -> dict:
-        """Add a comment to a page (needs the "Insert comments" capability)."""
+    async def create_comment(
+        self, page_id: str, text: str, mention_user_id: str | None = None
+    ) -> dict:
+        """Add a comment to a page (needs the "Insert comments" capability).
+
+        With ``mention_user_id`` the comment opens with a mention of that user,
+        which Notion renders as their name and notifies them about.
+        """
         ...
 
     async def list_comments(self, page_id: str) -> list[dict]:
@@ -280,10 +286,17 @@ class RealNotionAPI:
             schema[name] = {"id": prop.get("id", ""), "type": ptype, "options": options}
         return schema
 
-    async def create_comment(self, page_id: str, text: str) -> dict:
-        return await self._client.comments.create(
-            parent={"page_id": page_id}, rich_text=[{"type": "text", "text": {"content": text}}]
-        )
+    async def create_comment(
+        self, page_id: str, text: str, mention_user_id: str | None = None
+    ) -> dict:
+        rich_text: list[dict] = []
+        if mention_user_id:
+            rich_text.append(
+                {"type": "mention", "mention": {"type": "user", "user": {"id": mention_user_id}}}
+            )
+            text = f" {text}"
+        rich_text.append({"type": "text", "text": {"content": text}})
+        return await self._client.comments.create(parent={"page_id": page_id}, rich_text=rich_text)
 
     async def list_comments(self, page_id: str) -> list[dict]:
         comments: list[dict] = []
@@ -519,7 +532,16 @@ class FakeNotionAPI:
         self.free_pages[normalize_id(page_id)]["parent"] = parent
 
     def trash_page(self, page_id: str) -> None:
-        self.free_pages[normalize_id(page_id)]["in_trash"] = True
+        key = normalize_id(page_id)
+        if key in self.free_pages:
+            self.free_pages[key]["in_trash"] = True
+            return
+        for pages in self.databases.values():
+            for stored_id, page in pages.items():
+                if normalize_id(stored_id) == key:
+                    page["in_trash"] = True
+                    return
+        raise KeyError(page_id)
 
     def remove_child_page(self, parent_id: str, page_id: str) -> None:
         """Drop a page's ``child_page`` block from its parent and delete the page."""
@@ -539,6 +561,18 @@ class FakeNotionAPI:
                     "id": prop_id,
                     "type": "status",
                     "status": {"name": status},
+                }
+                return
+        raise KeyError(page_id)
+
+    def set_people(self, page_id: str, prop: str, user_ids: list[str]) -> None:
+        for db_key, pages in self.databases.items():
+            if page_id in pages:
+                name, prop_id = self._lookup(db_key, prop)
+                pages[page_id]["properties"][name] = {
+                    "id": prop_id,
+                    "type": "people",
+                    "people": [{"id": u} for u in user_ids],
                 }
                 return
         raise KeyError(page_id)
@@ -645,10 +679,13 @@ class FakeNotionAPI:
             raise FakeNotFound(block_id)
         return copy.deepcopy(self.children.get(key, []))
 
-    async def create_comment(self, page_id: str, text: str) -> dict:
-        self.calls.append(("create_comment", {"page_id": page_id}))
-        _check_text_length(text)
-        comment = self._store_comment(page_id, text, self.bot_id)
+    async def create_comment(
+        self, page_id: str, text: str, mention_user_id: str | None = None
+    ) -> dict:
+        self.calls.append(
+            ("create_comment", {"page_id": page_id, "mention_user_id": mention_user_id})
+        )
+        comment = self._store_comment(page_id, text, self.bot_id, mention_user_id)
         if self._visibility_delay:
             self._hidden_comments[comment["id"]] = self._visibility_delay
         await self._after_write("comment")
@@ -668,12 +705,22 @@ class FakeNotionAPI:
         self.calls.append(("bot_user_id", {}))
         return self.bot_id
 
-    def _store_comment(self, page_id: str, text: str, author_id: str) -> dict:
+    def _store_comment(
+        self, page_id: str, text: str, author_id: str, mention_user_id: str | None = None
+    ) -> dict:
+        rich_text: list[dict] = []
+        if mention_user_id:
+            rich_text.append(
+                {"type": "mention", "mention": {"type": "user", "user": {"id": mention_user_id}}}
+            )
+            text = f" {text}"
+        _check_text_length(text)
+        rich_text.append(_rich({"text": {"content": text}}))
         comment = {
             "object": "comment",
             "id": str(uuid.uuid4()),
             "created_by": {"object": "user", "id": author_id},
-            "rich_text": [_rich({"text": {"content": text}})],
+            "rich_text": rich_text,
         }
         self.comments.setdefault(normalize_id(page_id), []).append(comment)
         return comment
@@ -832,6 +879,7 @@ EXPECTED_TYPES = {
     "status": ("status", "select"),
     "requested_by": ("people",),
     "request_id": ("rich_text",),
+    "assignee": ("people",),
 }
 
 
@@ -842,7 +890,9 @@ class GrantCheck:
     ``resolved`` maps each role to the Notion property ID found for it.
     ``problems`` make the agent unavailable (at publish, or at the worker's
     health check); ``notes`` are worth knowing but do not (a property renamed
-    in Notion is still found by its ID).
+    in Notion is still found by its ID). A broken assignee mapping is a note,
+    not a problem: it disables only the nudge, which then comments without a
+    mention, never the agent.
     """
 
     resolved: dict[str, str] = field(default_factory=dict)
@@ -851,12 +901,18 @@ class GrantCheck:
 
 
 def _grant_role_config(grant: NotionDatabaseGrant) -> dict[str, tuple[str, str | None]]:
-    return {
+    roles = {
         "title": (grant.title_prop, grant.title_prop_id),
         "status": (grant.status_prop, grant.status_prop_id),
         "requested_by": (grant.requested_by_prop, grant.requested_by_prop_id),
         "request_id": (grant.request_id_prop, grant.request_id_prop_id),
     }
+    # The assignee is optional: unconfigured, it is not checked at all; configured, it
+    # is held to the same rules as the other roles, but a failure is reported as a
+    # nudge-only note (see check_grant), never as a problem that disables the agent.
+    if grant.assignee_prop or grant.assignee_prop_id:
+        roles["assignee"] = (grant.assignee_prop, grant.assignee_prop_id)
+    return roles
 
 
 def _find_by_name_loosely(schema: dict[str, dict], name: str) -> tuple[str, str] | None:
@@ -889,19 +945,22 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
     ID is a problem. With it false (the check command), a role without an ID is
     looked up by exact name so its ID can be printed; a near-match by name is
     still a problem, because the agent must not guess which property was meant.
+
+    The assignee is the exception: its failures are reported as notes, for the
+    console's grant check and the health log, because a broken assignee mapping
+    disables only the nudge (a comment without a mention), never the agent.
     """
     schema = await api.retrieve_schema(grant.id)
     by_id = {prop["id"]: (name, prop) for name, prop in schema.items()}
     result = GrantCheck()
 
     for role, (configured_name, configured_id) in _grant_role_config(grant).items():
+        sink = result.notes if role == "assignee" else result.problems
         found: tuple[str, dict] | None = None
         if configured_id:
             found = by_id.get(configured_id)
             if found is None:
-                result.problems.append(
-                    f"{role}: no property with ID '{configured_id}' in the database"
-                )
+                sink.append(f"{role}: no property with ID '{configured_id}' in the database")
                 continue
             if found[0] != configured_name:
                 result.notes.append(
@@ -909,19 +968,15 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
                 )
         else:
             if require_ids:
-                result.problems.append(
-                    f"{role}: no property ID configured; run agentos.check_grants"
-                )
+                sink.append(f"{role}: no property ID configured; run agentos.check_grants")
             if configured_name in schema:
                 found = (configured_name, schema[configured_name])
             else:
                 near = _find_by_name_loosely(schema, configured_name)
                 if near is None:
-                    result.problems.append(
-                        f"{role}: no property named '{configured_name}' in the database"
-                    )
+                    sink.append(f"{role}: no property named '{configured_name}' in the database")
                 else:
-                    result.problems.append(
+                    sink.append(
                         f"{role}: no property named '{configured_name}'; "
                         f"found '{near[0]}' ({near[1]})"
                     )
@@ -931,9 +986,7 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
         result.resolved[role] = prop["id"]
         if prop["type"] not in EXPECTED_TYPES[role]:
             expected = " or ".join(EXPECTED_TYPES[role])
-            result.problems.append(
-                f"{role}: property '{name}' has type '{prop['type']}', expected {expected}"
-            )
+            sink.append(f"{role}: property '{name}' has type '{prop['type']}', expected {expected}")
         if role == "status" and prop["type"] in ("status", "select"):
             for done in grant.done_values:
                 if done not in prop.get("options", []):
@@ -1047,10 +1100,10 @@ class NotionUserCache:
 
     One instance lives in the tenant's runtime, so every connector built for a call
     shares it. A lookup of a person reads the whole user list once and keeps it
-    as an email-to-ID map until it expires. An email missing from the map is a
-    cached "no match" for the same time, so a requester with no Notion account
-    does not page the user list again on every call. The integration's own bot
-    user ID is kept the same way.
+    as an email-to-ID map and an ID-to-person map until they expire. An email
+    missing from the map is a cached "no match" for the same time, so a requester
+    with no Notion account does not page the user list again on every call. The
+    integration's own bot user ID is kept the same way.
     """
 
     def __init__(
@@ -1061,10 +1114,23 @@ class NotionUserCache:
         self._ttl = ttl_seconds
         self._clock = clock
         self._users: dict[str, str] | None = None
+        self._people: dict[str, dict] | None = None
         self._users_until = 0.0
         self._bot: str | None = None
         self._bot_until = 0.0
         self._lock = asyncio.Lock()
+
+    async def _refresh(self, api: NotionAPI) -> None:
+        users: dict[str, str] = {}
+        people: dict[str, dict] = {}
+        for user in await api.list_users():
+            person_email = ((user.get("person") or {}).get("email") or "").strip().lower()
+            if person_email:
+                users.setdefault(person_email, user["id"])
+            people[user["id"]] = {"name": user.get("name") or "", "email": person_email or None}
+        self._users = users
+        self._people = people
+        self._users_until = self._clock() + self._ttl
 
     async def user_id(self, api: NotionAPI, email: str | None) -> str | None:
         """The Notion user ID for an email, or None when the workspace has no such person."""
@@ -1073,14 +1139,19 @@ class NotionUserCache:
         key = email.strip().lower()
         async with self._lock:
             if self._users is None or self._clock() >= self._users_until:
-                users: dict[str, str] = {}
-                for user in await api.list_users():
-                    person_email = ((user.get("person") or {}).get("email") or "").strip().lower()
-                    if person_email:
-                        users.setdefault(person_email, user["id"])
-                self._users = users
-                self._users_until = self._clock() + self._ttl
+                await self._refresh(api)
             return self._users.get(key)
+
+    async def person(self, api: NotionAPI, user_id: str) -> dict | None:
+        """The person's ``name`` and ``email`` as the workspace shows them, or None.
+
+        ``email`` is None when the user has none or the integration may not see
+        emails (its user-email capability is off); the name is still shown.
+        """
+        async with self._lock:
+            if self._people is None or self._clock() >= self._users_until:
+                await self._refresh(api)
+            return self._people.get(user_id)
 
     async def bot_id(self, api: NotionAPI) -> str:
         async with self._lock:
@@ -1222,6 +1293,10 @@ class NotionConnector:
         return item
 
     async def _granted_page(self, page_id: str) -> tuple[NotionDatabaseGrant, NotionItem]:
+        grant, page = await self._granted_raw_page(page_id)
+        return grant, self._to_item(grant, page)
+
+    async def _granted_raw_page(self, page_id: str) -> tuple[NotionDatabaseGrant, dict]:
         try:
             page = await self._api.retrieve_page(page_id)
         except Exception as err:
@@ -1233,7 +1308,27 @@ class NotionConnector:
             raise UnknownItem(UNKNOWN_PAGE_TEXT)
         if page.get("in_trash") or page.get("archived"):
             raise UnknownItem("The item was moved to the trash.")
-        return grant, self._to_item(grant, page)
+        return grant, page
+
+    async def assignee_user_id(self, page_id: str) -> str | None:
+        """The first person in the grant's assignee property, or None.
+
+        None when the grant maps no assignee property or the property is empty.
+        The page must sit in a granted database, the same check as any write target.
+        """
+        grant, page = await self._granted_raw_page(page_id)
+        if not grant.assignee_prop_id:
+            return None
+        prop = next(
+            (
+                p
+                for p in (page.get("properties") or {}).values()
+                if isinstance(p, dict) and p.get("id") == grant.assignee_prop_id
+            ),
+            {},
+        )
+        people = prop.get("people") or []
+        return people[0]["id"] if people else None
 
     async def find_comment(self, page_id: str, idem_key: str) -> str | None:
         """The ID of the comment an earlier attempt made under ``idem_key``, if visible.
@@ -1250,15 +1345,29 @@ class NotionConnector:
                 return comment["id"]
         return None
 
-    async def create_comment(self, page_id: str, text: str, idem_key: str, agent_name: str) -> str:
-        """Add the comment, ending with the agent's name and the key's reference."""
+    async def create_comment(
+        self,
+        page_id: str,
+        text: str,
+        idem_key: str,
+        agent_name: str,
+        mention_user_id: str | None = None,
+    ) -> str:
+        """Add the comment, ending with the agent's name and the key's reference.
+
+        With ``mention_user_id`` the comment opens with a mention of that Notion
+        user; the reference still ends the text, so a retry finds it the same way.
+        """
         body = f"{text}\n\n— {agent_name[:SIGNATURE_NAME_MAX]}, {comment_ref(idem_key)}"
-        if len(body) > NOTION_TEXT_MAX:
+        # A real mention renders as the user's name and the API puts a space before
+        # the text that follows it; that space counts against Notion's limit too.
+        size = len(body) + (1 if mention_user_id else 0)
+        if size > NOTION_TEXT_MAX:
             raise ConnectorError(
-                f"The comment is {len(body)} characters with its signature; "
+                f"The comment is {size} characters with its signature; "
                 f"Notion allows {NOTION_TEXT_MAX}."
             )
-        created = await self._api.create_comment(page_id, body)
+        created = await self._api.create_comment(page_id, body, mention_user_id=mention_user_id)
         return created["id"]
 
     async def _notion_user_id(self, email: str | None) -> str | None:

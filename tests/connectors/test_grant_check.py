@@ -90,6 +90,34 @@ async def test_check_renamed_property_by_id_is_note(agents):
     assert "'Status'" in check.notes[0] and "'Stage'" in check.notes[0]
 
 
+@pytest.mark.parametrize(
+    ("broken", "reported"),
+    [("missing", True), ("wrong-type", True), ("no-id", True), ("healthy", False)],
+)
+async def test_a_broken_assignee_mapping_is_reported_but_never_disables_the_agent(
+    agents, broken, reported
+):
+    """Fails if a broken assignee mapping becomes a grant problem, or goes unreported."""
+    api = make_fake_notion()
+    grant = replace(grant_from(agents), assignee_prop="Assignee", assignee_prop_id="asg1")
+    schema = default_schema()
+    if broken != "missing":
+        schema["Assignee"] = {
+            "id": "asg1",
+            "type": "rich_text" if broken == "wrong-type" else "people",
+        }
+    if broken == "no-id":
+        grant = replace(grant, assignee_prop_id=None)
+    api.set_schema(DB_ID, schema)
+    agent = agents.agents["it-helper"]
+    version = replace(agent, grants=replace(agent.grants, notion_databases=[grant]))
+
+    [report] = await NotionGrantChecker(lambda t: api).check(TENANT, version)
+
+    assert report.ok
+    assert any("assignee" in note for note in report.notes) == reported
+
+
 async def test_connector_uses_ids_in_filters_and_create(agents):
     api = make_fake_notion()
     # Names differ from the config; only IDs can work.

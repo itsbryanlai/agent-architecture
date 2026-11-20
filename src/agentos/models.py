@@ -234,6 +234,48 @@ class WatchState:
     deadline: datetime
     # A poke arrived and has not been answered by a poll yet.
     poked: bool = False
+    # Nudges this task has run; the live stale offer's nonce (empty when none); and the
+    # nudge task in flight (empty when none). A watch recorded before nudges carries none.
+    nudges_used: int = 0
+    nudge_nonce: str = ""
+    nudge_child: str = ""
+    # A click or a report the watch loop has not applied yet; a hop must not drop it.
+    nudge_requested: bool = False
+    nudge_done: bool = False
+
+
+@dataclass
+class NudgeRequest:
+    """A click on a stale notice's "Nudge the assignee" button.
+
+    The nonce is the offer's, issued when the stale notice was posted; the user is the
+    signed clicker. The workflow accepts it only from the requester, on the live offer.
+    """
+
+    nonce: str
+    user_id: str
+
+
+@dataclass
+class NudgeDone:
+    """A nudge task tells the watch it came from: the comment landed, the clock restarts.
+
+    Sent only when the nudge ran; a declined, expired or failed nudge sends nothing.
+    """
+
+    child_id: str
+
+
+@dataclass
+class NudgePrepared:
+    """What preparing a nudge found: the draft is stored, or there is nobody to nudge.
+
+    ``refused`` is True when the assignee resolved to the requester themselves.
+    ``dm`` says the assignee matched a Slack user, so the nudge includes a DM.
+    """
+
+    refused: bool = False
+    dm: bool = False
 
 
 @dataclass
@@ -253,6 +295,11 @@ class TaskSpec:
     database_id: str = ""
     # Set on a continue-as-new: the task is already past approval and only watches.
     resume: WatchState | None = None
+    # The watch that started this nudge task; it is told when the nudge ran. Empty otherwise.
+    parent_id: str = ""
+    # Whether the approved nudge includes a DM (the assignee matched a Slack user).
+    # Set by the watch from the prepared draft; edits change only the text, not this.
+    nudge_dm: bool = False
 
 
 @dataclass
@@ -273,6 +320,10 @@ NOTION_TEXT_MAX = 2000
 COMMENT_SIGNATURE_MAX = 100
 SIGNATURE_NAME_MAX = 26
 
+# The assignee name a nudge's plain-name mention may carry, capped when the draft is
+# frozen. A Notion name can be all "&", which escape to five characters each on the card.
+NUDGE_NAME_MAX = 80
+
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's
 # first draft, an edit) checks ``check_field``, so an accepted value always fits
@@ -280,6 +331,11 @@ SIGNATURE_NAME_MAX = 26
 EDITABLE_FIELDS = {
     "create_item": {"title": 150, "details": NOTION_TEXT_MAX - 100},
     "add_comment": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX},
+    # A nudge's editable text goes into both the comment and the DM; the mention and the
+    # DM's frame are the runtime's, rebuilt from the approved revision. The comment also
+    # carries a mention: worst case a plain-name one ("@<name> ", the name capped) or a
+    # real one's leading space, so the cap leaves its room under Notion's 2000 as well.
+    "nudge": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX - (NUDGE_NAME_MAX + len("@ "))},
 }
 
 # Room on the card for the escaped value, after the bold label above it.
@@ -288,6 +344,10 @@ _CARD_ROOM = {
     "details": 2000 - len("*Details*\n"),
     "comment": 3000 - len("*Comment*\n"),
 }
+# A nudge's comment preview shares its section with the mention ("@<name> ") behind a
+# longer label. The name is Notion-written, so its worst escaped size (five characters
+# per "&") is reserved too, and the section fits Slack's 3000 even for a hostile name.
+_NUDGE_COMMENT_ROOM = 3000 - len("*Comment on the item*\n") - (len("@ ") + 5 * NUDGE_NAME_MAX)
 
 
 def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:
@@ -298,10 +358,11 @@ def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | N
             f"'{name}' is {len(value)} characters; the limit is {limit}.",
             "Shorten it and call the tool again.",
         )
-    if len(escape_slack(value)) > _CARD_ROOM[name]:
+    room = _NUDGE_COMMENT_ROOM if tool_name == "nudge" else _CARD_ROOM[name]
+    if len(escape_slack(value)) > room:
         what = (
             f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "
-            f"approval card and the result is over its {_CARD_ROOM[name]}-character room."
+            f"approval card and the result is over its {room}-character room."
         )
         return what, "Shorten it or use fewer of them, and call the tool again."
     return None

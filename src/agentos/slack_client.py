@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 TRANSIENT_SLACK_ERRORS = frozenset(
     {"ratelimited", "rate_limited", "internal_error", "fatal_error", "service_unavailable"}
 )
+# Slack refusals of a nudge DM that a retry cannot fix: the DM channel or the user is
+# gone, or the account is inactive. The DM is audited as an error and not retried.
+PERMANENT_DM_ERRORS = frozenset({"channel_not_found", "user_not_found", "account_inactive"})
 PAGE_SIZE = 200
 # A workspace or channel has at most this many entries read; more is a bug or an abuse.
 MAX_PAGES = 500
@@ -156,6 +159,12 @@ class SlackPoster(Protocol):
         """Return the user's verified profile email (needs ``users:read.email``)."""
         ...
 
+    async def user_by_email(self, email: str) -> str | None:
+        """The Slack user ID for a profile email (``users.lookupByEmail``, needs
+        ``users:read.email``), or None when no user has it. A failed lookup raises
+        ``SlackLookupError``; only "no such user" is None."""
+        ...
+
     async def open_view(self, trigger_id: str, view: dict) -> None:
         """Open a modal. The trigger ID from a click is valid for 3 seconds."""
         ...
@@ -278,6 +287,16 @@ class RealSlackPoster:
     async def user_email(self, user_id: str) -> str | None:
         resp = await self._client.users_info(user=user_id)
         return (resp.get("user") or {}).get("profile", {}).get("email")
+
+    async def user_by_email(self, email: str) -> str | None:
+        try:
+            resp = await self._lookup_client.users_lookupByEmail(email=email)
+        except Exception as err:
+            error = _lookup_error(err)
+            if error.code == "users_not_found":
+                return None
+            raise error from err
+        return (resp.get("user") or {}).get("id") or None
 
     async def open_view(self, trigger_id: str, view: dict) -> None:
         await self._client.views_open(trigger_id=trigger_id, view=view)
@@ -492,6 +511,14 @@ class FakeSlack:
         self._fail_next_update: Exception | None = None
         self._update_failures_left: int | None = None
         self._hang_next_update: Hang | None = None
+        # Injection points for the failures a post meets in production. See the methods.
+        self._fail_after_post = 0
+        self._hang_after_post: list[Hang] = []
+        self._fail_next_post: Exception | None = None
+        self._post_failures_left: int | None = None
+        self._post_fail_channel: str | None = None
+        self._fail_next_open_dm: Exception | None = None
+        self._open_dm_failures_left: int | None = None
 
     def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
         """Make directory lookups raise ``error``: ``times`` of them, or all until set to None."""
@@ -512,6 +539,36 @@ class FakeSlack:
         self._hang_next_update = hang
         return hang
 
+    def fail_after_post(self, times: int = 1) -> None:
+        """The next ``times`` posts take effect and then raise a timeout, as when the
+        response is lost."""
+        self._fail_after_post = times
+
+    def hang_after_post(self) -> Hang:
+        """The next post takes effect, then waits until the returned ``Hang`` is
+        released. Another post meanwhile runs normally: this is how two attempts
+        overlap."""
+        from agentos.connectors.notion import Hang
+
+        hang = Hang()
+        self._hang_after_post.append(hang)
+        return hang
+
+    def fail_next_post(
+        self, error: Exception, times: int | None = 1, channel: str | None = None
+    ) -> None:
+        """Make post_message raise ``error`` before posting: the next ``times`` posts
+        (all when None), only those to ``channel`` when one is named."""
+        self._fail_next_post = error
+        self._post_failures_left = times
+        self._post_fail_channel = channel
+
+    def fail_next_open_dm(self, error: Exception, times: int | None = 1) -> None:
+        """Make open_dm raise ``error`` before opening: the next ``times`` calls
+        (all when None), as Slack refusing a DM with a gone or inactive user."""
+        self._fail_next_open_dm = error
+        self._open_dm_failures_left = times
+
     def _next_ts(self) -> str:
         self._ts += 1
         return f"1700000000.{self._ts:06d}"
@@ -522,6 +579,13 @@ class FakeSlack:
 
     async def post_message(self, channel, text, thread_ts=None, blocks=None, metadata=None) -> str:
         _check_blocks(blocks)
+        if self._fail_next_post is not None and self._post_fail_channel in (None, channel):
+            error = self._fail_next_post
+            if self._post_failures_left is not None:
+                self._post_failures_left -= 1
+                if self._post_failures_left <= 0:
+                    self._fail_next_post = None
+            raise error
         ts = self._next_ts()
         sent = {
             "channel": channel,
@@ -533,6 +597,11 @@ class FakeSlack:
         }
         self.calls.append(("post_message", sent))
         self.messages.append(sent)
+        if self._hang_after_post:
+            await self._hang_after_post.pop(0).wait()
+        if self._fail_after_post:
+            self._fail_after_post -= 1
+            raise TimeoutError("simulated lost response after the post took effect")
         return ts
 
     async def find_post(self, channel, thread_ts, marker, since) -> str | None:
@@ -574,11 +643,27 @@ class FakeSlack:
 
     async def open_dm(self, user_id: str) -> str:
         self.calls.append(("open_dm", {"user_id": user_id}))
+        if self._fail_next_open_dm is not None:
+            error = self._fail_next_open_dm
+            if self._open_dm_failures_left is not None:
+                self._open_dm_failures_left -= 1
+                if self._open_dm_failures_left <= 0:
+                    self._fail_next_open_dm = None
+            raise error
         return f"D-{user_id}"
 
     async def user_email(self, user_id: str) -> str | None:
         self.calls.append(("user_email", {"user_id": user_id}))
         return self.emails.get(user_id)
+
+    async def user_by_email(self, email: str) -> str | None:
+        self.calls.append(("user_by_email", {"email": email}))
+        self._check_lookup()
+        key = email.strip().lower()
+        for user_id, known in self.emails.items():
+            if known.strip().lower() == key:
+                return user_id
+        return None
 
     async def open_view(self, trigger_id: str, view: dict) -> None:
         self.calls.append(("open_view", {"trigger_id": trigger_id, "view": view}))
@@ -624,7 +709,14 @@ class FakeSlack:
 
     def lookups(self) -> list[tuple[str, dict]]:
         """The directory reads made so far."""
-        names = {"user_info", "usergroup_members", "channel_members", "list_users", "list_channels"}
+        names = {
+            "user_info",
+            "user_by_email",
+            "usergroup_members",
+            "channel_members",
+            "list_users",
+            "list_channels",
+        }
         return [(name, kw) for name, kw in self.calls if name in names]
 
     def ephemerals(self) -> list[dict]:

@@ -126,16 +126,18 @@ def make_fake_notion() -> FakeNotionAPI:
             {
                 "object": "user",
                 "id": ALICE_NOTION,
+                "name": "Alice",
                 "type": "person",
                 "person": {"email": "Alice@Example.com"},
             },
             {
                 "object": "user",
                 "id": BOB_NOTION,
+                "name": "Bob",
                 "type": "person",
                 "person": {"email": "bob@example.com"},
             },
-            {"object": "user", "id": "bot-1", "type": "bot", "bot": {}},
+            {"object": "user", "id": "bot-1", "name": "notion-bot", "type": "bot", "bot": {}},
         ]
     )
     api.add_database(DB_ID)

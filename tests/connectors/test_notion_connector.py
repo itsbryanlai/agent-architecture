@@ -1,6 +1,7 @@
 import pytest
 
 from agentos.connectors.notion import (
+    ConnectorError,
     GrantDenied,
     NotionConnector,
     NotionUserCache,
@@ -103,3 +104,31 @@ async def test_a_cached_requester_is_looked_up_again_after_the_ttl(agents):
     api.users.append({"object": "user", "id": "notion-new", "person": {"email": "new@example.com"}})
     now[0] = 61
     assert await users.user_id(api, "new@example.com") == "notion-new"
+
+
+@pytest.mark.parametrize(
+    ("mention", "text_len", "fits"),
+    [(None, 1900, True), (BOB_NOTION, 1899, True), (BOB_NOTION, 1900, False)],
+    ids=["plain-at-limit", "mention-under-limit", "mention-space-overflows"],
+)
+async def test_the_comment_body_check_counts_the_mentions_leading_space(
+    agents, mention, text_len, fits
+):
+    """Fails if a comment at Notion's limit is sent when a real mention's leading space pushes it over."""
+    api = make_fake_notion()
+    page = api.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    conn = connector(api, agents)
+    name = "a" * 26  # the longest signature name: text plus signature is text plus 100
+
+    if fits:
+        await conn.create_comment(
+            page["id"], "c" * text_len, "acme:task:1:comment", name, mention_user_id=mention
+        )
+        [comment] = api.comments[page["id"].replace("-", "")]
+        assert len(comment["rich_text"][-1]["text"]["content"]) <= 2000
+    else:
+        with pytest.raises(ConnectorError):
+            await conn.create_comment(
+                page["id"], "c" * text_len, "acme:task:1:comment", name, mention_user_id=mention
+            )
+        assert api.count("create_comment") == 0

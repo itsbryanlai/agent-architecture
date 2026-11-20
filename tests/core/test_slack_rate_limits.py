@@ -301,6 +301,42 @@ async def test_update_carries_the_cards_channel_ts_and_section_only_blocks_over_
     assert wire_blocks(sent) == refusal_blocks
 
 
+@pytest.mark.parametrize("case", ["found", "not found", "missing scope"])
+async def test_user_by_email_over_the_wire(serve, case):
+    """Fails if the email lookup misses users.lookupByEmail, or maps Slack's answers wrong."""
+    scripts = {
+        "found": [(200, None, {"ok": True, "user": {"id": "U1"}})],
+        "not found": [(200, None, {"ok": False, "error": "users_not_found"})],
+        "missing scope": [
+            (200, None, {"ok": False, "error": "missing_scope", "needed": "users:read.email"})
+        ],
+    }
+    server, url = await serve(scripts[case])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    if case == "found":
+        assert await poster.user_by_email("a@b.c") == "U1"
+    elif case == "not found":
+        assert await poster.user_by_email("a@b.c") is None
+    else:
+        with pytest.raises(SlackLookupError) as err:
+            await poster.user_by_email("a@b.c")
+        assert (err.value.code, err.value.scope) == ("missing_scope", "users:read.email")
+    assert server.requests == ["users.lookupByEmail"]
+    assert server.sent[0]["email"] == "a@b.c"
+
+
+async def test_open_dm_over_the_wire(serve):
+    """Fails if opening a DM misses conversations.open with the user, or loses the channel ID."""
+    server, url = await serve([(200, None, {"ok": True, "channel": {"id": "D1"}})])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    assert await poster.open_dm("U1") == "D1"
+
+    assert server.requests == ["conversations.open"]
+    assert server.sent[0]["users"] == "U1"
+
+
 async def test_update_with_no_blocks_sends_an_empty_list_over_the_wire(serve):
     """Fails if update_message(blocks=None) omits blocks, leaving the old buttons on the card."""
     server, url = await serve(

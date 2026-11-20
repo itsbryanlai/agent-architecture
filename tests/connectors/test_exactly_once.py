@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from slack_sdk.errors import SlackApiError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -16,7 +17,18 @@ from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
 from agentos.stores import InMemoryExternalWriteStore
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, ALICE_NOTION, DB_ID, TEAM, TENANT, eventually, title_prop
+from tests.conftest import (
+    ALICE,
+    ALICE_NOTION,
+    BOB,
+    BOB_NOTION,
+    DB_ID,
+    TEAM,
+    TENANT,
+    eventually,
+    title_prop,
+)
+from tests.helpers.slack import slack_error
 
 NONCE = "nonce-eo"
 DETAILS = "Mine flickers."
@@ -284,3 +296,132 @@ async def test_a_second_comment_attempt_beside_a_running_one_writes_nothing(harn
 
     assert await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id) == comment_id
     assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+# --- the nudge's two effects ---------------------------------------------------------
+
+
+def nudge_spec(page_id: str) -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": page_id,
+        "database_id": DB_ID,
+        "item_title": "Broken VPN",
+        "item_url": "https://www.notion.so/brokenvpn",
+        "comment": "Any update on this?",
+        "assignee_name": "Bob",
+        "assignee_notion_id": BOB_NOTION,
+        "assignee_slack_id": BOB,
+        "requester_name": "Alice",
+    }
+    return TaskSpec(ctx, "nudge", payload, NONCE)
+
+
+def dm_posts(h) -> list[dict]:
+    return [p for p in h.slack.posts() if p["channel"] == f"D-{BOB}"]
+
+
+async def test_a_nudge_comment_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a nudge comment whose response was lost posts it a second time."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "nudge-comment-lost")
+    h.notion.delay_visibility(1)
+    h.notion.fail_after_write("comment")
+    with pytest.raises(TimeoutError):
+        await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+
+    await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_second_nudge_comment_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a nudge comment attempt starting while another is mid-write posts a second comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "nudge-comment-overlap")
+    hang = h.notion.hang_after_write("comment")
+    first = asyncio.create_task(run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id) == comment_id
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_nudge_dm_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a nudge DM whose response was lost sends it a second time."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-lost")
+    h.slack.fail_after_post()
+    with pytest.raises(TimeoutError):
+        await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+
+    ts = await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+
+    [dm] = dm_posts(h)
+    assert dm["ts"] == ts
+
+
+async def test_a_second_nudge_dm_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a nudge DM attempt starting while another is mid-send sends a second DM."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-overlap")
+    hang = h.slack.hang_after_post()
+    first = asyncio.create_task(run(h.acts.nudge_dm, nudge_spec("page-1"), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    ts = await first
+
+    assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id) == ts
+    assert len(dm_posts(h)) == 1
+
+
+@pytest.mark.parametrize(
+    ("stage", "code", "refused"),
+    [
+        ("post", "channel_not_found", True),
+        ("post", "account_inactive", True),
+        ("open_dm", "user_not_found", True),
+        ("post", "internal_error", False),
+    ],
+    ids=["gone-channel", "inactive-account", "gone-user", "transient"],
+)
+async def test_a_slack_refusal_of_the_dm_is_audited_and_only_a_transient_one_is_retried(
+    harness, stage, code, refused
+):
+    """Fails if a permanent Slack refusal of the DM is retryable or unaudited, or a transient one ends the nudge."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-refused")
+    error = slack_error(code, "https://slack.com/api/conversations.open")
+    if stage == "open_dm":
+        h.slack.fail_next_open_dm(error, times=1)
+    else:
+        h.slack.fail_next_post(error, times=1, channel=f"D-{BOB}")
+
+    if refused:
+        with pytest.raises(ApplicationError) as err:
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert err.value.non_retryable
+        assert dm_posts(h) == []
+        outcome = "error"
+    else:
+        # The first attempt fails retryably; the next attempt sends the DM.
+        with pytest.raises(SlackApiError):
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert len(dm_posts(h)) == 1
+        outcome = "ok"
+
+    events = [(e.kind, e.tool, e.outcome) for e in h.audit.events if e.task_id == task_id]
+    assert events == [("approval", "nudge", "ok"), ("write", "nudge_dm", outcome)]

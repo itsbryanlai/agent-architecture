@@ -1478,6 +1478,72 @@ wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level securi
 grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
 app role).
 
+## Nudge the assignee
+
+A watched item that has not moved for `stale_after_days` posts its "No movement" line with a
+**Nudge the assignee** button (D-41). One click by the requester — the button carries a nonce
+only the watch accepts, from the requester alone — drafts a nudge and sends one approval card
+previewing both effects exactly: the comment on the item, and a DM to the assignee
+("<requester> asked me to check on '<item>'", the item link, the approved text; nothing else
+from the conversation). Submit / Edit / Cancel work as on other cards; an edit changes the text
+both effects carry. The nudge is never low-risk: it always shows a card. Nothing runs without
+approval, and what was approved is what runs.
+
+On approval the comment posts first, then the DM, each exactly once (the comment through the
+reference-marker-and-lease path, the DM through the Slack post path with its metadata marker and
+history lookup in the DM channel). A DM that fails after the comment is reported in the thread
+("Commented on '<item>', but I couldn't DM the assignee."); the comment is never retried. Both
+effects pass the agent-effect gate: an agent turned off, unavailable, a paused channel or a lost
+audience before the write cancels both, as for other writes. A nudge that ran restarts the stale
+clock from the nudge, so a later stale period can offer again. One offer per stale period; a
+declined, expired or failed nudge spends it, and a spent offer (clicked, prepare failed, nudge
+done) drops its button from the stale notice, best-effort. The watch keeps polling while the card
+waits (the nudge is a child task), and the nudge records its own row in `tasks`.
+
+**In the agent definition**, the assignee is an optional people property per database grant,
+mapped like the other roles (first person only):
+
+```yaml
+grants:
+  notion:
+    databases:
+      - id: <database id>
+        name: IT requests
+        properties:
+          # ...title, status, done_values, requested_by, request_id...
+          assignee: Assignee
+        property_ids:
+          # ...the other four IDs...
+          assignee: <property id>   # agentos.check_grants prints it
+follow_up:
+  nudge: true        # default; false offers no nudge
+  max_nudges: 2      # default; 0 to 10, nudges one task may run
+```
+
+The fallbacks are decided in the card text, never by the model: no assignee property or an empty
+one → a comment without a mention; an assignee with no Slack match → a comment with a plain-name
+mention and no DM; the assignee is the requester → no button at all. A configured assignee
+mapping is checked like the other roles (a people property, an ID configured), but a broken one
+disables only the nudge, never the agent: it is reported in the console's grant check and the
+health log, and the nudge then treats the mapping as absent (a comment without a mention).
+Adding the mapping is a widening the publish approver acknowledges.
+
+**Maintainer steps:**
+
+1. **Notion integration capability:** the DM match reads the assignee's email, which needs
+   "Read user information including email addresses" on the integration (Notion → Settings →
+   Connections → the integration → Capabilities). Without it the nudge still works as a
+   plain-name comment with no DM — the fallback, not an error.
+2. **Slack scopes:** `users:read.email` (the email lookup) and `im:history` (the DM's
+   exactly-once lookup) are already in `slack/app-manifest.yaml`; an app installed from the
+   current manifest needs no change. An older app missing them: add the scopes and reinstall.
+
+Audited as one `approval` (tool `nudge`) plus one `write` per effect (`nudge_comment`,
+`nudge_dm`); a decline or expiry as `approval_closed`. A DM Slack refuses for good (a gone
+channel or user, an inactive account) records its `write` as `error` and is not retried. All new
+workflow commands sit behind the `nudge` patch marker: a task already watching when this deployed
+keeps its old shape (one plain stale line, no offer) until it ends.
+
 ## Answer feedback
 
 Every final answer carries two small buttons, 👍 and 👎, under the text. Notices, approval

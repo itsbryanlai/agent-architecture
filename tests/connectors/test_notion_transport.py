@@ -161,3 +161,28 @@ async def test_aclose_closes_the_creator_clients_connection_pool():
     await api.aclose()
 
     assert http.is_closed
+
+
+@pytest.mark.parametrize("mention", [None, "user-1"], ids=["plain", "mention"])
+async def test_create_comment_sends_the_mention_as_a_user_object(mention):
+    """Fails if a mention comment does not open with a user mention object, or a plain one grows one."""
+    api, requests = api_with(
+        lambda request: httpx.Response(200, json={"object": "comment", "id": "c1"})
+    )
+
+    await api.create_comment("page-1", "Any update?", mention_user_id=mention)
+
+    [sent] = [
+        json.loads(r.content)
+        for r in requests
+        if r.method == "POST" and r.url.path == "/v1/comments"
+    ]
+    assert sent["parent"] == {"page_id": "page-1"}
+    if mention:
+        assert sent["rich_text"][0] == {
+            "type": "mention",
+            "mention": {"type": "user", "user": {"id": "user-1"}},
+        }
+        assert sent["rich_text"][1]["text"]["content"] == " Any update?"
+    else:
+        assert sent["rich_text"] == [{"type": "text", "text": {"content": "Any update?"}}]

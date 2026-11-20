@@ -58,6 +58,7 @@ def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
             db.status_prop_id or db.status_prop,
             db.requested_by_prop_id or db.requested_by_prop,
             db.request_id_prop_id or db.request_id_prop,
+            db.assignee_prop_id or db.assignee_prop,
         )
         found[normalize_id(db.id)] = ("database", db.name, mapping)
     for page in agent.grants.notion_pages:

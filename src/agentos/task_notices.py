@@ -24,6 +24,11 @@ STALE = "stale"
 FAILED_COMMENT = "failed_comment"
 NOT_CONFIRMED_COMMENT = "not_confirmed_comment"
 COMMENTED = "commented"
+NUDGED = "nudged"
+NUDGE_COMMENTED = "nudge_commented"
+NUDGE_NO_DM = "nudge_no_dm"
+NUDGE_SELF = "nudge_self"
+NUDGE_PREPARE_FAILED = "nudge_prepare_failed"
 
 # Kinds about the item a create made, not about the draft.
 ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE)
@@ -31,7 +36,7 @@ ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE)
 
 def subject(tool_name: str, payload: dict) -> str:
     """The short name of what a task is about, for card and thread lines."""
-    if tool_name == "add_comment":
+    if tool_name in ("add_comment", "nudge"):
         return payload.get("item_title") or payload.get("item") or ""
     return payload.get("title", "")
 
@@ -81,4 +86,14 @@ def notice_text(
         return f"I couldn't confirm whether the comment was posted; please check {url}"
     if kind == COMMENTED:
         return f"Commented on {name} ({url})."
+    if kind == NUDGED:
+        return f"Nudged the assignee about '{name}': commented on the item and sent a DM."
+    if kind == NUDGE_COMMENTED:
+        return f"Commented on '{name}' as a nudge."
+    if kind == NUDGE_NO_DM:
+        return f"Commented on '{name}', but I couldn't DM the assignee."
+    if kind == NUDGE_SELF:
+        return f"The assignee of '{name}' is you, so there's nobody to nudge."
+    if kind == NUDGE_PREPARE_FAILED:
+        return f"I couldn't prepare the nudge for '{name}'."
     raise ValueError(f"unknown notice kind {kind!r}")

@@ -347,6 +347,11 @@ class NotionDatabaseGrant:
     stable across renames. They may be missing in a names-only config so the
     check command can read it and print the IDs; a published agent whose grant
     lacks them is unavailable until all four are set.
+
+    ``assignee_prop`` is optional: the people property the nudge reads the
+    assignee from. Empty means the database has no assignee mapping and a nudge
+    is a comment without a mention. When set, it is checked like the other
+    roles (a people property, addressed by its ID).
     """
 
     id: str
@@ -360,6 +365,8 @@ class NotionDatabaseGrant:
     status_prop_id: str | None = None
     requested_by_prop_id: str | None = None
     request_id_prop_id: str | None = None
+    assignee_prop: str = ""
+    assignee_prop_id: str | None = None
 
     def missing_property_ids(self) -> list[str]:
         """Roles that have no property ID configured."""
@@ -401,6 +408,10 @@ class FollowUpPolicy:
     poll_interval_minutes: int = 15
     stale_after_days: int = 3
     max_watch_days: int = 30
+    # Whether a stale item offers a nudge of its assignee, and how many nudges
+    # one task may run. The offer also needs the watch to be stale again.
+    nudge: bool = True
+    max_nudges: int = 2
 
 
 @dataclass
@@ -516,6 +527,7 @@ _PROPERTY_ID_FIELDS = {
     "status": "status_prop_id",
     "requested_by": "requested_by_prop_id",
     "request_id": "request_id_prop_id",
+    "assignee": "assignee_prop_id",
 }
 
 
@@ -566,7 +578,9 @@ _FOLLOW_UP_RANGES = {
     "poll_interval_minutes": (1, 1440),
     "stale_after_days": (1, 365),
     "max_watch_days": (1, MAX_WATCH_DAYS),
+    "max_nudges": (0, 10),
 }
+_FOLLOW_UP_BOOLS = frozenset({"nudge"})
 _APPROVAL_RANGES = {
     "expires_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
     "reminder_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
@@ -623,7 +637,7 @@ def _parse_database_grant(
     if not isinstance(props, dict):
         raise ConfigError(f"agent '{agent_id}' grant '{name}': missing required field 'properties'")
     pwhere = f"agent '{agent_id}' grant '{name}' properties"
-    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS))
+    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS) | {"assignee"})
     values: dict[str, Any] = {}
     for key, attr in _PROPERTY_FIELDS.items():
         if key not in props or props[key] in (None, "", []):
@@ -637,6 +651,8 @@ def _parse_database_grant(
             values[attr] = done
         else:
             values[attr] = _text(pwhere, key, props[key])
+    assignee = props.get("assignee")
+    assignee_prop = "" if assignee in (None, "") else _text(pwhere, "assignee", assignee)
     ids_raw = raw.get("property_ids")
     if ids_raw is None:
         ids_raw = {}
@@ -662,6 +678,7 @@ def _parse_database_grant(
         done_values=list(values["done_values"]),
         requested_by_prop=values["requested_by_prop"],
         request_id_prop=values["request_id_prop"],
+        assignee_prop=assignee_prop,
         **id_values,
     )
 
@@ -675,9 +692,23 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> Not
     )
 
 
-def _parse_policy(where: str, raw: Any, ranges: dict[str, tuple[int, int]], cls: type) -> Any:
-    block = _mapping(where, raw, frozenset(ranges))
-    return cls(**{k: _whole(where, k, v, *ranges[k]) for k, v in block.items()})
+def _parse_policy(
+    where: str,
+    raw: Any,
+    ranges: dict[str, tuple[int, int]],
+    cls: type,
+    bool_keys: frozenset[str] = frozenset(),
+) -> Any:
+    block = _mapping(where, raw, frozenset(ranges) | bool_keys)
+    values: dict[str, Any] = {}
+    for key, value in block.items():
+        if key in bool_keys:
+            if type(value) is not bool:
+                raise ConfigError(f"{where}: '{key}' must be true or false")
+            values[key] = value
+        else:
+            values[key] = _whole(where, key, value, *ranges[key])
+    return cls(**values)
 
 
 def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
@@ -716,7 +747,11 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         max_steps=_whole(where, "max_steps", _require(raw, "max_steps", where), *MAX_STEPS_RANGE),
         grants=Grants(notion_databases=databases, notion_pages=pages),
         follow_up=_parse_policy(
-            f"{where} follow_up", raw.get("follow_up"), _FOLLOW_UP_RANGES, FollowUpPolicy
+            f"{where} follow_up",
+            raw.get("follow_up"),
+            _FOLLOW_UP_RANGES,
+            FollowUpPolicy,
+            bool_keys=_FOLLOW_UP_BOOLS,
         ),
         approval=_parse_policy(
             f"{where} approval", raw.get("approval"), _APPROVAL_RANGES, ApprovalPolicy
@@ -746,6 +781,7 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
                 "done_values": list(db.done_values),
                 "requested_by": db.requested_by_prop,
                 "request_id": db.request_id_prop,
+                **({"assignee": db.assignee_prop} if db.assignee_prop else {}),
             },
         }
         property_ids = {

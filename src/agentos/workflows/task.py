@@ -46,9 +46,10 @@ from datetime import timedelta
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from agentos import task_notices
+    from agentos import ids, task_notices
     from agentos.activities import AgentActivities
     from agentos.agent_health import agent_unavailable_text
     from agentos.config import AgentVersion
@@ -61,6 +62,9 @@ with workflow.unsafe.imports_passed_through():
         EditRequest,
         ExternalUpdate,
         NotionItem,
+        NudgeDone,
+        NudgePrepared,
+        NudgeRequest,
         TaskSpec,
         WatchState,
         check_field,
@@ -99,6 +103,9 @@ AGENT_UNAVAILABLE_PATCH = "agent-unavailable"
 # Histories recorded before the task store existed never record their state; they
 # replay without the record activity, and those tasks simply have no row.
 TASK_RECORD_PATCH = "task-record"
+# Histories recorded before the nudge existed never offer one: their stale notice is
+# the plain line, their watch never wakes for a nudge, and they carry no nudge state.
+NUDGE_PATCH = "nudge"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -121,6 +128,14 @@ class TaskWorkflow:
         self._poked = False
         self._edits = 0
         self._refresh_due = False
+        # The nudge offer's nonce, the nudge task in flight and a click or report the
+        # watch loop has not applied yet survive a hop in the WatchState; the loop
+        # applies them, never here.
+        resume = spec.resume
+        self._nudge_nonce = resume.nudge_nonce if resume is not None else ""
+        self._nudge_child = resume.nudge_child if resume is not None else ""
+        self._nudge_requested = resume.nudge_requested if resume is not None else False
+        self._nudge_done = resume.nudge_done if resume is not None else False
         if spec.resume is not None:
             self._state = "watching"
 
@@ -211,6 +226,35 @@ class TaskWorkflow:
     def external_update(self, u: ExternalUpdate) -> None:
         if self._page_key is not None and normalize_id(u.page_id) == self._page_key:
             self._poked = True
+
+    @workflow.signal(name="nudge")
+    def nudge(self, r: NudgeRequest) -> None:
+        """A click on the stale notice's nudge button: only the requester, only the
+        live offer's nonce, only while watching with no nudge already in flight.
+
+        An accepted click spends the offer at once: the nonce is cleared here, so a
+        second click on the same button is ignored even while the nudge is drafted.
+        """
+        if self._state != "watching":
+            workflow.logger.warning("ignored nudge click: the task is not watching")
+            return
+        if not self._nudge_nonce or r.nonce != self._nudge_nonce:
+            workflow.logger.warning("ignored nudge click: nonce does not match the offer")
+            return
+        if r.user_id != self._spec.ctx.requester_user_id:
+            workflow.logger.warning("ignored nudge click: clicker is not the requester")
+            return
+        if self._nudge_child:
+            workflow.logger.warning("ignored nudge click: a nudge is already in flight")
+            return
+        self._nudge_requested = True
+        self._nudge_nonce = ""
+
+    @workflow.signal(name="nudge_done")
+    def nudge_done(self, d: NudgeDone) -> None:
+        """The nudge task reports its comment landed; the watch restarts the stale clock."""
+        if self._nudge_child and d.child_id == self._nudge_child:
+            self._nudge_done = True
 
     @workflow.run
     async def run(self, spec: TaskSpec) -> str:
@@ -382,6 +426,8 @@ class TaskWorkflow:
 
         if spec.tool_name == "add_comment":
             return await self._run_comment(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "nudge":
+            return await self._run_nudge(spec, task_id, card_ts, agent.name)
 
         title = "" if self._refs else spec.payload["title"]
         database_id = spec.database_id if self._refs else spec.payload["database_id"]
@@ -475,8 +521,11 @@ class TaskWorkflow:
         last_status = state.last_status
         last_change = state.last_change
         stale_sent = state.stale_sent
+        nudges_used = state.nudges_used
         # Histories recorded before this patch neither hop nor space out pokes.
         hop = workflow.patched(CONTINUE_AS_NEW_PATCH)
+        # Histories recorded before the nudge never offer one and never wake for one.
+        nudge_on = workflow.patched(NUDGE_PATCH)
         last_poll = None
 
         while True:
@@ -499,11 +548,25 @@ class TaskWorkflow:
                     stale_sent=stale_sent,
                     deadline=deadline,
                     poked=self._poked,
+                    nudges_used=nudges_used,
+                    nudge_nonce=self._nudge_nonce,
+                    nudge_child=self._nudge_child,
+                    nudge_requested=self._nudge_requested,
+                    nudge_done=self._nudge_done,
                 )
                 workflow.continue_as_new(dataclasses.replace(self._spec, resume=resume))
             woken_by_poke = True
             try:
-                await workflow.wait_condition(lambda: self._poked, timeout=min(poll, remaining))
+                await workflow.wait_condition(
+                    lambda: (
+                        self._poked or (nudge_on and (self._nudge_requested or self._nudge_done))
+                    ),
+                    timeout=min(poll, remaining),
+                )
+                if nudge_on:
+                    # A nudge click or report is not a poke: it neither spaces out the
+                    # next poll nor asks for a fresh-status report.
+                    woken_by_poke = self._poked
             except TimeoutError:
                 woken_by_poke = False
             if hop and woken_by_poke and last_poll is not None:
@@ -512,6 +575,37 @@ class TaskWorkflow:
                     await workflow.sleep(wait)
             self._poked = False
             last_poll = workflow.now()
+
+            if nudge_on:
+                if self._nudge_done:
+                    # The nudge ran: the stale clock restarts from now, and a later
+                    # stale period may offer another, up to max_nudges. The spent
+                    # offer's button goes first, under the key its notice was posted.
+                    self._nudge_done = False
+                    self._nudge_child = ""
+                    self._nudge_nonce = ""
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
+                    nudges_used += 1
+                    last_change = workflow.now()
+                    stale_sent = False
+                if self._nudge_requested:
+                    self._nudge_requested = False
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
+                    await self._start_nudge(
+                        task_id, item, database_id, nudges_used, agent.follow_up.stale_after_days
+                    )
 
             try:
                 current: NotionItem = await self._act(
@@ -568,13 +662,45 @@ class TaskWorkflow:
                     await self._record(current.status or "")
                 if not stale_sent and now - last_change >= stale_after:
                     stale_sent = True
-                    await self._notice(
-                        task_notices.STALE,
-                        f"{task_id}:stale",
-                        task_id,
-                        subject=current.title,
-                        days=agent.follow_up.stale_after_days,
-                    )
+                    if nudge_on:
+                        # One offer per stale period: the button lives on this notice
+                        # alone, and only a nudge that runs starts the next period.
+                        nonce = ""
+                        if agent.follow_up.nudge and nudges_used < agent.follow_up.max_nudges:
+                            offer = False
+                            try:
+                                offer = await self._act(
+                                    AgentActivities.nudge_offer, self._spec, task_id, item.page_id
+                                )
+                            except ActivityError as err:
+                                error_type, slack_code = _failure_cause(err)
+                                workflow.logger.warning(
+                                    "activity nudge_offer failed after retries; continuing "
+                                    "tenant_id=%s task_id=%s error=%s slack_code=%s",
+                                    ctx.tenant_id,
+                                    task_id,
+                                    error_type,
+                                    slack_code,
+                                )
+                            if offer:
+                                nonce = str(workflow.uuid4())
+                                self._nudge_nonce = nonce
+                        await self._try(
+                            AgentActivities.post_stale_notice,
+                            self._spec,
+                            task_id,
+                            f"{task_id}:stale:{nudges_used}",
+                            agent.follow_up.stale_after_days,
+                            nonce,
+                        )
+                    else:
+                        await self._notice(
+                            task_notices.STALE,
+                            f"{task_id}:stale",
+                            task_id,
+                            subject=current.title,
+                            days=agent.follow_up.stale_after_days,
+                        )
             item = NotionItem(
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
@@ -688,6 +814,176 @@ class TaskWorkflow:
         self._state = "done"
         await self._record()
         return self._state
+
+    async def _start_nudge(
+        self, task_id: str, item: NotionItem, database_id: str, nudges_used: int, stale_days: int
+    ) -> None:
+        """Draft the nudge and start its task: one approval card for both effects.
+
+        The watch keeps watching while the card waits. The nudge task reports back
+        when its comment lands; only then does the stale clock restart. A nudge that
+        is declined, expires or fails reports nothing: the period's offer is spent.
+        """
+        ctx = self._spec.ctx
+        child_id = ids.task_id(ctx.tenant_id, str(workflow.uuid4()))
+        try:
+            prepared: NudgePrepared = await self._act(
+                AgentActivities.prepare_nudge, self._spec, task_id, item.page_id, child_id
+            )
+        except ActivityError as err:
+            error_type, slack_code = _failure_cause(err)
+            workflow.logger.warning(
+                "activity prepare_nudge failed after retries; continuing "
+                "tenant_id=%s task_id=%s error=%s slack_code=%s",
+                ctx.tenant_id,
+                task_id,
+                error_type,
+                slack_code,
+            )
+            self._nudge_nonce = ""
+            await self._try(
+                AgentActivities.clear_stale_offer,
+                self._spec,
+                task_id,
+                f"{task_id}:stale:{nudges_used}",
+                stale_days,
+            )
+            await self._notice(
+                task_notices.NUDGE_PREPARE_FAILED,
+                f"{task_id}:nudge-failed:{nudges_used}",
+                task_id,
+                subject=item.title,
+            )
+            return
+        self._nudge_nonce = ""
+        if prepared.refused:
+            await self._notice(
+                task_notices.NUDGE_SELF,
+                f"{task_id}:nudge-self:{nudges_used}",
+                task_id,
+                subject=item.title,
+            )
+            return
+        spec = TaskSpec(
+            ctx=ctx,
+            tool_name="nudge",
+            payload={},
+            approval_nonce=str(workflow.uuid4()),
+            draft_ref=child_id,
+            revision=1,
+            database_id=database_id,
+            parent_id=task_id,
+            nudge_dm=prepared.dm,
+        )
+        await workflow.start_child_workflow(
+            TaskWorkflow.run, spec, id=child_id, parent_close_policy=ParentClosePolicy.ABANDON
+        )
+        self._nudge_child = child_id
+
+    async def _run_nudge(self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str) -> str:
+        """Run the approved nudge: the comment first, then the DM, each exactly once.
+
+        A DM failure after the comment reports "commented, couldn't DM" and never
+        retries the comment. The watch that started this task is told the comment
+        landed, so its stale clock restarts from the nudge.
+        """
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.nudge_comment, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_notion_comment, spec, task_id
+                )
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_COMMENT,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        # The comment landed. The DM runs once; whatever happens to it, the comment
+        # is never attempted again. A nudge with no Slack match has no DM to run.
+        dm_ts = ""
+        if spec.nudge_dm:
+            try:
+                dm_ts = await self._act_write(AgentActivities.nudge_dm, spec, task_id)
+            except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    return await self._stop_for_tenant_disabled(spec, task_id)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, "Commented, DM failed"
+                )
+                await self._notice(
+                    task_notices.NUDGE_NO_DM, f"{task_id}:nudge-no-dm", task_id, subject=title
+                )
+                await self._report_nudge_done(spec, task_id)
+                self._state = "done"
+                await self._record()
+                return self._state
+        await self._try(
+            AgentActivities.update_card, spec, task_id, card_ts, "Nudged" if dm_ts else "Commented"
+        )
+        await self._notice(
+            task_notices.NUDGED if dm_ts else task_notices.NUDGE_COMMENTED,
+            f"{task_id}:nudged",
+            task_id,
+            subject=title,
+        )
+        await self._report_nudge_done(spec, task_id)
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _report_nudge_done(self, spec: TaskSpec, task_id: str) -> None:
+        """Tell the watch the nudge's comment landed, so it restarts the stale clock.
+
+        Best-effort: the watch may have ended while the card waited (the item is done
+        or the watch ran out); the nudge still ran, and the report is then dropped.
+        """
+        if not spec.parent_id:
+            return
+        try:
+            await workflow.get_external_workflow_handle(spec.parent_id).signal(
+                "nudge_done", NudgeDone(task_id)
+            )
+        except Exception:  # noqa: BLE001 - the report is best-effort; the nudge already ran
+            workflow.logger.warning(
+                "nudge report not delivered tenant_id=%s task_id=%s parent_id=%s",
+                spec.ctx.tenant_id,
+                task_id,
+                spec.parent_id,
+            )
 
     async def _store_edit(self, e: EditRequest) -> None:
         """Store the saved edit as the next revision of the draft, then redraw the card.

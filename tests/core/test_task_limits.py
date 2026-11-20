@@ -13,6 +13,7 @@ from agentos import ids
 from agentos.config import TASK_QUEUE
 from agentos.models import (
     EDITABLE_FIELDS,
+    NUDGE_NAME_MAX,
     ApprovalDecision,
     ConversationRef,
     EditRequest,
@@ -25,7 +26,7 @@ from agentos.models import (
 )
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, DB_ID, TENANT, eventually, title_prop
+from tests.conftest import ALICE, BOB_NOTION, DB_ID, TENANT, eventually, title_prop
 
 NONCE = "n-1"
 CHANNEL = "C_GENERAL"
@@ -34,7 +35,12 @@ THREAD = "1700000000.000100"
 
 @pytest.mark.parametrize(
     ("tool", "field"),
-    [("create_item", "title"), ("create_item", "details"), ("add_comment", "comment")],
+    [
+        ("create_item", "title"),
+        ("create_item", "details"),
+        ("add_comment", "comment"),
+        ("nudge", "comment"),
+    ],
 )
 def test_check_field_at_and_over_the_limit(tool, field):
     limit = EDITABLE_FIELDS[tool][field]
@@ -48,6 +54,15 @@ def test_check_field_counts_the_escaped_card_text():
     assert check_field("create_item", "details", "&" * 398) is None
     err = check_field("create_item", "details", "&" * 399)
     assert err is not None and "&" in err and "<" in err
+
+
+def test_check_field_leaves_room_for_the_nudge_mention_preview():
+    """Fails if a nudge comment whose card section (label + mention + text) overflows is accepted."""
+    # 515 "&" encode to 2575 characters; with the 21-character label and the mention
+    # prefix's worst escaped size (402: "@ " plus an 80-character name of all "&") that
+    # is 2998, under Slack's 3000. One more "&" goes over.
+    assert check_field("nudge", "comment", "&" * 515) is None
+    assert check_field("nudge", "comment", "&" * 516) is not None
 
 
 def _ctx() -> TurnContext:
@@ -145,6 +160,36 @@ async def test_comment_at_the_limit_with_signature_reaches_notion(harness):
     assert await handle.result() == "done"
     [comment] = next(iter(h.notion.comments.values()))
     assert len(comment["rich_text"][0]["text"]["content"]) <= 2000
+
+
+async def test_nudge_comment_at_the_limit_with_mention_and_signature_reaches_notion(harness):
+    """Fails if a nudge comment at the cap overflows Notion once its mention and signature are added."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    spec = TaskSpec(
+        _ctx(),
+        "nudge",
+        {
+            "page_id": page["id"],
+            "database_id": DB_ID,
+            "item_title": "Broken VPN",
+            "item_url": page["url"],
+            "comment": "c" * EDITABLE_FIELDS["nudge"]["comment"],
+            "assignee_name": "n" * NUDGE_NAME_MAX,
+            "assignee_notion_id": BOB_NOTION,
+            "assignee_slack_id": "",
+            "requester_name": "Alice",
+        },
+        NONCE,
+    )
+    handle = await _start(h, spec)
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+
+    assert await handle.result() == "done"
+    [comment] = next(iter(h.notion.comments.values()))
+    text = comment["rich_text"][0]["text"]["content"]
+    assert text.startswith("@" + "n" * NUDGE_NAME_MAX + " ")
+    assert len(text) <= 2000
 
 
 async def test_edit_over_the_limit_is_ignored_and_at_the_limit_accepted(harness):

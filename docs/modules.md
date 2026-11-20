@@ -25,14 +25,14 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `workflows/conversation.py` | The turn loop for one thread. Deterministic; carries references, never content; changes to commands sit behind `workflow.patched` | `core/test_conversation_workflow.py`, `core/test_conversation_replay.py`, `core/test_turn_loop.py`, `core/test_turn_limits.py`, `core/test_turn_failure.py`, `core/test_front_door.py` |
-| `workflows/task.py` | One unit of work: approval, write, watch. Only the requester approves; what was approved is what runs | `core/test_task_workflow.py`, `core/test_task_actions.py`, `core/test_task_failures.py`, `core/test_task_limits.py`, `connectors/test_restart_write.py` |
+| `workflows/task.py` | One unit of work: approval, write, watch. Only the requester approves; what was approved is what runs. A stale item's nudge is a child task: one card for its comment and DM, the watch keeps polling, the clock restarts from a nudge that ran | `core/test_task_workflow.py`, `core/test_task_actions.py`, `core/test_task_failures.py`, `core/test_task_limits.py`, `core/test_nudge.py`, `connectors/test_restart_write.py` |
 | `workflows/indexing.py` | Indexes one granted root page. History carries page IDs and counts; one bad page never fails the run | `knowledge/test_indexing.py`, `knowledge/test_knowledge_sync.py` |
 | `workflows/page_refresh.py` | Refreshes one page after webhook events, coalescing a burst | `knowledge/test_page_refresh.py` |
 | `workflows/audience_watch.py` | Acts on one `channel_shared` event; one never-reused ID per event | `console/test_audience_watch.py` |
 | `workflows/retention.py` | Purges one tenant's expired rows, a batch per activity | `core/test_retention_workflow.py` |
 | `workflows/creator_access.py` | One tenant's nightly creator-access pass and combined health check; history carries the tenant ID and counts only | `core/test_creator_access.py`, `core/test_replay.py` |
 | `activities.py` | All I/O the workflows do. One tenant per activity; the gate runs first in every activity that acts for an agent; writes happen once behind a lease; a final answer carries the feedback buttons, a fixed stop text none | `core/test_agent_gate.py`, `connectors/test_exactly_once.py`, `connectors/test_restart_write.py`, `core/test_retry_safety.py`, `core/test_tool_outputs.py`, `core/test_answer_feedback.py` |
-| `task_notices.py` | The lines a task posts in the thread, written in one place from stored content | `core/test_task_workflow.py` |
+| `task_notices.py` | The lines a task posts in the thread, written in one place from stored content | `core/test_task_workflow.py`, `core/test_nudge.py` |
 | `models.py` | Plain data types passed through Temporal (IDs and small values), audit kinds, editable-field limits | `core/test_task_limits.py`, `core/test_payload_codec.py` |
 | `ids.py` | The only place workflow, schedule and event-key IDs are built; every ID starts with the tenant | `core/test_ids.py` |
 | `history_view.py` | Repairs and windows stored history before the model sees it | `core/test_turn_history.py`, `pg/test_history_window.py` |
@@ -96,7 +96,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `knowledge/notion_text.py` | Turns a Notion page into text and chunks | `knowledge/test_indexing.py` |
 | `knowledge/embedder.py` | Embeddings behind one interface for any OpenAI-compatible endpoint, and a deterministic fake | `knowledge/test_embed_endpoint.py`, `knowledge/test_knowledge_sync.py` |
 | `llm.py` | The LLM client (Claude or Qwen); history is stored in one format whichever provider runs | `core/test_llm.py`, `core/test_llm_errors.py` |
-| `slack_client.py` | Posting to Slack, and the lookups the audience checks and the channel picker use | `core/test_slack_rate_limits.py`, `core/test_client_timeouts.py` |
+| `slack_client.py` | Posting to Slack, and the lookups the audience checks, the channel picker and the nudge's email-to-user match use | `core/test_slack_rate_limits.py`, `core/test_client_timeouts.py` |
 | `slack_format.py` | Markdown to Slack mrkdwn out, Slack's encoding decoded in; text the runtime did not write is escaped | `core/test_slack_format.py`, `core/test_slack_escaping.py` |
 
 ## Encryption

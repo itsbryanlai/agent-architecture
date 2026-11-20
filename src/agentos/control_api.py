@@ -789,6 +789,7 @@ async def _real_lifespan(app: FastAPI):
             from temporalio.exceptions import WorkflowAlreadyStartedError
 
             from agentos.config import TEST_TASK_QUEUE
+            from agentos.test_sets import RUN_LIMIT
             from agentos.workflows.test_run import TestRunWorkflow
 
             if test_client is None:
@@ -799,6 +800,7 @@ async def _real_lifespan(app: FastAPI):
                     args=[tenant_id, run_id],
                     id=run_id,
                     task_queue=TEST_TASK_QUEUE,
+                    execution_timeout=RUN_LIMIT,
                 )
             except WorkflowAlreadyStartedError:
                 pass  # a retried start finds the run already going

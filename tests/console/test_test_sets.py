@@ -1,7 +1,7 @@
 """Creator test sets through the console: roles, validation, runs, the submit view,
 and the feedback page's "Make a test case". Everything is in memory."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -19,9 +19,11 @@ from agentos.test_sets import (
     CITE,
     DONE,
     FAIL,
+    FAILED,
     HAND_OFF,
     PASS,
     REFUSE,
+    RUN_LIMIT,
     RUNNING,
     SOURCE_NOT_CITED,
     WRITE,
@@ -31,6 +33,7 @@ from agentos.test_sets import (
     TestSetError,
     case_set_sha256,
 )
+from agentos.usage import utcnow
 from tests.conftest import DB_ID, ROOT_A, TENANT, make_fake_notion
 from tests.helpers.agents import helper_block
 from tests.helpers.console_harness import (
@@ -38,6 +41,7 @@ from tests.helpers.console_harness import (
     OTHER,
     OWNER,
     ROOT,
+    Clock,
     ConsoleHarness,
     csrf_in,
     post,
@@ -61,12 +65,12 @@ class Starter:
         self.started.append((tenant_id, run_id))
 
 
-async def make_plane(starter=None, require_grant_picker=False):
+async def make_plane(starter=None, require_grant_picker=False, clock=utcnow):
     agents, members, audit = InMemoryAgentStore(), InMemoryMemberStore(), InMemoryAuditStore()
     await members.add_member(TENANT, ADMIN2, "admin", ROOT)
     await members.add_member(TENANT, OWNER, "creator", ROOT)
     await members.add_member(TENANT, OTHER, "creator", ROOT)
-    sets = InMemoryTestSetStore()
+    sets = InMemoryTestSetStore(clock)
     plane = ControlPlane(
         agents,
         members,
@@ -76,6 +80,7 @@ async def make_plane(starter=None, require_grant_picker=False):
         test_sets=sets,
         start_test_run=starter,
         require_grant_picker=require_grant_picker,
+        clock=clock,
     )
     return plane, agents, sets, audit
 
@@ -229,6 +234,34 @@ async def test_one_run_of_a_version_at_a_time_and_a_retry_returns_the_same_run(r
     # The second call is over (the settle point): one workflow start, one run row.
     assert starter.started == [(TENANT, first.run_id)]
     assert (await sets.latest_run(TENANT, "it-helper", 1)).run_id == first.run_id
+
+
+@pytest.mark.parametrize(
+    ("age", "stale"),
+    [
+        (RUN_LIMIT + timedelta(minutes=11), True),
+        (timedelta(minutes=5), False),
+    ],
+    ids=["outlived the limit", "still within the limit"],
+)
+async def test_a_run_that_outlived_its_limit_is_closed_so_the_version_can_run_again(age, stale):
+    """Fails if a running row older than the run limit still blocks a new run, or a fresh running row stops blocking one."""
+    clock = Clock()
+    starter = Starter()
+    plane, _, sets, _ = await make_plane(starter, clock=clock)
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await plane.add_test_case(TENANT, OWNER, "it-helper", 1, "q", REFUSE)
+    first = await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+    clock.advance(seconds=age.total_seconds())
+    if stale:
+        second = await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+        assert second.run_id != first.run_id
+        assert (await sets.get_run(TENANT, first.run_id)).status == FAILED
+        assert starter.started == [(TENANT, first.run_id), (TENANT, second.run_id)]
+    else:
+        with pytest.raises(TestSetError, match="A test run is already going on this version"):
+            await plane.run_tests(TENANT, OWNER, "it-helper", 1)
+        assert starter.started == [(TENANT, first.run_id)]
 
 
 async def test_a_new_draft_carries_the_source_versions_cases():

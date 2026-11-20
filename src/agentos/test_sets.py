@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -54,6 +54,12 @@ EXPECT_LABELS = {
 # The most one run may spend, in US dollars (the maintainer's cap, 2026-11-19).
 RUN_CAP_USD = Decimal("0.20")
 QUESTION_MAX = 2000
+
+# The most wall time one run may take. Temporal enforces it as the workflow's execution
+# timeout; the console also closes a running row older than this plus a grace as failed,
+# so a run whose workflow died (or whose final write could not land) never blocks the
+# version forever.
+RUN_LIMIT = timedelta(hours=1)
 
 # A run's lifecycle: the plane starts it, the worker's run finishes it.
 RUNNING = "running"

@@ -4,6 +4,7 @@ a tenant added, changed or disabled without a restart (gateway, worker, console)
 import logging
 import secrets as token_source
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 from temporalio.exceptions import ApplicationError
 
+from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
@@ -22,10 +24,13 @@ from agentos.config import (
     load_tenants_config,
     parse_agents_config,
 )
+from agentos.connectors.drive import DriveReader
+from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
 from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.gateway.app import create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
@@ -402,6 +407,53 @@ async def test_the_worker_serves_a_tenant_added_later_with_its_own_clients(monke
     assert built["slack"] == ["slack-ACME", "slack-GLOBEX"]
     assert registry.get(GLOBEX).config.slack_team_id == GLOBEX_TEAM
     assert await sync.sync() == []
+
+
+@pytest.mark.parametrize("connected", [True, False])
+async def test_a_tenant_admitted_later_gets_its_drive_reader(monkeypatch, connected):
+    """Fails if a tenant admitted after start-up carries no Drive reader while its
+    connection row exists, carries one with no row, or a rebuilt runtime keeps a reader
+    the row no longer backs."""
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    set_secrets(monkeypatch, "ACME")
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    _built, slack, notion = fake_factories()
+    google = FakeGoogleAccounts()
+    connections = InMemoryDriveConnectionStore()
+    email = google.account_email(ids.drive_account_id(GLOBEX))
+    if connected:
+        await connections.connect(GLOBEX, email, datetime(2026, 11, 20, tzinfo=UTC))
+    file_id = "drive-file-0001"
+    google.add_drive_file(file_id, "Guide", MIME_DOC, "folder-1", [DriveSection("", "text")])
+
+    async def drive(config):
+        row = await connections.get(config.tenant_id)
+        return DriveReader(google, row.service_account_email) if row is not None else None
+
+    registry = await build_registry(
+        await startup_tenants(directory), Settings(), slack, notion, drive=drive
+    )
+    sync = RegistrySync(directory, registry, slack, notion, drive=drive)
+    set_secrets(monkeypatch, "GLOBEX")
+    await import_tenant(store, globex())
+    clock.advance(6)
+
+    assert await sync.sync() == [GLOBEX]
+    reader = registry.get(GLOBEX).drive
+    if connected:
+        assert reader is not None
+        await reader.get_file(file_id)
+        assert google.get_calls == [(email, file_id)]
+    else:
+        assert reader is None
+
+    # A rebuilt runtime resolves the row again: a disconnect while the worker runs
+    # leaves the next rebuild without a reader.
+    await connections.delete(GLOBEX)
+    store.replace_config(replace(globex(), channels={"C9": "it-helper"}))
+    clock.advance(6)
+    await sync.sync()
+    assert registry.get(GLOBEX).drive is None
 
 
 async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):

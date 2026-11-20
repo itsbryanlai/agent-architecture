@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -47,6 +47,8 @@ from agentos.config import (
     load_settings,
     validate_worker_capacity,
 )
+from agentos.connectors.drive import DriveReader
+from agentos.connectors.google_iam import GoogleError, accounts_from_settings
 from agentos.connectors.notion import NotionAPI, RealNotionAPI
 from agentos.content_store import PostgresContentStore
 from agentos.creator_access import CreatorAccessActivities, PostgresCreatorAccessStore
@@ -59,7 +61,9 @@ from agentos.crypto_keys import (
     start_key_refresh,
     startup_key_failure,
 )
+from agentos.drive_connections import PostgresDriveConnectionStore
 from agentos.grant_picks import PostgresGrantPickStore
+from agentos.knowledge.drive_indexing import DriveIndexActivities
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -88,6 +92,7 @@ from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.creator_access import CreatorAccessWorkflow
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.retention import RetentionWorkflow
@@ -112,18 +117,20 @@ def build_llm(settings: Settings) -> LLMClient:
 
 
 def build_embedder(settings: Settings, tenants: TenantsConfig, http_client=None) -> Embedder | None:
-    """Build the embedder, only when some published agent of any tenant has a Notion page grant.
+    """Build the embedder, only when some published agent of any tenant has a knowledge grant
+    (a Notion page or a Drive folder/file).
 
     ``tenants`` carries each tenant's published agents (``published_tenants``).
 
     The embedder is the platform's own, shared by every tenant. Agents without
     knowledge need no embedding settings, so the Anthropic provider keeps
-    working without them. Returns None when no agent has a page grant. When ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no
-    Qwen setting is needed (a local server needs no key, but the SDK requires a
-    non-empty string). Otherwise the Qwen settings are used.
+    working without them. Returns None when no agent has a knowledge grant. When
+    ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no Qwen setting is needed
+    (a local server needs no key, but the SDK requires a non-empty string). Otherwise the
+    Qwen settings are used.
     """
     if not any(
-        agent.grants.notion_pages
+        agent.grants.notion_pages or agent.grants.drive
         for config in tenants.tenants.values()
         for agent in config.agents.values()
     ):
@@ -215,6 +222,7 @@ async def build_tenant_clients(
     log: logging.Logger,
     slack_factory: Callable[[str], SlackPoster] = RealSlackPoster,
     notion_factory: Callable[[str], NotionAPI] = RealNotionAPI,
+    drive: Callable[[AgentsConfig], Awaitable[DriveReader | None]] | None = None,
 ) -> tuple[TenantRegistry, RegistrySync]:
     """The worker's tenant clients at start-up, and the sync that keeps them current.
 
@@ -226,6 +234,8 @@ async def build_tenant_clients(
     a token connected or replaced while the worker runs rebuilds that tenant's
     client on the next sync, as a Slack reinstall does. The health check reads its
     Notion client from this registry, so it checks with the connected token too.
+    ``drive`` resolves each tenant's Drive reader from its connection row, so a tenant
+    admitted after start-up and a rebuilt runtime both carry it.
     """
     registry = await build_registry(
         tenants,
@@ -234,6 +244,7 @@ async def build_tenant_clients(
         notion_factory,
         slack_token=credentials.slack_bot_token,
         notion_token=credentials.notion_token,
+        drive=drive,
     )
     # The first sync pass is an interval away; until it lands, a stored-but-disabled
     # tenant would look not-yet-loaded and its pending work would retry, not end cleanly.
@@ -247,6 +258,7 @@ async def build_tenant_clients(
         slack_token=credentials.slack_bot_token,
         notion_token=credentials.notion_token,
         on_drop=credentials.forget,
+        drive=drive,
     )
     return registry, sync
 
@@ -281,6 +293,15 @@ async def main() -> None:
             raise SystemExit(agent_failure)
         published = await published_tenants(agent_store, tenants)
         embedder = build_embedder(settings, published)
+        # The deployment's Google client (None when Drive is not set up). A malformed key
+        # fails at start-up, never at the first read, like the console's connect.
+        try:
+            google = accounts_from_settings(
+                settings.google_project_id, settings.google_service_account_key
+            )
+        except GoogleError as err:
+            raise SystemExit(str(err)) from err
+        drive_connections = PostgresDriveConnectionStore(pool)
         price_failure = startup_price_failure(
             prices,
             settings.prices_path,
@@ -288,8 +309,19 @@ async def main() -> None:
         )
         if price_failure:
             raise SystemExit(price_failure)
+
+        # The tenant's Drive reader comes from its connection row, resolved like its Notion
+        # token: a tenant admitted after start-up and a rebuilt runtime both carry it.
+        # Indexing and search read the row fresh besides, so a connect while the worker
+        # runs reaches them on the next run.
+        async def drive_reader(config: AgentsConfig) -> DriveReader | None:
+            if google is None:
+                return None
+            row = await drive_connections.get(config.tenant_id)
+            return DriveReader(google, row.service_account_email) if row is not None else None
+
         registry, tenant_sync = await build_tenant_clients(
-            tenants, directory, settings, credentials, keys, log
+            tenants, directory, settings, credentials, keys, log, drive=drive_reader
         )
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
@@ -361,6 +393,8 @@ async def main() -> None:
             tasks=PostgresTaskStore(pool),
             policies=PostgresApprovalPolicyStore(pool),
             test_sets=PostgresTestSetStore(pool),
+            google=google,
+            drive_connections=drive_connections,
         )
         watch = AudienceWatchActivities(
             registry,
@@ -391,13 +425,25 @@ async def main() -> None:
             ).all()
         )
         if embedder is not None:
-            # Indexing runs only where some published agent has a page grant.
-            workflows += [IndexingWorkflow, PageRefreshWorkflow]
+            # Indexing runs only where some published agent has a knowledge grant.
+            workflows += [IndexingWorkflow, PageRefreshWorkflow, DriveIndexingWorkflow]
             all_activities += IndexActivities(
                 registry,
                 knowledge,
                 embedder,
                 agent_store,
+                usage,
+                switches,
+                budget_guard,
+                idempotency,
+            ).all()
+            all_activities += DriveIndexActivities(
+                registry,
+                knowledge,
+                embedder,
+                agent_store,
+                google,
+                drive_connections,
                 usage,
                 switches,
                 budget_guard,

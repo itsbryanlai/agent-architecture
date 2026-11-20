@@ -737,6 +737,8 @@ FORM_ROUTES = [
     ("settings/webhook/clear", {}),
     ("agents/it-helper/versions/1/test-cases", {"question": "q"}),
     ("agents/it-helper/versions/1/test-run", {}),
+    ("agents/it-helper/versions/1/drive/pick/choose", {"pick_0": "yes"}),
+    ("agents/it-helper/versions/1/drive/remove", {"grant_id": "drive-folder-0001"}),
     ("agents/it-helper/test-cases", {"conversation_id": "c1", "question_seq": "1"}),
 ]
 

@@ -27,6 +27,7 @@ def test_there_are_fixtures_for_every_workflow_type_and_both_shapes():
         "TaskWorkflow",
         "CreatorAccessWorkflow",
         "TestRunWorkflow",
+        "DriveIndexingWorkflow",
     }
     assert any("_inline" in n for n in NAMES) and any("_stored" in n for n in NAMES)
 

@@ -446,6 +446,36 @@ eventually consistent, so a delete takes a short while to finish. A second
 click a few minutes later connects, and the re-created account is a new
 identity: the old account's sharing and roles do not carry over.
 
+**Drive knowledge (read, D-46).** Anything shared with this address is
+available to every agent creator in this workspace; an admin approves each
+agent before it reads it. A creator grants a folder, file or shared drive by
+picking it from what the account can see on the agent's version page — one
+click adds it, one click removes it; there is no per-creator Google sign-in.
+For a shared drive, a Workspace customer adds this address as a member of the
+drive (Viewer is enough for reading) — that is the one share. What gets
+indexed: Google Docs and Slides as plain text, and Sheets as CSV with each
+tab's name kept as a heading; other file types are skipped and counted. A
+granted folder is walked recursively; a shared drive is walked from its root.
+Changes show up on the **next nightly run** (03:00 UTC, the same schedule as
+Notion): the walk compares each file's Drive version and re-exports only what
+changed, and removes files a complete walk no longer sees, trashed, or no
+longer readable (a 404, or a 403 whose reason is lost sharing). A walk that
+could not see everything — a folder whose listing kept failing, or the
+discovery cap — prunes nothing that run. A quota refusal is retried with the
+wait Google asked for; a disabled Drive or Sheets API counts the file failed
+and keeps what is stored. One bad file never fails the run. There is no Drive
+webhook in v1, so an edit is not reflected within seconds the way a Notion
+page event is. A scope whose root is gone or unreadable — any failure, not
+only a gone one — is kept for a few nightly runs before its index is deleted
+(the same guard as Notion), and the owner is told once, with the root's label
+and ID. The walk's outcome updates the connection's status on the settings
+page: an error with a code when any node failed. Before a Drive passage is
+cited it is re-checked live with the tenant's account, its parents walked up
+to the granted root; a file that is gone, no longer shared, or moved out of
+the granted folder is dropped, and the citation links to the file. The Drive
+connector switch (Console → Switches) stops Drive indexing and the Drive part
+of knowledge search while it is off.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,
@@ -1233,25 +1263,28 @@ uv run pytest tests/pg -v -m pg
 ## Knowledge: indexing and search
 
 An agent with a Notion page grant (`grants.notion.pages`) can answer from every
-page under that page. Index the pages first, with the worker running (the
-worker does the reading and embedding; the command only asks Temporal to start
-it):
+page under that page; an agent with a Drive grant (`grants.drive`) can answer
+from every file under the granted folder or shared drive, or from the one
+granted file. Index them first, with the worker running (the worker does the
+reading and embedding; the command only asks Temporal to start it):
 
 ```bash
-uv run python -m agentos.index_knowledge             # one run per granted page, now
+uv run python -m agentos.index_knowledge             # one run per granted scope, now
 uv run python -m agentos.index_knowledge --wait      # ... and print a summary per run
 uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
 uv run python -m agentos.index_knowledge --confirm-gone  # see "A page that cannot be read"
 ```
 
 Indexing calls the embeddings endpoint, so it **spends embedding credit**;
-pages whose content has not changed since the last run are not embedded again.
-Two agents granted the same page share one run. The worker ensures one nightly
-schedule (03:00 UTC) per granted page automatically, at start-up and on its
-refresh when a tenant's grants change (D-42); `--schedule` is a manual repair
-that creates or updates one schedule per granted page and deletes the schedules
-of pages that are no longer granted. Pages removed from the tree or trashed are
-removed from the index on the next run.
+pages and files whose content has not changed since the last run are not
+embedded again. Two agents granted the same page or Drive folder share one run.
+The worker ensures one nightly schedule (03:00 UTC) per granted scope
+automatically, at start-up and on its refresh when a tenant's grants change
+(D-42); `--schedule` is a manual repair that creates or updates one schedule per
+granted scope, Notion and Drive alike, and deletes the schedules of scopes that
+are no longer granted. Pages removed from the tree or trashed are removed from
+the index on the next run; the Drive walk's rules are in "Drive knowledge"
+above.
 
 What is indexed, how pages that cannot be read are treated, how a webhook refreshes a single page
 and how a search is checked and cited are in [architecture.md §6](architecture.md#6-knowledge-retrieval).

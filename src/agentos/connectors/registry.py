@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 
 from agentos.config import AgentVersion
-from agentos.connectors import notion_errors
+from agentos.connectors import drive_errors, notion_errors
 from agentos.connectors.base import Connector, ConnectorErrors
+from agentos.connectors.drive import DriveConnector
 from agentos.connectors.notion import NotionConnector
 from agentos.tenants import TenantRuntime
 
@@ -24,8 +25,12 @@ def _notion(runtime: TenantRuntime, agent: AgentVersion) -> Connector:
     )
 
 
-_FACTORIES: dict[str, ConnectorFactory] = {"notion": _notion}
-_ERRORS: dict[str, ConnectorErrors] = {"notion": notion_errors}
+def _drive(runtime: TenantRuntime, agent: AgentVersion) -> Connector:
+    return DriveConnector(runtime.drive, agent.grants.drive)
+
+
+_FACTORIES: dict[str, ConnectorFactory] = {"notion": _notion, "drive": _drive}
+_ERRORS: dict[str, ConnectorErrors] = {"notion": notion_errors, "drive": drive_errors}
 
 
 def connector_for(name: str, runtime: TenantRuntime, agent: AgentVersion) -> Connector:

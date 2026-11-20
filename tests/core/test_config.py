@@ -123,6 +123,15 @@ def _drop(path: str):
     return apply
 
 
+def _drive_grant_id(value):
+    """A definition whose one Drive folder grant carries ``value`` as its ID."""
+
+    def apply(definition: dict) -> None:
+        definition["grants"]["drive"] = {"folders": [{"id": value, "name": "Team folder"}]}
+
+    return apply
+
+
 DB = "grants.notion.databases.0"
 BAD_DEFINITIONS = [
     # An unknown key at the top, inside a grant, and three levels down.
@@ -154,6 +163,10 @@ BAD_DEFINITIONS = [
     (_set("follow_up.max_nudges", 11), "'max_nudges' must be"),
     (_set(f"{DB}.properties.assignee", 7), "'assignee' must be non-empty text"),
     (_drop("max_steps"), "missing required field 'max_steps'"),
+    # A Drive grant ID is the connector's bare-ID shape: no query injection, no short ID.
+    (_drive_grant_id("x' or '1'='1"), "'id' must be a Drive ID"),
+    (_drive_grant_id("folder 1"), "'id' must be a Drive ID"),
+    (_drive_grant_id("short"), "'id' must be a Drive ID"),
 ]
 
 

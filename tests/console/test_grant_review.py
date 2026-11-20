@@ -14,7 +14,7 @@ import pytest
 
 from agentos.access_diff import WideningNotAcknowledged, diff_access
 from agentos.audience import EffectiveAudience
-from agentos.config import NotionPageGrant
+from agentos.config import DriveGrant, NotionPageGrant
 from agentos.connectors.notion import normalize_id
 from agentos.control_api import create_app
 from agentos.creator_access import (
@@ -38,6 +38,7 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_api import JSON
+from tests.helpers.drive import DRIVE_FOLDER
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
@@ -147,6 +148,7 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ("grant_change", "audience", "widens"),
     [
         ("add_page", BASE, True),
+        ("add_drive_folder", BASE, True),
         ("other_properties", BASE, True),
         ("none", replace(BASE, channels=("C111", "C222")), True),
         ("none", replace(BASE, dm_everyone=True), True),
@@ -160,12 +162,15 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ],
 )
 def test_which_changes_widen_access(grant_change, audience, widens):
-    """Fails if a new grant, other properties, a new channel, wider direct messages or
-    guests do not count as widening, or if a removal, a relabel or no change does."""
+    """Fails if a new grant (a Drive folder included), other properties, a new channel,
+    wider direct messages or guests do not count as widening, or if a removal, a relabel
+    or no change does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
         new.grants.notion_pages.append(NotionPageGrant(PAGE, "Handbook"))
+    elif grant_change == "add_drive_folder":
+        new.grants.drive.append(DriveGrant(DRIVE_FOLDER, "Team folder", "folder"))
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"
     elif grant_change == "remove_database":

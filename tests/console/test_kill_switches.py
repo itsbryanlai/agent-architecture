@@ -944,6 +944,7 @@ def test_the_command_names_one_scope_per_switch_and_everything_names_them_all():
         (ALL_AGENTS, None),
         (WRITES, None),
         (CONNECTOR, "notion"),
+        (CONNECTOR, "drive"),
     ]
     with pytest.raises(SystemExit):
         parse(["--tenant", "t", "off"])
@@ -1001,7 +1002,7 @@ async def test_a_retried_command_invocation_records_one_event_per_switch_and_a_n
     assert await cli_execute(off_args, hs.switches, hs.audit, hs.agents, request_id="inv-2") == 0
 
     kinds = [e.kind for e in hs.audit.events]
-    assert (kinds.count("switch_off"), kinds.count("switch_on")) == (6, 6)
+    assert (kinds.count("switch_off"), kinds.count("switch_on")) == (8, 8)
 
 
 def test_the_operator_is_the_account_not_a_login_variable(monkeypatch):

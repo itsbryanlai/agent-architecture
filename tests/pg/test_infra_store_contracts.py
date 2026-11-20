@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from agentos import ids
 from agentos.content_store import InMemoryContentStore, PostgresContentStore, StoredStep
 from agentos.knowledge.store import InMemoryKnowledgeStore, PageSync, PostgresKnowledgeStore
 from agentos.stores import (
@@ -185,18 +186,34 @@ async def seeded_fruit(knowledge, tenant: str, other_tenant: str):
     return chunks
 
 
+@pytest.mark.parametrize(
+    "scopes",
+    [("s1", "s2"), (ids.drive_scope("folder-1"), ids.drive_scope("folder-2"))],
+    ids=["notion", "drive"],
+)
 async def test_knowledge_search_is_scoped_to_the_tenant_and_ordered_by_distance(
-    knowledge, tenant: str, other_tenant: str
+    knowledge, tenant: str, other_tenant: str, scopes
 ):
-    """Fails if search ignores scope or tenant, or the nearest chunk is not first."""
-    await seeded_fruit(knowledge, tenant, other_tenant)
+    """Fails if search ignores scope or tenant (a Drive scope included), returns a scope
+    the agent was not granted, or the nearest chunk is not first."""
+    granted, other = scopes
+    chunks = [("about apples", unit_vector(0)), ("about pears", unit_vector(1))]
+    await knowledge.replace_page(tenant, granted, "p1", "Fruit", "https://n/p1", "h1", chunks)
+    await knowledge.replace_page(tenant, other, "p2", "Hidden", "https://n/p2", "h2", chunks[:1])
+    await knowledge.replace_page(
+        other_tenant, granted, "p3", "Theirs", "https://n/p3", "h3", chunks[:1]
+    )
 
-    hits = await knowledge.search(tenant, ["s1"], unit_vector(1), limit=5)
+    hits = await knowledge.search(tenant, [granted], unit_vector(1), limit=5)
     assert [(h.page_id, h.text) for h in hits] == [("p1", "about pears"), ("p1", "about apples")]
     assert hits[0].distance == pytest.approx(0.0, abs=1e-6)
     assert (hits[0].title, hits[0].url) == ("Fruit", "https://n/p1")
     assert await knowledge.search(tenant, [], unit_vector(1), limit=5) == []
-    assert len(await knowledge.search(tenant, ["s1", "s2"], unit_vector(0), limit=5)) == 3
+    assert len(await knowledge.search(tenant, [granted, other], unit_vector(0), limit=5)) == 3
+    assert [
+        h.page_id for h in await knowledge.search(other_tenant, [granted], unit_vector(0), limit=5)
+    ] == ["p3"]
+    assert await knowledge.search(tenant, ["no-such-scope"], unit_vector(0), limit=5) == []
 
 
 async def test_reindexing_a_page_replaces_its_chunks_and_details(

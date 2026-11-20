@@ -20,6 +20,7 @@ Rules kept here:
 from __future__ import annotations
 
 import re
+from typing import Protocol
 
 from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
 from agentos.knowledge.notion_text import parent_ref
@@ -148,14 +149,22 @@ class PageChecker:
         )
 
 
+class HitChecker(Protocol):
+    """Confirms a stored hit is still live in its source before it may reach the model."""
+
+    async def confirm(self, hit: ChunkHit, root_page_id: str) -> bool: ...
+
+
 async def select_passages(
-    hits: list[ChunkHit], checker: PageChecker, roots: dict[str, str]
+    hits: list[ChunkHit], checker: HitChecker, roots: dict[str, str]
 ) -> list[ChunkHit]:
     """The hits that may reach the model, nearest first.
 
     ``hits`` are ordered by distance. Each page is checked once, however many of its chunks
     were found, and checking stops once ``SEARCH_RESULTS`` pages are confirmed. A page gives
     at most ``MAX_CHUNKS_PER_PAGE`` passages and the list holds at most ``SEARCH_RESULTS``.
+    ``checker`` confirms a hit against its source (Notion's ``PageChecker``, or a dispatcher
+    that sends Drive scopes to the Drive re-check).
     """
     live: dict[tuple[str, str], bool] = {}
     taken: dict[tuple[str, str], int] = {}

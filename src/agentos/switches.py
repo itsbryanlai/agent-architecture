@@ -69,12 +69,14 @@ WRITES = "writes"
 SCOPES = (AGENT, ALL_AGENTS, CONNECTOR, WRITES)
 
 NOTION = "notion"
-CONNECTORS = (NOTION,)
+DRIVE = "drive"
+CONNECTORS = (NOTION, DRIVE)
 
-# A connector whose reads go through another connector's API: knowledge search re-checks
-# its indexed pages against Notion, so the Notion switch covers it too. The platform
-# connector reads the platform's own store and answers to no connector switch.
-READS_THROUGH = {"knowledge": NOTION}
+# Knowledge search reads through both Notion and Drive, so its connector switch is checked
+# per scope inside the search activity (a Notion scope answers to the Notion switch, a Drive
+# scope to the Drive switch), not by mapping the whole tool to one connector here. The
+# platform connector reads the platform's own store and answers to no connector switch.
+READS_THROUGH: dict[str, str] = {}
 
 SWITCHED_OFF = "switched_off"
 

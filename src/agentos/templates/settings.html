@@ -171,6 +171,7 @@
 {% else %}
 <p>Share the folders and files your agents should use with: <code id="drive-address">{{ view.drive.service_account_email }}</code></p>
 <div class="actions"><button type="button" data-copy="drive-address">Copy address</button></div>
+<p class="muted">Anything shared with this address is available to every agent creator in this workspace; an admin approves each agent before it reads it.</p>
 <p class="muted">Connected {{ view.drive.connected_at | stamp }}. Status: {{ view.drive.status }}{% if view.drive.checked_at %} (last checked {{ view.drive.checked_at | stamp }}){% endif %}.</p>
 {% if view.drive_problem %}<p class="error">{{ view.drive_problem }}</p>{% endif %}
 {% if view.drive_items is not none %}

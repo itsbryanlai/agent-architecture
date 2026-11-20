@@ -4,7 +4,7 @@ error types: one adapter answers the deployment credential refresh and the API c
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
@@ -13,9 +13,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2 import service_account
 
+from agentos.connectors import drive_errors
 from agentos.connectors.google_iam import (
     CLOUD_PLATFORM,
     DRIVE_SCOPES,
+    MIME_DOC,
+    MIME_FOLDER,
+    MIME_SHEET,
+    MIME_SLIDES,
+    DriveFile,
+    DriveSection,
     GoogleError,
     RealGoogleAccounts,
 )
@@ -439,13 +446,258 @@ async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(de
 
     client, sent = client_with(handler, deployment_key)
     listing = await client.list_shared(EMAIL)
-    assert [(i.id, i.name, i.link) for i in listing.items] == [
-        ("f1", "Guide", "https://drive.google.com/file/d/f1"),
-        ("f2", "Roster", "https://drive.google.com/file/d/f2"),
-        ("d1", "Team drive", "https://drive.google.com/drive/folders/d1"),
+    assert [(i.id, i.name, i.link, i.kind) for i in listing.items] == [
+        ("f1", "Guide", "https://drive.google.com/file/d/f1", "file"),
+        ("f2", "Roster", "https://drive.google.com/file/d/f2", "file"),
+        ("d1", "Team drive", "https://drive.google.com/drive/folders/d1", "shared_drive"),
     ]
     assert listing.more is False
     files = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
     assert len(files) == 2
     assert "sharedWithMe" in files[0].path_url
     assert "includeItemsFromAllDrives=true" in files[0].path_url
+
+
+# --- the Drive read surface (knowledge) ---------------------------------------------------
+
+
+def _mint(request):
+    if request.path_url == MINT_PATH:
+        return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+    return None
+
+
+async def test_list_children_pages_through_and_returns_metadata(deployment_key):
+    """Fails if listing a folder's children stops at the first page, does not ask for the
+    folder's non-trashed children, or drops the metadata the walk needs."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files"):
+            if "pageToken=p2" in request.path_url:
+                return reply(
+                    request,
+                    200,
+                    {
+                        "files": [
+                            {"id": "f2", "name": "Sheet", "mimeType": MIME_SHEET, "version": "3"}
+                        ]
+                    },
+                )
+            return reply(
+                request,
+                200,
+                {
+                    "files": [{"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "version": "2"}],
+                    "nextPageToken": "p2",
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    children = await client.list_children(EMAIL, "folder-1")
+    assert [(c.id, c.mime_type, c.version) for c in children] == [
+        ("f1", MIME_DOC, "2"),
+        ("f2", MIME_SHEET, "3"),
+    ]
+    lists = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert len(lists) == 2
+    assert "folder-1" in lists[0].path_url and "trashed" in lists[0].path_url
+    assert lists[0].headers["Authorization"] == "Bearer tenant-token"
+
+
+@pytest.mark.parametrize(("status", "gone"), [(200, False), (404, True), (403, True)])
+async def test_get_file_returns_metadata_or_maps_gone_and_refused(deployment_key, status, gone):
+    """Fails if files.get does not return the metadata with its parents and the tenant's
+    token, or a 404/403 is not a GoogleError carrying its status so the caller can classify
+    the refusal."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if status == 200:
+            return reply(
+                request,
+                200,
+                {
+                    "id": "f1",
+                    "name": "Doc",
+                    "mimeType": MIME_DOC,
+                    "version": "7",
+                    "webViewLink": "https://drive/f1",
+                    "trashed": False,
+                    "parents": ["folder-1"],
+                },
+            )
+        return reply(request, status, {"error": {"status": "NOT_FOUND"}})
+
+    client, sent = client_with(handler, deployment_key)
+    if not gone:
+        assert await client.get_file(EMAIL, "f1") == DriveFile(
+            "f1",
+            "Doc",
+            MIME_DOC,
+            version="7",
+            web_view_link="https://drive/f1",
+            parents=("folder-1",),
+        )
+    else:
+        with pytest.raises(GoogleError) as err:
+            await client.get_file(EMAIL, "f1")
+        assert err.value.status == status
+    gets = [r for r in sent if r.path_url.startswith("/drive/v3/files/f1")]
+    assert gets[0].headers["Authorization"] == "Bearer tenant-token"
+    assert "parents" in gets[0].path_url
+
+
+@pytest.mark.parametrize(
+    ("reason", "retryable", "gone"),
+    [
+        ("userRateLimitExceeded", True, False),
+        ("rateLimitExceeded", True, False),
+        ("quotaExceeded", True, False),
+        ("SERVICE_DISABLED", False, False),
+        ("accessNotConfigured", False, False),
+        ("insufficientFilePermissions", False, True),
+        ("forbidden", False, True),
+        (None, False, True),
+    ],
+)
+async def test_a_403_is_classified_by_its_reason(deployment_key, reason, retryable, gone):
+    """Fails if a quota 403 reads as gone or final, a disabled-API 403 reads as gone, a
+    sharing-loss 403 (or one with no reason) reads as retryable or kept, or a quota wait
+    Google named is dropped."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        errors = [{"reason": reason}] if reason is not None else []
+        response = reply(request, 403, {"error": {"errors": errors}})
+        response.headers["Retry-After"] = "7"
+        return response
+
+    client, _sent = client_with(handler, deployment_key)
+    with pytest.raises(GoogleError) as err:
+        await client.get_file(EMAIL, "f1")
+    assert err.value.status == 403
+    assert drive_errors.entry_for(err.value).retryable is retryable
+    assert drive_errors.is_gone(err.value) is gone
+    delayed = drive_errors.retry_failure(err.value)
+    if retryable:
+        assert delayed is not None
+        assert delayed.next_retry_delay == timedelta(seconds=7)
+    else:
+        assert delayed is None
+
+
+async def test_the_shared_drive_surface_reads_drive_scoped_with_the_tenant_token(deployment_key):
+    """Fails if a shared drive's root is not read with drives.get, its children are not
+    listed with corpora=drive and the drive's ID, or either call carries another token."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/drives/d1"):
+            return reply(request, 200, {"id": "d1", "name": "Team drive"})
+        if request.path_url.startswith("/drive/v3/files"):
+            return reply(
+                request,
+                200,
+                {"files": [{"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "version": "2"}]},
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    root = await client.get_drive(EMAIL, "d1")
+    children = await client.list_drive_children(EMAIL, "d1")
+    assert (root.id, root.name, root.mime_type) == ("d1", "Team drive", MIME_FOLDER)
+    assert [(c.id, c.version) for c in children] == [("f1", "2")]
+    gets = [r for r in sent if r.path_url.startswith("/drive/v3/drives/d1")]
+    lists = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert len(gets) == 1 and len(lists) == 1
+    assert gets[0].headers["Authorization"] == "Bearer tenant-token"
+    assert lists[0].headers["Authorization"] == "Bearer tenant-token"
+    assert "corpora=drive" in lists[0].path_url and "driveId=d1" in lists[0].path_url
+    assert "includeItemsFromAllDrives=true" in lists[0].path_url
+    assert "supportsAllDrives=true" in lists[0].path_url
+
+
+@pytest.mark.parametrize("mime", [MIME_DOC, MIME_SLIDES], ids=["doc", "slides"])
+async def test_export_doc_and_slides_as_plain_text(deployment_key, mime):
+    """Fails if a Doc or Slides export does not ask Drive for text/plain, or returns
+    anything but the exported text."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files/f1/export"):
+            return reply(request, 200, "the exported text")
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    sections = await client.export_file(EMAIL, "f1", mime)
+    assert sections == [DriveSection("", "the exported text")]
+    exports = [r for r in sent if "/export" in r.path_url]
+    assert len(exports) == 1 and "mimeType=text" in exports[0].path_url
+    assert exports[0].headers["Authorization"] == "Bearer tenant-token"
+
+
+async def test_export_sheet_reads_every_tab_as_csv_with_its_name(deployment_key):
+    """Fails if a Sheet export uses Drive's first-tab-only CSV export, or drops a tab's
+    name or rows."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v4/spreadsheets/f1"):
+            return reply(
+                request,
+                200,
+                {
+                    "sheets": [
+                        {
+                            "properties": {"title": "Q1"},
+                            "data": [
+                                {
+                                    "rowData": [
+                                        {
+                                            "values": [
+                                                {"formattedValue": "name"},
+                                                {"formattedValue": "role"},
+                                            ]
+                                        },
+                                        {
+                                            "values": [
+                                                {"formattedValue": "alice"},
+                                                {"formattedValue": "eng"},
+                                            ]
+                                        },
+                                    ]
+                                }
+                            ],
+                        },
+                        {
+                            "properties": {"title": "Q2"},
+                            "data": [{"rowData": [{"values": [{"formattedValue": "bob"}]}]}],
+                        },
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    sections = await client.export_file(EMAIL, "f1", MIME_SHEET)
+    assert [(s.heading, s.text) for s in sections] == [
+        ("Q1", "name,role\nalice,eng\n"),
+        ("Q2", "bob\n"),
+    ]
+    assert not any("/export" in r.path_url for r in sent)
+    sheets = [r for r in sent if r.path_url.startswith("/v4/spreadsheets/f1")]
+    assert sheets[0].headers["Authorization"] == "Bearer tenant-token"

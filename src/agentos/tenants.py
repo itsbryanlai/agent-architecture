@@ -27,10 +27,12 @@ from agentos import ids
 from agentos.config import (
     AgentsConfig,
     ConfigError,
+    DriveGrant,
     Settings,
     TenantsConfig,
     read_secret,
 )
+from agentos.connectors.drive import DriveReader
 from agentos.connectors.notion import NotionAPI, NotionUserCache, normalize_id
 from agentos.slack_client import SlackPoster
 from agentos.tenant_store import TenantSource
@@ -73,6 +75,9 @@ class TenantRuntime:
     # The token the Notion client was built with, so a sync rebuilds it when Connect
     # Notion replaces the credential. In memory only, like the client's own copy.
     notion_token: str = field(default="", repr=False)
+    # The tenant's Drive reader (the deployment client bound to its account email), or
+    # None when Drive is not connected or not set up on the deployment.
+    drive: DriveReader | None = field(default=None, repr=False)
 
 
 def runtime_for(
@@ -81,10 +86,11 @@ def runtime_for(
     notion_api: NotionAPI | None = None,
     slack_token: str = "",
     notion_token: str = "",
+    drive: DriveReader | None = None,
 ) -> TenantRuntime:
     """Build a tenant's runtime."""
     return TenantRuntime(
-        config, slack, notion_api, slack_token=slack_token, notion_token=notion_token
+        config, slack, notion_api, slack_token=slack_token, notion_token=notion_token, drive=drive
     )
 
 
@@ -133,16 +139,16 @@ class RegistrySync:
     """Keeps a worker's ``TenantRegistry`` equal to the directory's enabled tenants.
 
     ``sync`` adds a tenant added to the database (building its clients from the token
-    the resolver returns, or the variables its settings name without one), swaps in
-    changed settings, rebuilds a client whose credential was replaced, and drops a
-    tenant that was disabled or removed, so the worker serves a tenant without a
-    restart. A dropped tenant is passed to ``on_drop`` (the resolver forgets its cached
-    token). A stored-but-disabled tenant is also marked in the registry, so its pending
-    work ends cleanly instead of retrying as not-yet-loaded; the mark follows the
-    directory every pass. A new tenant that cannot be admitted (its Slack token is
-    unavailable, or ``admit`` returns a reason) is left out and reported once per
-    reason; the next ``sync`` tries again. A tenant with no Notion token is served
-    Slack-only.
+    the resolver returns, or the variables its settings name without one, and its Drive
+    reader from its connection row), swaps in changed settings, rebuilds a client whose
+    credential was replaced, and drops a tenant that was disabled or removed, so the
+    worker serves a tenant without a restart. A dropped tenant is passed to ``on_drop``
+    (the resolver forgets its cached token). A stored-but-disabled tenant is also marked
+    in the registry, so its pending work ends cleanly instead of retrying as
+    not-yet-loaded; the mark follows the directory every pass. A new tenant that cannot
+    be admitted (its Slack token is unavailable, or ``admit`` returns a reason) is left
+    out and reported once per reason; the next ``sync`` tries again. A tenant with no
+    Notion token is served Slack-only.
     """
 
     def __init__(
@@ -155,6 +161,7 @@ class RegistrySync:
         slack_token: Callable[[AgentsConfig], Awaitable[str]] | None = None,
         on_drop: Callable[[str], None] | None = None,
         notion_token: Callable[[AgentsConfig], Awaitable[str | None]] | None = None,
+        drive: Callable[[AgentsConfig], Awaitable[DriveReader | None]] | None = None,
     ):
         self._directory = directory
         self._registry = registry
@@ -167,6 +174,10 @@ class RegistrySync:
         # Resolves a tenant's Notion token the same way; None when the tenant has
         # neither a row nor a variable (Slack-only). None here reads only the variable.
         self._notion_token = notion_token
+        # Resolves a tenant's Drive reader from its connection row (the deployment client
+        # bound to the account's email); None when Drive is not connected or not set up.
+        # None here leaves the runtime without a Drive reader.
+        self._drive = drive
         # Called with a dropped tenant's ID, so the resolver forgets its cached token.
         self._on_drop = on_drop
         self._reported: set[tuple[str, str]] = set()
@@ -217,7 +228,8 @@ class RegistrySync:
                 and current.slack_token == token
                 and current.notion_token == (notion_token or "")
             ):
-                self._registry.set(tenant_id, replace(current, config=config))
+                drive = await self._drive(config) if self._drive is not None else current.drive
+                self._registry.set(tenant_id, replace(current, config=config, drive=drive))
                 continue
             try:
                 if current is None and self._admit is not None:
@@ -230,10 +242,16 @@ class RegistrySync:
             except ConfigError as err:
                 self._report(tenant_id, str(err))
                 continue
+            drive = await self._drive(config) if self._drive is not None else None
             self._registry.set(
                 tenant_id,
                 runtime_for(
-                    config, slack, notion, slack_token=token, notion_token=notion_token or ""
+                    config,
+                    slack,
+                    notion,
+                    slack_token=token,
+                    notion_token=notion_token or "",
+                    drive=drive,
                 ),
             )
             if current is None:
@@ -274,13 +292,15 @@ async def build_registry(
     notion_factory: Callable[[str], NotionAPI],
     slack_token: Callable[[AgentsConfig], Awaitable[str]] | None = None,
     notion_token: Callable[[AgentsConfig], Awaitable[str | None]] | None = None,
+    drive: Callable[[AgentsConfig], Awaitable[DriveReader | None]] | None = None,
 ) -> TenantRegistry:
     """Build every tenant's clients from its own resolved credentials.
 
     Production passes ``RealSlackPoster`` and ``RealNotionAPI`` and the credential
     resolvers; tests pass factories that return fakes. ``settings`` carries the
     platform-wide settings; the tenants' secrets are not in it. A tenant with no
-    Notion token gets a Slack-only runtime.
+    Notion token gets a Slack-only runtime. ``drive`` resolves each tenant's Drive
+    reader from its connection row; without it the runtime carries none.
     """
     runtimes = {}
     for tenant_id, config in tenants_config.tenants.items():
@@ -294,8 +314,14 @@ async def build_registry(
         else:
             notion = read_secret(config.secrets.notion_token_env) or None
         notion_api = notion_factory(notion) if notion else None
+        drive_reader = await drive(config) if drive is not None else None
         runtimes[tenant_id] = runtime_for(
-            config, slack, notion_api, slack_token=token, notion_token=notion or ""
+            config,
+            slack,
+            notion_api,
+            slack_token=token,
+            notion_token=notion or "",
+            drive=drive_reader,
         )
     return TenantRegistry(runtimes)
 
@@ -310,4 +336,18 @@ def granted_roots(agents: AgentsConfig) -> dict[str, str]:
     for agent in agents.agents.values():
         for grant in agent.grants.notion_pages:
             roots.setdefault(ids.knowledge_scope(grant.id), normalize_id(grant.id))
+    return roots
+
+
+def granted_drive_roots(agents: AgentsConfig) -> dict[str, DriveGrant]:
+    """Scope to Drive grant, for every distinct folder or file granted to any agent of a tenant.
+
+    Pass a config whose ``agents`` are the tenant's published set
+    (``agent_store.with_published_agents``). The grant carries its kind (folder or file),
+    which the walk uses to decide whether to list children or index the one file.
+    """
+    roots: dict[str, DriveGrant] = {}
+    for agent in agents.agents.values():
+        for grant in agent.grants.drive:
+            roots.setdefault(ids.drive_scope(grant.id), grant)
     return roots

@@ -31,7 +31,7 @@ from agentos.crypto_keys import build_key_store
 from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
 from agentos.tenants import require_tenant_secret
 
-ROLES = ("title", "status", "requested_by", "request_id")
+ROLES = ("title", "status", "requested_by", "request_id", "assignee")
 
 
 async def _version_to_check(

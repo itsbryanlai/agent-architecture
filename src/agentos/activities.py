@@ -64,6 +64,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import NoReturn, TypeVar
 
+from slack_sdk.errors import SlackApiError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -146,6 +147,7 @@ from agentos.models import (
     check_field,
 )
 from agentos.slack_client import (
+    PERMANENT_DM_ERRORS,
     SlackHistoryUnavailable,
     SlackLookupError,
     SlackPoster,
@@ -440,6 +442,7 @@ class AgentActivities:
             self.wait_task_refresh,
             self.nudge_offer,
             self.post_stale_notice,
+            self.clear_stale_offer,
             self.prepare_nudge,
             self.nudge_comment,
             self.nudge_dm,
@@ -2195,6 +2198,36 @@ class AgentActivities:
             ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts, blocks
         )
 
+    @activity.defn(name="clear_stale_offer")
+    async def clear_stale_offer(
+        self, spec: TaskSpec, task_id: str, idem_key: str, days: int
+    ) -> None:
+        """Remove the spent nudge offer's button from its stale notice, keeping the line.
+
+        Best-effort, through the same card-update path as an approval card's result: the
+        notice's channel and ts are read from the post's stored result, and a notice that
+        never landed has nothing to update. The text is rebuilt from the stored item, the
+        same words the notice posted.
+        """
+        ctx = spec.ctx
+        self._log("clear_stale_offer", ctx.tenant_id, ctx.agent_id)
+        record = await self.idem.get(ctx.tenant_id, idem_key)
+        if record is None:
+            return
+        payload = await self._spec_payload(spec)
+        subject = task_notices.subject(spec.tool_name, payload)
+        stored = await self.writes.result(ctx.tenant_id, f"{task_id}:create")
+        if stored is not None:
+            subject = _item_from_ref(stored).title
+        text = task_notices.notice_text(task_notices.STALE, subject=subject, days=days)
+        slack = self._runtime(ctx.tenant_id).slack
+        await slack.update_message(
+            record["channel"],
+            record["ts"],
+            text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+        )
+
     @activity.defn(name="prepare_nudge")
     async def prepare_nudge(
         self, spec: TaskSpec, task_id: str, page_id: str, child_id: str
@@ -2306,7 +2339,8 @@ class AgentActivities:
         history lookup). The workflow runs it only when the approved nudge has a DM.
 
         Runs only after the comment landed; a failure here never retries the comment.
-        Audited as the ``nudge_dm`` write.
+        Audited as the ``nudge_dm`` write. A Slack refusal a retry cannot fix (a gone
+        channel or user, an inactive account) is audited as an error and not retried.
         """
         ctx = spec.ctx
         idem_key = f"{task_id}:dm"
@@ -2316,8 +2350,19 @@ class AgentActivities:
         assignee = payload["assignee_slack_id"]
         await self._record_approval(spec, payload, task_id, assignee)
         slack = self._runtime(ctx.tenant_id).slack
-        channel = await slack.open_dm(assignee)
-        ts = await self._post_once(ctx.tenant_id, idem_key, channel, _nudge_dm_text(payload), None)
+        try:
+            channel = await slack.open_dm(assignee)
+            ts = await self._post_once(
+                ctx.tenant_id, idem_key, channel, _nudge_dm_text(payload), None
+            )
+        except SlackApiError as err:
+            code = (getattr(err, "response", None) or {}).get("error") or ""
+            if code in PERMANENT_DM_ERRORS:
+                await self._record_write(
+                    spec, payload, task_id, idem_key, assignee, "error", tool="nudge_dm"
+                )
+                raise _non_retryable(err) from err
+            raise
         await self._record_write(
             spec, payload, task_id, idem_key, assignee, "ok", {"ts": ts}, tool="nudge_dm"
         )
@@ -2754,12 +2799,15 @@ def _nudge_comment_text(payload: dict) -> tuple[str, str | None]:
 def _nudge_dm_text(payload: dict) -> str:
     """The DM a nudge sends: who asked, the item and its link, the approved text.
 
-    Nothing else from the conversation. The card previews exactly this, and the DM
-    activity builds it from the same approved revision.
+    Nothing else from the conversation. The requester's name, the title (in the line
+    and as the link's label) and the approved text are Slack-escaped; the link the
+    runtime builds stays live. The card previews exactly this, and the DM activity
+    builds it from the same approved revision.
     """
+    title = escape_slack(payload["item_title"])
     return (
-        f"{payload['requester_name']} asked me to check on '{payload['item_title']}'\n"
-        f"{payload['item_url']}\n\n{payload['comment']}"
+        f"{escape_slack(payload['requester_name'])} asked me to check on '{title}'\n"
+        f"<{payload['item_url']}|{title}>\n\n{escape_slack(payload['comment'])}"
     )
 
 
@@ -2834,8 +2882,10 @@ def approval_card_blocks(
         ]
         if shown.get("assignee_slack_id"):
             # The DM previewed exactly: its frame and link, then the approved text (the
-            # same text the comment section shows). Two sections, so each fits Slack's
-            # 3000-character limit even at the field caps.
+            # same text the comment section shows). ``_nudge_dm_text`` already escapes
+            # what people and Notion wrote and keeps the link live, so the sections show
+            # it as it will be sent. Two sections, so each fits Slack's 3000-character
+            # limit even at the field caps.
             dm_text = _nudge_dm_text(shown)
             frame, _, approved = dm_text.partition("\n\n")
             body.append(
@@ -2843,13 +2893,11 @@ def approval_card_blocks(
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Direct message to the assignee*\n{escape_slack(frame)}",
+                        "text": f"*Direct message to the assignee*\n{frame}",
                     },
                 }
             )
-            body.append(
-                {"type": "section", "text": {"type": "mrkdwn", "text": escape_slack(approved)}}
-            )
+            body.append({"type": "section", "text": {"type": "mrkdwn", "text": approved}})
         note = "Nothing is posted or sent until you click Submit."
     elif spec.tool_name == "add_comment":
         head = {

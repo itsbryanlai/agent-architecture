@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from slack_sdk.errors import SlackApiError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -27,6 +28,7 @@ from tests.conftest import (
     eventually,
     title_prop,
 )
+from tests.helpers.slack import slack_error
 
 NONCE = "nonce-eo"
 DETAILS = "Mine flickers."
@@ -383,3 +385,43 @@ async def test_a_second_nudge_dm_attempt_beside_a_running_one_writes_nothing(har
 
     assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id) == ts
     assert len(dm_posts(h)) == 1
+
+
+@pytest.mark.parametrize(
+    ("stage", "code", "refused"),
+    [
+        ("post", "channel_not_found", True),
+        ("post", "account_inactive", True),
+        ("open_dm", "user_not_found", True),
+        ("post", "internal_error", False),
+    ],
+    ids=["gone-channel", "inactive-account", "gone-user", "transient"],
+)
+async def test_a_slack_refusal_of_the_dm_is_audited_and_only_a_transient_one_is_retried(
+    harness, stage, code, refused
+):
+    """Fails if a permanent Slack refusal of the DM is retryable or unaudited, or a transient one ends the nudge."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-refused")
+    error = slack_error(code, "https://slack.com/api/conversations.open")
+    if stage == "open_dm":
+        h.slack.fail_next_open_dm(error, times=1)
+    else:
+        h.slack.fail_next_post(error, times=1, channel=f"D-{BOB}")
+
+    if refused:
+        with pytest.raises(ApplicationError) as err:
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert err.value.non_retryable
+        assert dm_posts(h) == []
+        outcome = "error"
+    else:
+        # The first attempt fails retryably; the next attempt sends the DM.
+        with pytest.raises(SlackApiError):
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert len(dm_posts(h)) == 1
+        outcome = "ok"
+
+    events = [(e.kind, e.tool, e.outcome) for e in h.audit.events if e.task_id == task_id]
+    assert events == [("approval", "nudge", "ok"), ("write", "nudge_dm", outcome)]

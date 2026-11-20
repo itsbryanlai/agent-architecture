@@ -4,8 +4,8 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web.slack_response import SlackResponse
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import WorkflowExecutionStatus
 
 from agentos import ids
 from agentos.models import ApprovalDecision, EditRequest, ExternalUpdate, NudgeRequest
@@ -23,6 +23,8 @@ from tests.conftest import (
     eventually,
 )
 from tests.helpers.agents import republish
+from tests.helpers.replay_support import suggest_continue_as_new_after
+from tests.helpers.slack import slack_error
 from tests.helpers.tasks import approve, start_task, thread_posts, wait_state
 
 ASSIGNEE_SCHEMA = {**default_schema(), "Assignee": {"id": "asg1", "type": "people"}}
@@ -103,21 +105,6 @@ async def await_nudge_card(h):
     return child, value["nonce"]
 
 
-def slack_error(code: str) -> SlackApiError:
-    return SlackApiError(
-        "The request to the Slack API failed.",
-        SlackResponse(
-            client=None,
-            http_verb="POST",
-            api_url="https://slack.com/api/chat.postMessage",
-            req_args={},
-            data={"ok": False, "error": code},
-            headers={},
-            status_code=200,
-        ),
-    )
-
-
 # --- the offer and its fallbacks -------------------------------------------------
 
 
@@ -182,6 +169,55 @@ async def test_only_the_requester_on_the_live_nonce_starts_the_nudge(nh):
     assert len(nudge_cards(h)) == 1
 
 
+async def test_a_click_that_finds_the_assignee_is_the_requester_says_so(nh):
+    """Fails if a nudge whose assignee became the requester after the offer starts a card or says nothing."""
+    h = nh
+    handle, page = await stale_item(h)
+    h.notion.set_people(page["id"], "Assignee", [ALICE_NOTION])
+    value = offer_value(stale_posts(h)[-1])
+
+    await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+
+    # The line is the settle: it posts after the click was prepared and refused.
+    await eventually(lambda: thread_posts(h, "is you, so there's nobody to nudge"))
+    assert len(thread_posts(h, "is you, so there's nobody to nudge")) == 1
+    assert nudge_cards(h) == []
+
+
+async def test_a_nudge_that_cannot_be_prepared_says_so_and_keeps_watching(nh):
+    """Fails if a prepare that fails for good starts a card, says nothing, or ends the watch early."""
+    h = nh
+    handle, page = await stale_item(h)
+    h.notion.trash_page(page["id"])
+    value = offer_value(stale_posts(h)[-1])
+
+    await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+
+    await eventually(lambda: thread_posts(h, "I couldn't prepare the nudge"))
+    assert nudge_cards(h) == []
+    # Settle: the watch's next poll finds the item gone and stops with its own line.
+    await eventually(lambda: thread_posts(h, "I've stopped watching"))
+    assert len(thread_posts(h, "I couldn't prepare the nudge")) == 1
+    assert await handle.result() == "done"
+
+
+async def test_a_broken_assignee_mapping_disables_only_the_nudge_mention(nh):
+    """Fails if a broken assignee mapping stops the nudge or still mentions anyone."""
+    h = nh
+    # The property the grant maps is gone from the database; the agent stays published.
+    h.notion.set_schema(DB_ID, default_schema())
+    handle, page = await stale_item(h, assignee=None)
+
+    child, nonce = await click_nudge(h, handle)
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+
+    assert await child.result() == "done"
+    [comment] = comments(h, page["id"])
+    assert comment_text(comment).startswith("Any update on this?")
+    assert all("mention" not in t for t in comment["rich_text"])
+    assert dm_posts(h) == []
+
+
 # --- the card's preview is what runs ----------------------------------------------
 
 
@@ -223,7 +259,8 @@ async def test_what_the_nudge_card_previewed_is_what_ran(nh, mode):
         assert text.strip().startswith("Any update on this?")
         [dm] = dm_posts(h)
         assert dm["text"] == (
-            f"Alice asked me to check on 'New monitor'\n{page['url']}\n\nAny update on this?"
+            f"Alice asked me to check on 'New monitor'\n"
+            f"<{page['url']}|New monitor>\n\nAny update on this?"
         )
         assert events == [
             ("approval", "nudge", "ok"),
@@ -295,7 +332,7 @@ async def test_agent_off_before_the_nudge_writes_cancels_both(nh):
 
 
 async def test_a_failed_dm_reports_commented_and_never_recomments(nh):
-    """Fails if a DM failure after the comment retries the comment, or reports nothing."""
+    """Fails if a DM failure after the comment retries the comment, reports nothing, or goes unaudited."""
     h = nh
     handle, page = await stale_item(h)
     child, nonce = await click_nudge(h, handle)
@@ -307,6 +344,142 @@ async def test_a_failed_dm_reports_commented_and_never_recomments(nh):
     assert len(comments(h, page["id"])) == 1
     assert dm_posts(h) == []
     assert len(thread_posts(h, "but I couldn't DM the assignee")) == 1
+    events = [(e.kind, e.tool, e.outcome) for e in h.audit.events if e.task_id == child.id]
+    assert events == [
+        ("approval", "nudge", "ok"),
+        ("write", "nudge_comment", "ok"),
+        ("write", "nudge_dm", "error"),
+    ]
+
+
+async def test_a_permanent_dm_refusal_is_not_retried(nh):
+    """Fails if a DM Slack refuses for good is attempted again instead of ending the nudge."""
+    h = nh
+    handle, page = await stale_item(h)
+    child, nonce = await click_nudge(h, handle)
+    # Only the first attempt is refused: a retry would send the DM.
+    h.slack.fail_next_post(slack_error("account_inactive"), times=1, channel=f"D-{BOB}")
+
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+
+    assert await child.result() == "done"
+    assert len(comments(h, page["id"])) == 1
+    assert dm_posts(h) == []
+    assert len(thread_posts(h, "but I couldn't DM the assignee")) == 1
+
+
+# --- a spent offer and a hop -------------------------------------------------------
+
+
+async def test_a_spent_offer_drops_its_button(nh):
+    """Fails if the stale notice keeps its nudge button after the offer was spent."""
+    h = nh
+    handle, _ = await stale_item(h)
+    notice = stale_posts(h)[-1]
+    child, nonce = await click_nudge(h, handle)
+
+    # The card is the settle: the click was applied, and the button cleared, before it.
+    def cleared():
+        return [u for u in h.slack.updates() if u["ts"] == notice["ts"]]
+
+    assert cleared() and all(
+        u["text"] == notice["text"] and all(b["type"] != "actions" for b in u["blocks"])
+        for u in cleared()
+    )
+
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+    assert await child.result() == "done"
+    await eventually(lambda: thread_posts(h, "Nudged the assignee"))
+    assert cleared() and all(
+        u["text"] == notice["text"] and all(b["type"] != "actions" for b in u["blocks"])
+        for u in cleared()
+    )
+
+
+async def test_two_clicks_on_one_offer_start_one_nudge(nh):
+    """Fails if a second click on the same offer, while the first nudge is drafted, starts another."""
+    h = nh
+    handle, page = await stale_item(h)
+    value = offer_value(stale_posts(h)[-1])
+    await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+    # Hold the draft's first read open: the second click lands while the nudge is
+    # being prepared, before the child exists.
+    read = h.notion.hang_next_read("retrieve_page")
+    await read.reached.wait()
+    await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+    read.release()
+
+    child, nonce = await await_nudge_card(h)
+    polls = h.notion.count("retrieve_page")
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+    assert await child.result() == "done"
+    # Settle: applying the nudge report always polls, and a second draft would have
+    # started (and posted its card) before that poll.
+    await eventually(lambda: h.notion.count("retrieve_page") > polls, timeout=30)
+    assert len(nudge_cards(h)) == 1
+    assert len(comments(h, page["id"])) == 1
+
+
+async def _nudge_report_handled(handle) -> bool:
+    """The watch's history shows the nudge_done signal and a workflow task after it."""
+    events = (await handle.fetch_history()).events
+    for i, event in enumerate(events):
+        if (
+            event.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED
+            and event.workflow_execution_signaled_event_attributes.signal_name == "nudge_done"
+        ):
+            return any(
+                e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                for e in events[i + 1 :]
+            )
+    return False
+
+
+async def test_a_nudge_report_in_flight_survives_a_hop(nh):
+    """Fails if a watch that continues as new drops a nudge report it has not applied yet."""
+    h = nh
+    handle, page = await stale_item(h)
+    child, nonce = await click_nudge(h, handle)
+
+    # Hold the watch's next poll open and let the nudge run while it hangs: the report
+    # lands before the poll returns, so the hop at the top of the next loop must carry
+    # the report the loop has not applied yet.
+    read = h.notion.hang_next_read("retrieve_page")
+    await handle.signal(
+        TaskWorkflow.external_update, ExternalUpdate(page_id=page["id"], source="notion_webhook")
+    )
+    await read.reached.wait()
+    # The run that is watching now (the stale period may already have hopped once).
+    hanging_run = (await handle.describe()).run_id
+    bound = len((await handle.fetch_history()).events)
+    with suggest_continue_as_new_after(bound):
+        await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+        assert await child.result() == "done"
+        await eventually(lambda: _nudge_report_handled(handle))
+        read.release()
+
+        async def continued():
+            run = await h.client.get_workflow_handle(handle.id, run_id=hanging_run).describe()
+            return run.status == WorkflowExecutionStatus.CONTINUED_AS_NEW
+
+        await eventually(continued)
+        # The new run applies the report: the clock restarts from the nudge.
+        await h.wf_env.sleep(timedelta(days=2))
+        assert len(stale_posts(h)) == 1
+        await h.wf_env.sleep(timedelta(days=2))
+        await eventually(lambda: len(stale_posts(h)) == 2)
+        assert offer_value(stale_posts(h)[-1]) is not None
+
+        # The later offer works: a second nudge runs end to end.
+        value = offer_value(stale_posts(h)[-1])
+        await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+        await eventually(lambda: len(nudge_cards(h)) == 2)
+        second, second_nonce = await await_nudge_card(h)
+        await second.signal(TaskWorkflow.decision, ApprovalDecision(second_nonce, ALICE, True))
+        assert await second.result() == "done"
+
+    assert len(comments(h, page["id"])) == 2
+    assert len(dm_posts(h)) == 2
 
 
 # --- the stale clock ---------------------------------------------------------------

@@ -239,6 +239,9 @@ class WatchState:
     nudges_used: int = 0
     nudge_nonce: str = ""
     nudge_child: str = ""
+    # A click or a report the watch loop has not applied yet; a hop must not drop it.
+    nudge_requested: bool = False
+    nudge_done: bool = False
 
 
 @dataclass
@@ -317,6 +320,10 @@ NOTION_TEXT_MAX = 2000
 COMMENT_SIGNATURE_MAX = 100
 SIGNATURE_NAME_MAX = 26
 
+# The assignee name a nudge's plain-name mention may carry, capped when the draft is
+# frozen. A Notion name can be all "&", which escape to five characters each on the card.
+NUDGE_NAME_MAX = 80
+
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's
 # first draft, an edit) checks ``check_field``, so an accepted value always fits
@@ -325,8 +332,10 @@ EDITABLE_FIELDS = {
     "create_item": {"title": 150, "details": NOTION_TEXT_MAX - 100},
     "add_comment": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX},
     # A nudge's editable text goes into both the comment and the DM; the mention and the
-    # DM's frame are the runtime's, rebuilt from the approved revision.
-    "nudge": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX},
+    # DM's frame are the runtime's, rebuilt from the approved revision. The comment also
+    # carries a mention: worst case a plain-name one ("@<name> ", the name capped) or a
+    # real one's leading space, so the cap leaves its room under Notion's 2000 as well.
+    "nudge": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX - (NUDGE_NAME_MAX + len("@ "))},
 }
 
 # Room on the card for the escaped value, after the bold label above it.
@@ -335,10 +344,10 @@ _CARD_ROOM = {
     "details": 2000 - len("*Details*\n"),
     "comment": 3000 - len("*Comment*\n"),
 }
-# A nudge's comment preview shares its section with the mention ("@<name> ", the name
-# capped) behind a longer label, so its escaped room is smaller than a plain comment's.
-NUDGE_NAME_MAX = 80
-_NUDGE_COMMENT_ROOM = 3000 - len("*Comment on the item*\n") - NUDGE_NAME_MAX - len("@ ")
+# A nudge's comment preview shares its section with the mention ("@<name> ") behind a
+# longer label. The name is Notion-written, so its worst escaped size (five characters
+# per "&") is reserved too, and the section fits Slack's 3000 even for a hostile name.
+_NUDGE_COMMENT_ROOM = 3000 - len("*Comment on the item*\n") - (len("@ ") + 5 * NUDGE_NAME_MAX)
 
 
 def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:

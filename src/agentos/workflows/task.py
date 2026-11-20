@@ -128,13 +128,14 @@ class TaskWorkflow:
         self._poked = False
         self._edits = 0
         self._refresh_due = False
-        # The nudge offer's nonce and the nudge task in flight survive a hop in the
-        # WatchState; a click or a report is applied by the watch loop, never here.
+        # The nudge offer's nonce, the nudge task in flight and a click or report the
+        # watch loop has not applied yet survive a hop in the WatchState; the loop
+        # applies them, never here.
         resume = spec.resume
         self._nudge_nonce = resume.nudge_nonce if resume is not None else ""
         self._nudge_child = resume.nudge_child if resume is not None else ""
-        self._nudge_requested = False
-        self._nudge_done = False
+        self._nudge_requested = resume.nudge_requested if resume is not None else False
+        self._nudge_done = resume.nudge_done if resume is not None else False
         if spec.resume is not None:
             self._state = "watching"
 
@@ -229,7 +230,11 @@ class TaskWorkflow:
     @workflow.signal(name="nudge")
     def nudge(self, r: NudgeRequest) -> None:
         """A click on the stale notice's nudge button: only the requester, only the
-        live offer's nonce, only while watching with no nudge already in flight."""
+        live offer's nonce, only while watching with no nudge already in flight.
+
+        An accepted click spends the offer at once: the nonce is cleared here, so a
+        second click on the same button is ignored even while the nudge is drafted.
+        """
         if self._state != "watching":
             workflow.logger.warning("ignored nudge click: the task is not watching")
             return
@@ -243,6 +248,7 @@ class TaskWorkflow:
             workflow.logger.warning("ignored nudge click: a nudge is already in flight")
             return
         self._nudge_requested = True
+        self._nudge_nonce = ""
 
     @workflow.signal(name="nudge_done")
     def nudge_done(self, d: NudgeDone) -> None:
@@ -545,6 +551,8 @@ class TaskWorkflow:
                     nudges_used=nudges_used,
                     nudge_nonce=self._nudge_nonce,
                     nudge_child=self._nudge_child,
+                    nudge_requested=self._nudge_requested,
+                    nudge_done=self._nudge_done,
                 )
                 workflow.continue_as_new(dataclasses.replace(self._spec, resume=resume))
             woken_by_poke = True
@@ -571,16 +579,33 @@ class TaskWorkflow:
             if nudge_on:
                 if self._nudge_done:
                     # The nudge ran: the stale clock restarts from now, and a later
-                    # stale period may offer another, up to max_nudges.
+                    # stale period may offer another, up to max_nudges. The spent
+                    # offer's button goes first, under the key its notice was posted.
                     self._nudge_done = False
                     self._nudge_child = ""
                     self._nudge_nonce = ""
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
                     nudges_used += 1
                     last_change = workflow.now()
                     stale_sent = False
                 if self._nudge_requested:
                     self._nudge_requested = False
-                    await self._start_nudge(task_id, item, database_id, nudges_used)
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
+                    await self._start_nudge(
+                        task_id, item, database_id, nudges_used, agent.follow_up.stale_after_days
+                    )
 
             try:
                 current: NotionItem = await self._act(
@@ -791,7 +816,7 @@ class TaskWorkflow:
         return self._state
 
     async def _start_nudge(
-        self, task_id: str, item: NotionItem, database_id: str, nudges_used: int
+        self, task_id: str, item: NotionItem, database_id: str, nudges_used: int, stale_days: int
     ) -> None:
         """Draft the nudge and start its task: one approval card for both effects.
 
@@ -816,6 +841,13 @@ class TaskWorkflow:
                 slack_code,
             )
             self._nudge_nonce = ""
+            await self._try(
+                AgentActivities.clear_stale_offer,
+                self._spec,
+                task_id,
+                f"{task_id}:stale:{nudges_used}",
+                stale_days,
+            )
             await self._notice(
                 task_notices.NUDGE_PREPARE_FAILED,
                 f"{task_id}:nudge-failed:{nudges_used}",

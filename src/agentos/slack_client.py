@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 TRANSIENT_SLACK_ERRORS = frozenset(
     {"ratelimited", "rate_limited", "internal_error", "fatal_error", "service_unavailable"}
 )
+# Slack refusals of a nudge DM that a retry cannot fix: the DM channel or the user is
+# gone, or the account is inactive. The DM is audited as an error and not retried.
+PERMANENT_DM_ERRORS = frozenset({"channel_not_found", "user_not_found", "account_inactive"})
 PAGE_SIZE = 200
 # A workspace or channel has at most this many entries read; more is a bug or an abuse.
 MAX_PAGES = 500
@@ -514,6 +517,8 @@ class FakeSlack:
         self._fail_next_post: Exception | None = None
         self._post_failures_left: int | None = None
         self._post_fail_channel: str | None = None
+        self._fail_next_open_dm: Exception | None = None
+        self._open_dm_failures_left: int | None = None
 
     def fail_lookups(self, error: Exception | None, times: int | None = None) -> None:
         """Make directory lookups raise ``error``: ``times`` of them, or all until set to None."""
@@ -557,6 +562,12 @@ class FakeSlack:
         self._fail_next_post = error
         self._post_failures_left = times
         self._post_fail_channel = channel
+
+    def fail_next_open_dm(self, error: Exception, times: int | None = 1) -> None:
+        """Make open_dm raise ``error`` before opening: the next ``times`` calls
+        (all when None), as Slack refusing a DM with a gone or inactive user."""
+        self._fail_next_open_dm = error
+        self._open_dm_failures_left = times
 
     def _next_ts(self) -> str:
         self._ts += 1
@@ -632,6 +643,13 @@ class FakeSlack:
 
     async def open_dm(self, user_id: str) -> str:
         self.calls.append(("open_dm", {"user_id": user_id}))
+        if self._fail_next_open_dm is not None:
+            error = self._fail_next_open_dm
+            if self._open_dm_failures_left is not None:
+                self._open_dm_failures_left -= 1
+                if self._open_dm_failures_left <= 0:
+                    self._fail_next_open_dm = None
+            raise error
         return f"D-{user_id}"
 
     async def user_email(self, user_id: str) -> str | None:

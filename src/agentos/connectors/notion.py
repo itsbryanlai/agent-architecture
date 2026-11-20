@@ -532,7 +532,16 @@ class FakeNotionAPI:
         self.free_pages[normalize_id(page_id)]["parent"] = parent
 
     def trash_page(self, page_id: str) -> None:
-        self.free_pages[normalize_id(page_id)]["in_trash"] = True
+        key = normalize_id(page_id)
+        if key in self.free_pages:
+            self.free_pages[key]["in_trash"] = True
+            return
+        for pages in self.databases.values():
+            for stored_id, page in pages.items():
+                if normalize_id(stored_id) == key:
+                    page["in_trash"] = True
+                    return
+        raise KeyError(page_id)
 
     def remove_child_page(self, parent_id: str, page_id: str) -> None:
         """Drop a page's ``child_page`` block from its parent and delete the page."""
@@ -881,7 +890,9 @@ class GrantCheck:
     ``resolved`` maps each role to the Notion property ID found for it.
     ``problems`` make the agent unavailable (at publish, or at the worker's
     health check); ``notes`` are worth knowing but do not (a property renamed
-    in Notion is still found by its ID).
+    in Notion is still found by its ID). A broken assignee mapping is a note,
+    not a problem: it disables only the nudge, which then comments without a
+    mention, never the agent.
     """
 
     resolved: dict[str, str] = field(default_factory=dict)
@@ -897,7 +908,8 @@ def _grant_role_config(grant: NotionDatabaseGrant) -> dict[str, tuple[str, str |
         "request_id": (grant.request_id_prop, grant.request_id_prop_id),
     }
     # The assignee is optional: unconfigured, it is not checked at all; configured, it
-    # is held to the same rules as the other roles.
+    # is held to the same rules as the other roles, but a failure is reported as a
+    # nudge-only note (see check_grant), never as a problem that disables the agent.
     if grant.assignee_prop or grant.assignee_prop_id:
         roles["assignee"] = (grant.assignee_prop, grant.assignee_prop_id)
     return roles
@@ -933,19 +945,22 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
     ID is a problem. With it false (the check command), a role without an ID is
     looked up by exact name so its ID can be printed; a near-match by name is
     still a problem, because the agent must not guess which property was meant.
+
+    The assignee is the exception: its failures are reported as notes, for the
+    console's grant check and the health log, because a broken assignee mapping
+    disables only the nudge (a comment without a mention), never the agent.
     """
     schema = await api.retrieve_schema(grant.id)
     by_id = {prop["id"]: (name, prop) for name, prop in schema.items()}
     result = GrantCheck()
 
     for role, (configured_name, configured_id) in _grant_role_config(grant).items():
+        sink = result.notes if role == "assignee" else result.problems
         found: tuple[str, dict] | None = None
         if configured_id:
             found = by_id.get(configured_id)
             if found is None:
-                result.problems.append(
-                    f"{role}: no property with ID '{configured_id}' in the database"
-                )
+                sink.append(f"{role}: no property with ID '{configured_id}' in the database")
                 continue
             if found[0] != configured_name:
                 result.notes.append(
@@ -953,19 +968,15 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
                 )
         else:
             if require_ids:
-                result.problems.append(
-                    f"{role}: no property ID configured; run agentos.check_grants"
-                )
+                sink.append(f"{role}: no property ID configured; run agentos.check_grants")
             if configured_name in schema:
                 found = (configured_name, schema[configured_name])
             else:
                 near = _find_by_name_loosely(schema, configured_name)
                 if near is None:
-                    result.problems.append(
-                        f"{role}: no property named '{configured_name}' in the database"
-                    )
+                    sink.append(f"{role}: no property named '{configured_name}' in the database")
                 else:
-                    result.problems.append(
+                    sink.append(
                         f"{role}: no property named '{configured_name}'; "
                         f"found '{near[0]}' ({near[1]})"
                     )
@@ -975,9 +986,7 @@ async def check_grant(api: NotionAPI, grant: NotionDatabaseGrant, require_ids: b
         result.resolved[role] = prop["id"]
         if prop["type"] not in EXPECTED_TYPES[role]:
             expected = " or ".join(EXPECTED_TYPES[role])
-            result.problems.append(
-                f"{role}: property '{name}' has type '{prop['type']}', expected {expected}"
-            )
+            sink.append(f"{role}: property '{name}' has type '{prop['type']}', expected {expected}")
         if role == "status" and prop["type"] in ("status", "select"):
             for done in grant.done_values:
                 if done not in prop.get("options", []):
@@ -1350,9 +1359,12 @@ class NotionConnector:
         user; the reference still ends the text, so a retry finds it the same way.
         """
         body = f"{text}\n\n— {agent_name[:SIGNATURE_NAME_MAX]}, {comment_ref(idem_key)}"
-        if len(body) > NOTION_TEXT_MAX:
+        # A real mention renders as the user's name and the API puts a space before
+        # the text that follows it; that space counts against Notion's limit too.
+        size = len(body) + (1 if mention_user_id else 0)
+        if size > NOTION_TEXT_MAX:
             raise ConnectorError(
-                f"The comment is {len(body)} characters with its signature; "
+                f"The comment is {size} characters with its signature; "
                 f"Notion allows {NOTION_TEXT_MAX}."
             )
         created = await self._api.create_comment(page_id, body, mention_user_id=mention_user_id)

@@ -948,6 +948,17 @@ class WebUI:
                     503,
                     back=back,
                 )
+        else:
+            # The consent box is a per-pick choice: completing a re-pick with it unticked
+            # revokes the sign-in a former pick kept. Nothing stored revokes nothing, and
+            # a console that cannot keep sign-ins has nothing to revoke.
+            try:
+                if await self.deps.plane.creator_consent(flow.tenant_id, flow.user_id):
+                    await self.deps.plane.revoke_creator_consent(flow.tenant_id, flow.user_id)
+            except Forbidden as err:
+                return _message("Not allowed", str(err), 403, back=back)
+            except ConfigError as err:
+                return _message("Not possible now", str(err), 409, back=back)
         picker.sessions.store(flow, objects, now)
         return _redirect(back + "/pick")
 

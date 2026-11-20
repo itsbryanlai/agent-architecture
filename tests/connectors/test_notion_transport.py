@@ -124,12 +124,14 @@ async def test_retrieve_data_source_reads_the_data_source_object(reply, found):
     [
         ("database", 404, "object_not_found"),
         ("page", 403, "restricted_resource"),
+        ("database", 401, "unauthorized"),
     ],
-    ids=["database-gone", "page-unshared"],
+    ids=["database-gone", "page-unshared", "dead-token"],
 )
 async def test_a_creator_read_surfaces_notions_refusal_with_its_status(kind, status, code):
-    """Fails if the nightly creator read's 403/404 comes back as anything but the SDK's own
-    error with its status, so the check cannot tell a lost object from a transient failure."""
+    """Fails if the nightly creator read's 403/404/401 comes back as anything but the SDK's
+    own error with its status, so the check cannot tell a lost object from a dead token or a
+    transient failure."""
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -149,3 +151,13 @@ async def test_a_creator_read_surfaces_notions_refusal_with_its_status(kind, sta
     assert [r.url.path for r in requests] == [
         f"/v1/databases/{DB}" if kind == "database" else "/v1/pages/page-1"
     ]
+
+
+async def test_aclose_closes_the_creator_clients_connection_pool():
+    """Fails if the nightly pass's aclose leaves the creator client's HTTP pool open."""
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+    api = RealNotionAPI("creator-token", http_client=http)
+
+    await api.aclose()
+
+    assert http.is_closed

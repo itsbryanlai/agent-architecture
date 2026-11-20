@@ -518,13 +518,14 @@ async def test_the_notion_section_says_what_is_in_use_when_nothing_is_connected(
 
 @pytest.mark.parametrize(
     "case",
-    ["consent", "re-pick replaces", "revoke"],
-    ids=["consent", "replaces", "revoke"],
+    ["consent", "re-pick replaces", "revoke", "re-pick unticked"],
+    ids=["consent", "replaces", "revoke", "unticked-repick"],
 )
 async def test_the_pick_flow_keeps_the_sign_in_only_with_consent(case):
     """Fails if a consented pick does not store the creator's token encrypted (or shows it on
-    a page), a second consented pick keeps the old token, or revoke keeps the token, records
-    nothing, or a second revoke records again."""
+    a page), a second consented pick keeps the old token, a re-pick completed with the box
+    unticked keeps the old token, or revoke keeps the token, records nothing, or a second
+    revoke records again."""
     seen: dict = {}
     h = await build_harness(seen)
     await h.plane.add_agent(TENANT, ROOT, "it-helper", published_definition())
@@ -532,13 +533,14 @@ async def test_the_pick_flow_keeps_the_sign_in_only_with_consent(case):
     kind = ids.notion_creator_kind(ROOT)
     version = f"/ui/{TENANT}/agents/it-helper/versions/1"
 
-    async def pick(code: str):
-        start = await post(admin, f"{version}/pick/start", await csrf_token(admin), consent="yes")
+    async def pick(code: str, consent: bool = True):
+        fields = {"consent": "yes"} if consent else {}
+        start = await post(admin, f"{version}/pick/start", await csrf_token(admin), **fields)
         assert start.status_code == 303
         query = parse_qs(urlsplit(start.headers["location"]).query)
         response = await admin.get(CALLBACK, params={"code": code, "state": query["state"][0]})
         assert response.status_code == 303
-        # The consented flow still leaves a listing the creator can pick from.
+        # The flow still leaves a listing the creator can pick from.
         listing = await admin.get(response.headers["location"])
         assert listing.status_code == 200 and "A page" in listing.text
 
@@ -546,6 +548,8 @@ async def test_the_pick_flow_keeps_the_sign_in_only_with_consent(case):
         await pick("abc")
         if case == "re-pick replaces":
             await pick("second")
+        if case == "re-pick unticked":
+            await pick("second", consent=False)
         if case == "revoke":
             response = await post(admin, f"{version}/pick/revoke", await csrf_token(admin))
             assert response.status_code == 303
@@ -554,9 +558,10 @@ async def test_the_pick_flow_keeps_the_sign_in_only_with_consent(case):
         stored = await h.credential_store.get(TENANT, kind)
         # Settle point: the flow is over; a fresh page load shows the state, never the token.
         page = (await admin.get(version)).text
-        if case == "revoke":
+        if case in ("revoke", "re-pick unticked"):
             assert stored is None
             assert "Stop keeping it" not in page
+            assert 'name="consent" value="yes">' in page
             again = await post(admin, f"{version}/pick/revoke", await csrf_token(admin))
             assert again.status_code == 409
             assert [(e.kind, e.tool) for e in h.audit.events if e.kind == "connector"] == [

@@ -88,8 +88,10 @@ picker required (``require_grant_picker``), submit refuses a grant that is new s
 published version and was not chosen from the creator's own Notion (``record_grant_picks``,
 audited as ``grant_pick``). A creator who consents keeps their Notion sign-in
 (``store_creator_consent``, encrypted per tenant and creator, audited as ``connector``);
-``revoke_creator_consent`` deletes it, and ``creator_access_view`` reads the nightly
-verdicts the worker's check wrote (``creator_access``).
+``revoke_creator_consent`` deletes it, and dropping a member or moving a creator to a role
+that does not create deletes it in the same unit of work as the member change.
+``creator_access_view`` reads the nightly verdicts the worker's check wrote
+(``creator_access``).
 
 A refused action is not audited yet.
 
@@ -155,7 +157,7 @@ from agentos.config import (
 )
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
-from agentos.credentials import NOTION, TenantCredentials
+from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
 from agentos.grant_checker import (
     GrantChecker,
@@ -1433,8 +1435,11 @@ class ControlPlane:
 
         A consented pick replaces any sign-in already stored for them. The token and the
         ``connector`` event commit in one unit of work; the token is never logged or audited.
+        A user ID outside the credential kind's class is refused before anything is stored.
         """
         await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        if not CREATOR_USER_ID_PATTERN.fullmatch(actor):
+            raise InvalidMember(f"'{actor}' is not a Slack user ID a sign-in can be kept for")
         if self._credentials is None:
             raise ConfigError("the Notion sign-in cannot be kept on this console")
         async with self._uow.begin(tenant_id) as conn:
@@ -1473,6 +1478,28 @@ class ControlPlane:
                 conn=conn,
             )
         return True
+
+    async def _revoke_creator_signin(
+        self, tenant_id: str, actor: str, user_id: str, conn: Any, request_id: str | None = None
+    ) -> None:
+        """Delete a member's kept Notion sign-in in the caller's unit of work, audited as a
+        consent revoke with the member as the target. A member who never consented leaves
+        nothing to delete and nothing to record."""
+        if self._credentials is None:
+            return
+        deleted = await self._credentials.delete(
+            tenant_id, ids.notion_creator_kind(user_id), conn=conn
+        )
+        if deleted:
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent_revoked",
+                target=user_id,
+                request_id=request_id,
+                conn=conn,
+            )
 
     async def creator_access_view(
         self, tenant_id: str, actor: Actor, agent_id: str
@@ -1643,6 +1670,7 @@ class ControlPlane:
             await self._record(
                 "member_remove", tenant_id, actor, target=user_id, request_id=request_id, conn=conn
             )
+            await self._revoke_creator_signin(tenant_id, actor, user_id, conn, request_id)
 
     async def _protected_member(
         self, tenant_id: str, user_id: str, configured: tuple[str, ...], conn: Any = None

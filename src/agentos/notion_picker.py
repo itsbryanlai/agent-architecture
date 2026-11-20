@@ -14,6 +14,8 @@ The flow:
    table. With the consent the creator ticked before signing in ("keep my Notion sign-in"),
    the control plane stores it encrypted per tenant and creator, and the nightly check
    (``creator_access``) reads with it; a consented pick replaces it, revoking deletes it.
+   The box is a per-pick choice: completing a re-pick with it unticked revokes the sign-in
+   a former pick kept.
 3. What the search listed (IDs, kinds, titles) is kept in memory for the session so the
    creator can tick objects. Only an ID in that list can be picked, and a pick is recorded
    for the agent (``grant_picks``).

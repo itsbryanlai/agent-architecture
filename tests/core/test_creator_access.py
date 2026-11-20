@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from notion_client.errors import APIResponseError
 from temporalio.client import ScheduleAlreadyRunningError
 
 from agentos import ids
@@ -21,6 +22,7 @@ from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
 from agentos.config import parse_agents_config
 from agentos.connectors.notion import FakeNotFound, normalize_id
+from agentos.control import ControlPlane
 from agentos.creator_access import (
     CANNOT_VERIFY,
     LOST,
@@ -31,6 +33,7 @@ from agentos.creator_access import (
     apply_schedule,
 )
 from agentos.credentials import InMemoryCredentialStore, TenantCredentials
+from agentos.grant_checker import NotionGrantChecker
 from agentos.grant_picks import InMemoryGrantPickStore, PickedObject
 from agentos.members import InMemoryMemberStore
 from agentos.slack_client import FakeSlack
@@ -38,11 +41,13 @@ from agentos.stores import InMemoryIdempotencyStore
 from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import DB_ID, OTHER_DB_ID, TENANT, agents_dict, default_schema, make_fake_notion
 from tests.helpers.agents import make_published
+from tests.helpers.control_plane_tenants import tenants
 from tests.helpers.keys import RefreshableKeyStore
 
 NOW = datetime(2026, 11, 20, 5, 0, tzinfo=UTC)
 CREATOR = "U_EDITOR"  # the agent's creator, who picked its grant and consented
 LOST_REASON = "its creator can no longer see 'IT requests'"
+GRANT_PROBLEM = "grant 'IT requests'"
 
 
 class Clock:
@@ -59,6 +64,7 @@ class CreatorReads:
     def __init__(self, inner, error):
         self._inner = inner
         self._error = error
+        self.closed = 0
 
     async def retrieve_database(self, database_id):
         if self._error is not None:
@@ -69,6 +75,9 @@ class CreatorReads:
         if self._error is not None:
             raise self._error
         return await self._inner.retrieve_page(page_id)
+
+    async def aclose(self):
+        self.closed += 1
 
 
 def break_schema(notion) -> None:
@@ -143,44 +152,71 @@ async def world(creator_notion, consent: bool = True) -> World:
 
 
 @pytest.mark.parametrize(
-    ("case", "access_status", "health_status", "reason_part"),
+    ("case", "prior", "access_status", "stale_row", "health_status", "reason_parts"),
     [
-        ("readable", VERIFIED, AVAILABLE, None),
-        ("gone", LOST, UNAVAILABLE, LOST_REASON),
-        ("transient", VERIFIED, AVAILABLE, None),
-        ("no consent", CANNOT_VERIFY, AVAILABLE, None),
+        ("readable", None, VERIFIED, False, AVAILABLE, ()),
+        ("gone", None, LOST, False, UNAVAILABLE, (LOST_REASON,)),
+        ("transient", VERIFIED, VERIFIED, True, AVAILABLE, ()),
+        ("no consent", None, CANNOT_VERIFY, False, AVAILABLE, ()),
+        ("dead token", None, CANNOT_VERIFY, False, AVAILABLE, ()),
+        ("lost then no consent", LOST, LOST, True, UNAVAILABLE, (LOST_REASON,)),
+        ("lost then dead token", LOST, LOST, True, UNAVAILABLE, (LOST_REASON,)),
+        ("lost then transient", LOST, LOST, True, UNAVAILABLE, (LOST_REASON,)),
+        ("lost again", LOST, LOST, False, UNAVAILABLE, (LOST_REASON,)),
+        ("both sources fail", None, LOST, False, UNAVAILABLE, (GRANT_PROBLEM, LOST_REASON)),
     ],
-    ids=["readable", "lost", "transient", "no-consent"],
+    ids=[
+        "readable",
+        "lost",
+        "transient",
+        "no-consent",
+        "dead-token",
+        "lost-then-revoked",
+        "lost-then-dead-token",
+        "lost-then-transient",
+        "lost-again",
+        "both-fail",
+    ],
 )
 async def test_the_nightly_check_records_access_and_health(
-    case, access_status, health_status, reason_part
+    case, prior, access_status, stale_row, health_status, reason_parts
 ):
     """Fails if a readable object is not verified, a lost one does not suspend its agent with
-    the grant named, a transient error changes a row or health, or no consent suspends."""
+    the grant named, a dead token (401) is not cannot_verify, a transient error or a
+    cannot_verify lifts a lost verdict or refreshes its row, or both sources failing together
+    do not join their reasons."""
     creator_notion = make_fake_notion()
-    if case == "gone":
+    if case in ("gone", "lost again", "both sources fail"):
         creator_notion = CreatorReads(creator_notion, FakeNotFound(DB_ID))
-    elif case == "transient":
+    elif case in ("transient", "lost then transient"):
         creator_notion = CreatorReads(creator_notion, httpx.ConnectError("refused"))
-    w = await world(creator_notion, consent=case != "no consent")
+    elif case in ("dead token", "lost then dead token"):
+        creator_notion = CreatorReads(
+            creator_notion,
+            APIResponseError(
+                "unauthorized", 401, "the token is no longer valid", httpx.Headers(), ""
+            ),
+        )
+    w = await world(creator_notion, consent=case not in ("no consent", "lost then no consent"))
+    if case == "both sources fail":
+        break_schema(w.notion)
     key = normalize_id(DB_ID)
-    if case == "transient":
-        # A prior pass verified the object; the transient failure must leave that row as it was.
+    if prior is not None:
+        # A prior pass left this verdict; the new pass must treat it as the row to beat.
         await w.access.record(
-            TENANT, "it-helper", [AccessResult(key, VERIFIED)], NOW - timedelta(days=1), {key}
+            TENANT, "it-helper", [AccessResult(key, prior)], NOW - timedelta(days=1), {key}
         )
 
     await w.nightly()
 
     row = (await w.access.for_agent(TENANT, "it-helper")).get(key)
     assert row is not None and row.status == access_status
-    if case == "transient":
-        assert row.checked_at == NOW - timedelta(days=1)
+    assert row.checked_at == (NOW - timedelta(days=1) if stale_row else NOW)
     health = await w.health.get(TENANT, "it-helper")
     assert health.status == health_status
-    assert (health.reason is None) == (reason_part is None)
-    if reason_part is not None:
-        assert reason_part in health.reason
+    assert (health.reason is None) == (not reason_parts)
+    for part in reason_parts:
+        assert part in health.reason
 
 
 async def test_both_sources_must_pass_before_the_agent_is_available_again():
@@ -229,6 +265,47 @@ async def test_a_verdict_for_an_object_the_version_no_longer_grants_does_not_sus
     rows = await w.access.for_agent(TENANT, "it-helper")
     assert set(rows) == {normalize_id(DB_ID)}
     assert rows[normalize_id(DB_ID)].status == VERIFIED
+
+
+async def test_dropping_a_creator_deletes_their_kept_sign_in():
+    """Fails if dropping a consented creator keeps their sign-in, records no revoke, or leaves
+    the nightly check verifying their picks."""
+    w = await world(make_fake_notion())
+    members = InMemoryMemberStore()
+    await members.add_member(TENANT, CREATOR, "creator", "U_ADMIN")
+    audit = InMemoryAuditStore()
+    plane = ControlPlane(
+        w.agents,
+        members,
+        audit,
+        tenants("U_ADMIN"),
+        NotionGrantChecker(lambda _tenant: w.notion),
+        credentials=w.credentials,
+        grant_picks=w.picks,
+        creator_access=w.access,
+    )
+    assert await w.credentials.creator_consent(TENANT, CREATOR) is True
+
+    await plane.drop_member(TENANT, "U_ADMIN", CREATOR)
+
+    assert await w.credentials.creator_consent(TENANT, CREATOR) is False
+    assert [(e.tool, e.target, e.identity) for e in audit.events if e.kind == "connector"] == [
+        ("creator_consent_revoked", CREATOR, "user:U_ADMIN")
+    ]
+    await w.nightly()
+    row = (await w.access.for_agent(TENANT, "it-helper"))[normalize_id(DB_ID)]
+    assert row.status == CANNOT_VERIFY
+    assert (await w.health.get(TENANT, "it-helper")).status == AVAILABLE
+
+
+async def test_the_pass_closes_the_creator_client_it_resolved():
+    """Fails if the nightly pass leaves the creator's Notion client open after the pass."""
+    creator_notion = CreatorReads(make_fake_notion(), None)
+    w = await world(creator_notion)
+
+    await w.nightly()
+
+    assert creator_notion.closed == 1
 
 
 # --- the schedule: one per tenant, created once -------------------------------------------

@@ -25,6 +25,7 @@ per tenant and creator; a consented pick replaces it and revoking consent delete
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -42,6 +43,10 @@ from agentos.tenants import require_tenant_secret
 SLACK_BOT = "slack_bot"
 NOTION = "notion"
 NOTION_CREATOR_PREFIX = "notion_creator:"
+# The user-ID class of the kind CHECK (migration 038): a Slack user ID, upper-case
+# letters, digits and underscores, 1 to 64 of them. The store boundary refuses an ID
+# outside it, so the row never reaches the database's CHECK as a raw error.
+CREATOR_USER_ID_PATTERN = re.compile(r"[A-Z0-9_]{1,64}")
 
 
 @dataclass(frozen=True)

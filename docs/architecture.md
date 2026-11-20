@@ -386,7 +386,7 @@ Not built, kept as the design:
 
 Status: **built**, except a token budget per turn, tenant and agent and a cap on writes per task (target).
 
-- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions *always* need approval by the requester, show the exact payload, and can only reach what the agent's grants allow. An injected instruction can at most propose an action the user then sees and rejects.
+- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions need approval by the requester, show the exact payload, and can only reach what the agent's grants allow — unless an admin turned approval off for a low-risk comment on the requester's own item (D-43). An injected instruction can at most propose an action the user then sees and rejects, or, under that policy, add a comment to the requester's own item, shown in the thread with a link.
 - **Limits built:** maximum steps per turn, the model's reply token limit (3,072), a history window, `max_writes_per_turn`, at most 5 edits per approval. Not built: a token budget per turn, tenant or agent, and a cap on writes per task.
 
 ### Monthly budgets

@@ -1495,9 +1495,9 @@ link to the task that created it (`task_links`) and that task's requester — ne
 the model's word for it. The comment then runs as soon as its draft is resolved,
 through the same agent-effect gate and the same exactly-once lease as an approved
 comment, audited as `write` with outcome `policy`, no approver and no `approval`
-row. The thread line reads "Commented on '<item>' (no approval needed: your
-admin's setting)." A switch that covers the write still stops it (the thread says
-why, audited `write` with `error`). In every other case — the default policy, an
+row. The thread line reads "Commented on '<item>' (<link>) (no approval needed:
+your admin's setting)." A switch that covers the write still stops it (the thread
+says why, audited `write` with `error`). In every other case — the default policy, an
 item the requester did not file, an item with no creating task, any create, the
 nudge's comment — the card shows as before. The new workflow commands sit behind
 the `approval-policy` patch marker; tasks recorded before it keep showing the card.

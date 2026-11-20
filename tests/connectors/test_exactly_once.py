@@ -1,4 +1,5 @@
-"""An approved Notion write happens once, whatever the attempts, delays and failures around it."""
+"""An approved write happens once, whatever the attempts, delays and failures around it:
+a Notion item or comment, a nudge's two effects, a Drive comment."""
 
 import asyncio
 import dataclasses
@@ -13,6 +14,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.config import TASK_QUEUE
+from agentos.connectors.google_iam import GoogleError
 from agentos.connectors.notion import comment_ref
 from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
@@ -29,6 +31,7 @@ from tests.conftest import (
     eventually,
     title_prop,
 )
+from tests.helpers.drive import DRIVE_DOC
 from tests.helpers.slack import slack_error
 
 NONCE = "nonce-eo"
@@ -471,3 +474,48 @@ async def test_a_slack_refusal_of_the_dm_is_audited_and_only_a_transient_one_is_
 
     events = [(e.kind, e.tool, e.outcome) for e in h.audit.events if e.task_id == task_id]
     assert events == [("approval", "nudge", "ok"), ("write", "nudge_dm", outcome)]
+
+
+# --- a Drive comment (D-47) -----------------------------------------------------------
+
+
+def drive_comment_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_DOC,
+        "comment": "Any update?",
+        "item_title": "Guide",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_DOC}",
+    }
+    return TaskSpec(ctx, "add_comment", payload, NONCE, tool="comment_on_file")
+
+
+async def test_a_drive_comment_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a Drive comment whose response was lost posts it a second time."""
+    h = dharness
+    task_id = ids.task_id(TENANT, "drive-comment-lost")
+    h.google.fail_after_write("comment")
+    with pytest.raises(GoogleError):
+        await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+
+    await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+
+    assert len(h.google.drive_comments[DRIVE_DOC]) == 1
+
+
+async def test_a_second_drive_comment_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a Drive comment attempt starting while another is mid-write posts a second comment."""
+    h = dharness
+    task_id = ids.task_id(TENANT, "drive-comment-overlap")
+    hang = h.google.hang_after_write("comment")
+    first = asyncio.create_task(run(h.acts.add_notion_comment, drive_comment_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert await run(h.acts.add_notion_comment, drive_comment_spec(), task_id) == comment_id
+    assert len(h.google.drive_comments[DRIVE_DOC]) == 1

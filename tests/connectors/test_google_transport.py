@@ -285,7 +285,7 @@ async def test_a_refusal_words_the_deployment_role_on_iam_and_the_accounts_acces
 
 async def test_listing_mints_a_drive_token_once_and_reuses_it_until_it_expires(deployment_key):
     """Fails if every list mints a new token, the mint asks for scopes other than the
-    Drive read scope, the list does not carry the minted token, or an expired token is
+    Drive scope, the list does not carry the minted token, or an expired token is
     reused."""
     clock = Clock()
     clock.now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
@@ -701,3 +701,78 @@ async def test_export_sheet_reads_every_tab_as_csv_with_its_name(deployment_key)
     assert not any("/export" in r.path_url for r in sent)
     sheets = [r for r in sent if r.path_url.startswith("/v4/spreadsheets/f1")]
     assert sheets[0].headers["Authorization"] == "Bearer tenant-token"
+
+
+# --- the comment write surface (D-47) ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["create", "list pages", "create 403", "create 404", "list 403"],
+    ids=["create", "list-pages", "create-refused", "create-gone", "list-refused"],
+)
+async def test_comments_create_and_list_page_with_the_tenant_token_and_map_refusals(
+    deployment_key, case
+):
+    """Fails if comments.create does not post the content with the tenant's token, the
+    comment list stops at its first page or drops who wrote each comment, or a 403/404
+    is not a GoogleError carrying its status so the error table reads it as gone."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files/f1/comments"):
+            if request.method == "POST":
+                if case == "create 403":
+                    return reply(
+                        request,
+                        403,
+                        {"error": {"errors": [{"reason": "insufficientFilePermissions"}]}},
+                    )
+                if case == "create 404":
+                    return reply(request, 404, {"error": {"status": "NOT_FOUND"}})
+                return reply(request, 200, {"id": "c1"})
+            if case == "list 403":
+                return reply(request, 403, {"error": {"errors": [{"reason": "forbidden"}]}})
+            if "pageToken=p2" in request.path_url:
+                return reply(
+                    request,
+                    200,
+                    {"comments": [{"id": "c2", "content": "second", "author": {"me": True}}]},
+                )
+            return reply(
+                request,
+                200,
+                {
+                    "comments": [{"id": "c1", "content": "first", "author": {"me": False}}],
+                    "nextPageToken": "p2",
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    if case == "create":
+        assert await client.create_comment(EMAIL, "f1", "the text") == "c1"
+        posts = [r for r in sent if r.method == "POST" and "/comments" in r.path_url]
+        assert len(posts) == 1
+        assert json.loads(posts[0].body) == {"content": "the text"}
+        assert posts[0].headers["Authorization"] == "Bearer tenant-token"
+        assert "supportsAllDrives=true" in posts[0].path_url
+    elif case == "list pages":
+        comments = await client.list_comments(EMAIL, "f1")
+        assert [(c.id, c.content, c.mine) for c in comments] == [
+            ("c1", "first", False),
+            ("c2", "second", True),
+        ]
+        lists = [r for r in sent if r.method == "GET" and "/comments" in r.path_url]
+        assert len(lists) == 2
+        assert lists[0].headers["Authorization"] == "Bearer tenant-token"
+    else:
+        with pytest.raises(GoogleError) as err:
+            if case.startswith("create"):
+                await client.create_comment(EMAIL, "f1", "the text")
+            else:
+                await client.list_comments(EMAIL, "f1")
+        assert err.value.status == int(case.split()[-1])
+        assert drive_errors.is_gone(err.value)

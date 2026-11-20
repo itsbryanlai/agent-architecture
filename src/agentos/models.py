@@ -281,11 +281,17 @@ class NudgePrepared:
 @dataclass
 class TaskSpec:
     ctx: TurnContext
+    # The kind of task: "create_item", "add_comment" or "nudge" — what the workflow routes
+    # on and the editable fields are keyed by. A Drive comment is an "add_comment" task too.
     tool_name: str
     # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
     # ``revision``). A task recorded before that carries its frozen payload here.
     payload: dict
     approval_nonce: str
+    # The manifest tool the model called ("comment_on_file" for a Drive comment), which
+    # names the connector the write goes through. Empty on a task recorded before it: the
+    # kind named a Notion tool then, as it still does for Notion's own.
+    tool: str = ""
     # The task ID the draft revisions are stored under; empty on a task that carries its payload.
     draft_ref: str = ""
     # The revision the card shows and the approval names. An edit stores the next revision and

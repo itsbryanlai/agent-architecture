@@ -22,6 +22,7 @@ from agentos.config import (
     TenantsConfig,
     parse_agents_config,
 )
+from agentos.connectors.drive import DriveReader
 from agentos.connectors.notion import FakeNotionAPI, text_block
 from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.knowledge.drive_indexing import DriveIndexActivities
@@ -420,7 +421,9 @@ async def dharness(temporal_scope):
         google=google,
         drive_connections=drive_connections,
     )
-    registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, h.notion)})
+    registry = TenantRegistry(
+        {TENANT: runtime_for(cfg, h.slack, h.notion, drive=DriveReader(google, email))}
+    )
     h.acts = AgentActivities(
         settings=Settings(),
         registry=registry,

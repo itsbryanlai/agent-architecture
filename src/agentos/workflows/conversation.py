@@ -1353,6 +1353,7 @@ class ConversationWorkflow:
             tool_name=kind,
             payload=payload,
             approval_nonce=str(workflow.uuid4()),
+            tool=call.name,
         )
         await workflow.start_child_workflow(
             TaskWorkflow.run,
@@ -1384,6 +1385,7 @@ class ConversationWorkflow:
             tool_name=kind,
             payload={},
             approval_nonce=str(workflow.uuid4()),
+            tool=call.name,
             draft_ref=task_id,
             revision=outcome.revision,
             database_id=outcome.database_id,

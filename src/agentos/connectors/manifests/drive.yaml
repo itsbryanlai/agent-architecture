@@ -1,8 +1,25 @@
 # Google Drive connector manifest. The runtime reads it (see agentos.connectors.manifest).
 #
 # Drive reads are knowledge: the indexed folders and files are searched through
-# search_knowledge, not a Drive tool. No tool is offered to the model yet; the write
-# actions (comment, append a row, create from a template, replace a section) arrive with
-# their own tickets and declare their risk, idempotency and preview shape here then.
+# search_knowledge, not a Drive tool. The write actions declare their risk, idempotency
+# and preview shape here; comment is the first (D-47). A Drive comment always asks the
+# requester's approval: it never carries low_risk (maintainer, 2026-11-21). Append a row,
+# create from a template and replace a section arrive with their own tickets.
 connector: drive
-tools: {}
+tools:
+  comment_on_file:
+    risk: write_reversible
+    idempotency: marker_text
+    description: >-
+      Draft a comment on a Google Drive file. Nothing is posted until the
+      requester approves the draft in Slack.
+    input_schema:
+      type: object
+      properties:
+        file:
+          type: string
+          description: Link or ID of the Drive file to comment on, from search results.
+        comment:
+          type: string
+          description: The comment text.
+      required: [file, comment]

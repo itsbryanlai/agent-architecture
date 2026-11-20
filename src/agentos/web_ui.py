@@ -22,7 +22,7 @@ import hmac
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -118,6 +118,8 @@ NOTICES = {
     "rejected": "Rejected; the version is a draft again.",
     "published": "Published.",
     "picked": "Recorded. The objects you chose can now be granted in the definition.",
+    "consent-revoked": "Your Notion sign-in is no longer kept. The nightly check will show "
+    "your grants as cannot verify.",
     "resumed": "Resumed; the agent answers in that channel again.",
     "member-added": "Member added.",
     "member-role": "Role changed.",
@@ -209,13 +211,15 @@ def parse_definition(text: str) -> dict[str, Any]:
     return parsed
 
 
-def grant_rows(agent, review) -> list[dict[str, Any]]:
+def grant_rows(agent, review, creator_access=None) -> list[dict[str, Any]]:
     """The version's grants as table rows: the creator's label and ID, who picked each from
-    Notion, and (for an admin, on a draft or pending version) the live title and parent."""
+    Notion, the nightly creator-access verdict, and (for an admin, on a draft or pending
+    version) the live title and parent."""
     live = {}
     if review is not None and review.reports:
         live = {normalize_id(r.database_id): r for r in review.reports}
     picks = {} if review is None else review.picks
+    access = {} if creator_access is None else creator_access
     rows = []
     for kind, grant in (
         *(("database", g) for g in agent.grants.notion_databases),
@@ -229,6 +233,7 @@ def grant_rows(agent, review) -> list[dict[str, Any]]:
                 "id": grant.id,
                 "pick": picks.get(key),
                 "live": live.get(key),
+                "access": access.get(key),
             }
         )
     return rows
@@ -299,6 +304,7 @@ class WebUI:
         self.route("POST", version + "/pick/start", self.pick_start)
         self.route("GET", version + "/pick", self.pick_page)
         self.route("POST", version + "/pick/choose", self.pick_choose)
+        self.route("POST", version + "/pick/revoke", self.pick_revoke)
         app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
@@ -796,6 +802,17 @@ class WebUI:
             else None
         )
         picker = self.deps.picker
+        may_see_access = picker is not None and (editor or ctx.is_admin)
+        creator_access = (
+            await ctx.plane.creator_access_view(ctx.tenant_id, ctx.principal, agent_id)
+            if may_see_access
+            else {}
+        )
+        creator_consented = (
+            await ctx.plane.creator_consent(ctx.tenant_id, ctx.principal)
+            if may_see_access
+            else False
+        )
         return _page(
             "version.html",
             status,
@@ -803,9 +820,10 @@ class WebUI:
             record=record,
             audience=audience,
             review=review,
-            grant_rows=grant_rows(record.agent(), review),
+            grant_rows=grant_rows(record.agent(), review, creator_access),
             widens=bool(review and review.diff and review.diff.widens),
             picker_enabled=picker is not None,
+            creator_consented=creator_consented,
             paused=await self.paused_of(ctx, agent_id) if editor or ctx.is_admin else [],
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
@@ -871,7 +889,11 @@ class WebUI:
         if picker is None:
             return _message("Not available", "Choosing from Notion is not set up.", 404, ctx)
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
-        state = picker.sessions.begin(self.picker_flow(request, ctx, agent_id, version), ctx.now)
+        flow = replace(
+            self.picker_flow(request, ctx, agent_id, version),
+            consent=ctx.get("consent") == "yes",
+        )
+        state = picker.sessions.begin(flow, ctx.now)
         return _redirect(notion_authorize_url(picker.config, self.deps.console.sign_in, state))
 
     async def notion_callback(self, request: Request) -> Response:
@@ -898,10 +920,12 @@ class WebUI:
         code = request.query_params.get("code", "")
         if request.query_params.get("error") or not code:
             return _redirect(back)
+        redirect_uri = picker.config.redirect_uri(self.deps.console.sign_in)
         try:
-            objects = await picker.oauth.list_visible(
-                code, picker.config.redirect_uri(self.deps.console.sign_in)
-            )
+            if flow.consent:
+                objects, token = await picker.oauth.list_and_keep(code, redirect_uri)
+            else:
+                objects = await picker.oauth.list_visible(code, redirect_uri)
         except NotionPickerError as err:
             log.warning("notion picker failed: %s", err)
             return _message(
@@ -909,6 +933,32 @@ class WebUI:
                 "Couldn't list your Notion pages just now. Try again.",
                 page_status(502),
             )
+        if flow.consent:
+            try:
+                await self.deps.plane.store_creator_consent(flow.tenant_id, flow.user_id, token)
+            except Forbidden as err:
+                return _message("Not allowed", str(err), 403, back=back)
+            except ConfigError as err:
+                return _message("Not possible now", str(err), 409, back=back)
+            except TenantKeyError:
+                log.warning("notion consent refused tenant_id=%s: key unavailable", flow.tenant_id)
+                return _message(
+                    "Not available",
+                    "This organisation's encryption key is not available yet. Try again in a moment.",
+                    503,
+                    back=back,
+                )
+        else:
+            # The consent box is a per-pick choice: completing a re-pick with it unticked
+            # revokes the sign-in a former pick kept. Nothing stored revokes nothing, and
+            # a console that cannot keep sign-ins has nothing to revoke.
+            try:
+                if await self.deps.plane.creator_consent(flow.tenant_id, flow.user_id):
+                    await self.deps.plane.revoke_creator_consent(flow.tenant_id, flow.user_id)
+            except Forbidden as err:
+                return _message("Not allowed", str(err), 403, back=back)
+            except ConfigError as err:
+                return _message("Not possible now", str(err), 409, back=back)
         picker.sessions.store(flow, objects, now)
         return _redirect(back + "/pick")
 
@@ -951,6 +1001,29 @@ class WebUI:
         )
         picker.sessions.drop(flow)
         return _redirect(self.version_url(ctx, agent_id, version, "picked"))
+
+    async def pick_revoke(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """Stop keeping the signed-in creator's Notion sign-in; the token is deleted."""
+        try:
+            changed = await ctx.plane.revoke_creator_consent(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.version_page(
+                request,
+                ctx,
+                agent_id,
+                version,
+                409,
+                "Nothing is stored to revoke: you have not kept your Notion sign-in.",
+            )
+        return _redirect(self.version_url(ctx, agent_id, version, "consent-revoked"))
 
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
         plane = ctx.plane

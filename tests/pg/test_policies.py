@@ -85,6 +85,9 @@ SEEDS = {
     "agent_health": "INSERT INTO agent_health "
     "(tenant_id, agent_id, agent_version, status, reason, checked_at) "
     "VALUES (%(t)s, 'aa', 1, 'unavailable', 'grant g: problem', now())",
+    "creator_access": "INSERT INTO creator_access "
+    "(tenant_id, agent_id, notion_id, status, checked_at) "
+    "VALUES (%(t)s, 'aa', 'n', 'verified', now())",
     "answer_feedback": "INSERT INTO answer_feedback "
     "(tenant_id, conversation_id, answer_ts, voter, agent_id, agent_version, vote) "
     "VALUES (%(t)s, 'c', 'a1', 'u', 'aa', 1, 'up')",
@@ -132,6 +135,7 @@ PRIVILEGES = {
     "tenant_payload_keys": "SELECT INSERT",
     "tenant_credentials": "SELECT INSERT UPDATE DELETE",
     "agent_health": "SELECT INSERT UPDATE",
+    "creator_access": "SELECT INSERT UPDATE DELETE",
     "answer_feedback": "SELECT INSERT UPDATE DELETE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",

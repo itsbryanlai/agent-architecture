@@ -196,6 +196,11 @@ class RealNotionAPI:
     async def _wait_for_allowance(self, request: httpx.Request) -> None:
         await self.limiter.acquire()
 
+    async def aclose(self) -> None:
+        """Close the connection pool this client owns. The nightly creator-access pass
+        builds one client per creator and closes each after the pass."""
+        await self._client.aclose()
+
     async def _data_source_ids(self, database_id: str) -> list[str]:
         key = normalize_id(database_id)
         if key not in self._data_sources:

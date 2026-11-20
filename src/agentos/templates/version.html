@@ -39,17 +39,34 @@
     </form>
   {% endif %}
   {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
-  {% if editor and is_draft and picker_enabled %}{{ post_button(version_url ~ "/pick/start", ctx.csrf, "Choose from Notion") }}{% endif %}
+  {% if editor and is_draft and picker_enabled %}
+    <form method="post" action="{{ version_url }}/pick/start">
+      <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+      <label><input type="checkbox" name="consent" value="yes"{% if creator_consented %} checked{% endif %}> Keep my Notion sign-in so the platform can check each night that I can still see what I gave this agent.</label>
+      <button type="submit">Choose from Notion</button>
+    </form>
+  {% endif %}
   {% if editor and not is_draft %}
     {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version, "request_id": new_token()}) }}
   {% endif %}
 </div>
 
+{% if editor and picker_enabled and creator_consented %}
+<div class="actions">
+  <span>Your Notion sign-in is kept for the nightly access check.</span>
+  <form method="post" action="{{ version_url }}/pick/revoke">
+    <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+    <input type="hidden" name="request_id" value="{{ new_token() }}">
+    <button type="submit">Stop keeping it</button>
+  </form>
+</div>
+{% endif %}
+
 
 {% if grant_rows %}
 <h2>Grants</h2>
 <table>
-  <tr><th>Creator's label</th><th>Kind</th><th>Notion ID</th>{% if review and review.reports %}<th>Live title in Notion</th><th>Parent</th>{% endif %}{% if picker_enabled %}<th>Chosen from Notion</th>{% endif %}</tr>
+  <tr><th>Creator's label</th><th>Kind</th><th>Notion ID</th>{% if review and review.reports %}<th>Live title in Notion</th><th>Parent</th>{% endif %}{% if picker_enabled %}<th>Chosen from Notion</th><th>Creator access</th>{% endif %}</tr>
   {% for g in grant_rows %}
   <tr>
     <td>{{ g.label }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
@@ -57,7 +74,8 @@
     <td>{% if g.live and g.live.live_title is not none %}{{ g.live.live_title }}{% if g.live.label_differs %} <span class="error">The label does not match the live title: check this is the object you mean to give the agent.</span>{% endif %}{% else %}<span class="muted">not readable</span>{% endif %}</td>
     <td>{% if g.live and g.live.parent %}{{ g.live.parent }}{% endif %}</td>
     {% endif %}
-    {% if picker_enabled %}<td>{% if g.pick %}{{ g.pick.picked_by }}, {{ g.pick.picked_at | stamp }}{% else %}<span class="muted">no</span>{% endif %}</td>{% endif %}
+    {% if picker_enabled %}<td>{% if g.pick %}{{ g.pick.picked_by }}, {{ g.pick.picked_at | stamp }}{% else %}<span class="muted">no</span>{% endif %}</td>
+    <td>{% if g.access %}{% if g.access.status == "lost" %}<span class="error">lost</span>{% elif g.access.status == "cannot_verify" %}cannot verify (no consent){% else %}verified {{ g.access.checked_at | stamp }}{% endif %}{% else %}<span class="muted">not checked yet</span>{% endif %}</td>{% endif %}
   </tr>
   {% endfor %}
 </table>

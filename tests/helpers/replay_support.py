@@ -33,15 +33,26 @@ from temporalio.worker import Replayer, Worker
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_health import (
+    AVAILABLE,
+    UNAVAILABLE,
+    AgentHealthChecker,
+    InMemoryAgentHealthStore,
+)
 from agentos.agent_store import seeded_agent_store
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
+from agentos.connectors.notion import normalize_id
+from agentos.creator_access import CreatorAccessActivities, InMemoryCreatorAccessStore
+from agentos.credentials import InMemoryCredentialStore, TenantCredentials
 from agentos.crypto_keys import LocalKeyStore
+from agentos.grant_picks import InMemoryGrantPickStore, PickedObject
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.llm import ScriptedLLMClient
+from agentos.members import InMemoryMemberStore
 from agentos.models import (
     ApprovalDecision,
     ConversationRef,
@@ -71,6 +82,7 @@ from agentos.workflows.conversation import (
     TURN_FAILED,
     ConversationWorkflow,
 )
+from agentos.workflows.creator_access import CreatorAccessWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
@@ -151,6 +163,13 @@ class Rig:
     budgets: InMemoryBudgetStore
     usage: InMemoryUsageStore
     history: InMemoryHistoryStore
+    picks: InMemoryGrantPickStore
+    credentials: TenantCredentials
+    access: InMemoryCreatorAccessStore
+    # The creator's own Notion, separate from the tenant integration's: the nightly check
+    # reads with it, so a scenario can lose the creator's access while the grants pass.
+    creator_notion: object
+    health: InMemoryAgentHealthStore
 
     @property
     def client(self) -> Client:
@@ -197,16 +216,62 @@ async def rig(key_dir: Path, *, workflows=None):
         switches=switches,
         budgets=BudgetGuard(budgets, usage, ttl_seconds=0),
     )
+    picks = InMemoryGrantPickStore()
+    access = InMemoryCreatorAccessStore()
+    credentials = TenantCredentials(InMemoryCredentialStore(), fixture_key_store(key_dir))
+    health = InMemoryAgentHealthStore()
+    health_checker = AgentHealthChecker(
+        registry,
+        agent_store,
+        health,
+        acts.audit,
+        acts.idem,
+        InMemoryMemberStore(),
+        creator_access=access,
+    )
+    creator_notion = make_fake_notion()
+    creator_notion.add_page_tree(ROOT_A, a_tree())
+    creator_notion.add_page_tree(ROOT_B, b_tree())
+    creator_access_acts = CreatorAccessActivities(
+        registry,
+        agent_store,
+        picks,
+        credentials,
+        access,
+        health_checker,
+        client_for=lambda _token, _tenant: creator_notion,
+    )
     worker = Worker(
         env.client,
         task_queue=TASK_QUEUE,
         workflows=workflows
-        or [ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
-        activities=acts.all() + index.all(),
+        or [
+            ConversationWorkflow,
+            TaskWorkflow,
+            IndexingWorkflow,
+            PageRefreshWorkflow,
+            CreatorAccessWorkflow,
+        ],
+        activities=acts.all() + index.all() + creator_access_acts.all(),
     )
     async with worker:
         try:
-            yield Rig(env, llm, slack, notion, acts, switches, budgets, usage, history)
+            yield Rig(
+                env,
+                llm,
+                slack,
+                notion,
+                acts,
+                switches,
+                budgets,
+                usage,
+                history,
+                picks,
+                credentials,
+                access,
+                creator_notion,
+                health,
+            )
         finally:
             await env.shutdown()
 
@@ -1240,6 +1305,91 @@ async def progress_dropped(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
+async def creator_access(r: Rig) -> list[Recorded]:
+    """One nightly pass: a consented creator's picked grants read back, so both verify and
+    the run's health step leaves the agent available."""
+    await r.picks.record(
+        TENANT,
+        "it-helper",
+        [PickedObject(DB_ID, "database"), PickedObject(ROOT_A, "page")],
+        "U_CREATOR",
+        datetime(2026, 11, 20, tzinfo=UTC),
+    )
+    await r.credentials.store_with_current_key(
+        TENANT, ids.notion_creator_kind("U_CREATOR"), "ntn_creator_token_for_the_fixture"
+    )
+    counts = await r.client.execute_workflow(
+        CreatorAccessWorkflow.run,
+        TENANT,
+        id=ids.creator_access_workflow_id(TENANT),
+        task_queue=TASK_QUEUE,
+    )
+    assert (counts.verified, counts.lost, counts.cannot_verify, counts.unchanged) == (2, 0, 0, 0)
+    rows = await r.access.for_agent(TENANT, "it-helper")
+    assert {row.status for row in rows.values()} == {"verified"}
+    assert (await r.health.get(TENANT, "it-helper")).status == AVAILABLE
+    return [await current(r, "", ids.creator_access_workflow_id(TENANT))]
+
+
+async def creator_access_lost(r: Rig) -> list[Recorded]:
+    """One nightly pass where the creator can no longer see the database they picked: the
+    run's health step leaves the agent unavailable with the grant named, though the grants
+    themselves still pass."""
+    await r.picks.record(
+        TENANT,
+        "it-helper",
+        [PickedObject(DB_ID, "database"), PickedObject(ROOT_A, "page")],
+        "U_CREATOR",
+        datetime(2026, 11, 20, tzinfo=UTC),
+    )
+    await r.credentials.store_with_current_key(
+        TENANT, ids.notion_creator_kind("U_CREATOR"), "ntn_creator_token_for_the_fixture"
+    )
+    # The database is gone from the creator's own Notion; the tenant's integration still
+    # reads it, so only the creator-access source fails.
+    del r.creator_notion.databases[normalize_id(DB_ID)]
+    counts = await r.client.execute_workflow(
+        CreatorAccessWorkflow.run,
+        TENANT,
+        id=ids.creator_access_workflow_id(TENANT),
+        task_queue=TASK_QUEUE,
+    )
+    assert (counts.verified, counts.lost, counts.cannot_verify, counts.unchanged) == (1, 1, 0, 0)
+    rows = await r.access.for_agent(TENANT, "it-helper")
+    assert rows[normalize_id(DB_ID)].status == "lost"
+    assert rows[normalize_id(ROOT_A)].status == "verified"
+    health = await r.health.get(TENANT, "it-helper")
+    assert health.status == UNAVAILABLE
+    assert "its creator can no longer see 'IT requests'" in health.reason
+    return [await current(r, "", ids.creator_access_workflow_id(TENANT))]
+
+
+async def creator_access_tenant_disabled(r: Rig) -> list[Recorded]:
+    """The schedule fires for an uninstalled tenant: the pass completes with zero counts,
+    no reads and no retries."""
+    r.acts.registry.remove(TENANT)
+    r.acts.registry.set_disabled({TENANT})
+    counts = await r.client.execute_workflow(
+        CreatorAccessWorkflow.run,
+        TENANT,
+        id=ids.creator_access_workflow_id(TENANT),
+        task_queue=TASK_QUEUE,
+    )
+    assert (counts.verified, counts.lost, counts.cannot_verify, counts.unchanged) == (0, 0, 0, 0)
+    assert r.notion.calls == [] and r.creator_notion.calls == []
+    history = await r.client.get_workflow_handle(
+        ids.creator_access_workflow_id(TENANT)
+    ).fetch_history()
+    scheduled = [
+        e.activity_task_scheduled_event_attributes.activity_type.name
+        for e in history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+    ]
+    # One attempt each: the listing finds no served tenant, and the health step ends too.
+    assert scheduled == ["creator_access_agents", "creator_access_health"]
+    return [await current(r, "", ids.creator_access_workflow_id(TENANT))]
+
+
 def _both(fn):
     return {
         False: lambda r: fn(r, False),
@@ -1286,6 +1436,11 @@ for _name, _fn in {
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run
 
+# The nightly creator-access passes have one shape: no message or task payload rides in them.
+SCENARIOS["creator_access"] = creator_access
+SCENARIOS["creator_access_lost"] = creator_access_lost
+SCENARIOS["creator_access_tenant_disabled"] = creator_access_tenant_disabled
+
 
 # --- files --------------------------------------------------------------------------------
 
@@ -1323,7 +1478,7 @@ async def replay(path: Path, key_dir: Path):
     """Replay one fixture on the current workflow code; raises on non-determinism."""
     history, header = load_fixture(path)
     replayer = Replayer(
-        workflows=[ConversationWorkflow, TaskWorkflow],
+        workflows=[ConversationWorkflow, TaskWorkflow, CreatorAccessWorkflow],
         # An old file was recorded with the default converter; a new one with the encrypting one.
         data_converter=converter(key_dir) if header else DataConverter.default,
     )

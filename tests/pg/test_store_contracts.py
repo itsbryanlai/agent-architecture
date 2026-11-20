@@ -27,6 +27,14 @@ from agentos.audience_pauses import InMemoryPauseStore, PostgresPauseStore
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore
 from agentos.budgets import BudgetNotFound, InMemoryBudgetStore, PostgresBudgetStore
 from agentos.config import Settings, TenantsConfig, parse_agents_config
+from agentos.creator_access import (
+    CANNOT_VERIFY,
+    LOST,
+    VERIFIED,
+    AccessResult,
+    InMemoryCreatorAccessStore,
+    PostgresCreatorAccessStore,
+)
 from agentos.feedback import (
     AnswerFeedback,
     InMemoryFeedbackStore,
@@ -356,6 +364,43 @@ async def test_a_pick_is_kept_per_agent_by_normalised_id_and_choosing_again_refr
     assert mine[plain].picked_at == NOW + timedelta(days=1)
     assert await picks.for_agent(tenant, "bb") == {}
     assert await picks.for_agent(other_tenant, "aa") == {}
+
+
+# --- creator access -------------------------------------------------------------------
+
+
+@pytest.fixture
+def access(store_pool):
+    return twin(store_pool, InMemoryCreatorAccessStore, PostgresCreatorAccessStore)
+
+
+async def test_creator_access_records_verdicts_and_prunes_objects_no_longer_granted(
+    access, tenant: str, other_tenant: str
+):
+    """Fails if a verdict does not read back, a second pass keeps a stale object's row or the
+    old verdict, or another agent's or tenant's rows show."""
+    await access.record(
+        tenant,
+        "aa",
+        [AccessResult("n1", VERIFIED), AccessResult("n2", LOST)],
+        NOW,
+        {"n1", "n2"},
+    )
+    rows = await access.for_agent(tenant, "aa")
+    assert {nid: (row.status, row.checked_at) for nid, row in rows.items()} == {
+        "n1": (VERIFIED, NOW),
+        "n2": (LOST, NOW),
+    }
+
+    later = NOW + timedelta(days=1)
+    await access.record(tenant, "aa", [AccessResult("n1", CANNOT_VERIFY)], later, {"n1"})
+
+    rows = await access.for_agent(tenant, "aa")
+    assert {nid: (row.status, row.checked_at) for nid, row in rows.items()} == {
+        "n1": (CANNOT_VERIFY, later)
+    }
+    assert await access.for_agent(tenant, "bb") == {}
+    assert await access.for_agent(other_tenant, "aa") == {}
 
 
 # --- notion webhook tokens -----------------------------------------------------------

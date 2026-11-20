@@ -47,6 +47,7 @@ from agentos.config import (
 )
 from agentos.connectors.notion import NotionAPI, RealNotionAPI
 from agentos.content_store import PostgresContentStore
+from agentos.creator_access import CreatorAccessActivities, PostgresCreatorAccessStore
 from agentos.credentials import PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import (
     KeyStore,
@@ -56,6 +57,7 @@ from agentos.crypto_keys import (
     start_key_refresh,
     startup_key_failure,
 )
+from agentos.grant_picks import PostgresGrantPickStore
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
@@ -81,6 +83,7 @@ from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.creator_access import CreatorAccessWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.retention import RetentionWorkflow
@@ -287,6 +290,7 @@ async def main() -> None:
         idempotency = PostgresIdempotencyStore(pool)
         members = PostgresMemberStore(pool)
         health = PostgresAgentHealthStore(pool)
+        creator_access = PostgresCreatorAccessStore(pool)
         health_checker = AgentHealthChecker(
             registry,
             agent_store,
@@ -295,6 +299,7 @@ async def main() -> None:
             idempotency,
             members,
             uow=PostgresUnitOfWork(pool),
+            creator_access=creator_access,
         )
         # A broken grant disables its agent with the reason; the worker starts and
         # serves every other agent and tenant. Platform-wide problems above still exit.
@@ -363,9 +368,20 @@ async def main() -> None:
             TaskWorkflow,
             AudienceWatchWorkflow,
             RetentionWorkflow,
+            CreatorAccessWorkflow,
         ]
         all_activities = (
-            activities.all() + watch.all() + RetentionActivities(PostgresRetentionStore(pool)).all()
+            activities.all()
+            + watch.all()
+            + RetentionActivities(PostgresRetentionStore(pool)).all()
+            + CreatorAccessActivities(
+                registry,
+                agent_store,
+                PostgresGrantPickStore(pool),
+                credentials,
+                creator_access,
+                health_checker,
+            ).all()
         )
         if embedder is not None:
             # Indexing runs only where some published agent has a page grant.

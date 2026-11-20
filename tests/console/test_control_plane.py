@@ -1,5 +1,7 @@
 """The control plane: roles, the rules table, the audit trail and the stale-publish guard."""
 
+import secrets as token_source
+
 import pytest
 
 from agentos.agent_store import (
@@ -9,11 +11,13 @@ from agentos.agent_store import (
 )
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.control import ControlPlane, Forbidden
+from agentos.credentials import InMemoryCredentialStore, TenantCredentials
 from agentos.grant_checker import NotionGrantChecker
-from agentos.members import InMemoryMemberStore, MemberError
+from agentos.members import InMemoryMemberStore, InvalidMember, MemberError
 from tests.conftest import TENANT, make_fake_notion
 from tests.helpers.agents import helper_block
 from tests.helpers.control_plane_tenants import tenants
+from tests.helpers.keys import RefreshableKeyStore
 
 ROOT = "U_ROOT"  # an admin from the tenant file
 ADMIN2 = "U_ADMIN2"  # an admin added through the app
@@ -23,14 +27,14 @@ OUTSIDER = "U_OUTSIDER"  # no role
 PROMPT = "You help employees with IT requests."
 
 
-async def make_plane(admins: tuple[str, ...] = (ROOT,), seed: bool = True):
+async def make_plane(admins: tuple[str, ...] = (ROOT,), seed: bool = True, credentials=None):
     agents, members, audit = InMemoryAgentStore(), InMemoryMemberStore(), InMemoryAuditStore()
     if seed:
         await members.add_member(TENANT, ADMIN2, "admin", ROOT)
         await members.add_member(TENANT, OWNER, "creator", ROOT)
         await members.add_member(TENANT, OTHER, "creator", ROOT)
     checker = NotionGrantChecker(lambda tenant_id: make_fake_notion())
-    plane = ControlPlane(agents, members, audit, tenants(*admins), checker)
+    plane = ControlPlane(agents, members, audit, tenants(*admins), checker, credentials=credentials)
     return plane, agents, members, audit
 
 
@@ -298,6 +302,39 @@ async def test_member_changes_that_name_nobody_or_repeat_are_errors_not_forbidde
         await plane.change_role(TENANT, ROOT, OWNER, "creator")
     with pytest.raises(MemberError):
         await plane.invite_member(TENANT, ROOT, "U_NEW", "owner")
+
+
+@pytest.mark.parametrize(
+    ("user_id", "accepted"),
+    [
+        ("U0CREATOR", True),
+        ("W0ENTERPRISE", True),
+        ("U" + "A" * 63, True),  # 64 characters: the class's upper bound
+        ("u_lowercase", False),
+        ("U-DASH", False),
+        ("U" + "A" * 64, False),  # 65 characters
+        ("U SPACE", False),
+    ],
+    ids=["user", "enterprise", "max-length", "lowercase", "dash", "too-long", "space"],
+)
+async def test_consent_is_stored_only_for_a_user_id_in_the_credential_kind_class(user_id, accepted):
+    """Fails if a sign-in is stored for a user ID the credential kind's CHECK rejects, or a
+    valid Slack user ID is refused."""
+    keys = RefreshableKeyStore({(TENANT, 1): token_source.token_bytes(32)})
+    await keys.refresh()
+    credentials = TenantCredentials(InMemoryCredentialStore(), keys)
+    plane, _, members, audit = await make_plane(credentials=credentials)
+    await members.add_member(TENANT, user_id, "creator", ROOT)
+
+    if accepted:
+        await plane.store_creator_consent(TENANT, user_id, "ntn_creator_token_for_the_test")
+        assert await credentials.creator_consent(TENANT, user_id) is True
+        assert [(e.kind, e.tool) for e in audit.events] == [("connector", "creator_consent")]
+    else:
+        with pytest.raises(InvalidMember):
+            await plane.store_creator_consent(TENANT, user_id, "ntn_creator_token_for_the_test")
+        assert await credentials.creator_consent(TENANT, user_id) is False
+        assert audit.events == []
 
 
 # --- audit ----------------------------------------------------------------------------

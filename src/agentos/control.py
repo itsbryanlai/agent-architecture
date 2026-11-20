@@ -86,7 +86,12 @@ the published version. A version that widens access is published only with
 ``acknowledge_widening``; the acknowledgement is audited as ``widening_confirm``. With the
 picker required (``require_grant_picker``), submit refuses a grant that is new since the
 published version and was not chosen from the creator's own Notion (``record_grant_picks``,
-audited as ``grant_pick``).
+audited as ``grant_pick``). A creator who consents keeps their Notion sign-in
+(``store_creator_consent``, encrypted per tenant and creator, audited as ``connector``);
+``revoke_creator_consent`` deletes it, and dropping a member or moving a creator to a role
+that does not create deletes it in the same unit of work as the member change.
+``creator_access_view`` reads the nightly verdicts the worker's check wrote
+(``creator_access``).
 
 A refused action is not audited yet.
 
@@ -151,7 +156,8 @@ from agentos.config import (
     read_secret,
 )
 from agentos.connectors.notion import normalize_id
-from agentos.credentials import NOTION, TenantCredentials
+from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
+from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
 from agentos.grant_checker import (
     GrantChecker,
@@ -349,8 +355,12 @@ class ControlPlane:
         webhook_tokens: WebhookTokens | None = None,
         slack_for: Callable[[str], Awaitable[SlackPoster]] | None = None,
         health: HealthStore | None = None,
+        creator_access: CreatorAccessStore | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
+        self._creator_access = (
+            InMemoryCreatorAccessStore() if creator_access is None else creator_access
+        )
         self._require_picker = require_grant_picker
         self._switches = InMemorySwitchStore() if switches is None else switches
         self._pauses = InMemoryPauseStore() if pauses is None else pauses
@@ -1411,6 +1421,93 @@ class ControlPlane:
             )
         return True
 
+    async def creator_consent(self, tenant_id: str, actor: Actor) -> bool:
+        """Whether the actor's Notion sign-in is kept for the nightly check. Reads no token."""
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._credentials is None:
+            return False
+        return await self._credentials.creator_consent(tenant_id, who.user_id)
+
+    async def store_creator_consent(
+        self, tenant_id: str, actor: str, token: str, request_id: str | None = None
+    ) -> None:
+        """Store the actor's own Notion sign-in encrypted, with the consent they gave.
+
+        A consented pick replaces any sign-in already stored for them. The token and the
+        ``connector`` event commit in one unit of work; the token is never logged or audited.
+        A user ID outside the credential kind's class is refused before anything is stored.
+        """
+        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        if not CREATOR_USER_ID_PATTERN.fullmatch(actor):
+            raise InvalidMember(f"'{actor}' is not a Slack user ID a sign-in can be kept for")
+        if self._credentials is None:
+            raise ConfigError("the Notion sign-in cannot be kept on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            await self._credentials.store_with_current_key(
+                tenant_id, ids.notion_creator_kind(actor), token, conn=conn
+            )
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent",
+                target=actor,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def revoke_creator_consent(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Delete the actor's kept Notion sign-in. False, and nothing recorded, when none is."""
+        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        if self._credentials is None:
+            raise ConfigError("the Notion sign-in cannot be kept on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            deleted = await self._credentials.delete(
+                tenant_id, ids.notion_creator_kind(actor), conn=conn
+            )
+            if not deleted:
+                return False
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent_revoked",
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    async def _revoke_creator_signin(
+        self, tenant_id: str, actor: str, user_id: str, conn: Any, request_id: str | None = None
+    ) -> None:
+        """Delete a member's kept Notion sign-in in the caller's unit of work, audited as a
+        consent revoke with the member as the target. A member who never consented leaves
+        nothing to delete and nothing to record."""
+        if self._credentials is None:
+            return
+        deleted = await self._credentials.delete(
+            tenant_id, ids.notion_creator_kind(user_id), conn=conn
+        )
+        if deleted:
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent_revoked",
+                target=user_id,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def creator_access_view(
+        self, tenant_id: str, actor: Actor, agent_id: str
+    ) -> dict[str, AccessRow]:
+        """The nightly creator-access verdicts for an agent's grants. An editor or an admin."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        return await self._creator_access.for_agent(tenant_id, agent_id)
+
     def _require_webhook_tokens(self) -> WebhookTokens:
         if self._webhook_tokens is None:
             raise ConfigError("the webhook token cannot be managed on this console")
@@ -1573,6 +1670,7 @@ class ControlPlane:
             await self._record(
                 "member_remove", tenant_id, actor, target=user_id, request_id=request_id, conn=conn
             )
+            await self._revoke_creator_signin(tenant_id, actor, user_id, conn, request_id)
 
     async def _protected_member(
         self, tenant_id: str, user_id: str, configured: tuple[str, ...], conn: Any = None

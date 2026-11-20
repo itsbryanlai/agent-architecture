@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from agentos import ids
 from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, PostgresCredentialStore
 
 
@@ -12,7 +13,11 @@ def store(store_pool):
     return InMemoryCredentialStore() if store_pool is None else PostgresCredentialStore(store_pool)
 
 
-@pytest.mark.parametrize("kind", [SLACK_BOT, NOTION], ids=["slack_bot", "notion"])
+@pytest.mark.parametrize(
+    "kind",
+    [SLACK_BOT, NOTION, ids.notion_creator_kind("U_CREATOR")],
+    ids=["slack_bot", "notion", "notion_creator"],
+)
 async def test_a_credential_round_trips_and_a_reinstall_replaces_it(store, tenant: str, kind: str):
     """Fails if a stored credential does not read back, a second put keeps the old value, or
     the database refuses a kind the code stores."""

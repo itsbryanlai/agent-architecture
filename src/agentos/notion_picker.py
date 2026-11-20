@@ -9,8 +9,13 @@ The flow:
    browser to Notion.
 2. Notion sends the browser back to ``/auth/notion/callback``. The callback needs the same
    console session and a ``state`` it issued (single use, ten minutes), exchanges the code for
-   the creator's token, searches with that token, and drops the token. The token lives for
-   the length of that request: it is a local variable, never stored, logged or put in a table.
+   the creator's token and searches with that token. Without consent the token is dropped: it
+   lives for the length of that request, a local variable, never stored, logged or put in a
+   table. With the consent the creator ticked before signing in ("keep my Notion sign-in"),
+   the control plane stores it encrypted per tenant and creator, and the nightly check
+   (``creator_access``) reads with it; a consented pick replaces it, revoking deletes it.
+   The box is a per-pick choice: completing a re-pick with it unticked revokes the sign-in
+   a former pick kept.
 3. What the search listed (IDs, kinds, titles) is kept in memory for the session so the
    creator can tick objects. Only an ID in that list can be picked, and a pick is recorded
    for the agent (``grant_picks``).
@@ -88,6 +93,14 @@ class NotionOAuth(Protocol):
         """Trade the code for the creator's token, list what it can search, discard it."""
         ...
 
+    async def list_and_keep(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
+        """Trade the code for the creator's token, list what it can search, return both.
+
+        The caller stores the token only with the creator's consent; the token is never
+        logged. Without consent the caller uses ``list_visible``, which discards it.
+        """
+        ...
+
     async def connect_workspace(self, code: str, redirect_uri: str) -> WorkspaceGrant:
         """Trade the code for the workspace bot token, validate it with one cheap call."""
         ...
@@ -121,13 +134,20 @@ class HttpNotionOAuth:
         return body
 
     async def list_visible(self, code: str, redirect_uri: str) -> list[PickedObject]:
+        objects, _token = await self._list(code, redirect_uri)
+        return objects
+
+    async def list_and_keep(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
+        return await self._list(code, redirect_uri)
+
+    async def _list(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
         try:
             async with httpx.AsyncClient(timeout=15.0, transport=self._transport) as http:
                 body = await self._exchange(http, code, redirect_uri)
                 token = body.get("access_token")
                 if not isinstance(token, str) or not token:
                     raise NotionPickerError("token endpoint refused: no token")
-                return await self._search(http, token)
+                return await self._search(http, token), token
         except (httpx.HTTPError, ValueError) as err:
             raise NotionPickerError(f"Notion request failed: {type(err).__name__}") from err
 
@@ -218,6 +238,9 @@ class Flow:
     version: int
     # "pick" lists what the creator can see; "connect" authorizes the tenant's workspace.
     purpose: str = "pick"
+    # The creator ticked "keep my Notion sign-in" before signing in. Not part of the
+    # flow's identity: the listing is found again on the pick page either way.
+    consent: bool = field(default=False, compare=False)
 
 
 @dataclass

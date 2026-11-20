@@ -49,8 +49,15 @@ class AccessDiff:
         return any(c.widens for c in self.changes)
 
 
+_DRIVE_KIND_LABELS = {
+    "folder": "drive folder",
+    "file": "drive file",
+    "shared_drive": "drive shared drive",
+}
+
+
 def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
-    """Normalised ID -> (kind, label, mapping) of every Notion grant."""
+    """Normalised ID -> (kind, label, mapping) of every Notion and Drive grant."""
     found: dict[str, tuple[str, str, tuple]] = {}
     for db in agent.grants.notion_databases:
         mapping = (
@@ -63,6 +70,8 @@ def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
         found[normalize_id(db.id)] = ("database", db.name, mapping)
     for page in agent.grants.notion_pages:
         found[normalize_id(page.id)] = ("page", page.name, ())
+    for grant in agent.grants.drive:
+        found[grant.id] = (_DRIVE_KIND_LABELS[grant.kind], grant.name, ())
     return found
 
 

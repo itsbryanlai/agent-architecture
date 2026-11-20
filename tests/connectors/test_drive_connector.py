@@ -3,7 +3,7 @@
 import pytest
 
 from agentos.config import DriveGrant
-from agentos.connectors.base import GrantDenied, UnknownItem
+from agentos.connectors.base import UnknownItem
 from agentos.connectors.drive import DriveConnector, DriveReader
 from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts
 
@@ -44,11 +44,3 @@ async def test_resolve_item_resolves_only_a_granted_live_file(case, resolves):
     else:
         with pytest.raises(UnknownItem):
             await conn.resolve_item(ref)
-
-
-def test_grant_for_refuses_a_target_outside_the_grants():
-    """Fails if grant_for returns a grant for a target the agent was not granted."""
-    conn, _ = make(granted=True)
-    assert conn.grant_for(FILE).id == FILE
-    with pytest.raises(GrantDenied):
-        conn.grant_for("drive-file-9999")

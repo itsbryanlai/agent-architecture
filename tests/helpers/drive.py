@@ -21,6 +21,13 @@ DRIVE_NESTED_DOC = "drive-nested-doc-0001"
 
 DRIVE_SCOPE = ids.drive_scope(DRIVE_FOLDER)
 
+DRIVE_SHARED = "drive-shared-0001"
+DRIVE_SHARED_DOC = "drive-shared-doc-0001"
+DRIVE_SHARED_SUB = "drive-shared-sub-0001"
+DRIVE_SHARED_NESTED = "drive-shared-nested-0001"
+
+SHARED_DRIVE_SCOPE = ids.drive_scope(DRIVE_SHARED)
+
 
 def drive_account_email(google: FakeGoogleAccounts) -> str:
     """The tenant's account email, with the account registered in the fake."""
@@ -82,18 +89,72 @@ def drive_agents_dict() -> dict:
 
 
 def drive_grants_dict() -> dict:
-    """A definition with both Drive grant kinds, for the parse/serialise round trip."""
+    """A definition with every Drive grant kind, for the parse/serialise round trip."""
     raw = drive_agents_dict()
     raw["agents"]["it-helper"]["grants"]["drive"]["files"] = [{"id": DRIVE_DOC, "name": "Guide"}]
+    raw["agents"]["it-helper"]["grants"]["drive"]["shared_drives"] = [
+        {"id": DRIVE_SHARED, "name": "Team drive"}
+    ]
     return raw
 
 
-async def run_drive_index(h, scope=DRIVE_SCOPE, root=DRIVE_FOLDER, suffix=""):
+def add_shared_drive_tree(google: FakeGoogleAccounts) -> None:
+    """A shared drive with a Doc at its root and a sub-folder holding one more Doc."""
+    google.add_drive_folder(DRIVE_SHARED, "Team drive")
+    google.add_drive_file(
+        DRIVE_SHARED_DOC,
+        "Shared guide",
+        MIME_DOC,
+        DRIVE_SHARED,
+        [DriveSection("", "Shared drive text.")],
+    )
+    google.add_drive_folder(DRIVE_SHARED_SUB, "Policies", parent=DRIVE_SHARED)
+    google.add_drive_file(
+        DRIVE_SHARED_NESTED,
+        "Shared policy",
+        MIME_DOC,
+        DRIVE_SHARED_SUB,
+        [DriveSection("", "Nested shared text.")],
+    )
+
+
+def add_bulk_children(
+    google: FakeGoogleAccounts, parent: str, count: int, prefix: str
+) -> list[str]:
+    """``count`` non-exportable files under ``parent``: the walk skips and counts them,
+    so a wide tree costs discovery only, never an export or an embedding."""
+    file_ids = [f"{prefix}-{i:04d}" for i in range(count)]
+    for file_id in file_ids:
+        google.add_drive_file(file_id, f"Bulk {file_id}", "application/pdf", parent, [])
+    return file_ids
+
+
+async def run_drive_index(h, scope=DRIVE_SCOPE, root=DRIVE_FOLDER, suffix="", confirm_gone=False):
+    """One DriveIndexingWorkflow run, with its own workflow ID as each nightly run has."""
     from tests.conftest import TENANT
 
     return await h.client.execute_workflow(
         DriveIndexingWorkflow.run,
-        args=[TENANT, scope, root],
+        args=[
+            TENANT,
+            scope,
+            root,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            False,
+            True,
+            False,
+            None,
+            None,
+            confirm_gone,
+        ],
         id=ids.drive_index_workflow_id(TENANT, scope) + suffix,
         task_queue=TASK_QUEUE,
     )

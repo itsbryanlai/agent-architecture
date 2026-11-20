@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -222,6 +222,7 @@ async def build_tenant_clients(
     log: logging.Logger,
     slack_factory: Callable[[str], SlackPoster] = RealSlackPoster,
     notion_factory: Callable[[str], NotionAPI] = RealNotionAPI,
+    drive: Callable[[AgentsConfig], Awaitable[DriveReader | None]] | None = None,
 ) -> tuple[TenantRegistry, RegistrySync]:
     """The worker's tenant clients at start-up, and the sync that keeps them current.
 
@@ -233,6 +234,8 @@ async def build_tenant_clients(
     a token connected or replaced while the worker runs rebuilds that tenant's
     client on the next sync, as a Slack reinstall does. The health check reads its
     Notion client from this registry, so it checks with the connected token too.
+    ``drive`` resolves each tenant's Drive reader from its connection row, so a tenant
+    admitted after start-up and a rebuilt runtime both carry it.
     """
     registry = await build_registry(
         tenants,
@@ -241,6 +244,7 @@ async def build_tenant_clients(
         notion_factory,
         slack_token=credentials.slack_bot_token,
         notion_token=credentials.notion_token,
+        drive=drive,
     )
     # The first sync pass is an interval away; until it lands, a stored-but-disabled
     # tenant would look not-yet-loaded and its pending work would retry, not end cleanly.
@@ -254,6 +258,7 @@ async def build_tenant_clients(
         slack_token=credentials.slack_bot_token,
         notion_token=credentials.notion_token,
         on_drop=credentials.forget,
+        drive=drive,
     )
     return registry, sync
 
@@ -304,17 +309,20 @@ async def main() -> None:
         )
         if price_failure:
             raise SystemExit(price_failure)
+
+        # The tenant's Drive reader comes from its connection row, resolved like its Notion
+        # token: a tenant admitted after start-up and a rebuilt runtime both carry it.
+        # Indexing and search read the row fresh besides, so a connect while the worker
+        # runs reaches them on the next run.
+        async def drive_reader(config: AgentsConfig) -> DriveReader | None:
+            if google is None:
+                return None
+            row = await drive_connections.get(config.tenant_id)
+            return DriveReader(google, row.service_account_email) if row is not None else None
+
         registry, tenant_sync = await build_tenant_clients(
-            tenants, directory, settings, credentials, keys, log
+            tenants, directory, settings, credentials, keys, log, drive=drive_reader
         )
-        # Bind each connected tenant's Drive reader for the connector. Indexing and search
-        # read the connection row fresh, so a connect while the worker runs reaches them on
-        # the next run; the connector's reader is refreshed on the next restart.
-        if google is not None:
-            for tenant_id in registry.tenants():
-                row = await drive_connections.get(tenant_id)
-                if row is not None:
-                    registry.get(tenant_id).drive = DriveReader(google, row.service_account_email)
         audit_store = PostgresAuditStore(pool)
         idempotency = PostgresIdempotencyStore(pool)
         members = PostgresMemberStore(pool)

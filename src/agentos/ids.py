@@ -38,8 +38,14 @@ def knowledge_scope(page_id: str) -> str:
 
 
 def drive_scope(granted_id: str) -> str:
-    """The scope name for a granted Drive folder or file: everything under it shares it."""
+    """The scope name for a granted Drive folder, file or shared drive: everything under
+    it shares it."""
     return f"drive:{granted_id}"
+
+
+def is_drive_scope(scope: str) -> bool:
+    """True for a scope ``drive_scope`` built: a Drive folder, file or shared drive."""
+    return scope.startswith("drive:")
 
 
 def index_workflow_id(tenant: str, scope: str) -> str:

@@ -1706,9 +1706,10 @@ class AgentActivities:
         A scope whose connector an admin turned off is left out (Notion scopes answer to the
         Notion switch, Drive scopes to the Drive switch). Chunks beyond the model's distance
         cut-off are dropped. Each page found is then re-checked with its source — Notion (not
-        trashed, still where it was indexed) or Drive (a live ``files.get``) — before it can
-        reach the model. The numbered passages are stored as the tool output; only the citation
-        numbers and page IDs go back to the workflow.
+        trashed, still where it was indexed) or Drive (a live ``files.get``, its parents walked
+        up to the granted root) — before it can reach the model. The numbered passages are
+        stored as the tool output; only the citation numbers and page IDs go back to the
+        workflow.
         """
         agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
         notion_roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
@@ -1746,7 +1747,7 @@ class AgentActivities:
             hits = [hit for hit in hits if hit.distance <= cutoff]
         drive_checker = (
             await self._drive_checker(ctx.tenant_id)
-            if any(scope.startswith("drive:") for scope in roots)
+            if any(ids.is_drive_scope(scope) for scope in roots)
             else None
         )
         checker = ScopeChecker(PageChecker(self._runtime(ctx.tenant_id).notion_api), drive_checker)

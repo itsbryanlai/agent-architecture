@@ -404,10 +404,12 @@ class NotionPageGrant:
 
 @dataclass
 class DriveGrant:
-    """A Google Drive folder or file the agent may read, shared with the tenant's account.
+    """A Google Drive folder, file or shared drive the agent may read, shared with the
+    tenant's account.
 
-    A folder grants everything under it (recursively); a file grants just that file. Each
-    grant is one scope that searches are filtered by. ``kind`` is ``folder`` or ``file``.
+    A folder grants everything under it (recursively); a file grants just that file; a
+    shared drive grants everything in it, walked from its root. Each grant is one scope
+    that searches are filtered by. ``kind`` is ``folder``, ``file`` or ``shared_drive``.
     """
 
     id: str
@@ -596,9 +598,12 @@ _GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
-_DRIVE_KEYS = frozenset({"folders", "files"})
+_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
-DRIVE_GRANT_KINDS = ("folder", "file")
+DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive")
+# A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
+# The connector's link parser uses the same shape, so a grant and a resolved link agree.
+DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -723,8 +728,13 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> Not
 def _parse_drive_grant(agent_id: str, raw: dict[str, Any], kind: str, index: int = 0) -> DriveGrant:
     where = f"agent '{agent_id}' grants.drive.{kind}s[{index}]"
     _mapping(where, raw, _DRIVE_ITEM_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
     return DriveGrant(
-        id=_text(where, "id", _require(raw, "id", where)),
+        id=grant_id,
         name=_text(where, "name", _require(raw, "name", where)),
         kind=kind,
     )
@@ -870,10 +880,8 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         definition["audience"] = _audience_definition(agent.audience)
     if agent.grants.drive:
         definition["grants"]["drive"] = {
-            "folders": [
-                {"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == "folder"
-            ],
-            "files": [{"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == "file"],
+            f"{kind}s": [{"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == kind]
+            for kind in DRIVE_GRANT_KINDS
         }
     return definition
 

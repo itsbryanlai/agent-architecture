@@ -1,7 +1,14 @@
 """Drive knowledge search: the live re-check before citing, and the citation footer."""
 
 from tests.conftest import TENANT, eventually
-from tests.helpers.drive import DRIVE_DOC, DRIVE_SCOPE, DRIVE_SHEET, run_drive_index
+from tests.helpers.drive import (
+    DRIVE_DOC,
+    DRIVE_FOLDER,
+    DRIVE_SCOPE,
+    DRIVE_SHEET,
+    drive_account_email,
+    run_drive_index,
+)
 from tests.helpers.knowledge import answer, call, converse, search, tool_turn
 
 
@@ -16,6 +23,34 @@ async def test_a_drive_hit_that_now_answers_403_is_dropped(dharness):
     _, after = await search(h, "it-helper", "reset your vpn password")
 
     assert DRIVE_DOC not in {c.page_id for c in after.citations}
+
+
+async def test_a_file_moved_out_of_the_granted_folder_is_dropped(dharness):
+    """Fails if a file moved to another shared folder outside the grant still reaches the
+    model before the next nightly walk."""
+    h = dharness
+    await run_drive_index(h)
+    _, before = await search(h, "it-helper", "reset your vpn password")
+    assert DRIVE_DOC in {c.page_id for c in before.citations}
+    h.google.add_drive_folder("drive-other-folder-0001", "Elsewhere")
+    h.google.move_drive_child(DRIVE_FOLDER, "drive-other-folder-0001", DRIVE_DOC)
+
+    _, after = await search(h, "it-helper", "reset your vpn password")
+
+    assert DRIVE_DOC not in {c.page_id for c in after.citations}
+
+
+async def test_the_search_recheck_reads_with_the_tenants_own_address(dharness):
+    """Fails if the live re-check reads with another account than the tenant's own Drive
+    address."""
+    h = dharness
+    await run_drive_index(h)
+    h.google.get_calls.clear()
+
+    await search(h, "it-helper", "reset your vpn password")
+
+    email = drive_account_email(h.google)
+    assert h.google.get_calls and all(e == email for e, _ in h.google.get_calls)
 
 
 async def test_a_drive_citation_links_to_the_file_and_names_the_sheet(dharness):

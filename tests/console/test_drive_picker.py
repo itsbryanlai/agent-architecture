@@ -10,7 +10,7 @@ from agentos.drive_connections import InMemoryDriveConnectionStore
 from tests.conftest import TENANT
 from tests.helpers.agents import helper_block
 from tests.helpers.console_harness import ROOT, ConsoleHarness, csrf_in, post, using
-from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER
+from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, DRIVE_SHARED
 
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
 
@@ -34,6 +34,12 @@ async def picker_harness(connected: bool = True):
                 "folder",
             ),
             DriveItem(DRIVE_DOC, "Guide", f"https://drive.google.com/file/d/{DRIVE_DOC}", "file"),
+            DriveItem(
+                DRIVE_SHARED,
+                "Team drive",
+                f"https://drive.google.com/drive/folders/{DRIVE_SHARED}",
+                "shared_drive",
+            ),
         ]
     await h.agents.create_agent(TENANT, "it-helper", helper_block(), ROOT)
     return h, google
@@ -64,21 +70,31 @@ async def test_the_version_page_drive_section(case):
 
 
 async def test_the_picker_lists_the_account_items_and_adds_a_grant_in_one_click():
-    """Fails if the picker does not list what the workspace's account can see, or a chosen
-    item is not added to the draft as a Drive grant of the right kind."""
+    """Fails if the picker does not list what the workspace's account can see, marks a
+    shared drive as an ordinary folder, or a chosen item is not added to the draft as a
+    Drive grant of the right kind."""
     h, _ = await picker_harness()
     c = await h.signed_in(ROOT)
     async with using(c):
         pick = (await c.get(VERSION + "/drive/pick")).text
-        assert "Team folder" in pick and "Guide" in pick
+        assert "Team folder" in pick and "Guide" in pick and "Team drive" in pick
+        assert "shared_drive" in pick
         resp = await post(
-            c, VERSION + "/drive/pick/choose", csrf_in(pick), pick_0="yes", request_id="r1"
+            c,
+            VERSION + "/drive/pick/choose",
+            csrf_in(pick),
+            pick_0="yes",
+            pick_2="yes",
+            request_id="r1",
         )
         assert resp.status_code == 303
         page = (await c.get(VERSION)).text
         assert DRIVE_FOLDER in page
     record = await h.agents.get_version(TENANT, "it-helper", 1)
-    assert [(g.id, g.kind) for g in record.agent().grants.drive] == [(DRIVE_FOLDER, "folder")]
+    assert [(g.id, g.kind) for g in record.agent().grants.drive] == [
+        (DRIVE_FOLDER, "folder"),
+        (DRIVE_SHARED, "shared_drive"),
+    ]
 
 
 async def test_removing_a_drive_grant():

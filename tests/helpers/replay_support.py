@@ -1740,8 +1740,9 @@ async def test_run_tenant_disabled(r: Rig) -> list[Recorded]:
 
 
 async def drive_indexing(r: Rig) -> list[Recorded]:
-    """One nightly Drive walk: a granted folder's Doc, Sheet and Slides are indexed, a
-    non-exportable type is counted, and the walk's outcome is recorded on the connection."""
+    """One nightly Drive walk, continued as new mid-walk: a granted folder's Doc, Sheet and
+    Slides are indexed, a non-exportable type is counted, and the walk's outcome is recorded
+    on the connection."""
     await republish(
         r.acts.agents,
         "it-helper",
@@ -1753,14 +1754,18 @@ async def drive_indexing(r: Rig) -> list[Recorded]:
         TENANT, drive_account_email(r.google), datetime(2026, 11, 20, tzinfo=UTC)
     )
     scope = ids.drive_scope(DRIVE_FOLDER)
-    summary = await r.client.execute_workflow(
-        DriveIndexingWorkflow.run,
-        args=[TENANT, scope, DRIVE_FOLDER],
-        id=ids.drive_index_workflow_id(TENANT, scope),
-        task_queue=TASK_QUEUE,
-    )
+    with suggest_continue_as_new_after(HOP_EVENTS):
+        handle = await r.client.start_workflow(
+            DriveIndexingWorkflow.run,
+            args=[TENANT, scope, DRIVE_FOLDER],
+            id=ids.drive_index_workflow_id(TENANT, scope),
+            task_queue=TASK_QUEUE,
+        )
+        summary = await handle.result()
     assert (summary.files, summary.changed, summary.skipped_type, summary.failed) == (5, 4, 1, 0)
-    return [await current(r, "", ids.drive_index_workflow_id(TENANT, scope))]
+    chain = await hop_chain(r.client, handle.id, handle.result_run_id)
+    assert len(chain) >= 2, "the Drive walk never continued as new"
+    return [Recorded(f"run{i + 1}", h, HOP_EVENTS) for i, h in enumerate(chain)]
 
 
 def _both(fn):
@@ -1819,7 +1824,7 @@ SCENARIOS["creator_access_tenant_disabled"] = creator_access_tenant_disabled
 # A test run carries references only: one shape, like the creator-access passes.
 SCENARIOS["test_run"] = test_run
 SCENARIOS["test_run_tenant_disabled"] = test_run_tenant_disabled
-# The Drive walk carries references only: one shape, like the Notion index runs.
+# The Drive walk carries references only: one shape, no message or task payload rides in it.
 SCENARIOS["drive_indexing"] = drive_indexing
 
 

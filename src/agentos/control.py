@@ -2048,9 +2048,10 @@ class ControlPlane:
         items: list[DriveItem],
         request_id: str | None = None,
     ) -> AgentVersionRecord:
-        """Add the picked folders/files to the draft's Drive grants. ``items`` come from a
-        listing of the workspace's account (the picker matches them), so only what is shared
-        with the address is granted. An item already granted is not added twice."""
+        """Add the picked folders/files/shared drives to the draft's Drive grants. ``items``
+        come from a listing of the workspace's account (the picker matches them), so only
+        what is shared with the address is granted. An item already granted is not added
+        twice."""
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None:
@@ -2058,13 +2059,13 @@ class ControlPlane:
         if not items:
             return record
         definition = agent_definition(record.agent())
-        drive_block = definition["grants"].setdefault("drive", {"folders": [], "files": []})
+        drive_block = definition["grants"].setdefault("drive", {})
         existing = {g.id for g in record.agent().grants.drive}
+        keys = {"folder": "folders", "file": "files", "shared_drive": "shared_drives"}
         for item in items:
             if item.id in existing:
                 continue
-            key = "folders" if item.kind == "folder" else "files"
-            drive_block[key].append({"id": item.id, "name": item.name})
+            drive_block.setdefault(keys[item.kind], []).append({"id": item.id, "name": item.name})
             existing.add(item.id)
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.replace_draft(
@@ -2092,9 +2093,9 @@ class ControlPlane:
         definition = agent_definition(record.agent())
         drive_block = definition.get("grants", {}).get("drive")
         if drive_block is not None:
-            for key in ("folders", "files"):
+            for key in ("folders", "files", "shared_drives"):
                 drive_block[key] = [g for g in drive_block.get(key, []) if g["id"] != grant_id]
-            if not drive_block["folders"] and not drive_block["files"]:
+            if not any(drive_block.values()):
                 del definition["grants"]["drive"]
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.replace_draft(

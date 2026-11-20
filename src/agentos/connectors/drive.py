@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from contextlib import AbstractContextManager, nullcontext
 
-from agentos.config import DriveGrant
+from agentos.config import DRIVE_ID, DriveGrant
 from agentos.connectors import drive_errors
 from agentos.connectors.base import ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import DriveFile, DriveSection, GoogleAccounts
@@ -27,7 +27,6 @@ from agentos.models import NotionItem
 # /presentation/d/<id>, or an open?id=<id> query. IDs are letters, digits, - and _.
 _LINK_ID = re.compile(r"/(?:file|document|spreadsheets|presentation)/d/([A-Za-z0-9_-]+)")
 _QUERY_ID = re.compile(r"[?&]id=([A-Za-z0-9_-]+)")
-_BARE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
 
 
 def drive_file_id(ref: str) -> str | None:
@@ -37,7 +36,7 @@ def drive_file_id(ref: str) -> str | None:
         match = pattern.search(ref)
         if match:
             return match.group(1)
-    return ref if _BARE_ID.fullmatch(ref) else None
+    return ref if DRIVE_ID.fullmatch(ref) else None
 
 
 class DriveReader:
@@ -59,6 +58,12 @@ class DriveReader:
 
     async def export_file(self, file_id: str, mime_type: str) -> list[DriveSection]:
         return await self._google.export_file(self._email, file_id, mime_type)
+
+    async def get_drive(self, drive_id: str) -> DriveFile:
+        return await self._google.get_drive(self._email, drive_id)
+
+    async def list_drive_children(self, drive_id: str) -> list[DriveFile]:
+        return await self._google.list_drive_children(self._email, drive_id)
 
 
 class DriveConnector:

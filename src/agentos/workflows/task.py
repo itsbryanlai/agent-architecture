@@ -55,6 +55,7 @@ with workflow.unsafe.imports_passed_through():
     from agentos.activities import AgentActivities
     from agentos.agent_health import agent_unavailable_text
     from agentos.config import AgentVersion
+    from agentos.connectors.manifest import TOOLS
     from agentos.connectors.notion import normalize_id
     from agentos.models import (
         EDITABLE_FIELDS,
@@ -71,7 +72,7 @@ with workflow.unsafe.imports_passed_through():
         WatchState,
         check_field,
     )
-    from agentos.switches import agent_off_card_text, agent_off_text
+    from agentos.switches import DRIVE, agent_off_card_text, agent_off_text
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         POKE_GAP,
@@ -333,11 +334,21 @@ class TaskWorkflow:
                     self._state = "cancelled"
                     await self._record()
                     return self._state
+                tool = TOOLS.get(spec.tool)
+                if tool is not None and tool.connector == DRIVE:
+                    refusal = (
+                        "I can't comment on that file: I couldn't find it, or it isn't in a "
+                        "folder I have access to."
+                    )
+                else:
+                    refusal = (
+                        "I can't comment on that item: I couldn't find it, or it isn't in a "
+                        "database I have access to."
+                    )
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
-                    "I can't comment on that item: I couldn't find it, or it isn't in a "
-                    "database I have access to.",
+                    refusal,
                     f"{task_id}:failed",
                 )
                 self._state = "failed"

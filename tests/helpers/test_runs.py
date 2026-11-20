@@ -1,4 +1,5 @@
-"""A test-run harness: fakes, indexed pages, a draft with cases, and the run workflow.
+"""A test-run harness: fakes, indexed pages, a Drive tree, a draft with cases, and the
+run workflow.
 
 The run workflow polls the test's own queue here (the scope redirects the main queue's
 name); production polls ``TEST_TASK_QUEUE``, which changes no workflow behaviour.
@@ -23,6 +24,8 @@ from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import DEFAULT_MODEL, TASK_QUEUE, Settings, parse_agents_config
+from agentos.connectors.drive import DriveReader
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -38,7 +41,7 @@ from agentos.stores import (
 from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.test_sets import RUNNING, InMemoryTestSetStore, TestCase, TestRun, case_set_sha256
-from agentos.usage import InMemoryUsageStore, PriceEntry, Prices, UsageRecorder
+from agentos.usage import InMemoryUsageStore, PriceEntry, Prices, UsageRecorder, utcnow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.test_run import TestRunWorkflow
 from tests.conftest import (
@@ -51,6 +54,7 @@ from tests.conftest import (
     knowledge_agents_dict,
     make_fake_notion,
 )
+from tests.helpers.drive import drive_account_email, make_drive_google
 from tests.helpers.temporal import TemporalScope
 
 # The cap test prices its own model: $1 per million input tokens, so a scripted
@@ -114,6 +118,7 @@ class RunHarness:
     agents: InMemoryAgentStore
     sets: InMemoryTestSetStore
     usage: InMemoryUsageStore
+    google: object = None
 
     @property
     def client(self):
@@ -135,9 +140,15 @@ async def run_harness(wf_env: TemporalScope) -> AsyncIterator[RunHarness]:
     knowledge, embedder = InMemoryKnowledgeStore(), FakeEmbedder()
     switches = InMemorySwitchStore()
     guard = BudgetGuard(budgets, usage, ttl_seconds=0)
+    google = make_drive_google()
+    email = drive_account_email(google)
+    drive_connections = InMemoryDriveConnectionStore()
+    await drive_connections.connect(TENANT, email, utcnow())
     acts = AgentActivities(
         settings=Settings(),
-        registry=TenantRegistry({TENANT: runtime_for(cfg, slack, notion)}),
+        registry=TenantRegistry(
+            {TENANT: runtime_for(cfg, slack, notion, drive=DriveReader(google, email))}
+        ),
         history=InMemoryHistoryStore(),
         idem=InMemoryIdempotencyStore(),
         links=InMemoryTaskLinkStore(),
@@ -151,6 +162,8 @@ async def run_harness(wf_env: TemporalScope) -> AsyncIterator[RunHarness]:
         usage=UsageRecorder(usage, run_prices(), listener=guard),
         budgets=guard,
         test_sets=sets,
+        google=google,
+        drive_connections=drive_connections,
     )
     index = IndexActivities(
         acts.registry,
@@ -176,7 +189,7 @@ async def run_harness(wf_env: TemporalScope) -> AsyncIterator[RunHarness]:
                 id=ids.index_workflow_id(TENANT, scope),
                 task_queue=TASK_QUEUE,
             )
-        yield RunHarness(wf_env, llm, slack, notion, acts, agents, sets, usage)
+        yield RunHarness(wf_env, llm, slack, notion, acts, agents, sets, usage, google)
 
 
 async def make_draft(h: RunHarness, agent: str = "it-helper", change=None) -> int:

@@ -1561,20 +1561,24 @@ class ControlPlane:
     @staticmethod
     def _validated_expectation(expect: str, target: str, agent: AgentVersion) -> tuple[str, str]:
         """The case's expectation as stored: a known kind, and a target this draft grants
-        (a page, a database) or lists (a specialist). Notion IDs are normalized."""
+        (a page, a database, a Drive file) or lists (a specialist). Notion IDs are
+        normalized; a Drive file ID is kept as it is."""
         expect, target = expect.strip(), target.strip()
         if expect and expect not in EXPECT_KINDS:
             raise TestSetError(f"unknown expected behaviour '{expect}'")
         if not expect or expect == REFUSE:
             return expect, ""
         if not target:
-            raise TestSetError("choose the source, database or agent this case expects")
+            raise TestSetError("choose the source, database, Drive file or agent this case expects")
         if expect == CITE:
             granted = {normalize_id(g.id) for g in agent.grants.notion_pages}
             what = "a page granted to this draft"
         elif expect == WRITE:
+            drive_files = {g.id for g in agent.grants.drive if g.kind == "file"}
+            if target in drive_files:
+                return expect, target
             granted = {normalize_id(g.id) for g in agent.grants.notion_databases}
-            what = "a database granted to this draft"
+            what = "a database or Drive file granted to this draft"
         else:
             granted = set(agent.specialists)
             what = "a specialist this draft lists"

@@ -14,6 +14,7 @@ from agentos.workflows.conversation import ConversationWorkflow
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, BOB, DB_ID, TENANT, default_schema, eventually
 from tests.helpers.agents import republish
+from tests.helpers.drive import DRIVE_DOC
 from tests.helpers.tasks import ClosesTaskOnLookup, approve, spec, start_task, wait_state
 
 CHANNEL = "C_GENERAL"
@@ -47,9 +48,18 @@ async def test_the_listed_state_of_each_workflow_state(harness, workflow_state, 
     assert row.state == listed
 
 
-@pytest.mark.parametrize(("grants", "offered"), [(None, True), ({}, False)])
+@pytest.mark.parametrize(
+    ("grants", "offered"),
+    [
+        (None, True),
+        ({}, False),
+        ({"drive": {"files": [{"id": DRIVE_DOC, "name": "Guide"}]}}, True),
+    ],
+    ids=["notion database", "no grants", "drive only"],
+)
 async def test_my_tasks_is_offered_only_to_an_agent_with_a_write_grant(harness, grants, offered):
-    """Fails if an agent without a database grant is offered my_tasks, or one with a grant is not."""
+    """Fails if an agent without a write grant is offered my_tasks, or one with a Notion
+    database or Drive grant is not."""
     h = harness
     if grants is not None:
         await republish(h.agent_store, "it-helper", lambda d: d.update(grants=grants))

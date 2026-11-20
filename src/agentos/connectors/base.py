@@ -41,6 +41,10 @@ from temporalio.exceptions import ApplicationError
 from agentos.connectors.manifest import Manifest
 from agentos.models import NotionItem
 
+# A guard against a loop in a connector's parent links, far deeper than any real tree.
+# An item at any depth the indexer reached is also found by a search and by a resolve.
+MAX_WALK_DEPTH = 100
+
 
 class ConnectorError(Exception):
     """Base for connector errors that retrying cannot fix."""

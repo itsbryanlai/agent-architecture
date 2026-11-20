@@ -22,7 +22,8 @@ The knowledge read surface (D-46) lists a folder's children, gets a file's metad
 (parents included), exports a Doc/Sheet/Slides as text, and reads a shared drive's root
 (``drives.get``) and its children (a drive-scoped ``files.list``). A 403 carries the
 body's reason, so ``drive_errors`` can tell a quota wave from a disabled API from lost
-sharing.
+sharing. The comment write surface (D-47) lists a file's comments (paged, each with
+whether the tenant's account wrote it) and posts a comment as that account.
 
 The fake keeps the accounts and what is shared with each, and carries the failure
 injections in one place: ``fail_after_write`` (the response is lost after the effect),
@@ -38,6 +39,7 @@ import asyncio
 import csv
 import io
 import json
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -64,8 +66,9 @@ MIME_DOC = "application/vnd.google-apps.document"
 MIME_SHEET = "application/vnd.google-apps.spreadsheet"
 MIME_SLIDES = "application/vnd.google-apps.presentation"
 EXPORTABLE = (MIME_DOC, MIME_SHEET, MIME_SLIDES)
-# Connect only lists what the account can see. A later write adds its scopes here.
-DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive.readonly",)
+# The full Drive scope: the comment write (D-47) needs it, and it covers every read too
+# (the Sheets tab export included). One constant, so a minted token serves reads and writes.
+DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
 TOKEN_LIFETIME = "3600s"
 # A cached token is reused until this close to its expiry, then minted again.
 TOKEN_MARGIN = timedelta(seconds=60)
@@ -191,6 +194,17 @@ class DriveSection:
     text: str
 
 
+@dataclass(frozen=True)
+class DriveComment:
+    """One comment on a file: its ID, its text, and whether the tenant's own account
+    wrote it (Drive's ``author.me``). The marker lookup counts only the account's own
+    comments, as Notion's counts only the integration's."""
+
+    id: str
+    content: str
+    mine: bool
+
+
 class GoogleAccounts(Protocol):
     """The deployment's hold on the tenant accounts: create-or-find, delete, and list."""
 
@@ -236,6 +250,15 @@ class GoogleAccounts(Protocol):
     async def list_drive_children(self, email: str, drive_id: str) -> list[DriveFile]:
         """The shared drive root's non-trashed children, listed drive-scoped
         (``corpora=drive`` with the drive's ID). Metadata only, never content."""
+        ...
+
+    async def list_comments(self, email: str, file_id: str) -> list[DriveComment]:
+        """Every comment on a file, paging through Drive's list, each with whether the
+        tenant's own account wrote it. The marker lookup of a comment write (D-47)."""
+        ...
+
+    async def create_comment(self, email: str, file_id: str, content: str) -> str:
+        """Post a comment on a file as the tenant's account; returns the comment's ID."""
         ...
 
 
@@ -723,6 +746,82 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
+    # --- the comment write surface (D-47) ----------------------------------------------
+    # These carry the TENANT account's minted token, like the reads, so a comment is
+    # written as the account the files are shared with, never the deployment's.
+
+    async def list_comments(self, email: str, file_id: str) -> list[DriveComment]:
+        token = await self._drive_token(email)
+
+        def call() -> list[DriveComment]:
+            session = self._drive_session_for_call()
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                comments: list[DriveComment] = []
+                page_token = None
+                while True:
+                    params = {
+                        "fields": "nextPageToken,comments(id,content,author)",
+                        "supportsAllDrives": "true",
+                        "pageSize": "100",
+                    }
+                    if page_token:
+                        params["pageToken"] = page_token
+                    response = self._send(
+                        session,
+                        "GET",
+                        f"{DRIVE}/files/{file_id}/comments",
+                        headers=headers,
+                        params=params,
+                    )
+                    self._check_drive(response)
+                    body = _json_object(response)
+                    try:
+                        for comment in body.get("comments", []):
+                            comments.append(
+                                DriveComment(
+                                    comment["id"],
+                                    comment.get("content", ""),
+                                    bool((comment.get("author") or {}).get("me", False)),
+                                )
+                            )
+                    except (KeyError, TypeError) as err:
+                        raise GoogleError("unavailable") from err
+                    page_token = body.get("nextPageToken")
+                    if not page_token:
+                        break
+                return comments
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def create_comment(self, email: str, file_id: str, content: str) -> str:
+        token = await self._drive_token(email)
+
+        def call() -> str:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{DRIVE}/files/{file_id}/comments",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"fields": "id", "supportsAllDrives": "true"},
+                    json={"content": content},
+                )
+                self._check_drive(response)
+                try:
+                    return _json_object(response)["id"]
+                except (KeyError, TypeError) as err:
+                    raise GoogleError("unavailable") from err
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
 
 def _drive_file(file: dict) -> DriveFile:
     return DriveFile(
@@ -747,8 +846,8 @@ class FakeGoogleAccounts:
         self.created: list[str] = []
         self.create_calls: list[str] = []
         self.delete_calls: list[str] = []
-        self._fail_after_write = {"create": 0, "delete": 0}
-        self._hang_after_write: dict[str, list[Hang]] = {"create": [], "delete": []}
+        self._fail_after_write = {"create": 0, "delete": 0, "comment": 0}
+        self._hang_after_write: dict[str, list[Hang]] = {"create": [], "delete": [], "comment": []}
         self._list_error: Exception | None = None
         self._delete_error: Exception | None = None
         # The Drive tree the read surface serves: metadata by ID, a folder's child IDs,
@@ -760,6 +859,12 @@ class FakeGoogleAccounts:
         self.drive_children: dict[str, list[str]] = {}
         self.drive_content: dict[str, list[DriveSection]] = {}
         self.drive_refused: set[str] = set()
+        # The comments each file carries, as Google returns them (id, content, author).
+        # ``comment_calls`` and ``comment_list_calls`` record the (email, file ID) of every
+        # create and list, so a test can see whose account wrote and that a lookup ran.
+        self.drive_comments: dict[str, list[dict]] = {}
+        self.comment_calls: list[tuple[str, str]] = []
+        self.comment_list_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
@@ -774,8 +879,8 @@ class FakeGoogleAccounts:
         self.drive_get_errors: dict[str, Exception] = {}
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
-        """The next ``times`` writes of ``kind`` ("create" or "delete") take effect and
-        then raise, as when the response is lost."""
+        """The next ``times`` writes of ``kind`` ("create", "delete" or "comment") take
+        effect and then raise, as when the response is lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
@@ -890,6 +995,13 @@ class FakeGoogleAccounts:
         child = self.drive_files[child_id]
         self.drive_files[child_id] = replace(child, parents=(*child.parents, to_parent))
 
+    def add_drive_comment(self, file_id: str, content: str, mine: bool = True) -> str:
+        """A comment already on a file, as Google would return it; its ID comes back.
+        ``mine=False`` is another author's comment (the marker lookup must not count it)."""
+        comment = {"id": str(uuid.uuid4()), "content": content, "author": {"me": mine}}
+        self.drive_comments.setdefault(file_id, []).append(comment)
+        return comment["id"]
+
     def fail_next_export(self, error: Exception) -> None:
         self._export_error = error
 
@@ -972,6 +1084,27 @@ class FakeGoogleAccounts:
 
     async def list_drive_children(self, email: str, drive_id: str) -> list[DriveFile]:
         return await self.list_children(email, drive_id)
+
+    async def list_comments(self, email: str, file_id: str) -> list[DriveComment]:
+        self.comment_list_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        return [
+            DriveComment(c["id"], c["content"], bool((c.get("author") or {}).get("me", False)))
+            for c in self.drive_comments.get(file_id, [])
+        ]
+
+    async def create_comment(self, email: str, file_id: str, content: str) -> str:
+        self.comment_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        comment_id = self.add_drive_comment(file_id, content)
+        await self._after_write("comment")
+        return comment_id
 
 
 def accounts_from_settings(

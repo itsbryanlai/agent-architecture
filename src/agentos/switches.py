@@ -5,9 +5,9 @@ deletes the row (the audit log keeps the history). There are four scopes:
 
 * ``agent``: one agent answers every turn with a fixed text and calls no model.
 * ``all_agents``: the same for every agent of the tenant.
-* ``connector``: one connector (Notion) is unavailable to the tenant. Its own tool calls
-  return an error the model passes on, knowledge search refuses (it reads through
-  Notion), indexing and follow-up polling do nothing until it is back on. The platform's
+* ``connector``: one connector (Notion or Drive) is unavailable to the tenant. Its own
+  tool calls return an error the model passes on, knowledge search leaves out its
+  scopes, indexing and follow-up polling do nothing until it is back on. The platform's
   own reads (``my_tasks``) answer to no connector switch; an agent switch still stops them.
 * ``writes``: read-only mode. Drafting still works; Submit is refused, and a write that
   was approved but has not run yet is refused too, so nothing is changed.

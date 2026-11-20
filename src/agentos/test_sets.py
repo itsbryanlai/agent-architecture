@@ -1,7 +1,8 @@
 """Creator test sets: cases on an agent version, and runs of them against a draft.
 
 A case is a question and an expected behaviour — answers citing a granted page,
-drafts a write to a granted database, refuses, or hands off to a listed specialist.
+drafts a write to a granted database or Drive file, refuses, or hands off to a listed
+specialist.
 Cases are stored per agent version and copied forward when a new draft is made.
 The question's text lives here, in Postgres; a run's workflow carries only the
 case's reference and its expectation (kind and target ID), never the text.
@@ -46,7 +47,7 @@ EXPECT_KINDS = (CITE, WRITE, REFUSE, HAND_OFF)
 
 EXPECT_LABELS = {
     CITE: "Answers citing a source",
-    WRITE: "Drafts a write to a database",
+    WRITE: "Drafts a write to a database or Drive file",
     REFUSE: "Refuses",
     HAND_OFF: "Hands off to an agent",
 }
@@ -143,10 +144,12 @@ class CaseRef:
 
 @dataclass(frozen=True)
 class DraftedWrite:
-    """The write a case's turn drafted: its task kind and target database (a reference).
+    """The write a case's turn drafted: its task kind and target (a reference).
 
-    ``database_id`` is empty when the target could not be resolved from the draft's
-    grants; nothing was written either way.
+    ``database_id`` holds the Notion database a write aims at, or the Drive file a
+    comment aims at (the field keeps its name: it rides in workflow payloads). Empty
+    when the target could not be resolved from the draft's grants; nothing was written
+    either way.
     """
 
     tool: str
@@ -161,7 +164,7 @@ class CaseResult:
     outcome: str
     reason: str = ""
     tool: str = ""  # the drafted write's task kind, when one was drafted
-    target: str = ""  # the drafted write's database, or the hand-off's agent
+    target: str = ""  # the drafted write's target, or the hand-off's agent
 
 
 @dataclass(frozen=True)

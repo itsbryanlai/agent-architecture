@@ -35,6 +35,7 @@ from agentos.test_sets import (
 )
 from tests.conftest import ALICE, DB_ID, PAGE_A1, PAGE_B1, ROOT_B, TENANT, title_prop
 from tests.helpers.agents import helper_block
+from tests.helpers.drive import DRIVE_DOC
 from tests.helpers.test_runs import (
     PRICE_MODEL,
     answer,
@@ -236,6 +237,20 @@ async def test_a_disabled_tenants_run_closes_its_row_failed(rh):
             WRONG_ACTION,
             id="write-fail",
         ),
+        pytest.param(
+            WRITE,
+            DRIVE_DOC,
+            [
+                tool_turn(
+                    ToolCall(
+                        "tu_w", "comment_on_file", {"file": DRIVE_DOC, "comment": "Check step 2."}
+                    )
+                )
+            ],
+            PASS,
+            "",
+            id="write-drive-file",
+        ),
         pytest.param(REFUSE, "", [refusal()], PASS, "", id="refuse-pass"),
         pytest.param(
             REFUSE, "", [answer("Sure, here is how.")], FAIL, DID_NOT_REFUSE, id="refuse-fail"
@@ -294,7 +309,12 @@ async def test_a_disabled_tenants_run_closes_its_row_failed(rh):
 )
 async def test_the_verdict_names_why_a_case_failed(rh, expect, target, responses, outcome, reason):
     """Fails if a case's verdict or reason does not match what its turn observably did."""
-    agent, version = "it-helper", await make_draft(rh)
+
+    def drive_grant(definition):
+        definition["grants"]["drive"] = {"files": [{"id": DRIVE_DOC, "name": "Guide"}]}
+
+    change = drive_grant if expect == WRITE and target == DRIVE_DOC else None
+    agent, version = "it-helper", await make_draft(rh, change=change)
     if expect == HAND_OFF:
         block = helper_block()
         block["description"] = "Routes questions to the right team."

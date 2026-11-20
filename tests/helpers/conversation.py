@@ -34,6 +34,34 @@ async def start_conversation(h, msg: InboundMessage):
     )
 
 
+async def start_stored_conversation(h, event_id: str, text: str = "hello"):
+    """A conversation whose message text is in the content store, as the gateway stores
+    it now: the turn runs the content-free path, and a write becomes a stored-draft task."""
+    await h.acts.content.put_inbound(
+        TENANT,
+        event_id,
+        {
+            "kind": "message",
+            "agent_id": "it-helper",
+            "user_id": ALICE,
+            "text": text,
+            "channel": CHANNEL,
+            "thread_ts": THREAD,
+            "channel_kind": "channel",
+        },
+    )
+    return await h.client.start_workflow(
+        ConversationWorkflow.run,
+        ConversationRef(TENANT, "it-helper", CHANNEL, THREAD),
+        id=ids.conversation_id(TENANT, CHANNEL, THREAD),
+        task_queue=TASK_QUEUE,
+        start_signal="message",
+        start_signal_args=[
+            InboundMessage(event_id, ALICE, "", CHANNEL, THREAD, "channel", text_stored=True)
+        ],
+    )
+
+
 def placeholders(h):
     return [p for p in h.slack.posts() if p["text"] == "Thinking…"]
 

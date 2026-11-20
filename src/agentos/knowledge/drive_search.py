@@ -2,19 +2,22 @@
 
 A Drive hit is confirmed live with the tenant's own Drive account: ``files.get`` with the
 file's parents, walked up until it reaches the scope's granted root (kept) or a node that
-is gone, trashed, has no readable parent, or sits outside the root (dropped). A file moved
-out of the granted folder since the last walk therefore never reaches the model, as
-``PageChecker`` keeps a Notion page still under its root. Lookups are cached for the one
-search, so a folder shared by many hits is read once.
+is gone, trashed, has no readable parent, or sits outside the root (dropped). The granted
+root is matched by ID and never fetched — a shared drive's root is not a file, so
+``files.get`` of it would answer 404. A file moved out of the granted folder since the
+last walk therefore never reaches the model, as ``PageChecker`` keeps a Notion page still
+under its root. Lookups are cached for the one search, so a folder shared by many hits is
+read once.
 """
 
 from __future__ import annotations
 
 from agentos import ids
 from agentos.connectors import drive_errors
+from agentos.connectors.base import MAX_WALK_DEPTH
 from agentos.connectors.drive import DriveReader
 from agentos.connectors.google_iam import DriveFile
-from agentos.knowledge.search import MAX_WALK_DEPTH, PageChecker
+from agentos.knowledge.search import PageChecker
 from agentos.knowledge.store import ChunkHit
 
 
@@ -42,16 +45,20 @@ class DriveChecker:
     async def confirm(self, hit: ChunkHit, root_page_id: str = "") -> bool:
         if self._reader is None:
             return False
-        current = hit.page_id
+        file = await self._file(hit.page_id)
+        if file is None:
+            return False
+        if hit.page_id == root_page_id:
+            return True
         for _ in range(MAX_WALK_DEPTH):
-            file = await self._file(current)
-            if file is None:
-                return False
-            if current == root_page_id:
-                return True
             if not file.parents:
                 return False
-            current = file.parents[0]
+            parent = file.parents[0]
+            if parent == root_page_id:
+                return True
+            file = await self._file(parent)
+            if file is None:
+                return False
         return False
 
 

@@ -14,10 +14,10 @@ Rules this workflow keeps:
   reference and expectation (kind and target ID), citations and drafted-action
   references. The question is appended to the case's conversation by an activity that
   reads it from the case row; the final answer is read by the activity that judges it.
-* Writes never run. A call to a write tool is recorded (its task kind and target
-  database, resolved with the draft's grants) and stops the case: no card is posted,
-  no task starts, nothing is written. A hand-off is recorded and stops the case too;
-  the specialist does not answer.
+* Writes never run. A call to a write tool is recorded (its task kind and target — a
+  Notion database or a Drive file — resolved with the draft's grants) and stops the
+  case: no card is posted, no task starts, nothing is written. A hand-off is recorded
+  and stops the case too; the specialist does not answer.
 * Nothing is posted to Slack: no placeholder, no progress, no reply.
 * The run's spend counts in the tenant's usage (``call_model`` records it) and is
   capped: a check after every model step stops the run at the cap, and the cases not

@@ -44,6 +44,7 @@ from agentos.approval_policy import NO_APPROVAL
 from agentos.audit import InMemoryAuditStore, canonical_sha256
 from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
+from agentos.connectors.drive import DriveReader
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import CreatorAccessActivities, InMemoryCreatorAccessStore
 from agentos.credentials import InMemoryCredentialStore, TenantCredentials
@@ -119,7 +120,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.helpers.agents import republish
-from tests.helpers.drive import DRIVE_FOLDER, drive_account_email, make_drive_google
+from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, drive_account_email, make_drive_google
 from tests.helpers.health import FlipsAfterReads
 from tests.helpers.llm_errors import StatusError
 
@@ -213,7 +214,15 @@ async def rig(key_dir: Path, *, workflows=None):
     history = InMemoryHistoryStore()
     knowledge, embedder = InMemoryKnowledgeStore(), FakeEmbedder()
     agent_store = seeded_agent_store(cfg)
-    registry = TenantRegistry({TENANT: runtime_for(cfg, slack, notion)})
+    google = make_drive_google()
+    drive_connections = InMemoryDriveConnectionStore()
+    registry = TenantRegistry(
+        {
+            TENANT: runtime_for(
+                cfg, slack, notion, drive=DriveReader(google, drive_account_email(google))
+            )
+        }
+    )
     acts = AgentActivities(
         settings=Settings(),
         registry=registry,
@@ -263,8 +272,6 @@ async def rig(key_dir: Path, *, workflows=None):
         health_checker,
         client_for=lambda _token, _tenant: creator_notion,
     )
-    google = make_drive_google()
-    drive_connections = InMemoryDriveConnectionStore()
     drive_index = DriveIndexActivities(
         registry,
         knowledge,
@@ -1271,6 +1278,44 @@ async def task_comment_policy(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", write.task_id), await current(r, "conversation", conv)]
 
 
+async def drive_comment(r: Rig) -> list[Recorded]:
+    """A Drive comment task (D-47): the model drafts comment_on_file on a granted file,
+    the requester approves the card, and the comment posts once with its marker."""
+    thread = thread_ts(321)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: d["grants"].update(
+            drive={"folders": [{"id": DRIVE_FOLDER, "name": "Team folder"}]}
+        ),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 21, tzinfo=UTC)
+    )
+    r.llm.queue(
+        tool_turn(
+            ToolCall("tu_dc", "comment_on_file", {"file": DRIVE_DOC, "comment": "Please review."})
+        ),
+        answer("Sent you a card."),
+    )
+    await start_conversation(r, "it-helper", thread, "comment on the guide", stored=True)
+    cards = await eventually(lambda: [p for p in r.slack.posts() if p["blocks"]], timeout=30)
+    actions = next(b for b in cards[0]["blocks"] if b["type"] == "actions")
+    value = json.loads(actions["elements"][0]["value"])
+    handle = r.client.get_workflow_handle(value["task_id"])
+    await wait_state(handle, "awaiting_approval")
+    await approve(handle, value["nonce"])
+    assert await handle.result() == "done"
+    [comment] = r.google.drive_comments[DRIVE_DOC]
+    assert comment["content"].startswith("Please review.")
+    assert "ref " in comment["content"]
+    assert any(p["thread_ts"] and "Commented on Guide" in p["text"] for p in r.slack.posts())
+    return [
+        await current(r, "", handle.id),
+        await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
+    ]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1826,6 +1871,8 @@ SCENARIOS["test_run"] = test_run
 SCENARIOS["test_run_tenant_disabled"] = test_run_tenant_disabled
 # The Drive walk carries references only: one shape, no message or task payload rides in it.
 SCENARIOS["drive_indexing"] = drive_indexing
+# A Drive comment task is new: one shape (the stored draft), no legacy inline history exists.
+SCENARIOS["drive_comment"] = drive_comment
 
 
 # --- files --------------------------------------------------------------------------------

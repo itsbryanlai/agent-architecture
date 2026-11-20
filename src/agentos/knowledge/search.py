@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from typing import Protocol
 
+from agentos.connectors.base import MAX_WALK_DEPTH
 from agentos.connectors.notion import NotionAPI, is_unreachable, normalize_id
 from agentos.knowledge.notion_text import parent_ref
 from agentos.knowledge.store import ChunkHit
@@ -32,9 +33,6 @@ SEARCH_CANDIDATES = 16
 SEARCH_RESULTS = 6
 # At most this many passages of one page reach the model, so one long page cannot fill the answer.
 MAX_CHUNKS_PER_PAGE = 2
-# A guard against a loop in Notion's parent links, far deeper than any real workspace. A page
-# at any depth the indexer reached is also found by a search and by a page event.
-MAX_WALK_DEPTH = 100
 
 NO_MATCH = "No documents this agent can read match that."
 

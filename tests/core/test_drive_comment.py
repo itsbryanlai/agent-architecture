@@ -4,6 +4,7 @@ import json
 import uuid
 
 import pytest
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
@@ -116,6 +117,61 @@ async def test_a_drive_comment_needs_a_live_grant_before_the_card_and_before_the
         assert "couldn't find a Google Drive file" in told["text"]
     assert h.google.comment_calls == []
     assert not h.google.drive_comments.get(ref, [])
+
+
+@pytest.mark.parametrize(
+    ("off", "outcome"), [("drive", "failed"), ("notion", "done")], ids=["drive-off", "notion-off"]
+)
+async def test_the_comment_prepare_gate_answers_to_the_tools_connector(dharness, off, outcome):
+    """Fails if a Drive comment's prepare step answers to the Notion switch: Drive off
+    must refuse it before any Drive call and any card, and Notion off must not stop it."""
+    h = dharness
+    assert await h.switches.switch_off(TENANT, "connector", off, "U_ADMIN", NOV)
+    handle = await start_comment_task(h, DRIVE_DOC)
+    if outcome == "done":
+        await wait_state(handle, "awaiting_approval")
+        await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+
+    assert await handle.result() == outcome
+
+    if outcome == "failed":
+        assert cards(h) == []
+        assert h.google.get_calls == []
+        assert h.google.comment_calls == []
+        [told] = thread_posts(h, "I can't comment on that file")
+        assert "folder I have access to" in told["text"]
+    else:
+        [comment] = h.google.drive_comments[DRIVE_DOC]
+        assert comment["content"].startswith("Please review.")
+
+
+async def test_the_drive_switch_refuses_reconcile_before_any_drive_call(dharness):
+    """Fails if reconcile_notion_comment reads Drive while the Drive connector switch is
+    off, instead of refusing before any call as the tool's connector requires."""
+    h = dharness
+    task_id = ids.task_id(TENANT, str(uuid.uuid4()))
+    await h.acts.content.put_draft(
+        TENANT,
+        task_id,
+        1,
+        {
+            "page_id": DRIVE_DOC,
+            "item_title": "Guide",
+            "item_url": GUIDE_LINK,
+            "comment": "Please review.",
+        },
+    )
+    spec = TaskSpec(
+        ctx(), "add_comment", {}, NONCE, tool="comment_on_file", draft_ref=task_id, revision=1
+    )
+    assert await h.switches.switch_off(TENANT, "connector", "drive", "U_ADMIN", NOV)
+
+    with pytest.raises(ApplicationError) as err:
+        await ActivityEnvironment().run(h.acts.reconcile_notion_comment, spec, task_id)
+
+    assert err.value.non_retryable and err.value.type == "ConnectorOff"
+    assert h.google.get_calls == []
+    assert h.google.comment_list_calls == []
 
 
 async def test_the_drive_switch_refuses_an_approved_drive_comment(dharness):

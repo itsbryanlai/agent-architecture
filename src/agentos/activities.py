@@ -629,13 +629,16 @@ class AgentActivities:
             )
         return refusal
 
-    async def _gate(self, tenant_id: str, agent_id: str, effect: Effect) -> None:
+    async def _gate(
+        self, tenant_id: str, agent_id: str, effect: Effect, connector: str = NOTION
+    ) -> None:
         """Stop for good, before any call, when a switch covers the effect.
 
+        ``connector`` is the tool's manifest connector, as for ``_gate_refusal``.
         Non-retryable: a retry within the minute would find it off again. The next step
         reads the switches afresh.
         """
-        refusal = await self._gate_refusal(tenant_id, agent_id, effect)
+        refusal = await self._gate_refusal(tenant_id, agent_id, effect, connector)
         if refusal is not None:
             raise _non_retryable(refusal)
 
@@ -1099,8 +1102,9 @@ class AgentActivities:
             # The Drive tools join only an agent that was granted Drive folders or files;
             # the grant check before a write reads the same grants.
             tools = tools + self._connector_for(ctx.tenant_id, agent, DRIVE).tools_for_llm()
-        if agent.grants.notion_databases:
-            # Only an agent with a write grant starts tasks, so only it has any to list.
+        if agent.grants.notion_databases or agent.grants.drive:
+            # Only an agent with a write grant (a Notion database or a Drive scope) starts
+            # tasks, so only it has any to list.
             tools = tools + [TOOLS[MY_TASKS_TOOL].llm_definition()]
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
@@ -1809,7 +1813,7 @@ class AgentActivities:
         none to list.
         """
         agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
-        if not agent.grants.notion_databases:
+        if not agent.grants.notion_databases and not agent.grants.drive:
             return "This agent has no write access, so it has no requests to list.", True
         records = await self.tasks.list_for_requester(ctx.tenant_id, ctx.requester_user_id)
         team_id = self._runtime(ctx.tenant_id).config.slack_team_id
@@ -1938,15 +1942,17 @@ class AgentActivities:
     async def record_test_write(
         self, ctx: TurnContext, conversation_id: str, call: ToolCallRef
     ) -> DraftedWrite:
-        """The write a case's turn drafted: its task kind and target database. Nothing runs.
+        """The write a case's turn drafted: its task kind and target. Nothing runs.
 
         The target is resolved with the pinned version's grants as the task path resolves
-        it: a create aims at the first granted database, a comment at the item's own (one
-        connector read, gated like any read). No draft is stored, no card posted, no task
+        it: a create aims at the first granted database, a Notion comment at the item's
+        own database, a Drive comment at the file itself (one connector read, gated like
+        any read of the tool's connector). No draft is stored, no card posted, no task
         started; an unresolvable or refused target is empty.
         """
         self._log("record_test_write", ctx.tenant_id, ctx.agent_id, tool=call.kind)
-        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, NOTION)
+        connector_name = _tool_connector(call.name)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, connector_name)
         found, raw = await self.content.get_tool_input(ctx.tenant_id, conversation_id, call.id)
         if not found:
             raise ApplicationError(
@@ -1955,14 +1961,21 @@ class AgentActivities:
         tool_input = raw if isinstance(raw, dict) else {}
         agent = await self._pinned(ctx)
         if call.kind == "add_comment":
-            item = tool_input.get("item")
+            # A Drive comment names its target 'file'; a Notion comment 'item'.
+            item = tool_input.get("file" if call.name == "comment_on_file" else "item")
             if refusal is None and isinstance(item, str) and item.strip():
-                connector = self._connector_for(ctx.tenant_id, agent)
+                connector = self._connector_for(ctx.tenant_id, agent, connector_name)
                 try:
                     resolved = await connector.resolve_item(item.strip())
                 except ConnectorError:
                     return DraftedWrite(call.kind)
-                return DraftedWrite(call.kind, normalize_id(resolved.database_id))
+                # A Drive target is the file ID as it is; Notion IDs are normalized.
+                target = (
+                    resolved.page_id
+                    if connector_name == DRIVE
+                    else normalize_id(resolved.database_id)
+                )
+                return DraftedWrite(call.kind, target)
             return DraftedWrite(call.kind)
         if agent.grants.notion_databases:
             return DraftedWrite(call.kind, normalize_id(agent.grants.notion_databases[0].id))
@@ -2156,7 +2169,9 @@ class AgentActivities:
         fails before any card is posted or anything is written.
         """
         ctx = spec.ctx
-        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
         self._log("prepare_comment", ctx.tenant_id, ctx.agent_id)
         return await self._resolve_comment(spec, spec.payload)
 
@@ -2168,7 +2183,9 @@ class AgentActivities:
         approval names; nothing was shown or approved before it. A retry finds it stored.
         """
         ctx = spec.ctx
-        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
         self._log("prepare_stored_comment", ctx.tenant_id, ctx.agent_id)
         revision = spec.revision + 1
         resolved = await self.content.get_draft(ctx.tenant_id, spec.draft_ref, revision)
@@ -2501,7 +2518,9 @@ class AgentActivities:
     async def reconcile_notion_comment(self, spec: TaskSpec, task_id: str) -> str | None:
         """The comment counterpart of ``reconcile_notion_item``: its ID, or None for "not seen"."""
         ctx = spec.ctx
-        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
         self._log("reconcile_notion_comment", ctx.tenant_id, ctx.agent_id)
         payload = await self._spec_payload(spec)
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)

@@ -48,6 +48,7 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_plane_tenants import tenants
+from tests.helpers.drive import DRIVE_DOC
 
 UI = f"/ui/{TENANT}"
 VERSION = f"{UI}/agents/it-helper/versions/1"
@@ -86,9 +87,11 @@ async def make_plane(starter=None, require_grant_picker=False, clock=utcnow):
 
 
 def granting_block() -> dict:
-    """it-helper with a page grant and a specialist, so every expectation has a valid target."""
+    """it-helper with a page grant, a Drive file grant and a specialist, so every
+    expectation has a valid target."""
     block = helper_block()
     block["grants"]["notion"]["pages"] = [{"id": ROOT_A, "name": "IT wiki"}]
+    block["grants"]["drive"] = {"files": [{"id": DRIVE_DOC, "name": "Guide"}]}
     block["specialists"] = ["hr-helper"]
     return block
 
@@ -131,6 +134,8 @@ async def test_only_the_agents_creator_and_admins_may_change_cases_or_run_them(a
         ("q", CITE, DB_ID, False),
         ("q", WRITE, DB_ID, True),
         ("q", WRITE, ROOT_A, False),
+        ("q", WRITE, DRIVE_DOC, True),
+        ("q", WRITE, "drive-file-9999", False),
         ("q", HAND_OFF, "hr-helper", True),
         ("q", HAND_OFF, "plain", False),
     ],
@@ -147,6 +152,8 @@ async def test_only_the_agents_creator_and_admins_may_change_cases_or_run_them(a
         "cite a database",
         "write granted database",
         "write a page",
+        "write granted Drive file",
+        "write an ungranted Drive file",
         "hand-off listed specialist",
         "hand-off unlisted agent",
     ],
@@ -165,6 +172,8 @@ async def test_a_case_needs_a_question_and_a_target_the_draft_grants(
             assert stored.target == normalize_id(ROOT_A)
         if expect == REFUSE:
             assert stored.target == ""
+        if expect == WRITE and target == DRIVE_DOC:
+            assert stored.target == DRIVE_DOC
     else:
         with pytest.raises(TestSetError):
             await plane.add_test_case(TENANT, OWNER, "it-helper", 1, question, expect, target)

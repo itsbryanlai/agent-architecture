@@ -156,7 +156,7 @@
           <option value="">choose…</option>
           {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
         </select>
-        <input type="text" name="target" placeholder="page or database ID, or agent ID">
+        <input type="text" name="target" placeholder="page, database or Drive file ID, or agent ID">
         <button type="submit">Save</button>
       </form>
       {% endif %}
@@ -177,7 +177,7 @@
     <option value="">choose later</option>
     {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
   </select>
-  <input type="text" name="target" placeholder="page or database ID, or agent ID">
+  <input type="text" name="target" placeholder="page, database or Drive file ID, or agent ID">
   <button type="submit">Add case</button></p>
 </form>
 {{ post_button(version_url ~ "/test-run", ctx.csrf, "Run tests", {"request_id": new_token()}) }}

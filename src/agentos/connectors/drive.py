@@ -10,8 +10,9 @@ Knowledge search reads the indexed Drive scopes; the model's first Drive tool is
 ends with the key's reference, and the marker lookup scans the file's comments for it
 before a retry posts again. ``resolve_item`` walks a file's parents up to a granted
 root — the same walk the search re-check makes — so a file inside a granted folder or
-shared drive resolves, and one moved out of it does not. The connector brings the Drive
-error table so a failure is classified like every other connector's.
+shared drive resolves, and one moved out of it does not; the granted root is matched by
+ID and never fetched, as a shared drive's root is not a file. The connector brings the
+Drive error table so a failure is classified like every other connector's.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from contextlib import AbstractContextManager, nullcontext
 
 from agentos.config import DRIVE_ID, DriveGrant
 from agentos.connectors import drive_errors
-from agentos.connectors.base import ConnectorError, GrantDenied, UnknownItem
+from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import (
     MIME_FOLDER,
     DriveComment,
@@ -31,7 +32,6 @@ from agentos.connectors.google_iam import (
 )
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
 from agentos.connectors.notion import comment_ref
-from agentos.knowledge.search import MAX_WALK_DEPTH
 from agentos.models import SIGNATURE_NAME_MAX, NotionItem
 
 # A Drive file ID in a link: /file/d/<id>, /document/d/<id>, /spreadsheets/d/<id>,
@@ -126,42 +126,48 @@ class DriveConnector:
     ) -> list[NotionItem]:
         raise ConnectorError(f"Unknown tool '{tool}'.")
 
+    async def _live_file(self, file_id: str) -> DriveFile:
+        """The file as it is now: gone, unreadable or trashed reads as ``UnknownItem``."""
+        try:
+            node = await self._reader.get_file(file_id)
+        except Exception as err:
+            if drive_errors.is_gone(err):
+                raise UnknownItem(_UNKNOWN_FILE) from err
+            raise
+        if node.trashed:
+            raise UnknownItem(_UNKNOWN_FILE)
+        return node
+
     async def resolve_item(self, item_ref: str) -> NotionItem:
         """The granted file a link or ID names: a directly granted file, or one under a
         granted folder or shared drive.
 
-        The file's parents are walked up to a granted root, the same walk the search
-        re-check makes (first parent, bounded depth): a file moved out of the granted
-        folder does not resolve. A folder or a shared drive's root is not a file to
-        comment on. A file that is not granted, not found, not shared or trashed raises
-        the same ``UnknownItem``, so the answer never reveals whether an ungranted file
-        exists.
+        The file itself is fetched (trashed and folder checks), then its parents are
+        walked up to a granted root, the same walk the search re-check makes (first
+        parent, bounded depth): a file moved out of the granted folder does not resolve.
+        A granted root is matched by ID and never fetched — a shared drive's root is
+        not a file, so ``files.get`` of it would answer 404. A folder or a shared
+        drive's root is not a file to comment on. A file that is not granted, not
+        found, not shared or trashed raises the same ``UnknownItem``, so the answer
+        never reveals whether an ungranted file exists.
         """
         file_id = drive_file_id(item_ref)
         if file_id is None or self._reader is None:
             raise UnknownItem(_UNKNOWN_FILE)
-        file: DriveFile | None = None
-        current = file_id
+        file = await self._live_file(file_id)
+        if file.mime_type == MIME_FOLDER:
+            raise UnknownItem(_UNKNOWN_FILE)
+        item = NotionItem(page_id=file.id, url=file.web_view_link, title=file.name, status=None)
+        if file_id in self._grants:
+            return item
+        node = file
         for _ in range(MAX_WALK_DEPTH):
-            try:
-                node = await self._reader.get_file(current)
-            except Exception as err:
-                if drive_errors.is_gone(err):
-                    raise UnknownItem(_UNKNOWN_FILE) from err
-                raise
-            if node.trashed:
-                raise UnknownItem(_UNKNOWN_FILE)
-            if file is None:
-                file = node
-            if current in self._grants:
-                if file.mime_type == MIME_FOLDER:
-                    raise UnknownItem(_UNKNOWN_FILE)
-                return NotionItem(
-                    page_id=file.id, url=file.web_view_link, title=file.name, status=None
-                )
             if not node.parents:
                 raise UnknownItem(_UNKNOWN_FILE)
-            current = node.parents[0]
+            parent = node.parents[0]
+            if parent in self._grants:
+                return item
+            node = await self._live_file(parent)
         raise UnknownItem(_UNKNOWN_FILE)
 
     async def assignee_user_id(self, item_id: str) -> str | None:

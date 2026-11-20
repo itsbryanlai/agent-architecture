@@ -13,7 +13,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2 import service_account
 
+from agentos.config import DriveGrant
 from agentos.connectors import drive_errors
+from agentos.connectors.drive import DriveConnector, DriveReader
 from agentos.connectors.google_iam import (
     CLOUD_PLATFORM,
     DRIVE_SCOPES,
@@ -625,6 +627,42 @@ async def test_the_shared_drive_surface_reads_drive_scoped_with_the_tenant_token
     assert "corpora=drive" in lists[0].path_url and "driveId=d1" in lists[0].path_url
     assert "includeItemsFromAllDrives=true" in lists[0].path_url
     assert "supportsAllDrives=true" in lists[0].path_url
+
+
+async def test_resolving_a_shared_drive_file_never_gets_the_drive_root(deployment_key):
+    """Fails if resolve_item sends files.get for a granted shared drive's root (not a
+    file, 404 at Google) instead of matching the grant by ID."""
+    file_id, drive_id = "shared-file-0001", "shared-drive-0001"
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith(f"/drive/v3/files/{file_id}"):
+            return reply(
+                request,
+                200,
+                {
+                    "id": file_id,
+                    "name": "Shared guide",
+                    "mimeType": MIME_DOC,
+                    "webViewLink": f"https://drive/{file_id}",
+                    "trashed": False,
+                    "parents": [drive_id],
+                },
+            )
+        return reply(request, 404, {"error": {"status": "NOT_FOUND"}})
+
+    client, sent = client_with(handler, deployment_key)
+    conn = DriveConnector(
+        DriveReader(client, EMAIL), [DriveGrant(drive_id, "Team drive", "shared_drive")]
+    )
+
+    item = await conn.resolve_item(file_id)
+
+    assert (item.page_id, item.title) == (file_id, "Shared guide")
+    gets = [r.path_url.split("?")[0] for r in sent if r.path_url.startswith("/drive/v3/files/")]
+    assert gets == [f"/drive/v3/files/{file_id}"]
 
 
 @pytest.mark.parametrize("mime", [MIME_DOC, MIME_SLIDES], ids=["doc", "slides"])

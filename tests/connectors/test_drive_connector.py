@@ -6,23 +6,29 @@ import pytest
 from agentos.config import DriveGrant
 from agentos.connectors.base import UnknownItem
 from agentos.connectors.drive import DriveConnector, DriveReader
-from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts
+from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts, GoogleError
 from agentos.connectors.notion import comment_ref
+from tests.helpers.drive import DRIVE_SHARED, DRIVE_SHARED_DOC, add_shared_drive_tree
 
 FILE = "drive-file-0001"
 FOLDER = "team-folder-0001"
 ELSEWHERE = "elsewhere-folder-0001"
+EMAIL = "agent@x.iam.gserviceaccount.com"
 
 
 def make(granted: bool, kind: str = "file"):
     google = FakeGoogleAccounts()
-    google.add_drive_folder(FOLDER, "Team folder")
-    google.add_drive_file(FILE, "Guide", MIME_DOC, FOLDER, [DriveSection("", "text")])
-    grants = []
-    if granted:
+    if kind == "shared_drive":
+        add_shared_drive_tree(google)
+        # A shared drive's root is not a file: files.get of it answers 404, as Google does.
+        google.fail_get_for(DRIVE_SHARED, GoogleError("not_found", status=404))
+        target, name = DRIVE_SHARED, "Team drive"
+    else:
+        google.add_drive_folder(FOLDER, "Team folder")
+        google.add_drive_file(FILE, "Guide", MIME_DOC, FOLDER, [DriveSection("", "text")])
         target, name = (FILE, "Guide") if kind == "file" else (FOLDER, "Team folder")
-        grants = [DriveGrant(target, name, kind)]
-    conn = DriveConnector(DriveReader(google, "agent@x.iam.gserviceaccount.com"), grants)
+    grants = [DriveGrant(target, name, kind)] if granted else []
+    conn = DriveConnector(DriveReader(google, EMAIL), grants)
     return conn, google
 
 
@@ -41,8 +47,9 @@ def make(granted: bool, kind: str = "file"):
 )
 async def test_resolve_item_resolves_only_a_granted_live_file(case, resolves):
     """Fails if resolve_item returns a file outside the grants (including one moved out of
-    a granted folder), a folder or drive root, or reveals whether an ungranted, missing or
-    trashed file exists instead of the same UnknownItem."""
+    a granted folder), a folder or drive root, fetches a granted shared drive's root (not a
+    file) instead of matching it by ID, or reveals whether an ungranted, missing or trashed
+    file exists instead of the same UnknownItem."""
     kind = "file"
     if case in (
         "file in granted folder",
@@ -53,8 +60,10 @@ async def test_resolve_item_resolves_only_a_granted_live_file(case, resolves):
     elif case == "file in granted shared drive":
         kind = "shared_drive"
     conn, google = make(granted=case != "ungranted file", kind=kind)
-    ref = FILE
-    if case == "missing file":
+    ref, expected = FILE, (FILE, "Guide")
+    if case == "file in granted shared drive":
+        ref, expected = DRIVE_SHARED_DOC, (DRIVE_SHARED_DOC, "Shared guide")
+    elif case == "missing file":
         ref = "drive-file-9999"
     elif case == "trashed file":
         google.trash_drive_file(FILE)
@@ -65,7 +74,7 @@ async def test_resolve_item_resolves_only_a_granted_live_file(case, resolves):
         ref = FOLDER
     if resolves:
         item = await conn.resolve_item(ref)
-        assert (item.page_id, item.title) == (FILE, "Guide")
+        assert (item.page_id, item.title) == expected
     else:
         with pytest.raises(UnknownItem):
             await conn.resolve_item(ref)

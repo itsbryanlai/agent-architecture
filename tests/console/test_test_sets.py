@@ -48,7 +48,7 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_plane_tenants import tenants
-from tests.helpers.drive import DRIVE_DOC
+from tests.helpers.drive import DRIVE_DOC, DRIVE_SHEET, sheet_grant_block
 
 UI = f"/ui/{TENANT}"
 VERSION = f"{UI}/agents/it-helper/versions/1"
@@ -87,11 +87,14 @@ async def make_plane(starter=None, require_grant_picker=False, clock=utcnow):
 
 
 def granting_block() -> dict:
-    """it-helper with a page grant, a Drive file grant and a specialist, so every
-    expectation has a valid target."""
+    """it-helper with a page grant, a Drive file grant, a Drive sheet grant and a specialist,
+    so every expectation has a valid target."""
     block = helper_block()
     block["grants"]["notion"]["pages"] = [{"id": ROOT_A, "name": "IT wiki"}]
-    block["grants"]["drive"] = {"files": [{"id": DRIVE_DOC, "name": "Guide"}]}
+    block["grants"]["drive"] = {
+        "files": [{"id": DRIVE_DOC, "name": "Guide"}],
+        "sheets": [sheet_grant_block()],
+    }
     block["specialists"] = ["hr-helper"]
     return block
 
@@ -132,9 +135,11 @@ async def test_only_the_agents_creator_and_admins_may_change_cases_or_run_them(a
         ("q", CITE, "", False),
         ("q", CITE, ROOT_A, True),
         ("q", CITE, DB_ID, False),
+        ("q", CITE, DRIVE_DOC, True),
         ("q", WRITE, DB_ID, True),
         ("q", WRITE, ROOT_A, False),
         ("q", WRITE, DRIVE_DOC, True),
+        ("q", WRITE, DRIVE_SHEET, True),
         ("q", WRITE, "drive-file-9999", False),
         ("q", HAND_OFF, "hr-helper", True),
         ("q", HAND_OFF, "plain", False),
@@ -150,9 +155,11 @@ async def test_only_the_agents_creator_and_admins_may_change_cases_or_run_them(a
         "cite without target",
         "cite granted page",
         "cite a database",
+        "cite granted Drive file",
         "write granted database",
         "write a page",
         "write granted Drive file",
+        "write granted Drive sheet",
         "write an ungranted Drive file",
         "hand-off listed specialist",
         "hand-off unlisted agent",
@@ -169,11 +176,11 @@ async def test_a_case_needs_a_question_and_a_target_the_draft_grants(
         stored = (await sets.cases(TENANT, "it-helper", 1))[0]
         assert stored.case_id == case.case_id
         if expect == CITE:
-            assert stored.target == normalize_id(ROOT_A)
+            assert stored.target == (DRIVE_DOC if target == DRIVE_DOC else normalize_id(ROOT_A))
         if expect == REFUSE:
             assert stored.target == ""
-        if expect == WRITE and target == DRIVE_DOC:
-            assert stored.target == DRIVE_DOC
+        if expect == WRITE and target in (DRIVE_DOC, DRIVE_SHEET):
+            assert stored.target == target
     else:
         with pytest.raises(TestSetError):
             await plane.add_test_case(TENANT, OWNER, "it-helper", 1, question, expect, target)

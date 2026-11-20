@@ -2,9 +2,10 @@
 #
 # Drive reads are knowledge: the indexed folders and files are searched through
 # search_knowledge, not a Drive tool. The write actions declare their risk, idempotency
-# and preview shape here; comment is the first (D-47). A Drive comment always asks the
-# requester's approval: it never carries low_risk (maintainer, 2026-11-21). Append a row,
-# create from a template and replace a section arrive with their own tickets.
+# and preview shape here; comment is the first (D-47), append a row the second (D-48). A
+# Drive write always asks the requester's approval: neither tool carries low_risk
+# (maintainer, 2026-11-21 / 2026-11-19). Create from a template and replace a section
+# arrive with their own tickets.
 connector: drive
 tools:
   comment_on_file:
@@ -23,3 +24,23 @@ tools:
           type: string
           description: The comment text.
       required: [file, comment]
+
+  append_row:
+    risk: write_irreversible
+    idempotency: developer_metadata
+    description: >-
+      Draft a row to append to one of the agent's granted Google Sheets. Nothing is
+      appended until the requester approves the draft in Slack. The row's keys must be
+      columns of the chosen sheet; the granted sheets and their columns are listed below.
+    input_schema:
+      type: object
+      properties:
+        sheet:
+          type: string
+          description: ID or name of one of the granted sheets listed in this description.
+        row:
+          type: object
+          description: >-
+            The row to append, as column name to value (text or a number). Use only the
+            sheet's columns; a column left out is appended empty.
+      required: [sheet, row]

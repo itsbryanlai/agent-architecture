@@ -409,12 +409,19 @@ class DriveGrant:
 
     A folder grants everything under it (recursively); a file grants just that file; a
     shared drive grants everything in it, walked from its root. Each grant is one scope
-    that searches are filtered by. ``kind`` is ``folder``, ``file`` or ``shared_drive``.
+    that searches are filtered by. ``kind`` is ``folder``, ``file``, ``shared_drive`` or
+    ``sheet``.
+
+    A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
+    ``columns`` is its header row, read once when the version is submitted and frozen
+    into the definition. The write refuses when the live header no longer matches.
     """
 
     id: str
     name: str
     kind: str = "folder"
+    tab: str = ""
+    columns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -598,12 +605,18 @@ _GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
-_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives"})
+_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
-DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive")
+_DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
+DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet")
 # A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
 # The connector's link parser uses the same shape, so a grant and a resolved link agree.
 DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
+# A sheet grant's header row is bounded so the approval card (Slack section fields) and
+# the Edit form (Slack modal blocks) always fit: at most 50 columns, each name at most 200
+# characters. The submit step refuses a wider header rather than store a card Slack rejects.
+MAX_SHEET_COLUMNS = 50
+MAX_COLUMN_NAME = 200
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -740,6 +753,35 @@ def _parse_drive_grant(agent_id: str, raw: dict[str, Any], kind: str, index: int
     )
 
 
+def _parse_drive_sheet(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.sheets[{index}]"
+    _mapping(where, raw, _DRIVE_SHEET_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    columns_raw = raw.get("columns")
+    columns: tuple[str, ...] = ()
+    if columns_raw is not None:
+        if not isinstance(columns_raw, list) or not all(
+            isinstance(c, str) and c.strip() for c in columns_raw
+        ):
+            raise ConfigError(f"{where}: 'columns' must be a list of non-empty column names")
+        if len(columns_raw) > MAX_SHEET_COLUMNS:
+            raise ConfigError(f"{where}: a sheet may name at most {MAX_SHEET_COLUMNS} columns")
+        if any(len(c) > MAX_COLUMN_NAME for c in columns_raw):
+            raise ConfigError(f"{where}: a column name may be at most {MAX_COLUMN_NAME} characters")
+        columns = tuple(columns_raw)
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="sheet",
+        tab=_text(where, "tab", _require(raw, "tab", where)),
+        columns=columns,
+    )
+
+
 def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
     where = f"agent '{agent_id}' grants.drive"
     drive = _mapping(where, raw, _DRIVE_KEYS)
@@ -747,7 +789,10 @@ def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
     for kind in DRIVE_GRANT_KINDS:
         key = f"{kind}s"
         for i, item in enumerate(_list_of(f"{where}.{key}", drive.get(key))):
-            grants.append(_parse_drive_grant(agent_id, item, kind, i))
+            if kind == "sheet":
+                grants.append(_parse_drive_sheet(agent_id, item, i))
+            else:
+                grants.append(_parse_drive_grant(agent_id, item, kind, i))
     seen: set[str] = set()
     for grant in grants:
         if grant.id in seen:
@@ -880,10 +925,19 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
         definition["audience"] = _audience_definition(agent.audience)
     if agent.grants.drive:
         definition["grants"]["drive"] = {
-            f"{kind}s": [{"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == kind]
+            f"{kind}s": [_drive_grant_entry(g) for g in agent.grants.drive if g.kind == kind]
             for kind in DRIVE_GRANT_KINDS
         }
     return definition
+
+
+def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
+    entry: dict[str, Any] = {"id": grant.id, "name": grant.name}
+    if grant.kind == "sheet":
+        entry["tab"] = grant.tab
+        if grant.columns:
+            entry["columns"] = list(grant.columns)
+    return entry
 
 
 def _audience_definition(audience: Audience) -> dict[str, Any]:

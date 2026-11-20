@@ -92,6 +92,7 @@ from agentos.models import (
     ExternalUpdate,
     NudgeRequest,
     field_error,
+    row_limits,
 )
 from agentos.notion_webhook import WebhookTokens
 from agentos.slack_format import from_slack_text
@@ -855,6 +856,9 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
     if not draft.revision or d.content is None:
         return {}
     stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
+    if draft.tool_name == "append_row":
+        # An append's editable values are its row's cells, keyed by the sheet's columns.
+        return dict(stored.get("row", {}))
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -871,7 +875,10 @@ async def _query_draft(d: GatewayDeps, tenant: str, task_id: str) -> DraftView |
 
 def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     """The Edit form: one input per editable field, prefilled from the draft."""
-    limits = EDITABLE_FIELDS[draft.tool_name]
+    if draft.tool_name == "append_row":
+        limits = row_limits(list(fields))
+    else:
+        limits = EDITABLE_FIELDS[draft.tool_name]
     blocks = []
     for name, current in fields.items():
         blocks.append(
@@ -884,7 +891,7 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
                     "action_id": "value",
                     "initial_value": current,
                     "max_length": limits[name],
-                    "multiline": name in MULTILINE_FIELDS,
+                    "multiline": name in MULTILINE_FIELDS or draft.tool_name == "append_row",
                 },
             }
         )
@@ -938,7 +945,7 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
     else:
         # The workflow checks every field again; this is the same check, shown here.
         for name, value in fields.items():
-            known = name in EDITABLE_FIELDS[draft.tool_name]
+            known = draft.tool_name == "append_row" or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):
                 errors[name] = message
     if errors:

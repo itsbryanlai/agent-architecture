@@ -28,8 +28,13 @@ from agentos.models import READ_KIND
 MANIFEST_DIR = Path(__file__).parent / "manifests"
 
 # The kind of task that carries out a write, by the idempotency method its manifest declares:
-# an item carrying a marker property is created, a comment ending in a marker is posted.
-WRITE_KINDS = {"marker_property": "create_item", "marker_text": "add_comment"}
+# an item carrying a marker property is created, a comment ending in a marker is posted, a
+# sheet row carrying developer metadata is appended.
+WRITE_KINDS = {
+    "marker_property": "create_item",
+    "marker_text": "add_comment",
+    "developer_metadata": "append_row",
+}
 
 
 class RiskClass(str, Enum):

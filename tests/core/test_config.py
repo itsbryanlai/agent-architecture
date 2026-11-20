@@ -132,6 +132,17 @@ def _drive_grant_id(value):
     return apply
 
 
+def _drive_sheet(**overrides):
+    """A definition whose one Drive sheet grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        sheet = {"id": "drive-sheet-0001", "name": "Roster", "tab": "Q1"}
+        sheet.update(overrides)
+        definition["grants"]["drive"] = {"sheets": [sheet]}
+
+    return apply
+
+
 DB = "grants.notion.databases.0"
 BAD_DEFINITIONS = [
     # An unknown key at the top, inside a grant, and three levels down.
@@ -167,6 +178,14 @@ BAD_DEFINITIONS = [
     (_drive_grant_id("x' or '1'='1"), "'id' must be a Drive ID"),
     (_drive_grant_id("folder 1"), "'id' must be a Drive ID"),
     (_drive_grant_id("short"), "'id' must be a Drive ID"),
+    # A sheet grant names a tab; its columns are a bounded list of non-empty names.
+    (_drive_sheet(tab=""), "missing required field 'tab'"),
+    (_drive_sheet(id="short"), "'id' must be a Drive ID"),
+    (_drive_sheet(columns="name,role"), "'columns' must be a list"),
+    (_drive_sheet(columns=["name", ""]), "'columns' must be a list of non-empty"),
+    (_drive_sheet(columns=["c"] * 51), "at most 50 columns"),
+    (_drive_sheet(columns=["c" * 201]), "at most 200 characters"),
+    (_drive_sheet(colours=["name"]), "unknown field 'colours'"),
 ]
 
 

@@ -205,6 +205,32 @@ class DriveComment:
     mine: bool
 
 
+@dataclass(frozen=True)
+class SheetTab:
+    """One tab of a Sheet as the append write needs it: references and small values.
+
+    ``sheet_id`` is the tab's numeric ID (the Sheets API addresses tabs by it, not by
+    name); ``header`` is its first row's column names; ``data_rows`` is the number of rows
+    that hold data, so the appended row lands at that zero-based index. Never the rows'
+    content: the write reads the header and the count, not the table.
+    """
+
+    sheet_id: int
+    header: tuple[str, ...]
+    data_rows: int
+
+
+@dataclass(frozen=True)
+class SheetMetadata:
+    """One developer metadata entry on a Sheet: its ID, key, value and the zero-based row
+    it marks. The append write's marker lookup searches by key and value (D-48)."""
+
+    metadata_id: int
+    key: str
+    value: str
+    row_index: int
+
+
 class GoogleAccounts(Protocol):
     """The deployment's hold on the tenant accounts: create-or-find, delete, and list."""
 
@@ -259,6 +285,34 @@ class GoogleAccounts(Protocol):
 
     async def create_comment(self, email: str, file_id: str, content: str) -> str:
         """Post a comment on a file as the tenant's account; returns the comment's ID."""
+        ...
+
+    async def read_sheet(self, email: str, file_id: str, tab: str) -> SheetTab:
+        """One tab's numeric sheet ID, header row and count of data rows, read from the
+        spreadsheet's grid data (one ``spreadsheets.get``). A tab the Sheet does not have
+        raises ``GoogleError`` (a 400), so the caller refuses rather than appends blind."""
+        ...
+
+    async def search_sheet_metadata(
+        self, email: str, file_id: str, key: str, value: str
+    ) -> list[SheetMetadata]:
+        """The developer metadata entries matching ``key`` and ``value``
+        (``developerMetadata:search``): the marker lookup of an append write (D-48)."""
+        ...
+
+    async def append_sheet_row(
+        self,
+        email: str,
+        file_id: str,
+        sheet_id: int,
+        row: list[str],
+        row_index: int,
+        key: str,
+        value: str,
+    ) -> str:
+        """Append ``row`` and mark it with developer metadata in ONE atomic batchUpdate
+        (``appendCells`` then ``createDeveloperMetadata`` on the appended row), so a lost
+        response never leaves an unmarked row. Returns the created metadata's ID."""
         ...
 
 
@@ -822,6 +876,185 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
+    # --- the Sheet append write surface (D-48) -----------------------------------------
+    # These carry the TENANT account's minted token, like the reads and the comment, so a
+    # row is appended as the account the Sheet is shared with, never the deployment's.
+
+    async def read_sheet(self, email: str, file_id: str, tab: str) -> SheetTab:
+        token = await self._drive_token(email)
+
+        def call() -> SheetTab:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "GET",
+                    f"{SHEETS}/spreadsheets/{file_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "fields": "sheets(properties(sheetId,title),data.rowData.values.formattedValue)"
+                    },
+                )
+                self._check_drive(response)
+                body = _json_object(response)
+                try:
+                    for sheet in body.get("sheets", []):
+                        props = sheet["properties"]
+                        if props["title"] != tab:
+                            continue
+                        rows = (sheet.get("data") or [{}])[0].get("rowData", [])
+                        return _sheet_tab(int(props["sheetId"]), rows)
+                except (KeyError, TypeError, IndexError, ValueError) as err:
+                    raise GoogleError("unavailable") from err
+                raise GoogleError("refused", f"The Sheet has no tab named '{tab}'.", status=400)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def search_sheet_metadata(
+        self, email: str, file_id: str, key: str, value: str
+    ) -> list[SheetMetadata]:
+        token = await self._drive_token(email)
+
+        def call() -> list[SheetMetadata]:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{SHEETS}/spreadsheets/{file_id}/developerMetadata:search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "dataFilters": [
+                            {
+                                "developerMetadataLookup": {
+                                    "metadataKey": key,
+                                    "metadataValue": value,
+                                }
+                            }
+                        ]
+                    },
+                )
+                self._check_drive(response)
+                body = _json_object(response)
+                try:
+                    found = []
+                    for match in body.get("matchedDeveloperMetadata", []):
+                        meta = match["developerMetadata"]
+                        dim = (meta.get("location") or {}).get("dimensionRange") or {}
+                        found.append(
+                            SheetMetadata(
+                                int(meta["metadataId"]),
+                                meta.get("metadataKey", ""),
+                                meta.get("metadataValue", ""),
+                                int(dim.get("startIndex", 0)),
+                            )
+                        )
+                    return found
+                except (KeyError, TypeError, ValueError) as err:
+                    raise GoogleError("unavailable") from err
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def append_sheet_row(
+        self,
+        email: str,
+        file_id: str,
+        sheet_id: int,
+        row: list[str],
+        row_index: int,
+        key: str,
+        value: str,
+    ) -> str:
+        token = await self._drive_token(email)
+
+        def call() -> str:
+            session = self._drive_session_for_call()
+            try:
+                # One batchUpdate: Google applies its requests together atomically, so the
+                # row and its marker land together or not at all — a lost response cannot
+                # leave an unmarked row a retry would append again.
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{SHEETS}/spreadsheets/{file_id}:batchUpdate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "requests": [
+                            {
+                                "appendCells": {
+                                    "sheetId": sheet_id,
+                                    "rows": [
+                                        {
+                                            "values": [
+                                                {"userEnteredValue": {"stringValue": v}}
+                                                for v in row
+                                            ]
+                                        }
+                                    ],
+                                    "fields": "userEnteredValue",
+                                }
+                            },
+                            {
+                                "createDeveloperMetadata": {
+                                    "developerMetadata": {
+                                        "metadataKey": key,
+                                        "metadataValue": value,
+                                        "visibility": "DOCUMENT",
+                                        "location": {
+                                            "dimensionRange": {
+                                                "sheetId": sheet_id,
+                                                "dimension": "ROWS",
+                                                "startIndex": row_index,
+                                                "endIndex": row_index + 1,
+                                            }
+                                        },
+                                    }
+                                }
+                            },
+                        ]
+                    },
+                )
+                self._check_drive(response)
+                try:
+                    replies = _json_object(response)["replies"]
+                    created = replies[1]["createDeveloperMetadata"]["developerMetadata"]
+                    return str(created["metadataId"])
+                except (KeyError, TypeError, IndexError, ValueError) as err:
+                    raise GoogleError("unavailable") from err
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+
+def _trim_trailing_empty(values: list[str]) -> list[str]:
+    end = len(values)
+    while end and values[end - 1] == "":
+        end -= 1
+    return values[:end]
+
+
+def _sheet_tab(sheet_id: int, rows: list[dict]) -> SheetTab:
+    """The tab's header (first row, trailing empty cells trimmed) and its count of data
+    rows: the index after the last row holding any value, where ``appendCells`` appends."""
+    grid = [
+        [(cell or {}).get("formattedValue", "") for cell in (row.get("values") or [])]
+        for row in rows
+    ]
+    header = tuple(_trim_trailing_empty(grid[0])) if grid else ()
+    data_rows = 0
+    for i, row in enumerate(grid):
+        if any(value != "" for value in row):
+            data_rows = i + 1
+    return SheetTab(sheet_id, header, data_rows)
+
 
 def _drive_file(file: dict) -> DriveFile:
     return DriveFile(
@@ -846,8 +1079,13 @@ class FakeGoogleAccounts:
         self.created: list[str] = []
         self.create_calls: list[str] = []
         self.delete_calls: list[str] = []
-        self._fail_after_write = {"create": 0, "delete": 0, "comment": 0}
-        self._hang_after_write: dict[str, list[Hang]] = {"create": [], "delete": [], "comment": []}
+        self._fail_after_write = {"create": 0, "delete": 0, "comment": 0, "append": 0}
+        self._hang_after_write: dict[str, list[Hang]] = {
+            "create": [],
+            "delete": [],
+            "comment": [],
+            "append": [],
+        }
         self._list_error: Exception | None = None
         self._delete_error: Exception | None = None
         # The Drive tree the read surface serves: metadata by ID, a folder's child IDs,
@@ -865,6 +1103,18 @@ class FakeGoogleAccounts:
         self.drive_comments: dict[str, list[dict]] = {}
         self.comment_calls: list[tuple[str, str]] = []
         self.comment_list_calls: list[tuple[str, str]] = []
+        # The Sheet tabs each file carries: file ID -> tab name -> its numeric sheet ID and
+        # its rows (row 0 the header). ``sheet_metadata`` holds the developer metadata as
+        # Google returns it; ``append_calls``, ``sheet_read_calls`` and ``metadata_search_calls``
+        # record the (email, file ID) of every call, so a test sees whose account wrote and
+        # that a lookup ran. The append failure injections live in ``_after_write``.
+        self.sheets: dict[str, dict[str, dict]] = {}
+        self.sheet_metadata: dict[str, list[dict]] = {}
+        self.append_calls: list[tuple[str, str]] = []
+        self.sheet_read_calls: list[tuple[str, str]] = []
+        self.metadata_search_calls: list[tuple[str, str]] = []
+        self._next_sheet_id = 1
+        self._next_metadata_id = 1
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
@@ -879,8 +1129,8 @@ class FakeGoogleAccounts:
         self.drive_get_errors: dict[str, Exception] = {}
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
-        """The next ``times`` writes of ``kind`` ("create", "delete" or "comment") take
-        effect and then raise, as when the response is lost."""
+        """The next ``times`` writes of ``kind`` ("create", "delete", "comment" or
+        "append") take effect and then raise, as when the response is lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
@@ -1002,6 +1252,21 @@ class FakeGoogleAccounts:
         self.drive_comments.setdefault(file_id, []).append(comment)
         return comment["id"]
 
+    def add_sheet_tab(self, file_id: str, tab: str, header: list[str], rows=()) -> int:
+        """A tab of a Sheet as Google would serve it: its header row and any data rows.
+        Returns the tab's numeric sheet ID. The file itself is added with add_drive_file."""
+        sheet_id = self._next_sheet_id
+        self._next_sheet_id += 1
+        self.sheets.setdefault(file_id, {})[tab] = {
+            "sheet_id": sheet_id,
+            "rows": [list(header), *[list(r) for r in rows]],
+        }
+        return sheet_id
+
+    def set_sheet_header(self, file_id: str, tab: str, header: list[str]) -> None:
+        """Replace a tab's header row, as a creator editing the Sheet's columns would."""
+        self.sheets[file_id][tab]["rows"][0] = list(header)
+
     def fail_next_export(self, error: Exception) -> None:
         self._export_error = error
 
@@ -1105,6 +1370,90 @@ class FakeGoogleAccounts:
         comment_id = self.add_drive_comment(file_id, content)
         await self._after_write("comment")
         return comment_id
+
+    async def read_sheet(self, email: str, file_id: str, tab: str) -> SheetTab:
+        self.sheet_read_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        state = self.sheets.get(file_id, {}).get(tab)
+        if state is None:
+            raise GoogleError("refused", f"The Sheet has no tab named '{tab}'.", status=400)
+        rows = state["rows"]
+        header = tuple(_trim_trailing_empty(rows[0])) if rows else ()
+        data_rows = 0
+        for i, row in enumerate(rows):
+            if any(value != "" for value in row):
+                data_rows = i + 1
+        return SheetTab(state["sheet_id"], header, data_rows)
+
+    async def search_sheet_metadata(
+        self, email: str, file_id: str, key: str, value: str
+    ) -> list[SheetMetadata]:
+        self.metadata_search_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        return [
+            SheetMetadata(
+                m["metadataId"],
+                m["metadataKey"],
+                m["metadataValue"],
+                m["location"]["dimensionRange"]["startIndex"],
+            )
+            for m in self.sheet_metadata.get(file_id, [])
+            if m["metadataKey"] == key and m["metadataValue"] == value
+        ]
+
+    async def append_sheet_row(
+        self,
+        email: str,
+        file_id: str,
+        sheet_id: int,
+        row: list[str],
+        row_index: int,
+        key: str,
+        value: str,
+    ) -> str:
+        self.append_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        tab = next(
+            (t for t, s in self.sheets.get(file_id, {}).items() if s["sheet_id"] == sheet_id),
+            None,
+        )
+        if tab is None:
+            raise GoogleError("refused", "The Sheet has no tab with that ID.", status=400)
+        rows = self.sheets[file_id][tab]["rows"]
+        while len(rows) < row_index:
+            rows.append([])
+        if len(rows) == row_index:
+            rows.append(list(row))
+        else:
+            rows[row_index] = list(row)
+        metadata_id = self._next_metadata_id
+        self._next_metadata_id += 1
+        self.sheet_metadata.setdefault(file_id, []).append(
+            {
+                "metadataId": metadata_id,
+                "metadataKey": key,
+                "metadataValue": value,
+                "location": {
+                    "dimensionRange": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_index,
+                        "endIndex": row_index + 1,
+                    }
+                },
+            }
+        )
+        await self._after_write("append")
+        return str(metadata_id)
 
 
 def accounts_from_settings(

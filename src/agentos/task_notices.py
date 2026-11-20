@@ -25,6 +25,10 @@ FAILED_COMMENT = "failed_comment"
 NOT_CONFIRMED_COMMENT = "not_confirmed_comment"
 COMMENTED = "commented"
 COMMENTED_NO_APPROVAL = "commented_no_approval"
+# The append write's lines (D-48): a row appended to a granted Sheet, no watch afterwards.
+APPENDED = "appended"
+FAILED_APPEND = "failed_append"
+NOT_CONFIRMED_APPEND = "not_confirmed_append"
 # The fixed line a card shows when a write is stopped before it runs; a policy write
 # has no card, so the line goes to the thread as it is.
 STOPPED_COMMENT = "stopped_comment"
@@ -40,7 +44,7 @@ ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE)
 
 def subject(tool_name: str, payload: dict) -> str:
     """The short name of what a task is about, for card and thread lines."""
-    if tool_name in ("add_comment", "nudge"):
+    if tool_name in ("add_comment", "append_row", "nudge"):
         return payload.get("item_title") or payload.get("item") or ""
     return payload.get("title", "")
 
@@ -92,6 +96,12 @@ def notice_text(
         return f"Commented on {name} ({url})."
     if kind == COMMENTED_NO_APPROVAL:
         return f"Commented on '{name}' ({url}) (no approval needed: your admin's setting)."
+    if kind == APPENDED:
+        return f"Appended a row to {name} ({url})."
+    if kind == FAILED_APPEND:
+        return f"I couldn't append a row to '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_APPEND:
+        return f"I couldn't confirm whether the row was appended; please check {url}"
     if kind == STOPPED_COMMENT:
         return reason
     if kind == NUDGED:

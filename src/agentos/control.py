@@ -24,6 +24,9 @@ Roles. A tenant has admins and creators.
   any agent.
 - An admin reads usage and cost for every agent; a creator reads it for the agents
   they created. Usage is never broken down by requester.
+- An admin reads any agent's feedback page; a creator reads the feedback of the agents
+  they created. The page shows counts, outcomes and votes, and a question's text only
+  while retention keeps it — never who asked or who voted.
 - An admin sets, raises and removes monthly budgets (one for the tenant, one per agent). An
   admin reads all of them; a creator reads the budgets of the agents they created, and
   never sets one. Every change is audited as ``budget_set`` with the new amount in
@@ -108,13 +111,19 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
 
 from agentos import ids
 from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
+from agentos.agent_feedback import (
+    FEEDBACK_DAYS,
+    AgentFeedbackStore,
+    AgentFeedbackView,
+    empty_view,
+)
 from agentos.agent_health import AgentHealth, HealthStore
 from agentos.agent_store import (
     PENDING,
@@ -356,6 +365,7 @@ class ControlPlane:
         slack_for: Callable[[str], Awaitable[SlackPoster]] | None = None,
         health: HealthStore | None = None,
         creator_access: CreatorAccessStore | None = None,
+        feedback_reads: AgentFeedbackStore | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
         self._creator_access = (
@@ -381,6 +391,9 @@ class ControlPlane:
         # Agent health is read-only here: the worker's checks write it. None leaves the
         # console without health to show.
         self._health = health
+        # The feedback page's reads are read-only here too: the worker and the gateway
+        # write the rows. None leaves the page with empty sections.
+        self._feedback_reads = feedback_reads
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
         settings_stores = [s for s in (credentials, tenant_store, webhook_tokens) if s is not None]
         self._uow = (
@@ -533,6 +546,25 @@ class ControlPlane:
         if self._health is None:
             return {}
         return {h.agent_id: h for h in await self._health.list(tenant_id) if who.sees(h.agent_id)}
+
+    async def agent_feedback(
+        self, tenant_id: str, actor: Actor, agent_id: str, days: int = FEEDBACK_DAYS[0]
+    ) -> AgentFeedbackView:
+        """The agent's feedback page: outcomes, votes and questions of the last ``days``.
+
+        An admin reads any agent's, a creator their own; another creator's agent is
+        refused the same as one that does not exist. The view never names who asked
+        or who voted, and shows a question's text only while retention keeps it.
+        A plane built without a feedback store has empty sections.
+        """
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        agent = await self._agents.get_agent(tenant_id, agent_id)
+        if agent is None or not who.sees(agent_id):
+            raise AgentNotFound(f"agent '{agent_id}' does not exist")
+        since = self._clock() - timedelta(days=days)
+        if self._feedback_reads is None:
+            return empty_view(agent_id, since)
+        return await self._feedback_reads.read(tenant_id, agent_id, since)
 
     async def versions(
         self, tenant_id: str, actor: Actor, agent_id: str

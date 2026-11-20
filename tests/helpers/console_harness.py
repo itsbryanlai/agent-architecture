@@ -11,6 +11,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from agentos.agent_feedback import InMemoryAgentFeedbackStore
 from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audience_pauses import InMemoryPauseStore
@@ -19,6 +20,7 @@ from agentos.budgets import InMemoryBudgetStore
 from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane
 from agentos.control_api import create_app
+from agentos.feedback import InMemoryFeedbackStore
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from agentos.sessions import InMemorySessionStore
@@ -31,6 +33,7 @@ from agentos.slack_signin import (
     SlackSession,
     SlackSignInError,
 )
+from agentos.stores import InMemoryHistoryStore
 from agentos.switches import InMemorySwitchStore
 from agentos.tenant_store import TenantDirectory
 from agentos.usage import InMemoryUsageStore
@@ -128,6 +131,9 @@ class ConsoleHarness:
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
+        self.feedback = InMemoryFeedbackStore()
+        self.history = InMemoryHistoryStore()
+        self.feedback_reads = InMemoryAgentFeedbackStore(self.audit, self.feedback, self.history)
         self.usage = InMemoryUsageStore()
         self.budgets = InMemoryBudgetStore()
         self.pauses = InMemoryPauseStore()
@@ -170,6 +176,7 @@ class ConsoleHarness:
             slack_for=slack_for,
             health=self.health,
             creator_access=creator_access,
+            feedback_reads=self.feedback_reads,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

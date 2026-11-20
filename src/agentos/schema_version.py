@@ -63,6 +63,7 @@ EXPECTED_VERSIONS = (
     "036",
     "037",
     "038",
+    "039",
 )
 
 MIGRATE_COMMAND = "uv run python scripts/migrate.py"

@@ -1572,10 +1572,10 @@ than the limit, the reason text with them. The reason is the only free text the 
 
 ## Web console
 
-The same process serves web pages for agents, versions, members, usage and the audit log,
-behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
-JSON API, so a user's role in the tenant decides what they can do in both. The
-console is off unless sign-in is configured.
+The same process serves web pages for agents, versions, members, usage, the audit log
+and each agent's feedback, behind Sign in with Slack. The pages call the same
+`ControlPlane` methods as the JSON API, so a user's role in the tenant decides what they
+can do in both. The console is off unless sign-in is configured.
 
 The pages call the same `ControlPlane` methods as the JSON API. Who sees what, the browser guard, the session cookie and the error pages are in [architecture.md §5](architecture.md#control-plane-and-console).
 
@@ -1680,6 +1680,26 @@ process on its next directory refresh, with no restart.
   paste it into the Notion integration, then **Confirm** or **Clear** — the same steps and
   audit kind (`webhook_token`) as the command line, as the signed-in user. See
   [Notion webhook](#notion-webhook-optional).
+
+**Creator feedback page.** `/ui/<tenant>/agents/<agent>/feedback` (the **Feedback** link
+on the agent page) shows what went wrong with one agent's answers, for the agent's
+creator and admins; another creator's agent is refused the same as one that does not
+exist. Sections, newest first, each with the count of every matching row in the window:
+questions the agent could not answer (a knowledge search that found nothing within the
+cut-off, or the fixed no-answer text — both detected from the hashes the audit row
+holds, no model call), turns that failed or hit the step limit, refused tools and grants
+(a tool call that errored, or a turn refused because the agent's grant check failed),
+declined or expired approvals, writes that failed, and 👎 votes with their reasons beside
+the 👍/👎 totals. The window is the last 30 days by default, with 90 and 365 offered.
+
+The page never shows who asked or who voted: no user IDs, no names, no thread links.
+A question's text is shown only while retention keeps the stored message, and only for
+a row whose turn stored one; otherwise the row keeps its count, date and agent version.
+Each stored question row carries the question's reference (conversation and message)
+beside the version — the seam a later "make a test case" action reads; there is no
+button yet. The reads are one indexed query per section over the rows the worker and
+the gateway already write (`audit_events`, `answer_feedback`, `conversation_messages`;
+migration `039` adds the per-agent indexes): no new data collection.
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or

@@ -193,7 +193,8 @@ class PostgresHistoryStore:
 
 # A user message with text and no tool result: the only place the window may be cut. The same
 # test as ``history_view._starts_a_turn``, which also ignores text blocks with no visible text.
-_STARTS_A_TURN = """
+# The feedback page's question join reads it too, so it is public.
+STARTS_A_TURN = """
   m.role = 'user' AND jsonb_typeof(m.content) = 'array'
   AND EXISTS (SELECT 1 FROM jsonb_array_elements(m.content) b
               WHERE b ->> 'type' = 'text' AND b ->> 'text' ~ '\\S')
@@ -213,9 +214,9 @@ WITH sizes AS (
 SELECT CASE WHEN (SELECT COALESCE(MAX(kept), 0) FROM sizes) <= %(budget)s THEN 0 ELSE COALESCE(
   (SELECT MIN(m.seq) FROM conversation_messages m JOIN sizes s ON s.seq = m.seq
    WHERE m.tenant_id = %(t)s AND m.conversation_id = %(c)s AND s.kept <= %(budget)s
-     AND {_STARTS_A_TURN}),
+     AND {STARTS_A_TURN}),
   (SELECT MAX(m.seq) FROM conversation_messages m
-   WHERE m.tenant_id = %(t)s AND m.conversation_id = %(c)s AND {_STARTS_A_TURN}),
+   WHERE m.tenant_id = %(t)s AND m.conversation_id = %(c)s AND {STARTS_A_TURN}),
   0) END
 """
 
@@ -462,9 +463,13 @@ class PostgresTaskLinkStore:
 
 
 class InMemoryHistoryStore:
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self.messages: dict[tuple[str, str], list[dict]] = {}
+        # When each message was appended, as the database's created_at: the feedback
+        # page's question join orders stored questions against audit events by it.
+        self.times: dict[tuple[str, str], list[datetime]] = {}
         self.step_keys: dict[tuple[str, str], dict[str, int]] = {}
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._fail_next_append = False
 
     # Test hooks.
@@ -482,6 +487,7 @@ class InMemoryHistoryStore:
         if seq is None:
             msgs = self.messages.setdefault(key, [])
             msgs.append({"role": role, "content": copy.deepcopy(content)})
+            self.times.setdefault(key, []).append(self._clock())
             seq = keys[step_key] = len(msgs)
         if self._fail_next_append:
             self._fail_next_append = False

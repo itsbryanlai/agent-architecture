@@ -10,6 +10,7 @@ from agentos.audience import AudienceCheckUnavailable, AudienceError
 from agentos.audience_pauses import NotPaused
 from agentos.budgets import BudgetError, BudgetNotFound, InvalidBudget
 from agentos.config import ConfigError
+from agentos.connectors.google_iam import GoogleError
 from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
@@ -33,6 +34,7 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     ConfigError: 422,
     GrantProblems: 409,
     GrantCheckUnavailable: 502,
+    GoogleError: 502,
     AudienceError: 409,
     AudienceCheckUnavailable: 502,
     NotPaused: 409,

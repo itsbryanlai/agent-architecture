@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 041 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 042 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -1229,6 +1229,29 @@ CREATE POLICY tenant_isolation ON test_runs
 
 INSERT INTO audit_kinds (kind) VALUES ('test_case'), ('test_run') ON CONFLICT DO NOTHING;
 
+-- Google Drive connections (D-45): one service account per tenant; the row is the
+-- connection's identity and last check, not a credential. Same as migration 042.
+CREATE TABLE IF NOT EXISTS drive_connections (
+  tenant_id             text        NOT NULL PRIMARY KEY,
+  service_account_email text        NOT NULL,
+  status                text        NOT NULL CHECK (status IN ('connected', 'error')),
+  last_error            text,
+  connected_at          timestamptz NOT NULL DEFAULT now(),
+  checked_at            timestamptz,
+  CONSTRAINT drive_connections_error_matches_status CHECK (
+    (status = 'error') = (last_error IS NOT NULL))
+);
+
+REVOKE ALL ON drive_connections FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON drive_connections TO agentos_app;
+
+ALTER TABLE drive_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE drive_connections FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON drive_connections;
+CREATE POLICY tenant_isolation ON drive_connections
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1240,5 +1263,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040'), ('041')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040'), ('041'), ('042')
 ON CONFLICT DO NOTHING;

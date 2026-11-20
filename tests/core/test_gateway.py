@@ -1,6 +1,7 @@
 import json
 import secrets
 from dataclasses import replace
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import pytest
@@ -11,7 +12,9 @@ from slack_sdk.signature import SignatureVerifier
 from agentos import ids
 from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
+from agentos.connectors.google_iam import FakeGoogleAccounts, GoogleError
 from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.slack_client import FakeSlack
@@ -237,7 +240,8 @@ NOTION_TOKEN = "ntn-made-up-kept"
 
 @pytest_asyncio.fixture
 async def uninstall_gateway(agents, temporal, secret):
-    """A gateway with the uninstall flow's stores and a tenant holding both credentials."""
+    """A gateway with the uninstall flow's stores, a tenant holding both credentials
+    and a connected Drive account."""
     store = InMemoryTenantStore(agents)
     credential_store = InMemoryCredentialStore()
     key = secrets.token_bytes(32)
@@ -246,6 +250,11 @@ async def uninstall_gateway(agents, temporal, secret):
     credentials = TenantCredentials(credential_store, keys)
     await credentials.store_secret(TENANT, SLACK_BOT, UNINSTALL_TOKEN, 1, key)
     await credentials.store_secret(TENANT, NOTION, NOTION_TOKEN, 1, key)
+    drive = InMemoryDriveConnectionStore()
+    google = FakeGoogleAccounts()
+    account_id = ids.drive_account_id(TENANT)
+    await google.ensure_account(account_id)
+    await drive.connect(TENANT, google.account_email(account_id), datetime(2026, 1, 1, tzinfo=UTC))
     audit = InMemoryAuditStore()
     app = create_app(
         Settings(),
@@ -256,9 +265,11 @@ async def uninstall_gateway(agents, temporal, secret):
         tenant_store=store,
         credentials=credentials,
         audit=audit,
-        uow=InMemoryUnitOfWork(store, credential_store, audit),
+        uow=InMemoryUnitOfWork(store, credential_store, audit, drive),
+        drive=drive,
+        google=google,
     )
-    return TestClient(app), store, credential_store, audit, credentials
+    return TestClient(app), store, credential_store, audit, credentials, drive, google
 
 
 @pytest.mark.parametrize(
@@ -270,6 +281,7 @@ async def uninstall_gateway(agents, temporal, secret):
         "late retry after reinstall",
         "unknown team",
         "oauth only",
+        "drive delete fails",
     ],
     ids=[
         "app-uninstalled",
@@ -278,14 +290,16 @@ async def uninstall_gateway(agents, temporal, secret):
         "late-retry-after-reinstall",
         "unknown-team",
         "oauth-only",
+        "drive-delete-fails",
     ],
 )
 async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
-    """Fails if an uninstall event leaves the tenant enabled, its Slack token stored or its
-    Notion token deleted, a repeat or out-of-order event audits again, a late retry of a
-    processed event disables a reinstalled tenant or deletes its fresh token, or an unknown
-    team or a user-token-only revocation is acted on."""
-    client, store, credential_store, audit, credentials = uninstall_gateway
+    """Fails if an uninstall event leaves the tenant enabled, its Slack token stored, its
+    Notion token deleted or its Drive account and row kept, a repeat or out-of-order event
+    audits again, a late retry of a processed event disables a reinstalled tenant or deletes
+    its fresh token, an unknown team or a user-token-only revocation is acted on, or a
+    refused Google delete blocks the uninstall."""
+    client, store, credential_store, audit, credentials, drive, google = uninstall_gateway
     uninstall = {"type": "app_uninstalled"}
     revoked_bot = {"type": "tokens_revoked", "tokens": {"oauth": [], "bot": [UNINSTALL_TOKEN]}}
     revoked_oauth = {
@@ -299,7 +313,10 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         "late retry after reinstall": [(TEAM, "EvU1", uninstall)],
         "unknown team": [("T_OTHER", "EvU1", uninstall)],
         "oauth only": [(TEAM, "EvU1", revoked_oauth)],
+        "drive delete fails": [(TEAM, "EvU1", uninstall)],
     }[case]
+    if case == "drive delete fails":
+        google.fail_next_delete(GoogleError("unavailable"))
     for team, event_id, event in payloads:
         payload = {"type": "event_callback", "team_id": team, "event_id": event_id, "event": event}
         assert post_event(client, secret, payload).status_code == 200
@@ -324,6 +341,10 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         assert ref.enabled is True
         assert await credential_store.get(TENANT, SLACK_BOT) is not None
         assert audit.events == []
+        assert await drive.get(TENANT) is not None
+        assert google.accounts == {
+            ids.drive_account_id(TENANT): google.account_email(ids.drive_account_id(TENANT))
+        }
         return
     if case == "late retry after reinstall":
         assert ref.enabled is True
@@ -331,10 +352,21 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         assert await credentials.slack_bot_token(row.config) == REINSTALL_TOKEN
         assert await credential_store.get(TENANT, NOTION) is not None
         assert [(e.kind, e.tool) for e in audit.events] == [("uninstall", "app_uninstalled")]
+        assert await drive.get(TENANT) is None
+        assert google.accounts == {}
         return
     assert ref.enabled is False
     assert await credential_store.get(TENANT, SLACK_BOT) is None
     assert await credential_store.get(TENANT, NOTION) is not None
+    assert await drive.get(TENANT) is None
+    if case == "drive delete fails":
+        # The uninstall stands; the account is left at Google, logged, and a reconnect
+        # finds it again by its deterministic ID.
+        assert google.accounts == {
+            ids.drive_account_id(TENANT): google.account_email(ids.drive_account_id(TENANT))
+        }
+    else:
+        assert google.accounts == {}
     assert len(audit.events) == 1
     recorded = audit.events[0]
     assert (recorded.kind, recorded.tool, recorded.target, recorded.identity) == (

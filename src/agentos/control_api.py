@@ -689,6 +689,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.audit import PostgresAuditStore
     from agentos.budgets import PostgresBudgetStore
     from agentos.config import KEY_SOURCE_DB
+    from agentos.connectors.google_iam import GoogleError, accounts_from_settings
     from agentos.connectors.notion import RealNotionAPI
     from agentos.creator_access import PostgresCreatorAccessStore
     from agentos.credentials import PostgresCredentialStore, TenantCredentials
@@ -699,6 +700,7 @@ async def _real_lifespan(app: FastAPI):
         start_key_refresh,
         tenant_key_material,
     )
+    from agentos.drive_connections import PostgresDriveConnectionStore
     from agentos.grant_checker import NotionGrantChecker
     from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
@@ -735,6 +737,15 @@ async def _real_lifespan(app: FastAPI):
         key_refresh = start_key_refresh(keys)
         credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
         webhook_tokens = WebhookTokens(PostgresWebhookTokenStore(pool), keys)
+        # Drive (D-45): configured only with both deployment settings; a malformed key
+        # stops start-up with a plain message, never at the first click.
+        try:
+            google = accounts_from_settings(
+                settings.google_project_id, settings.google_service_account_key
+            )
+        except GoogleError as err:
+            raise SystemExit(str(err)) from err
+        drive = None if google is None else PostgresDriveConnectionStore(pool)
         apis: dict[str, tuple[str, RealNotionAPI]] = {}
 
         async def notion_for(tenant_id: str) -> RealNotionAPI:
@@ -817,6 +828,8 @@ async def _real_lifespan(app: FastAPI):
             policies=PostgresApprovalPolicyStore(pool),
             test_sets=PostgresTestSetStore(pool),
             start_test_run=start_test_run,
+            drive=drive,
+            google=google,
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:

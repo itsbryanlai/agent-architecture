@@ -102,6 +102,9 @@ SEEDS = {
     "VALUES (%(t)s, 'c', 'a1', 'u', 'aa', 1, 'up')",
     "approval_policies": "INSERT INTO approval_policies (tenant_id, action, policy) "
     "VALUES (%(t)s, 'add_comment', 'none')",
+    "drive_connections": "INSERT INTO drive_connections "
+    "(tenant_id, service_account_email, status, connected_at) "
+    "VALUES (%(t)s, 'ag-x@test-project.iam.gserviceaccount.com', 'connected', now())",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
@@ -151,6 +154,7 @@ PRIVILEGES = {
     "creator_access": "SELECT INSERT UPDATE DELETE",
     "answer_feedback": "SELECT INSERT UPDATE DELETE",
     "approval_policies": "SELECT INSERT UPDATE",
+    "drive_connections": "SELECT INSERT UPDATE DELETE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }

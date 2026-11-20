@@ -116,7 +116,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -316,9 +316,11 @@ class TenantSettingsView:
     ``health`` holds the worker's last check of each published agent, by agent ID.
     ``approvals`` holds the tenant's approval policy for each low-risk action (D-43).
     ``drive_configured`` is False on a deployment without the Google settings; ``drive``
-    is the tenant's connection row (None when never connected), ``drive_items`` what its
-    account can see now (None when the live list failed or was not run) and
-    ``drive_problem`` the plain words for the last failed check (D-45).
+    is the tenant's connection row as stored (None when never connected), ``drive_items``
+    what its account can see now (None when the live list failed or was not run),
+    ``drive_more`` when more than the first 100 items are shared, and ``drive_problem``
+    the plain words for the failed live check or the row's last error. The GET writes
+    nothing (D-45).
     """
 
     default_agent: str | None
@@ -340,6 +342,7 @@ class TenantSettingsView:
     drive_configured: bool = False
     drive: DriveConnection | None = None
     drive_items: list[DriveItem] | None = None
+    drive_more: bool = False
     drive_problem: str | None = None
 
 
@@ -1707,24 +1710,19 @@ class ControlPlane:
         drive_configured = self._drive is not None and self._google is not None
         drive_row = None if self._drive is None else await self._drive.get(tenant_id)
         drive_items: list[DriveItem] | None = None
+        drive_more = False
         drive_problem: str | None = None
         if drive_row is not None and self._google is not None:
-            # The page's check of what the account can see now: its outcome and time land
-            # on the row (no audit event — a read of Google, not an admin change).
-            checked_at = self._clock()
+            # A read of Google for this view only: its outcome is shown, never stored.
+            # The row's status is written by connect and disconnect; a later check
+            # polls it.
             try:
-                drive_items = await self._google.list_shared(drive_row.service_account_email)
+                listing = await self._google.list_shared(drive_row.service_account_email)
             except GoogleError as err:
-                drive_problem = problem_text(err.code)
-                await self._drive.record_check(tenant_id, ERROR, err.code, checked_at)
-                drive_row = replace(
-                    drive_row, status=ERROR, last_error=err.code, checked_at=checked_at
-                )
+                drive_problem = str(err)
             else:
-                await self._drive.record_check(tenant_id, CONNECTED, None, checked_at)
-                drive_row = replace(
-                    drive_row, status=CONNECTED, last_error=None, checked_at=checked_at
-                )
+                drive_items = listing.items
+                drive_more = listing.more
         elif drive_row is not None and drive_row.status == ERROR:
             drive_problem = problem_text(drive_row.last_error)
         return TenantSettingsView(
@@ -1745,6 +1743,7 @@ class ControlPlane:
             drive_configured=drive_configured,
             drive=drive_row,
             drive_items=drive_items,
+            drive_more=drive_more,
             drive_problem=drive_problem,
         )
 
@@ -1910,20 +1909,21 @@ class ControlPlane:
 
         The account ID is deterministic from the tenant (``ids.drive_account_id``), so a
         second click, a retry after a lost create response and an overlapping attempt all
-        find the same account: the Google call runs first, and the row and its
-        ``connector`` event (``drive_connect``, the account email as target) commit in one
-        unit of work after it succeeds. A tenant already connected to the same account
-        changes nothing and records nothing; a reconnect after an error records again.
-        No key is created or stored for the tenant.
+        find the same account. The tenant's unit-of-work lock is held across the Google
+        call and the row write, so a connect and a disconnect never interleave: the row
+        and its ``connector`` event (``drive_connect``, the account email as target)
+        commit in one unit of work after the call succeeds. A tenant already connected to
+        the same account changes nothing and records nothing; a reconnect after an error
+        records again. No key is created or stored for the tenant.
         """
         await self._require_role(tenant_id, actor, ADMIN)
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
-        email = await self._google.ensure_account(ids.drive_account_id(tenant_id))
         async with self._uow.begin(tenant_id) as conn:
+            email = await self._google.ensure_account(ids.drive_account_id(tenant_id))
             # Under the tenant lock: an overlapping attempt that committed first makes
             # this one a no-op, so two clicks record one event.
-            existing = await self._drive.get(tenant_id)
+            existing = await self._drive.get(tenant_id, conn=conn)
             if (
                 existing is not None
                 and existing.status == CONNECTED
@@ -1946,23 +1946,29 @@ class ControlPlane:
     ) -> bool:
         """Delete the tenant's Google service account and its connection row. Only an admin.
 
-        False, and nothing changes or is recorded, when Drive is not connected. The
-        account is deleted at Google first (a 404 — already gone, as after a lost delete
-        response — still clears the row); the row's deletion and the ``connector`` event
-        (``drive_disconnect``, the account email as target) commit in one unit of work.
-        An overlapping attempt whose row deletion lands first makes the other a no-op.
+        False, and nothing is recorded, when Drive is not connected; the derived account
+        is still deleted at Google, so an account left by a connect whose row write failed
+        does not stay orphaned. The delete targets the row's stored email — a project move
+        must not orphan the old account — and a 404 (already gone, as after a lost delete
+        response) still clears the row. The tenant's unit-of-work lock is held across the
+        Google call and the row write, so a connect and a disconnect never interleave; the
+        row's deletion and the ``connector`` event (``drive_disconnect``, the account email
+        as target) commit in one unit of work.
         """
         await self._require_role(tenant_id, actor, ADMIN)
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
-        row = await self._drive.get(tenant_id)
-        if row is None:
-            return False
-        await self._google.delete_account(ids.drive_account_id(tenant_id))
         async with self._uow.begin(tenant_id) as conn:
-            deleted = await self._drive.delete(tenant_id, conn=conn)
-            if not deleted:
+            row = await self._drive.get(tenant_id, conn=conn)
+            email = (
+                row.service_account_email
+                if row is not None
+                else self._google.account_email(ids.drive_account_id(tenant_id))
+            )
+            await self._google.delete_account(email)
+            if row is None:
                 return False
+            await self._drive.delete(tenant_id, conn=conn)
             await self._record(
                 "connector",
                 tenant_id,

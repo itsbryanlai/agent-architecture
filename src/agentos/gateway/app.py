@@ -176,8 +176,8 @@ class GatewayDeps:
     # When a vote is recorded; tests inject a fixed clock.
     clock: Callable[[], datetime] = _utcnow
     # The uninstall flow's Drive stores (D-45): the connection row is deleted with the
-    # disable, the tenant's Google account best effort after the commit. None (a gateway
-    # without Drive configured) leaves uninstall as it was.
+    # disable, the tenant's Google account best effort under the same tenant lock, row
+    # or no row. None (a gateway without Drive configured) leaves uninstall as it was.
     drive: DriveConnectionStore | None = None
     google: GoogleAccounts | None = None
 
@@ -497,11 +497,13 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
     its Drive connection row deleted (D-45) and one ``uninstall`` audit event (the event
     type in ``tool``, the team ID in ``target``, never a token). The Notion credential is
     kept: a reinstall resumes the tenant with its data. The tenant's Google service
-    account is deleted at Google after the commit, best effort: a refusal is logged with
-    the tenant ID and never blocks the uninstall (a reconnect finds the same account by
-    its deterministic ID). The event's audit key is authoritative: a retry of an event
-    already processed changes nothing even after a reinstall re-enabled the tenant and
-    stored a fresh token, while a new uninstall event (a new ``event_id``) still acts.
+    account is deleted at Google under the same tenant lock, best effort: a refusal is
+    logged with the tenant ID and never blocks the uninstall (a reconnect finds the same
+    account by its deterministic ID). The delete is tried whenever Google is configured,
+    row or no row, targeting the row's stored email else the derived account. The event's
+    audit key is authoritative: a retry of an event already processed changes nothing even
+    after a reinstall re-enabled the tenant and stored a fresh token, while a new uninstall
+    event (a new ``event_id``) still acts.
     An out-of-order event with a different ID finds the tenant already disabled with no
     credential and changes nothing more. Both checks sit inside the unit's tenant lock,
     so two events arriving together still record one uninstall. ``tokens_revoked`` acts
@@ -544,7 +546,7 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
             )
             return
         await d.tenant_store.set_enabled(tenant, False, conn=conn)
-        drive_row = None if d.drive is None else await d.drive.get(tenant)
+        drive_row = None if d.drive is None else await d.drive.get(tenant, conn=conn)
         if drive_row is not None:
             await d.drive.delete(tenant, conn=conn)
         await d.audit.record(
@@ -561,17 +563,22 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
             ),
             conn=conn,
         )
-    if drive_row is not None and d.google is not None:
-        try:
-            await d.google.delete_account(ids.drive_account_id(tenant))
-        except Exception as err:  # noqa: BLE001 - the uninstall stands even if Google refuses
-            log.warning(
-                "tenant_id=%s drive account not deleted at Google error_type=%s",
-                tenant,
-                type(err).__name__,
+        if d.google is not None:
+            email = (
+                drive_row.service_account_email
+                if drive_row is not None
+                else d.google.account_email(ids.drive_account_id(tenant))
             )
-        else:
-            log.info("tenant_id=%s drive account deleted at Google", tenant)
+            try:
+                await d.google.delete_account(email)
+            except Exception as err:  # noqa: BLE001 - the uninstall stands even if Google refuses
+                log.warning(
+                    "tenant_id=%s drive account not deleted at Google error_type=%s",
+                    tenant,
+                    type(err).__name__,
+                )
+            else:
+                log.info("tenant_id=%s drive account deleted at Google", tenant)
     log.info("tenant_id=%s team_id=%s uninstalled event=%s", tenant, team_id, kind)
 
 

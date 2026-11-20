@@ -282,6 +282,7 @@ async def uninstall_gateway(agents, temporal, secret):
         "unknown team",
         "oauth only",
         "drive delete fails",
+        "no drive row",
     ],
     ids=[
         "app-uninstalled",
@@ -291,14 +292,15 @@ async def uninstall_gateway(agents, temporal, secret):
         "unknown-team",
         "oauth-only",
         "drive-delete-fails",
+        "no-drive-row",
     ],
 )
 async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
     """Fails if an uninstall event leaves the tenant enabled, its Slack token stored, its
     Notion token deleted or its Drive account and row kept, a repeat or out-of-order event
     audits again, a late retry of a processed event disables a reinstalled tenant or deletes
-    its fresh token, an unknown team or a user-token-only revocation is acted on, or a
-    refused Google delete blocks the uninstall."""
+    its fresh token, an unknown team or a user-token-only revocation is acted on, a
+    refused Google delete blocks the uninstall, or an account with no Drive row is kept."""
     client, store, credential_store, audit, credentials, drive, google = uninstall_gateway
     uninstall = {"type": "app_uninstalled"}
     revoked_bot = {"type": "tokens_revoked", "tokens": {"oauth": [], "bot": [UNINSTALL_TOKEN]}}
@@ -314,9 +316,14 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         "unknown team": [("T_OTHER", "EvU1", uninstall)],
         "oauth only": [(TEAM, "EvU1", revoked_oauth)],
         "drive delete fails": [(TEAM, "EvU1", uninstall)],
+        "no drive row": [(TEAM, "EvU1", uninstall)],
     }[case]
     if case == "drive delete fails":
         google.fail_next_delete(GoogleError("unavailable"))
+    if case == "no drive row":
+        # The account exists at Google with no row naming it: the uninstall still
+        # deletes it, by the derived ID.
+        await drive.delete(TENANT)
     for team, event_id, event in payloads:
         payload = {"type": "event_callback", "team_id": team, "event_id": event_id, "event": event}
         assert post_event(client, secret, payload).status_code == 200

@@ -24,10 +24,15 @@ from tests.helpers.console_harness import Clock
 PROJECT = "test-project"
 ACCOUNT_ID = "ag-abcdefghijklmnopqrstuvwx"
 EMAIL = f"{ACCOUNT_ID}@{PROJECT}.iam.gserviceaccount.com"
+# The row's stored email after a project move: the delete must target it, not the ID
+# re-derived at the current project.
+OTHER_EMAIL = f"{ACCOUNT_ID}@old-project.iam.gserviceaccount.com"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 CREATE_PATH = f"/v1/projects/{PROJECT}/serviceAccounts"
 ACCOUNT_PATH = f"{CREATE_PATH}/{EMAIL}"
+OTHER_ACCOUNT_PATH = f"{CREATE_PATH}/{OTHER_EMAIL}"
 MINT_PATH = f"/v1/projects/-/serviceAccounts/{EMAIL}:generateAccessToken"
+EXPIRES = "2026-11-20T13:00:00Z"
 
 
 @pytest.fixture(scope="module")
@@ -51,11 +56,15 @@ def deployment_key() -> str:
     )
 
 
-def reply(request: requests.PreparedRequest, status: int, body: dict) -> requests.Response:
+def reply(request: requests.PreparedRequest, status: int, body: dict | str) -> requests.Response:
     response = requests.Response()
     response.status_code = status
-    response._content = json.dumps(body).encode()
-    response.headers["Content-Type"] = "application/json"
+    if isinstance(body, str):
+        response._content = body.encode()
+        response.headers["Content-Type"] = "text/html"
+    else:
+        response._content = json.dumps(body).encode()
+        response.headers["Content-Type"] = "application/json"
     response.request = request
     response.url = request.url
     return response
@@ -113,27 +122,42 @@ def client_with(handler, deployment_key, clock=None, token_status: int = 200):
     [
         ("created", None),
         ("already exists", None),
+        ("recently deleted", "recently_deleted"),
         ("refused", "permission_denied"),
+        ("bad request", "refused"),
         ("connection lost", "unavailable"),
         ("key refused", "invalid_key"),
     ],
-    ids=["created", "already-exists", "refused", "connection-lost", "key-refused"],
+    ids=[
+        "created",
+        "already-exists",
+        "recently-deleted",
+        "refused",
+        "bad-request",
+        "connection-lost",
+        "key-refused",
+    ],
 )
 async def test_create_account_sends_the_id_and_maps_googles_answers(case, code, deployment_key):
     """Fails if create does not POST the account ID to the project, a 409 does not find
-    the existing account, or a refusal, a lost connection or a refused deployment key
-    comes back as anything but a GoogleError with its code."""
+    the existing account, a 409 whose get answers 404 does not read as recently deleted,
+    or a refusal, a bad request, a lost connection or a refused deployment key comes
+    back as anything but a GoogleError with its code."""
 
     def handler(request):
         if request.method == "POST" and request.path_url == CREATE_PATH:
             if case == "created":
                 return reply(request, 201, {"email": EMAIL, "accountId": ACCOUNT_ID})
-            if case == "already exists":
+            if case in ("already exists", "recently deleted"):
                 return reply(request, 409, {"error": {"status": "ALREADY_EXISTS"}})
             if case == "refused":
                 return reply(request, 403, {"error": {"status": "PERMISSION_DENIED"}})
+            if case == "bad request":
+                return reply(request, 400, {"error": {"status": "INVALID_ARGUMENT"}})
             raise requests.exceptions.ConnectionError("connection refused")
         if request.method == "GET" and request.path_url == ACCOUNT_PATH:
+            if case == "recently deleted":
+                return reply(request, 404, {"error": {"status": "NOT_FOUND"}})
             return reply(request, 200, {"email": EMAIL})
         return reply(request, 404, {"error": {"status": "NOT_FOUND"}})
 
@@ -150,7 +174,7 @@ async def test_create_account_sends_the_id_and_maps_googles_answers(case, code, 
         posts = [r for r in sent if r.method == "POST" and r.path_url == CREATE_PATH]
         assert len(posts) == 1
         assert json.loads(posts[0].body)["accountId"] == ACCOUNT_ID
-    if case == "already exists":
+    if case in ("already exists", "recently deleted"):
         assert [r.method for r in sent if r.path_url in (CREATE_PATH, ACCOUNT_PATH)] == [
             "POST",
             "GET",
@@ -165,17 +189,91 @@ async def test_create_account_sends_the_id_and_maps_googles_answers(case, code, 
 async def test_delete_account_maps_gone_to_false_and_a_refusal_to_its_code(
     status, expected, deployment_key
 ):
-    """Fails if a deleted account does not read as deleted, a 404 raises instead of
-    reading as already gone, or a refusal comes back as anything but its GoogleError
-    code."""
+    """Fails if a delete does not target the stored email it is given, a deleted account
+    does not read as deleted, a 404 raises instead of reading as already gone, or a
+    refusal comes back as anything but its GoogleError code."""
     client, sent = client_with(lambda request: reply(request, status, {}), deployment_key)
     if isinstance(expected, bool):
-        assert await client.delete_account(ACCOUNT_ID) is expected
+        assert await client.delete_account(OTHER_EMAIL) is expected
     else:
         with pytest.raises(GoogleError) as err:
-            await client.delete_account(ACCOUNT_ID)
+            await client.delete_account(OTHER_EMAIL)
         assert err.value.code == expected
-    assert [r.method for r in sent if r.path_url == ACCOUNT_PATH] == ["DELETE"]
+    assert [r.method for r in sent if r.path_url == OTHER_ACCOUNT_PATH] == ["DELETE"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "create without email",
+        "create not json",
+        "mint without token",
+        "list not json",
+        "file without name",
+    ],
+    ids=[
+        "create-missing-email",
+        "create-not-json",
+        "mint-missing-token",
+        "list-not-json",
+        "file-missing-name",
+    ],
+)
+async def test_a_2xx_body_missing_a_field_or_not_json_reads_as_unavailable(case, deployment_key):
+    """Fails if a 2xx answer with a missing field or a non-JSON body escapes as anything
+    but GoogleError('unavailable')."""
+
+    def handler(request):
+        if request.method == "POST" and request.path_url == CREATE_PATH:
+            if case == "create without email":
+                return reply(request, 201, {})
+            return reply(request, 201, "<html>maintenance</html>")
+        if request.path_url == MINT_PATH:
+            if case == "mint without token":
+                return reply(request, 200, {})
+            return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        if request.path_url.startswith("/drive/v3/files"):
+            if case == "list not json":
+                return reply(request, 200, "<html>maintenance</html>")
+            return reply(request, 200, {"files": [{"id": "f1"}]})
+        return reply(request, 200, {"drives": []})
+
+    client, _sent = client_with(handler, deployment_key)
+    with pytest.raises(GoogleError) as err:
+        if case.startswith("create"):
+            await client.ensure_account(ACCOUNT_ID)
+        else:
+            await client.list_shared(EMAIL)
+    assert err.value.code == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("kind", "names", "not_names"),
+    [("iam", "deployment", "sharing"), ("drive", "sharing", "deployment")],
+    ids=["iam", "drive"],
+)
+async def test_a_refusal_words_the_deployment_role_on_iam_and_the_accounts_access_on_drive(
+    kind, names, not_names, deployment_key
+):
+    """Fails if a 401/403 names the deployment account's role on a Drive call or the
+    tenant account's refused access on an IAM call."""
+
+    def handler(request):
+        if kind == "iam":
+            return reply(request, 403, {"error": {"status": "PERMISSION_DENIED"}})
+        if request.path_url == MINT_PATH:
+            return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        return reply(request, 403, {"error": {"status": "PERMISSION_DENIED"}})
+
+    client, _sent = client_with(handler, deployment_key)
+    with pytest.raises(GoogleError) as err:
+        if kind == "iam":
+            await client.ensure_account(ACCOUNT_ID)
+        else:
+            await client.list_shared(EMAIL)
+    assert err.value.code == "permission_denied"
+    assert names in str(err.value)
+    assert not_names not in str(err.value)
 
 
 async def test_listing_mints_a_drive_token_once_and_reuses_it_until_it_expires(deployment_key):
@@ -190,7 +288,7 @@ async def test_listing_mints_a_drive_token_once_and_reuses_it_until_it_expires(d
             return reply(
                 request,
                 200,
-                {"accessToken": "tenant-token", "expireTime": "2026-11-20T13:00:00Z"},
+                {"accessToken": "tenant-token", "expireTime": EXPIRES},
             )
         if request.path_url.startswith("/drive/v3/files"):
             return reply(request, 200, {"files": []})
@@ -210,6 +308,89 @@ async def test_listing_mints_a_drive_token_once_and_reuses_it_until_it_expires(d
     clock.advance(minutes=2)  # 13:00, expired
     await client.list_shared(EMAIL)
     assert len([r for r in sent if r.path_url == MINT_PATH]) == 2
+
+
+async def test_a_recreated_account_mints_a_fresh_token(deployment_key):
+    """Fails if a list after a delete and a re-create reuses the deleted account's
+    cached token."""
+    mints = 0
+
+    def handler(request):
+        nonlocal mints
+        if request.path_url == MINT_PATH:
+            mints += 1
+            return reply(
+                request, 200, {"accessToken": f"tenant-token-{mints}", "expireTime": EXPIRES}
+            )
+        if request.method == "POST" and request.path_url == CREATE_PATH:
+            return reply(request, 201, {"email": EMAIL})
+        if request.method == "DELETE":
+            return reply(request, 200, {})
+        if request.path_url.startswith("/drive/v3/files"):
+            return reply(request, 200, {"files": []})
+        return reply(request, 200, {"drives": []})
+
+    client, sent = client_with(handler, deployment_key)
+    await client.list_shared(EMAIL)
+    await client.delete_account(EMAIL)
+    await client.ensure_account(ACCOUNT_ID)
+    await client.list_shared(EMAIL)
+    assert mints == 2
+    files = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert files[-1].headers["Authorization"] == "Bearer tenant-token-2"
+
+
+async def test_two_accounts_keep_separate_cached_tokens(deployment_key):
+    """Fails if one account's list reuses another account's token or evicts it."""
+
+    def handler(request):
+        if ":generateAccessToken" in request.path_url:
+            email = request.path_url.split("/serviceAccounts/")[1].split(":generateAccessToken")[0]
+            return reply(request, 200, {"accessToken": f"token-{email}", "expireTime": EXPIRES})
+        if request.path_url.startswith("/drive/v3/files"):
+            return reply(request, 200, {"files": []})
+        return reply(request, 200, {"drives": []})
+
+    client, sent = client_with(handler, deployment_key)
+    await client.list_shared(EMAIL)
+    await client.list_shared(OTHER_EMAIL)
+    await client.list_shared(EMAIL)
+    mints = [r for r in sent if ":generateAccessToken" in r.path_url]
+    assert len(mints) == 2
+    files = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert [r.headers["Authorization"] for r in files] == [
+        f"Bearer token-{EMAIL}",
+        f"Bearer token-{OTHER_EMAIL}",
+        f"Bearer token-{EMAIL}",
+    ]
+
+
+async def test_listing_stops_at_the_first_100_items_and_says_there_are_more(deployment_key):
+    """Fails if a list with more than 100 items shared fetches a second page, returns
+    more than the first 100 items, or does not say there are more."""
+
+    def handler(request):
+        if request.path_url == MINT_PATH:
+            return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        if request.path_url.startswith("/drive/v3/files"):
+            return reply(
+                request,
+                200,
+                {
+                    "files": [{"id": f"f{i}", "name": f"File {i}"} for i in range(100)],
+                    "nextPageToken": "p2",
+                },
+            )
+        return reply(request, 200, {"drives": [{"id": "d1", "name": "Team drive"}]})
+
+    client, sent = client_with(handler, deployment_key)
+    listing = await client.list_shared(EMAIL)
+    assert len(listing.items) == 100
+    assert listing.more is True
+    assert listing.items[0].id == "f0"
+    assert listing.items[-1].id == "f99"
+    pages = [r for r in sent if r.path_url.startswith("/drive/v3/")]
+    assert len(pages) == 1
 
 
 async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(deployment_key):
@@ -252,17 +433,18 @@ async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(de
             return reply(
                 request,
                 200,
-                {"accessToken": "tenant-token", "expireTime": "2026-11-20T13:00:00Z"},
+                {"accessToken": "tenant-token", "expireTime": EXPIRES},
             )
         return reply(request, 404, {})
 
     client, sent = client_with(handler, deployment_key)
-    items = await client.list_shared(EMAIL)
-    assert [(i.id, i.name, i.link) for i in items] == [
+    listing = await client.list_shared(EMAIL)
+    assert [(i.id, i.name, i.link) for i in listing.items] == [
         ("f1", "Guide", "https://drive.google.com/file/d/f1"),
         ("f2", "Roster", "https://drive.google.com/file/d/f2"),
         ("d1", "Team drive", "https://drive.google.com/drive/folders/d1"),
     ]
+    assert listing.more is False
     files = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
     assert len(files) == 2
     assert "sharedWithMe" in files[0].path_url

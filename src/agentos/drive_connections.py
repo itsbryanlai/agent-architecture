@@ -7,9 +7,10 @@ mints short-lived tokens for it; this table holds which account belongs to the t
 whether the last check of what it can see succeeded, and when.
 
 The console writes the row in the same unit of work as its ``connector`` audit event
-(``drive_connect`` / ``drive_disconnect``). The settings page's check of what the account
-can see updates ``status``, ``last_error`` and ``checked_at`` without an audit event: it
-is a read of Google, not an admin change. Disconnect and uninstall delete the row.
+(``drive_connect`` / ``drive_disconnect``), under the tenant lock that also covers the
+Google call. The settings page reads the row and lists what the account can see without
+writing anything: the live check's outcome is shown, not stored. ``record_check`` is for
+a later background check of the connection. Disconnect and uninstall delete the row.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
-from agentos.stores import joined_transaction, tenant_transaction
+from agentos.stores import joined_transaction
 
 CONNECTED = "connected"
 ERROR = "error"
@@ -40,8 +41,9 @@ class DriveConnection:
 
 
 class DriveConnectionStore(Protocol):
-    async def get(self, tenant_id: str) -> DriveConnection | None:
-        """The tenant's connection, or None when Drive was never connected."""
+    async def get(self, tenant_id: str, conn: Any = None) -> DriveConnection | None:
+        """The tenant's connection, or None when Drive was never connected. With
+        ``conn`` the read joins the unit of work's transaction."""
         ...
 
     async def connect(self, tenant_id: str, email: str, at: datetime, conn: Any = None) -> None:
@@ -56,7 +58,7 @@ class DriveConnectionStore(Protocol):
     async def record_check(
         self, tenant_id: str, status: str, last_error: str | None, at: datetime, conn: Any = None
     ) -> None:
-        """The settings page's check of what the account can see: its outcome and time.
+        """A background check's outcome and time (a later Drive-read poll writes it).
         A tenant with no row is unchanged."""
         ...
 
@@ -76,7 +78,7 @@ class InMemoryDriveConnectionStore:
     def restore(self, state: dict[str, DriveConnection]) -> None:
         self._rows = dict(state)
 
-    async def get(self, tenant_id: str) -> DriveConnection | None:
+    async def get(self, tenant_id: str, conn: Any = None) -> DriveConnection | None:
         return self._rows.get(tenant_id)
 
     async def connect(self, tenant_id: str, email: str, at: datetime, conn: Any = None) -> None:
@@ -109,9 +111,9 @@ class PostgresDriveConnectionStore:
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
 
-    async def get(self, tenant_id: str) -> DriveConnection | None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            cur = await conn.execute(
+    async def get(self, tenant_id: str, conn: Any = None) -> DriveConnection | None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            cur = await db.execute(
                 f"SELECT {_COLUMNS} FROM drive_connections WHERE tenant_id = %s",
                 (tenant_id,),
             )

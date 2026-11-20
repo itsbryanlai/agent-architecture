@@ -184,6 +184,7 @@
 {% else %}
 <p class="muted">Nothing is shared with this address yet.</p>
 {% endif %}
+{% if view.drive_more %}<p class="muted">Showing the first 100 items shared with this address.</p>{% endif %}
 {% endif %}
 {{ post_button(base ~ "/settings/drive/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
 <p class="muted">Disconnect deletes the account at Google and removes this connection. Files shared with the address keep their sharing until their owners remove it.</p>

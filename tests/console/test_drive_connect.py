@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 
 import pytest
 
@@ -11,7 +10,7 @@ from agentos import ids
 from agentos.config import ConfigError
 from agentos.connectors.google_iam import DriveItem, FakeGoogleAccounts, GoogleError
 from agentos.control import Forbidden
-from agentos.drive_connections import CONNECTED, InMemoryDriveConnectionStore
+from agentos.drive_connections import CONNECTED, ERROR, InMemoryDriveConnectionStore
 from tests.conftest import TENANT
 from tests.helpers.console_harness import OWNER, ROOT, ConsoleHarness, using
 
@@ -31,13 +30,30 @@ def tenant_email() -> str:
 
 @pytest.mark.parametrize(
     "case",
-    ["first connect", "second click", "lost response", "overlap", "non-admin", "not set up"],
-    ids=["first", "second-click", "lost-response", "overlap", "non-admin", "not-set-up"],
+    [
+        "first connect",
+        "second click",
+        "lost response",
+        "overlap",
+        "reconnect after error",
+        "non-admin",
+        "not set up",
+    ],
+    ids=[
+        "first",
+        "second-click",
+        "lost-response",
+        "overlap",
+        "reconnect-after-error",
+        "non-admin",
+        "not-set-up",
+    ],
 )
 async def test_connect_creates_the_tenant_account_once_and_a_retry_finds_it(case):
     """Fails if a second click, a retry after a lost create response or an overlapping
-    attempt creates a second account, stores a second row or records a second event, or
-    a non-admin or an unconfigured deployment connects."""
+    attempt creates a second account, stores a second row or records a second event, a
+    reconnect after an error records nothing, or a non-admin or an unconfigured
+    deployment connects."""
     if case == "not set up":
         h = ConsoleHarness()
         with pytest.raises(ConfigError):
@@ -69,28 +85,42 @@ async def test_connect_creates_the_tenant_account_once_and_a_retry_finds_it(case
         hang = google.hang_after_write("create")
         first = asyncio.create_task(h.plane.connect_drive(TENANT, ROOT))
         await hang.reached.wait()
-        await h.plane.connect_drive(TENANT, ROOT)
+        second = asyncio.create_task(h.plane.connect_drive(TENANT, ROOT))
         hang.release()
         await first
+        await second
+    elif case == "reconnect after error":
+        await h.plane.connect_drive(TENANT, ROOT)
+        await drive.record_check(TENANT, ERROR, "unavailable", h.clock())
+        await h.plane.connect_drive(TENANT, ROOT)
 
     account_id = ids.drive_account_id(TENANT)
     email = tenant_email()
-    assert re.fullmatch(r"[a-z][a-z0-9-]{5,29}", account_id)
     assert google.created == [account_id]
     assert google.accounts == {account_id: email}
     row = await drive.get(TENANT)
     assert (row.service_account_email, row.status, row.last_error) == (email, CONNECTED, None)
+    connects = 2 if case == "reconnect after error" else 1
     assert [(e.kind, e.tool, e.target, e.identity) for e in h.audit.events] == [
         ("connector", "drive_connect", email, f"user:{ROOT}")
-    ]
+    ] * connects
 
 
 @pytest.mark.parametrize(
     "case",
-    ["connected", "not connected", "lost delete response", "already gone", "overlap", "non-admin"],
+    [
+        "connected",
+        "not connected",
+        "orphan account",
+        "lost delete response",
+        "already gone",
+        "overlap",
+        "non-admin",
+    ],
     ids=[
         "connected",
         "not-connected",
+        "orphan-account",
         "lost-delete-response",
         "already-gone",
         "overlap",
@@ -99,14 +129,16 @@ async def test_connect_creates_the_tenant_account_once_and_a_retry_finds_it(case
 )
 async def test_disconnect_deletes_the_account_and_the_row_once(case):
     """Fails if disconnect leaves the account at Google or the row stored, records a
-    second event, refuses when the account is already gone, or lets a non-admin
-    disconnect."""
+    second event, refuses when the account is already gone, keeps an account no row
+    names, or lets a non-admin disconnect."""
     h, drive, google = drive_harness()
     await h.seed_members()
     account_id = ids.drive_account_id(TENANT)
     email = tenant_email()
-    if case != "not connected":
+    if case not in ("not connected", "orphan account"):
         await h.plane.connect_drive(TENANT, ROOT)
+    if case == "orphan account":
+        await google.ensure_account(account_id)
     if case == "non-admin":
         with pytest.raises(Forbidden):
             await h.plane.disconnect_drive(TENANT, OWNER)
@@ -114,13 +146,15 @@ async def test_disconnect_deletes_the_account_and_the_row_once(case):
         assert await drive.get(TENANT) is not None
         assert [(e.kind, e.tool) for e in h.audit.events] == [("connector", "drive_connect")]
         return
-    if case == "connected":
-        assert await h.plane.disconnect_drive(TENANT, ROOT) is True
-    elif case == "not connected":
+    if case in ("not connected", "orphan account"):
         assert await h.plane.disconnect_drive(TENANT, ROOT) is False
-        assert google.delete_calls == []
+        assert google.delete_calls == [email]
+        assert google.accounts == {}
+        assert await drive.get(TENANT) is None
         assert h.audit.events == []
         return
+    if case == "connected":
+        assert await h.plane.disconnect_drive(TENANT, ROOT) is True
     elif case == "lost delete response":
         google.fail_after_write("delete")
         with pytest.raises(GoogleError):
@@ -128,15 +162,15 @@ async def test_disconnect_deletes_the_account_and_the_row_once(case):
         assert await drive.get(TENANT) is not None
         assert await h.plane.disconnect_drive(TENANT, ROOT) is True
     elif case == "already gone":
-        assert await google.delete_account(account_id) is True
+        assert await google.delete_account(email) is True
         assert await h.plane.disconnect_drive(TENANT, ROOT) is True
     elif case == "overlap":
         hang = google.hang_after_write("delete")
         first = asyncio.create_task(h.plane.disconnect_drive(TENANT, ROOT))
         await hang.reached.wait()
-        second = await h.plane.disconnect_drive(TENANT, ROOT)
+        second = asyncio.create_task(h.plane.disconnect_drive(TENANT, ROOT))
         hang.release()
-        assert (await first, second) == (False, True)
+        assert (await first, await second) == (True, False)
 
     assert google.accounts == {}
     assert await drive.get(TENANT) is None
@@ -146,20 +180,45 @@ async def test_disconnect_deletes_the_account_and_the_row_once(case):
     ]
 
 
+async def test_a_connect_overlapping_a_disconnect_ends_with_row_and_account_together():
+    """Fails if a connect overlapping a disconnect leaves a row without an account or an
+    account without a row."""
+    h, drive, google = drive_harness()
+    await h.seed_members()
+    await h.plane.connect_drive(TENANT, ROOT)
+    hang = google.hang_after_write("delete")
+    disconnect = asyncio.create_task(h.plane.disconnect_drive(TENANT, ROOT))
+    await hang.reached.wait()
+    connect = asyncio.create_task(h.plane.connect_drive(TENANT, ROOT))
+    hang.release()
+    assert await disconnect is True
+    await connect
+    row = await drive.get(TENANT)
+    assert row is not None
+    assert google.accounts == {ids.drive_account_id(TENANT): row.service_account_email}
+    assert [(e.kind, e.tool) for e in h.audit.events] == [
+        ("connector", "drive_connect"),
+        ("connector", "drive_disconnect"),
+        ("connector", "drive_connect"),
+    ]
+
+
 @pytest.mark.parametrize(
     "case",
-    ["not set up", "not connected", "connected", "empty", "error"],
-    ids=["not-set-up", "not-connected", "connected", "empty", "error"],
+    ["not set up", "not connected", "connected", "empty", "error", "cap"],
+    ids=["not-set-up", "not-connected", "connected", "empty", "error", "cap"],
 )
 async def test_the_settings_page_shows_the_drive_section(case):
     """Fails if the page offers a connect button on a deployment without Drive, hides
     the address, the copy button or the shared list when connected, shows no empty
-    state, or shows a raw error code instead of plain words."""
+    state, shows a raw error code instead of plain words, stores the live check's
+    outcome on the row, or lists past the first 100 items without the cap note."""
     email = tenant_email()
     if case == "not set up":
         h = ConsoleHarness()
+        drive = None
     else:
-        h, _drive, google = drive_harness()
+        h, drive, google = drive_harness()
         if case != "not connected":
             await h.plane.connect_drive(TENANT, ROOT)
         if case == "connected":
@@ -167,7 +226,12 @@ async def test_the_settings_page_shows_the_drive_section(case):
                 DriveItem("file-1", "IT guidebook", "https://drive.google.com/file/d/file-1")
             ]
         if case == "error":
-            google.fail_next_list(GoogleError("permission_denied"))
+            google.fail_next_list(GoogleError("rate_limited"))
+        if case == "cap":
+            google.shared[email] = [
+                DriveItem(f"f{i}", f"File {i}", f"https://drive.google.com/file/d/f{i}")
+                for i in range(101)
+            ]
     c = await h.signed_in(ROOT)
     async with using(c):
         page = (await c.get(SETTINGS)).text
@@ -186,9 +250,17 @@ async def test_the_settings_page_shows_the_drive_section(case):
             assert "IT guidebook" in page
             assert "https://drive.google.com/file/d/file-1" in page
             assert "Status: connected" in page
+            assert (await drive.get(TENANT)).checked_at is None
         elif case == "empty":
             assert "Nothing is shared with this address yet" in page
         elif case == "error":
-            assert "Status: error" in page
-            assert "Google refused the request" in page
-            assert "permission_denied" not in page
+            assert "Status: connected" in page
+            assert "Google is rate-limiting the requests" in page
+            assert "rate_limited" not in page
+            row = await drive.get(TENANT)
+            assert (row.status, row.last_error, row.checked_at) == (CONNECTED, None, None)
+        elif case == "cap":
+            assert "Showing the first 100 items shared with this address." in page
+            assert page.count("<tr><td>") == 100
+            assert "File 99" in page
+            assert "File 100" not in page

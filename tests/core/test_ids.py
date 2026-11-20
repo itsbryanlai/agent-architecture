@@ -1,3 +1,7 @@
+import re
+
+import pytest
+
 from agentos import ids
 
 
@@ -11,3 +15,9 @@ def test_ids_format():
 def test_an_import_audit_key_names_the_tenant_and_the_agent():
     assert ids.audit_import_key("acme", "it-helper") == "acme:audit:import:it-helper"
     assert ids.audit_import_key("globex", "it-helper") != ids.audit_import_key("acme", "it-helper")
+
+
+@pytest.mark.parametrize("tenant", ["acme", "t", "a-tenant-id-longer-than-googles-class"])
+def test_a_drive_account_id_fits_googles_account_id_class(tenant):
+    """Fails if a tenant's Drive account ID falls outside Google's 6-30 character class."""
+    assert re.fullmatch(r"[a-z][-a-z0-9]{4,28}[a-z0-9]", ids.drive_account_id(tenant))

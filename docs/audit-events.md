@@ -218,12 +218,16 @@ The same kind records a creator's consent to keep their own Notion sign-in for t
 access check (`creator_consent`, written with the encrypted per-creator credential when a
 consented picker flow completes) and its revocation (`creator_consent_revoked`, written with
 the credential's deletion). Any member with a role may consent or revoke for themselves; a
-revoke with nothing stored writes nothing. The token is never in these rows either.
+re-pick completed with the consent box unticked revokes the sign-in a former pick kept. An
+admin dropping a member deletes the
+sign-in in the same transaction as the member change and records the revoke with the member
+as target. A revoke with nothing stored writes nothing. The token is never in these rows
+either.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `connector` | Notion is connected (or reconnected), or disconnected | the admin / `user:<admin>` | none | `connect` or `disconnect` | the Notion workspace ID on connect; empty on disconnect | `ok` | Control key |
-| `connector` | A creator consents to keep their Notion sign-in (a consented pick replaces it), or revokes the consent | the creator / `user:<creator>` | none | `creator_consent` or `creator_consent_revoked` | the creator's Slack ID on consent; empty on revoke | `ok` | Control key |
+| `connector` | A creator consents to keep their Notion sign-in (a consented pick replaces it), or the consent is revoked: by the creator, by an unticked re-pick, or by an admin's member change | the creator / `user:<creator>`, or the admin / `user:<admin>` for a member change | none | `creator_consent` or `creator_consent_revoked` | the creator's Slack ID on consent; the member's Slack ID when a member change deletes it; empty on a self-revoke | `ok` | Control key |
 
 ## Tenant settings
 

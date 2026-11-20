@@ -813,19 +813,29 @@ The check reads with the creator's own Notion sign-in, which exists only if they
 "Keep my Notion sign-in" before a Choose-from-Notion sign-in. The token is stored encrypted
 per tenant and creator (`tenant_credentials`, kind `notion_creator:<Slack user ID>`); a
 consented pick replaces it, and "Stop keeping it" on the version page deletes it (audited
-`connector`, as `creator_consent` / `creator_consent_revoked`). Without consent the picker
-works unchanged and the grant shows "cannot verify (no consent)" — never a suspension.
+`connector`, as `creator_consent` / `creator_consent_revoked`). The box is a per-pick
+choice: completing a re-pick with it unticked revokes the sign-in a former pick kept.
+Dropping a creator from the tenant deletes
+their sign-in in the same unit of work as the member change (audited as the same revoke,
+with the member as target). Without consent the picker works unchanged and the grant shows
+"cannot verify (no consent)" — never a suspension.
 
-One cheap read per object, through the tenant's Notion rate limiter. The verdict per object
-lives in `creator_access`: `verified`, `lost` (Notion refused the creator: gone or unshared)
-or `cannot_verify`. A transient failure (network, rate limit, server error) changes nothing;
-the next pass tries again. The pass then runs the worker's health check, which combines both
-sources: an agent is available only when its grants pass and no granted object is lost. A
-lost object suspends the agent with the reason "its creator can no longer see '<grant>'" —
-the same fixed reply, refused Submit, audit and once-per-transition DMs as a grant problem
-(D-35); the creator and admins are told. A later pass where both sources pass recovers it,
-and the worker's five-minute re-check of unavailable agents means neither source can flap
-the other. The version page shows each grant's last verdict and when it was checked.
+The workflow lists the tenant's published agents and runs one activity per agent — one
+cheap read per picked object, through the tenant's Notion rate limiter, heartbeating
+between reads — then the combined health check. A disabled (uninstalled) or unknown
+tenant's pass ends cleanly with zero counts, before any read. The verdict per object lives
+in `creator_access`: `verified`, `lost` (Notion refused the creator: gone or unshared) or
+`cannot_verify` (no consent, or a dead token — a 401). A transient failure (network, rate
+limit, server error) changes nothing; the next pass tries again. A `lost` verdict is
+sticky: only a successful read replaces it, and a `cannot_verify` never lifts it. The
+health check combines both sources: an agent is available only when its grants pass and no
+granted object is lost. A lost object suspends the agent with the reason "its creator can
+no longer see '<grant>'" — the same fixed reply, refused Submit, audit and
+once-per-transition DMs as a grant problem (D-35); the creator and admins are told. A later
+pass where both sources pass recovers it; neither source can flap the other. Recovery from
+a lost verdict waits for the next nightly pass — the worker's five-minute re-check
+re-evaluates health from the stored verdicts but does not re-read the creator's access. The
+version page shows each grant's last verdict and when it was checked.
 
 ## Run
 

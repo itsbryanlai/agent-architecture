@@ -23,6 +23,12 @@ from agentos.agent_health import (
     InMemoryAgentHealthStore,
     PostgresAgentHealthStore,
 )
+from agentos.approval_policy import (
+    NO_APPROVAL,
+    REQUESTER_APPROVAL,
+    InMemoryApprovalPolicyStore,
+    PostgresApprovalPolicyStore,
+)
 from agentos.audience_pauses import InMemoryPauseStore, PostgresPauseStore
 from agentos.audit import InMemoryAuditStore, PostgresAuditStore
 from agentos.budgets import BudgetNotFound, InMemoryBudgetStore, PostgresBudgetStore
@@ -673,3 +679,29 @@ async def test_a_failed_audit_insert_leaves_no_vote(pool, tenant: str):
     assert resp.status_code == 200  # the clicker is told to try again; nothing is half done
     assert await feedback.get(tenant, conv, "1.2", "U1") is None
     assert await PostgresAuditStore(pool).list(tenant) == []
+
+
+# --- approval policy -------------------------------------------------------------------
+
+
+@pytest.fixture
+def policies(store_pool):
+    return twin(store_pool, InMemoryApprovalPolicyStore, PostgresApprovalPolicyStore)
+
+
+async def test_the_policy_reads_back_what_was_set_per_tenant_and_defaults_to_approval(
+    policies, tenant: str, other_tenant: str
+):
+    """Fails if an action with no row reads as anything but requester approval, a set does not
+    replace the stored policy, or one tenant's change reaches another."""
+    assert await policies.get(tenant, "add_comment") == REQUESTER_APPROVAL
+    assert await policies.get(tenant, "an-action-no-manifest-declares") == REQUESTER_APPROVAL
+
+    await policies.set(tenant, "add_comment", NO_APPROVAL)
+
+    assert await policies.get(tenant, "add_comment") == NO_APPROVAL
+    assert await policies.get(other_tenant, "add_comment") == REQUESTER_APPROVAL
+
+    await policies.set(tenant, "add_comment", REQUESTER_APPROVAL)
+
+    assert await policies.get(tenant, "add_comment") == REQUESTER_APPROVAL

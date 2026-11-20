@@ -30,6 +30,7 @@ from agentos.agent_store import (
     published_tenants,
     startup_agent_failure,
 )
+from agentos.approval_policy import PostgresApprovalPolicyStore
 from agentos.audience_pauses import PostgresPauseStore
 from agentos.audience_watch import AudienceWatchActivities
 from agentos.audit import PostgresAuditStore
@@ -355,6 +356,7 @@ async def main() -> None:
             content=PostgresContentStore(pool),
             health=health,
             tasks=PostgresTaskStore(pool),
+            policies=PostgresApprovalPolicyStore(pool),
         )
         watch = AudienceWatchActivities(
             registry,

@@ -40,6 +40,7 @@ from agentos.agent_health import (
     InMemoryAgentHealthStore,
 )
 from agentos.agent_store import seeded_agent_store
+from agentos.approval_policy import NO_APPROVAL
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import BudgetGuard, InMemoryBudgetStore
 from agentos.config import TASK_QUEUE, Settings, parse_agents_config
@@ -1180,6 +1181,62 @@ async def task_nudge_comment_only(r: Rig, stored: bool) -> list[Recorded]:
     return out
 
 
+async def task_comment_policy(r: Rig, stored: bool) -> list[Recorded]:
+    """A comment on the requester's own filed item runs without a card under the policy.
+
+    The create task files the item and records who filed it; the admin's policy then
+    turns approval off for the comment action, and a second turn's comment runs at once.
+    """
+    thread = thread_ts(302 if stored else 301)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce)
+    await wait_state(handle, "watching")
+    page = r.notion.all_pages(DB_ID)[0]
+    await r.acts.policies.set(TENANT, "add_comment", NO_APPROVAL)
+    r.llm.queue(
+        tool_turn(ToolCall("tu_cp", "add_comment", {"item": page["id"], "comment": "Any update?"})),
+        answer("Commented."),
+    )
+    conv = ids.conversation_id(TENANT, "C_GENERAL", thread)
+    text = "any update on my request?"
+    event_id = f"Ev-{thread}-2"
+    if stored:
+        await r.acts.content.put_inbound(
+            TENANT,
+            event_id,
+            {
+                "kind": "message",
+                "agent_id": "it-helper",
+                "user_id": ALICE,
+                "text": text,
+                "channel": "C_GENERAL",
+                "thread_ts": thread,
+                "channel_kind": "channel",
+            },
+        )
+        await r.client.get_workflow_handle(conv).signal(
+            ConversationWorkflow.message,
+            InboundMessage(event_id, ALICE, "", "C_GENERAL", thread, "channel", text_stored=True),
+        )
+    else:
+        await start_conversation(r, "it-helper", thread, text, event_id=event_id)
+    await eventually(
+        lambda: [
+            p for p in r.slack.posts() if p["thread_ts"] and "no approval needed" in p["text"]
+        ],
+        timeout=30,
+    )
+    comments = r.notion.comments[page["id"].replace("-", "")]
+    assert len(comments) == 1
+    write = next(e for e in r.acts.audit.events if e.kind == "write" and e.outcome == "policy")
+    assert [e.kind for e in r.acts.audit.events if e.task_id == write.task_id] == ["write"]
+    return [await current(r, "", write.task_id), await current(r, "conversation", conv)]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1529,6 +1586,7 @@ for _name, _fn in {
     "my_tasks_once": my_tasks_once,
     "task_nudge": task_nudge,
     "task_nudge_comment_only": task_nudge_comment_only,
+    "task_comment_policy": task_comment_policy,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

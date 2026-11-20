@@ -424,6 +424,7 @@ NOT_GATED = {
     "record_task_state": "stores the task's state row in the platform's store; no model, connector or post",
     "task_in_thread": "reads the asker's task row to poke its watch; no model or connector",
     "wait_task_refresh": "reads the task row until the poke's poll reports; no model or connector",
+    "comment_approval_policy": "reads the tenant's policy and the platform's task records; no model, connector or post",
 }
 
 

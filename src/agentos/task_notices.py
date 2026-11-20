@@ -24,6 +24,7 @@ STALE = "stale"
 FAILED_COMMENT = "failed_comment"
 NOT_CONFIRMED_COMMENT = "not_confirmed_comment"
 COMMENTED = "commented"
+COMMENTED_NO_APPROVAL = "commented_no_approval"
 NUDGED = "nudged"
 NUDGE_COMMENTED = "nudge_commented"
 NUDGE_NO_DM = "nudge_no_dm"
@@ -86,6 +87,8 @@ def notice_text(
         return f"I couldn't confirm whether the comment was posted; please check {url}"
     if kind == COMMENTED:
         return f"Commented on {name} ({url})."
+    if kind == COMMENTED_NO_APPROVAL:
+        return f"Commented on '{name}' (no approval needed: your admin's setting)."
     if kind == NUDGED:
         return f"Nudged the assignee about '{name}': commented on the item and sent a DM."
     if kind == NUDGE_COMMENTED:

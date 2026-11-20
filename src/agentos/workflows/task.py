@@ -2,9 +2,11 @@
 
 Rules this workflow keeps:
 
-* Writes never run without approval. Only the requester can approve, and the
-  approval nonce on the click must match the one on the card. Anything else is
-  ignored and the workflow keeps waiting.
+* Writes never run without approval, unless an admin turned approval off for that
+  low-risk action (D-43): a comment on an item the requester filed then runs without
+  a card, behind the ``approval-policy`` marker, and the thread line says so. Only the
+  requester can approve, and the approval nonce on the click must match the one on the
+  card. Anything else is ignored and the workflow keeps waiting.
 * What was approved is exactly what runs: the payload is frozen before the card is posted,
   as revision 1 of the task's draft in Postgres (``task_drafts``); the spec carries the
   reference (``draft_ref``, ``revision``) and the nonce, never the text. The only thing that
@@ -106,6 +108,9 @@ TASK_RECORD_PATCH = "task-record"
 # Histories recorded before the nudge existed never offer one: their stale notice is
 # the plain line, their watch never wakes for a nudge, and they carry no nudge state.
 NUDGE_PATCH = "nudge"
+# Histories recorded before the approval policy existed never ask it: every comment
+# shows its card, as it did then.
+APPROVAL_POLICY_PATCH = "approval-policy"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -344,6 +349,16 @@ class TaskWorkflow:
                 )
             else:
                 self._spec = dataclasses.replace(spec, payload=payload)
+        # The policy may let this comment run without a card (D-43): the activity reads
+        # the tenant's setting and the platform's own record of who filed the item.
+        # Histories recorded before the policy never ask and always show the card.
+        if (
+            workflow.patched(APPROVAL_POLICY_PATCH)
+            and spec.tool_name == "add_comment"
+            and await self._act(AgentActivities.comment_approval_policy, self._spec)
+        ):
+            self._spec = dataclasses.replace(self._spec, under_policy=True)
+            return await self._run_comment_under_policy(self._spec, task_id, agent.name)
         card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
         await self._record()
@@ -806,6 +821,75 @@ class TaskWorkflow:
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
         await self._notice(
             task_notices.COMMENTED,
+            f"{task_id}:commented",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_comment_under_policy(self, spec: TaskSpec, task_id: str, agent_name: str) -> str:
+        """Post the comment the tenant's policy allows, without a card (D-43).
+
+        The write is the same exactly-once comment write, with no approval row and
+        outcome 'policy'. There is no card to update, so a refusal or a failure says
+        so in the thread. There is nothing to watch afterwards.
+        """
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            stopped_text = None
+            if _is_agent_off(err):
+                stopped_text = agent_off_text(agent_name)
+            elif workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                stopped_text = agent_unavailable_text(agent_name)
+            if stopped_text is not None:
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=stopped_text,
+                )
+                self._state = "cancelled"
+                await self._record()
+                return self._state
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_notion_comment, spec, task_id
+                )
+                if found is None:
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_COMMENT,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._notice(
+            task_notices.COMMENTED_NO_APPROVAL,
             f"{task_id}:commented",
             task_id,
             subject=title,

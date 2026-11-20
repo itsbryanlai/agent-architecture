@@ -16,6 +16,9 @@
 # input_schema: the model's input is checked against it before anything runs; a missing,
 #   unexpected or wrongly typed field becomes an error the model reads and can correct.
 # offer_to_llm: false keeps a tool for runtime use only; the model cannot call it.
+# low_risk: true marks a comment action an admin may let run without the requester's
+#   approval (D-43), on an item the requester filed. Loading refuses the flag on any
+#   create, append or replace; the default policy still asks for approval.
 connector: notion
 tools:
   search_items:
@@ -65,6 +68,7 @@ tools:
   add_comment:
     risk: write_reversible
     idempotency: marker_text
+    low_risk: true
     description: >-
       Draft a comment on an existing item. Nothing is posted until the
       requester approves the draft in Slack.

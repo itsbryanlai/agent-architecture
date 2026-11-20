@@ -1,6 +1,7 @@
 """An approved Notion write happens once, whatever the attempts, delays and failures around it."""
 
 import asyncio
+import dataclasses
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -295,6 +296,51 @@ async def test_a_second_comment_attempt_beside_a_running_one_writes_nothing(harn
     comment_id = await first
 
     assert await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id) == comment_id
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+# --- a comment under the approval policy (no card) -------------------------------------
+
+
+def policy_comment_spec(page_id: str) -> TaskSpec:
+    return dataclasses.replace(comment_spec(page_id), under_policy=True)
+
+
+async def test_a_policy_comment_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a policy-allowed comment whose response was lost posts it a second time."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "policy-comment-lost")
+    h.notion.delay_visibility(1)
+    h.notion.fail_after_write("comment")
+    with pytest.raises(TimeoutError):
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+
+    await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_second_policy_comment_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a policy-allowed comment attempt starting while another is mid-write posts a second comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "policy-comment-overlap")
+    hang = h.notion.hang_after_write("comment")
+    first = asyncio.create_task(
+        run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+    )
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert (
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id) == comment_id
+    )
     assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
 
 

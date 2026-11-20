@@ -116,7 +116,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -232,6 +232,7 @@ from agentos.test_sets import (
     HAND_OFF,
     QUESTION_MAX,
     REFUSE,
+    RUN_LIMIT,
     RUNNING,
     WRITE,
     InMemoryTestSetStore,
@@ -1392,12 +1393,13 @@ class ControlPlane:
 
         Every case needs an expectation first, and a grant new since the published version
         must have been picked, as at submit. One run of a version at a time: a second start
-        while one is running is refused. With a ``request_id`` the call is idempotent: a
-        retry finds the event the first attempt recorded and returns that run. The checks
-        and the row's insert share the unit of work's tenant lock, so two starts never
-        interleave. The row and its audit event commit before the workflow starts on its
-        own task queue; a start that fails closes the row as failed, so the console never
-        shows a run that is not coming.
+        while one is running is refused, unless that run outlived the run limit, in which
+        case its row is closed as failed first so a dead run never blocks the version. With
+        a ``request_id`` the call is idempotent: a retry finds the event the first attempt
+        recorded and returns that run. The checks and the row's insert share the unit of
+        work's tenant lock, so two starts never interleave. The row and its audit event
+        commit before the workflow starts on its own task queue; a start that fails closes
+        the row as failed, so the console never shows a run that is not coming.
         """
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._draft_for_cases(tenant_id, agent_id, version)
@@ -1428,7 +1430,18 @@ class ControlPlane:
                 raise TestSetError("test runs are not available in this console")
             latest = await self._test_sets.latest_run(tenant_id, agent_id, version)
             if latest is not None and latest.status == RUNNING:
-                raise TestSetError("A test run is already going on this version")
+                if not self._run_outlived_limit(latest):
+                    raise TestSetError("A test run is already going on this version")
+                # The run outlived its limit and can never finish on its own; close it as
+                # failed (its results and spend kept) so this version can run again.
+                await self._test_sets.finish_run(
+                    tenant_id,
+                    latest.run_id,
+                    latest.results,
+                    latest.spend_usd,
+                    status=FAILED,
+                    conn=conn,
+                )
             run = TestRun(
                 tenant_id,
                 ids.test_run_id(tenant_id, uuid.uuid4().hex),
@@ -1468,12 +1481,26 @@ class ControlPlane:
         if record is None:
             raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
         run = await self._test_sets.latest_run(tenant_id, agent_id, version)
+        if run is not None and run.status == RUNNING and self._run_outlived_limit(run):
+            # Shown as failed; the page only reads, the next run start closes the row.
+            run = replace(run, status=FAILED)
         stale = run is not None and (
             run.definition_sha256 != canonical_sha256(record.definition)
             or run.cases_sha256
             != case_set_sha256(await self._test_sets.cases(tenant_id, agent_id, version))
         )
         return TestRunReview(run, stale)
+
+    def _run_outlived_limit(self, run: TestRun) -> bool:
+        """Whether a running row is too old to ever finish on its own.
+
+        Temporal ends the workflow at ``RUN_LIMIT``; the extra grace covers clock skew
+        and the run's final write, so a row still running past it is dead, not slow.
+        """
+        return (
+            run.started_at is not None
+            and self._clock() - run.started_at > RUN_LIMIT + timedelta(minutes=10)
+        )
 
     async def make_test_case_from_feedback(
         self,

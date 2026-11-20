@@ -135,6 +135,8 @@ NOTICES = {
     "approval-policy-saved": "Approval policy saved. The next task reads it.",
     "notion-connected": "Notion connected.",
     "notion-disconnected": "Notion disconnected.",
+    "drive-connected": "Google Drive connected. Share folders and files with the address on this page.",
+    "drive-disconnected": "Google Drive disconnected. The organisation's account was deleted at Google.",
     "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
     "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
     "case-added": "Test case added to the draft. Choose its expected behaviour.",
@@ -343,6 +345,8 @@ class WebUI:
         self.route("POST", base + "/settings/approvals", self.set_approval_policy)
         self.route("POST", base + "/settings/notion/start", self.notion_connect_start)
         self.route("POST", base + "/settings/notion/disconnect", self.notion_disconnect)
+        self.route("POST", base + "/settings/drive/connect", self.drive_connect)
+        self.route("POST", base + "/settings/drive/disconnect", self.drive_disconnect)
         self.route("POST", base + "/settings/webhook/reveal", self.webhook_reveal)
         self.route("POST", base + "/settings/webhook/confirm", self.webhook_confirm)
         self.route("POST", base + "/settings/webhook/clear", self.webhook_clear)
@@ -1488,6 +1492,38 @@ class WebUI:
                 "The environment variable, if set, is unchanged.",
             )
         return _redirect(self.base(ctx) + "/settings?done=notion-disconnected")
+
+    async def drive_connect(self, request: Request, ctx: Ctx) -> Response:
+        """Connect Google Drive: the control plane creates the tenant's account and checks
+        the role; a Google failure shows on the settings page with nothing stored."""
+        try:
+            await ctx.plane.connect_drive(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=drive-connected")
+
+    async def drive_disconnect(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            changed = await ctx.plane.disconnect_drive(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.settings_page(
+                request, ctx, 409, "Nothing is stored to disconnect: Google Drive is not connected."
+            )
+        return _redirect(self.base(ctx) + "/settings?done=drive-disconnected")
 
     async def webhook_reveal(self, request: Request, ctx: Ctx) -> Response:
         try:

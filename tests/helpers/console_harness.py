@@ -129,6 +129,8 @@ class ConsoleHarness:
         slack_for=None,
         directory_ttl: float = 0,
         creator_access=None,
+        drive=None,
+        google=None,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
@@ -183,6 +185,8 @@ class ConsoleHarness:
             feedback_reads=self.feedback_reads,
             policies=self.policies,
             test_sets=self.test_sets,
+            drive=drive,
+            google=google,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

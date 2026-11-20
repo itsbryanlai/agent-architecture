@@ -247,10 +247,21 @@ sign-in in the same transaction as the member change and records the revoke with
 as target. A revoke with nothing stored writes nothing. The token is never in these rows
 either.
 
+The same kind records the tenant's Google Drive connection (D-45): `drive_connect` when the
+deployment's Google service account creates (or finds) the tenant's own service account,
+`drive_disconnect` when the account is deleted at Google. Written in the same transaction as
+the connection row, after the Google call succeeds. A second click on an already-connected
+tenant, a disconnect with nothing connected, or a refused connect (a non-admin, a deployment
+without the Google settings, a failed Google call) writes nothing. No key is created or
+stored per tenant; the account email in `target` is not a secret. An uninstall deletes the
+connection row with the disable and the account best effort; it records `uninstall`, not a
+connector event.
+
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `connector` | Notion is connected (or reconnected), or disconnected | the admin / `user:<admin>` | none | `connect` or `disconnect` | the Notion workspace ID on connect; empty on disconnect | `ok` | Control key |
 | `connector` | A creator consents to keep their Notion sign-in (a consented pick replaces it), or the consent is revoked: by the creator, by an unticked re-pick, or by an admin's member change | the creator / `user:<creator>`, or the admin / `user:<admin>` for a member change | none | `creator_consent` or `creator_consent_revoked` | the creator's Slack ID on consent; the member's Slack ID when a member change deletes it; empty on a self-revoke | `ok` | Control key |
+| `connector` | Google Drive is connected (or reconnected after an error), or disconnected (D-45) | the admin / `user:<admin>` | none | `drive_connect` or `drive_disconnect` | the tenant's service-account email | `ok` | Control key |
 
 ## Tenant settings
 

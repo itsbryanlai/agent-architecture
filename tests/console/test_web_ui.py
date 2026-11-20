@@ -730,6 +730,8 @@ FORM_ROUTES = [
     ("settings/approvals", {"action": "add_comment", "policy": "none"}),
     ("settings/notion/start", {}),
     ("settings/notion/disconnect", {}),
+    ("settings/drive/connect", {}),
+    ("settings/drive/disconnect", {}),
     ("settings/webhook/reveal", {}),
     ("settings/webhook/confirm", {}),
     ("settings/webhook/clear", {}),

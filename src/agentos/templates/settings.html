@@ -161,5 +161,33 @@
 {{ post_button(base ~ "/settings/webhook/clear", ctx.csrf, "Clear", {"request_id": new_token()}) }}
 <p class="muted">To re-subscribe (a new subscription sends a new token), clear the token first, then let the new handshake arrive.</p>
 {% endif %}
+
+<h2>Google Drive</h2>
+{% if not view.drive_configured %}
+<p class="muted">Google Drive is not set up on this deployment. The operator configures the deployment's Google service account (<code>GOOGLE_PROJECT_ID</code> and <code>GOOGLE_SERVICE_ACCOUNT_KEY</code>); see the operations guide.</p>
+{% elif view.drive is none %}
+<p class="muted">Not connected. Connecting creates this organisation's own Google account in the deployment's project. Share the folders and files your agents should use with its address — that is the whole setup.</p>
+{{ post_button(base ~ "/settings/drive/connect", ctx.csrf, "Connect Google Drive", {"request_id": new_token()}) }}
+{% else %}
+<p>Share the folders and files your agents should use with: <code id="drive-address">{{ view.drive.service_account_email }}</code></p>
+<div class="actions"><button type="button" data-copy="drive-address">Copy address</button></div>
+<p class="muted">Connected {{ view.drive.connected_at | stamp }}. Status: {{ view.drive.status }}{% if view.drive.checked_at %} (last checked {{ view.drive.checked_at | stamp }}){% endif %}.</p>
+{% if view.drive_problem %}<p class="error">{{ view.drive_problem }}</p>{% endif %}
+{% if view.drive_items is not none %}
+{% if view.drive_items %}
+<table>
+  <tr><th>Shared with this address now</th></tr>
+  {% for item in view.drive_items %}
+  <tr><td><a href="{{ item.link }}">{{ item.name }}</a></td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">Nothing is shared with this address yet.</p>
+{% endif %}
+{% if view.drive_more %}<p class="muted">Showing the first 100 items shared with this address.</p>{% endif %}
+{% endif %}
+{{ post_button(base ~ "/settings/drive/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
+<p class="muted">Disconnect deletes the account at Google and removes this connection. Files shared with the address keep their sharing until their owners remove it.</p>
+{% endif %}
 <script src="/static/console.js" defer></script>
 {% endblock %}

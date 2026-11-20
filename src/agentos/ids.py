@@ -66,6 +66,15 @@ def notion_creator_kind(user_id: str) -> str:
     return f"notion_creator:{user_id}"
 
 
+def drive_account_id(tenant_id: str) -> str:
+    """The tenant's Google service-account ID, deterministic from the tenant ID so a
+    retried connect finds the same account. Google's class is 6-30 characters, a letter
+    then lowercase letters, digits and hyphens; a tenant ID does not fit it, so this
+    carries the tenant's hash instead of the tenant ID itself.
+    """
+    return f"ag-{hashlib.sha256(tenant_id.encode()).hexdigest()[:24]}"
+
+
 def page_refresh_id(tenant: str, page_id: str) -> str:
     """One refresh workflow per page, so a burst of events lands in one run."""
     return f"{tenant}:page-refresh:{normalize_id(page_id)}"

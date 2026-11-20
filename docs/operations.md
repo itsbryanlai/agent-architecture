@@ -358,8 +358,12 @@ When a workspace removes the app, Slack sends `app_uninstalled` (and
 `tokens_revoked` for its bot tokens). The gateway handles both for the
 workspace's tenant, taken from the signed event's `team_id`: in one unit of
 work it **disables the tenant**, **deletes its `slack_bot` credential** and
-records one `uninstall` audit event (the event type in `tool`, the team ID in
-`target`, never a token). The **Notion credential is kept**, with the rest of
+its Drive connection row, and records one `uninstall` audit event (the event
+type in `tool`, the team ID in `target`, never a token). The tenant's Google
+service account is deleted at Google under the same tenant lock, best effort:
+a refusal is logged with the tenant ID and never blocks the uninstall, and the
+delete is tried even when no Drive row is stored (D-45). The
+**Notion credential is kept**, with the rest of
 the tenant's data, under normal retention. A retry of an event already
 handled changes nothing, even after a reinstall (its audit key is checked
 first), and an out-of-order event finds the tenant already disabled with no
@@ -388,6 +392,59 @@ tenant's data is a later admin action, not part of uninstall.
 effect without reinstalling the app into each workspace. The uninstall flow
 needs migration `037` (the `uninstall` audit kind); a new install gets it
 from `scripts/init_db.sql`.
+
+## Google Drive (one service account per tenant)
+
+Drive connects with one Google service account per tenant, created
+automatically in the deployment's Google Cloud project when an admin clicks
+**Connect Google Drive** on the settings page (D-45). Whatever that account
+can see is the tenant's: isolation is by identity, there is no sharer-matching
+rule. The customer's whole setup is that one click plus sharing folders and
+files with the account's address — no Google Cloud console steps, no keys to
+paste. A single **deployment** service account creates the tenant accounts
+and mints short-lived access tokens for them through the IAM Credentials API;
+no key is created or stored per tenant. The connection row
+(`drive_connections`, migration `042`) holds the account email and the
+connection's status and error code — not a credential. The settings page's
+list of what the account can see is a live read that writes nothing; the
+status changes on connect or disconnect.
+
+**Maintainer setup (once per deployment).**
+
+1. Create a Google Cloud project for the agents (or pick one). Note its
+   project ID.
+2. Enable the APIs: **IAM**, **IAM Credentials**, **Drive**, **Sheets** and
+   **Docs** (the last two are for the write tickets; enabling them now costs
+   nothing).
+3. Create a **deployment service account** in the project. Grant it, on the
+   project: **Service Account Admin** (`roles/iam.serviceAccountAdmin`, to
+   create and delete the tenant accounts) and **Service Account Token
+   Creator** (`roles/iam.serviceAccountTokenCreator`, to mint their tokens).
+4. Create a JSON key for the deployment account and put the whole JSON in the
+   shared variable `GOOGLE_SERVICE_ACCOUNT_KEY`; set `GOOGLE_PROJECT_ID` to
+   the project ID. On Railway both are shared variables, so the console and
+   the gateway read the same values. The key is a secret: it is never logged
+   and never appears in a repr.
+
+With either variable unset, Drive is simply not set up on that deployment:
+the settings page says so and offers no button. A malformed key stops the
+console or gateway at start-up with a plain message.
+
+**Limits.** A project holds about **100 service accounts by default** — one
+per connected tenant. Raise the quota on request to Google, or add projects,
+before the product outgrows it; the account ID is deterministic from the
+tenant, so a retried connect always finds the same account. The settings page
+lists at most the **first 100 items** shared with the address (files and
+shared drives together) and says so when more are shared. Service accounts
+created after 2025-04-15 cannot own Drive files: create-from-template (a
+later write ticket) works only in Workspace shared drives. Disconnect deletes
+the account at Google and the row; files shared with the address keep their
+sharing until their owners remove it. A reconnect right after a disconnect
+can be refused with "Google is still removing this workspace's previous
+Drive account; try Connect again in a few minutes" — Google's IAM API is
+eventually consistent, so a delete takes a short while to finish. A second
+click a few minutes later connects, and the re-created account is a new
+identity: the old account's sharing and roles do not carry over.
 
 ## Encrypted workflow data
 

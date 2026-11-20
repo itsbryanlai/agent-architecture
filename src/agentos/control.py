@@ -81,7 +81,11 @@ audited as ``connector``, never the token) and disconnects it; and reveals, conf
 clears the Notion webhook verification token exactly as the host command does, audited as
 ``webhook_token`` as the user instead of the operator. An admin also turns requester
 approval off or on per low-risk action (``policy_change``): a comment on an item the
-requester filed may then run without a card (D-43).
+requester filed may then run without a card (D-43). An admin connects the tenant's
+Google Drive (``connect_drive``): the deployment's Google service account creates one
+service account per tenant, and the connection row and its ``connector`` event commit
+together (``drive_connect``); ``disconnect_drive`` deletes the account at Google and the
+row (D-45). No key is stored per tenant.
 
 Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
 title and parent of each granted object, the creator's label and any mismatch, and the
@@ -173,11 +177,18 @@ from agentos.config import (
     channel_audience_problems,
     read_secret,
 )
+from agentos.connectors.google_iam import DriveItem, GoogleAccounts, GoogleError, problem_text
 from agentos.connectors.manifest import low_risk_actions
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
 from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
+from agentos.drive_connections import (
+    CONNECTED,
+    ERROR,
+    DriveConnection,
+    DriveConnectionStore,
+)
 from agentos.grant_checker import (
     GrantChecker,
     GrantCheckUnavailable,
@@ -304,6 +315,12 @@ class TenantSettingsView:
     is connected; None when Notion is connected or the tenant has no token at all.
     ``health`` holds the worker's last check of each published agent, by agent ID.
     ``approvals`` holds the tenant's approval policy for each low-risk action (D-43).
+    ``drive_configured`` is False on a deployment without the Google settings; ``drive``
+    is the tenant's connection row as stored (None when never connected), ``drive_items``
+    what its account can see now (None when the live list failed or was not run),
+    ``drive_more`` when more than the first 100 items are shared, and ``drive_problem``
+    the plain words for the failed live check or the row's last error. The GET writes
+    nothing (D-45).
     """
 
     default_agent: str | None
@@ -322,6 +339,11 @@ class TenantSettingsView:
     health: dict[str, AgentHealth] = field(default_factory=dict)
     # The approval policy of each low-risk action, by action name.
     approvals: dict[str, str] = field(default_factory=dict)
+    drive_configured: bool = False
+    drive: DriveConnection | None = None
+    drive_items: list[DriveItem] | None = None
+    drive_more: bool = False
+    drive_problem: str | None = None
 
 
 def _slack_problem(err: Exception) -> str:
@@ -411,6 +433,8 @@ class ControlPlane:
         policies: ApprovalPolicyStore | None = None,
         test_sets: TestSetStore | None = None,
         start_test_run: Callable[[str, str], Awaitable[None]] | None = None,
+        drive: DriveConnectionStore | None = None,
+        google: GoogleAccounts | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
         self._policies = InMemoryApprovalPolicyStore() if policies is None else policies
@@ -437,6 +461,9 @@ class ControlPlane:
         self._tenant_store = tenant_store
         self._webhook_tokens = webhook_tokens
         self._slack_for = slack_for
+        # Google Drive (D-45): either one None leaves Drive not set up on this console.
+        self._drive = drive
+        self._google = google
         # Agent health is read-only here: the worker's checks write it. None leaves the
         # console without health to show.
         self._health = health
@@ -444,7 +471,9 @@ class ControlPlane:
         # write the rows. None leaves the page with empty sections.
         self._feedback_reads = feedback_reads
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
-        settings_stores = [s for s in (credentials, tenant_store, webhook_tokens) if s is not None]
+        settings_stores = [
+            s for s in (credentials, tenant_store, webhook_tokens, drive) if s is not None
+        ]
         self._uow = (
             InMemoryUnitOfWork(
                 agents,
@@ -1678,6 +1707,24 @@ class ControlPlane:
         approvals = {
             action: await self._policies.get(tenant_id, action) for action in low_risk_actions()
         }
+        drive_configured = self._drive is not None and self._google is not None
+        drive_row = None if self._drive is None else await self._drive.get(tenant_id)
+        drive_items: list[DriveItem] | None = None
+        drive_more = False
+        drive_problem: str | None = None
+        if drive_row is not None and self._google is not None:
+            # A read of Google for this view only: its outcome is shown, never stored.
+            # The row's status is written by connect and disconnect; a later check
+            # polls it.
+            try:
+                listing = await self._google.list_shared(drive_row.service_account_email)
+            except GoogleError as err:
+                drive_problem = str(err)
+            else:
+                drive_items = listing.items
+                drive_more = listing.more
+        elif drive_row is not None and drive_row.status == ERROR:
+            drive_problem = problem_text(drive_row.last_error)
         return TenantSettingsView(
             default_agent=config.default_agent,
             channels=dict(config.channels),
@@ -1693,6 +1740,11 @@ class ControlPlane:
             webhook_state=webhook_state,
             health=health,
             approvals=approvals,
+            drive_configured=drive_configured,
+            drive=drive_row,
+            drive_items=drive_items,
+            drive_more=drive_more,
+            drive_problem=drive_problem,
         )
 
     async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:
@@ -1844,6 +1896,85 @@ class ControlPlane:
                 tenant_id,
                 actor,
                 tool="disconnect",
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    async def connect_drive(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Create (or find) the tenant's Google service account and store the connection.
+        Only an admin.
+
+        The account ID is deterministic from the tenant (``ids.drive_account_id``), so a
+        second click, a retry after a lost create response and an overlapping attempt all
+        find the same account. The tenant's unit-of-work lock is held across the Google
+        call and the row write, so a connect and a disconnect never interleave: the row
+        and its ``connector`` event (``drive_connect``, the account email as target)
+        commit in one unit of work after the call succeeds. A tenant already connected to
+        the same account changes nothing and records nothing; a reconnect after an error
+        records again. No key is created or stored for the tenant.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        async with self._uow.begin(tenant_id) as conn:
+            email = await self._google.ensure_account(ids.drive_account_id(tenant_id))
+            # Under the tenant lock: an overlapping attempt that committed first makes
+            # this one a no-op, so two clicks record one event.
+            existing = await self._drive.get(tenant_id, conn=conn)
+            if (
+                existing is not None
+                and existing.status == CONNECTED
+                and existing.service_account_email == email
+            ):
+                return
+            await self._drive.connect(tenant_id, email, self._clock(), conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="drive_connect",
+                target=email,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def disconnect_drive(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Delete the tenant's Google service account and its connection row. Only an admin.
+
+        False, and nothing is recorded, when Drive is not connected; the derived account
+        is still deleted at Google, so an account left by a connect whose row write failed
+        does not stay orphaned. The delete targets the row's stored email — a project move
+        must not orphan the old account — and a 404 (already gone, as after a lost delete
+        response) still clears the row. The tenant's unit-of-work lock is held across the
+        Google call and the row write, so a connect and a disconnect never interleave; the
+        row's deletion and the ``connector`` event (``drive_disconnect``, the account email
+        as target) commit in one unit of work.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        async with self._uow.begin(tenant_id) as conn:
+            row = await self._drive.get(tenant_id, conn=conn)
+            email = (
+                row.service_account_email
+                if row is not None
+                else self._google.account_email(ids.drive_account_id(tenant_id))
+            )
+            await self._google.delete_account(email)
+            if row is None:
+                return False
+            await self._drive.delete(tenant_id, conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="drive_disconnect",
+                target=row.service_account_email,
                 request_id=request_id,
                 conn=conn,
             )

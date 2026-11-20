@@ -42,6 +42,12 @@ from agentos.creator_access import (
     InMemoryCreatorAccessStore,
     PostgresCreatorAccessStore,
 )
+from agentos.drive_connections import (
+    CONNECTED,
+    ERROR,
+    InMemoryDriveConnectionStore,
+    PostgresDriveConnectionStore,
+)
 from agentos.feedback import (
     AnswerFeedback,
     InMemoryFeedbackStore,
@@ -733,6 +739,49 @@ async def test_the_policy_reads_back_what_was_set_per_tenant_and_defaults_to_app
     await policies.set(tenant, "add_comment", REQUESTER_APPROVAL)
 
     assert await policies.get(tenant, "add_comment") == REQUESTER_APPROVAL
+
+
+# --- drive connections -------------------------------------------------------------------
+
+
+@pytest.fixture
+def drive_connections(store_pool):
+    return twin(store_pool, InMemoryDriveConnectionStore, PostgresDriveConnectionStore)
+
+
+async def test_a_drive_connection_reads_back_its_account_and_last_check_per_tenant(
+    drive_connections, tenant: str, other_tenant: str
+):
+    """Fails if a connect does not store the account, a reconnect moves connected_at or
+    keeps an error, a check's outcome is lost, a delete leaves the row, or one tenant
+    reads another's connection."""
+    email = "ag-abcdefghijklmnopqrstuvwx@test-project.iam.gserviceaccount.com"
+    at = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    assert await drive_connections.get(tenant) is None
+
+    await drive_connections.connect(tenant, email, at)
+    row = await drive_connections.get(tenant)
+    assert (row.service_account_email, row.status, row.last_error, row.connected_at) == (
+        email,
+        CONNECTED,
+        None,
+        at,
+    )
+    assert row.checked_at is None
+
+    checked = at + timedelta(minutes=1)
+    await drive_connections.record_check(tenant, ERROR, "permission_denied", checked)
+    row = await drive_connections.get(tenant)
+    assert (row.status, row.last_error, row.checked_at) == (ERROR, "permission_denied", checked)
+
+    await drive_connections.connect(tenant, email, at + timedelta(minutes=2))
+    row = await drive_connections.get(tenant)
+    assert (row.status, row.last_error, row.connected_at) == (CONNECTED, None, at)
+    assert await drive_connections.get(other_tenant) is None
+
+    assert await drive_connections.delete(tenant) is True
+    assert await drive_connections.delete(tenant) is False
+    assert await drive_connections.get(tenant) is None
 
 
 # --- test sets ---------------------------------------------------------------------

@@ -476,6 +476,25 @@ the granted folder is dropped, and the citation links to the file. The Drive
 connector switch (Console → Switches) stops Drive indexing and the Drive part
 of knowledge search while it is off.
 
+**Drive writes (comment, D-47).** An agent granted Drive folders or files is
+offered `comment_on_file`: it drafts a comment on a granted file (or a file
+under a granted folder or shared drive), and nothing is posted until the
+requester approves the card in Slack — a Drive comment always asks, whatever
+the tenant's approval policy for Notion comments says. The card shows the
+file's name with its link and the exact text; Edit changes the text and needs
+a fresh approval. The comment posts as the workspace's Drive account, ending
+with the agent's name and a reference; a retry looks the file's comments up
+for that reference before posting again, so an approved comment posts once.
+The file's grant is checked when the draft is made and again just before the
+write: a grant removed since approval stops it, and the thread says why.
+There is no follow-up watch on a Drive comment. **Commenting needs the share
+to allow comments**: Viewer access is enough for reading, but the write needs
+Commenter or above on the file (or its folder / shared drive); a view-only
+share is refused and the task reports it could not comment. The Drive
+connector switch and the writes switch (Console → Switches) stop the write
+while off. The minted token now carries the full `drive` scope (reads
+included); no re-consent is needed — the accounts are service accounts.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,

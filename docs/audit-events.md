@@ -64,8 +64,10 @@ form records nothing new.
 
 Written when an approved write is carried out, as the agent. Requester is the person who asked;
 the approver is the same person (only the requester can approve). Tool is the write tool's name
-(`add_comment` for a comment, otherwise the create tool the agent's connector declares). Target is the Notion database ID
-for a create or the page ID for a comment (after a create, the new page ID on success).
+(`add_comment` for a Notion comment, `comment_on_file` for a Drive comment (D-47), otherwise the
+create tool the agent's connector declares). Target is the Notion database ID for a create, the
+page ID for a Notion comment or the Drive file ID for a Drive comment (after a create, the new
+page ID on success).
 A comment that ran under the tenant's approval policy (D-43) is written here too: its `write`
 row has outcome `policy` and an empty approver, and no `approval` row precedes it — the log
 alone shows it ran without approval.

@@ -79,6 +79,11 @@ from agentos.agent_health import (
     agent_unavailable_text,
 )
 from agentos.agent_store import AgentStore
+from agentos.approval_policy import (
+    NO_APPROVAL,
+    ApprovalPolicyStore,
+    InMemoryApprovalPolicyStore,
+)
 from agentos.audience import (
     HEALTH,
     OFF,
@@ -353,6 +358,7 @@ class AgentActivities:
         content: ContentStore | None = None,
         health: HealthStore | None = None,
         tasks: TaskStore | None = None,
+        policies: ApprovalPolicyStore | None = None,
     ):
         self.settings = settings
         self.content = content or InMemoryContentStore()
@@ -368,6 +374,7 @@ class AgentActivities:
         self.switches = switches or InMemorySwitchStore()
         self.health = health or InMemoryAgentHealthStore()
         self.tasks = tasks or InMemoryTaskStore()
+        self.policies = policies or InMemoryApprovalPolicyStore()
         # How long the in-thread wait for a poke-answered poll may take. Tests move it.
         self.refresh_wait_seconds = REFRESH_WAIT.total_seconds()
         self.usage = usage
@@ -434,6 +441,7 @@ class AgentActivities:
             self.run_stored_read_tool,
             self.draft_task,
             self.prepare_stored_comment,
+            self.comment_approval_policy,
             self.apply_edit,
             self.post_task_notice,
             self.watch_notion_item,
@@ -603,6 +611,7 @@ class AgentActivities:
         changed. The requester can ask again later. ``target_field`` names the payload
         field that holds what the write is aimed at (a page or a database). ``tool``
         overrides the audited write tool (a nudge's two effects have their own names).
+        A write under the policy (D-43) had no approval, so only the refusal is audited.
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
@@ -610,7 +619,8 @@ class AgentActivities:
             return
         payload = await self._spec_payload(spec)
         target = payload[target_field]
-        await self._record_approval(spec, payload, task_id, target)
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, target)
         await self._record_write(spec, payload, task_id, idem_key, target, "error", tool=tool)
         raise _non_retryable(refusal)
 
@@ -632,7 +642,8 @@ class AgentActivities:
         try:
             require_idempotency(method)
         except ValueError as err:
-            await self._record_approval(spec, payload, task_id, target)
+            if not spec.under_policy:
+                await self._record_approval(spec, payload, task_id, target)
             await self._record_write(spec, payload, task_id, idem_key, target, "error")
             raise _non_retryable(err) from err
 
@@ -819,8 +830,13 @@ class AgentActivities:
             target=target,
             input_sha256=canonical_sha256(payload),
             output_sha256=None if output is None else canonical_sha256(output),
-            approver_user_id=ctx.requester_user_id,
+            # A write under the policy (D-43) had no approver; its outcome says so.
+            approver_user_id=None if spec.under_policy else ctx.requester_user_id,
         )
+
+    def _write_outcome(self, spec: TaskSpec) -> str:
+        """The outcome of a write that ran: 'policy' when no approval was needed (D-43)."""
+        return "policy" if spec.under_policy else "ok"
 
     async def _post_once(
         self,
@@ -1859,6 +1875,31 @@ class AgentActivities:
             "comment": payload["comment"],
         }
 
+    @activity.defn(name="comment_approval_policy")
+    async def comment_approval_policy(self, spec: TaskSpec) -> bool:
+        """Whether this comment may run without the requester's approval card (D-43).
+
+        True only when the manifest marks the action low-risk, the tenant's policy for
+        it is 'none', and the item was filed by the requester — read from the platform's
+        own records (the created page's link to its creating task, and that task's
+        requester), never from the model. Every other case shows the card as usual.
+        """
+        ctx = spec.ctx
+        self._log("comment_approval_policy", ctx.tenant_id, ctx.agent_id)
+        tool = TOOLS.get(spec.tool_name)
+        if tool is None or not tool.low_risk:
+            return False
+        if await self.policies.get(ctx.tenant_id, spec.tool_name) != NO_APPROVAL:
+            return False
+        payload = await self._spec_payload(spec)
+        creator_task = await self.links.task_for_page(
+            ctx.tenant_id, normalize_id(payload["page_id"])
+        )
+        if creator_task is None:
+            return False
+        record = await self.tasks.get(ctx.tenant_id, creator_task)
+        return record is not None and record.requester_user_id == ctx.requester_user_id
+
     @activity.defn(name="draft_task")
     async def draft_task(
         self, ctx: TurnContext, conversation_id: str, call: ToolCallRef, task_id: str
@@ -1997,6 +2038,11 @@ class AgentActivities:
 
     @activity.defn(name="add_notion_comment")
     async def add_notion_comment(self, spec: TaskSpec, task_id: str) -> str:
+        """Post the comment once, after approval or under the tenant's policy (D-43).
+
+        A write under the policy records no approval row and no approver; its outcome
+        is 'policy'. The gate, the lease and the look-before-write are the same either way.
+        """
         ctx = spec.ctx
         idem_key = f"{task_id}:comment"
         await self._gate_write(spec, task_id, idem_key, "page_id")
@@ -2009,7 +2055,8 @@ class AgentActivities:
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
         connector = self._connector_for(ctx.tenant_id, agent)
         text = payload["comment"]
-        await self._record_approval(spec, payload, task_id, page_id)
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, page_id)
         try:
             await connector.resolve_item(page_id)
             comment_id = await self._write_once(
@@ -2026,7 +2073,13 @@ class AgentActivities:
                 raise _non_retryable(err) from err
             _reraise(err)
         await self._record_write(
-            spec, payload, task_id, idem_key, page_id, "ok", {"comment_id": comment_id}
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"comment_id": comment_id},
         )
         return comment_id
 
@@ -2119,7 +2172,13 @@ class AgentActivities:
         if comment_id is None:
             return None
         await self._record_write(
-            spec, payload, task_id, idem_key, page_id, "ok", {"comment_id": comment_id}
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"comment_id": comment_id},
         )
         return comment_id
 
@@ -2634,14 +2693,15 @@ class AgentActivities:
 
     @activity.defn(name="check_before_write")
     async def check_before_write(self, spec: TaskSpec, task_id: str) -> str | None:
-        """Just before an approved write: may the agent still act for the requester here?
+        """Just before a write: may the agent still act for the requester here?
 
         None means go on. Otherwise the line the card shows, and nothing is to be written:
         the agent was turned off, the agent is unavailable (its grant check failed), the
         agent's channel was paused, or the requester is no longer in the audience of the
         agent's current published version. A switch that covers the write itself (writes,
         the connector) is left to the write activity, which says so in its own words. A
-        lookup that fails for good fails the activity.
+        lookup that fails for good fails the activity. A write under the policy (D-43)
+        had no approval, so only the refusal is audited.
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
@@ -2660,7 +2720,8 @@ class AgentActivities:
             target, idem_key = payload["page_id"], f"{task_id}:comment"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
-        await self._record_approval(spec, payload, task_id, target)
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, target)
         await self._record_write(
             spec,
             payload,

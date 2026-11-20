@@ -1,12 +1,15 @@
 """Connector manifests: the safety metadata that sits on top of each tool.
 
 Calling a tool is generic; what makes a tool safe for an agent that does work
-is its risk class, whether it is scoped to the requester, and how a write
-avoids duplicates. That metadata lives in a YAML manifest per connector.
+is its risk class, whether it is scoped to the requester, how a write avoids
+duplicates, and whether an admin may let it run without the requester's
+approval (``low_risk``, a comment action only). That metadata lives in a YAML
+manifest per connector.
 
 The runtime reads it. ``screen`` classifies a call the model made: a read tool runs at
-once, a tool whose ``risk`` is a write becomes a task that needs the requester's approval
-(its ``idempotency`` method says which kind of task carries it out), and input that does
+once, a tool whose ``risk`` is a write becomes a task that asks for the requester's
+approval, unless an admin's policy lets a low-risk action run without it (D-43; its
+``idempotency`` method says which kind of task carries it out), and input that does
 not fit the tool's schema is refused with a message for the model. ``TOOLS`` holds every
 manifest's tools by name.
 """
@@ -44,6 +47,9 @@ class ToolSpec:
     requester_scoped: str | None = None  # name of the hidden person field
     idempotency: str | None = None  # idempotency method, e.g. "marker_property"
     offer_to_llm: bool = True
+    # An admin may turn requester approval off for this action (D-43). Only a comment
+    # action may carry it; loading refuses the flag on anything else.
+    low_risk: bool = False
     connector: str = ""  # the manifest's connector; empty for a spec built outside one
 
     @property
@@ -79,14 +85,25 @@ def load_manifest(path: str | Path) -> Manifest:
     connector = str(raw["connector"])
     tools = {}
     for name, spec in (raw.get("tools") or {}).items():
+        risk = RiskClass(spec["risk"])
+        low_risk = bool(spec.get("low_risk", False))
+        if low_risk and (
+            risk is RiskClass.READ
+            or WRITE_KINDS.get(spec.get("idempotency") or "") != "add_comment"
+        ):
+            raise ValueError(
+                f"tool '{name}': low_risk may only mark a comment action, "
+                "never a create, append or replace"
+            )
         tools[name] = ToolSpec(
             name=name,
-            risk=RiskClass(spec["risk"]),
+            risk=risk,
             description=str(spec.get("description", "")).strip(),
             input_schema=spec.get("input_schema") or {"type": "object", "properties": {}},
             requester_scoped=spec.get("requester_scoped"),
             idempotency=spec.get("idempotency"),
             offer_to_llm=bool(spec.get("offer_to_llm", True)),
+            low_risk=low_risk,
             connector=connector,
         )
     return Manifest(connector=connector, tools=tools)
@@ -161,6 +178,11 @@ def screen(name: str, tool_input: object) -> tuple[str, str]:
             return "", ""
     problem = check_input(spec.llm_definition()["input_schema"], tool_input)
     return kind, "" if problem is None else f"Invalid input for {name}: {problem}."
+
+
+def low_risk_actions() -> list[str]:
+    """The actions an admin may turn requester approval off for (D-43), by name."""
+    return sorted(name for name, spec in TOOLS.items() if spec.low_risk)
 
 
 def require_idempotency(method: str) -> None:

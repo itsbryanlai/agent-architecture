@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from psycopg import errors
 
+from agentos.models import AUDIT_OUTCOMES
 from agentos.stores import tenant_transaction
 from tests.helpers.pg_seed import seed_version
 from tests.pg.conftest import TestDatabase
@@ -91,6 +92,8 @@ SEEDS = {
     "answer_feedback": "INSERT INTO answer_feedback "
     "(tenant_id, conversation_id, answer_ts, voter, agent_id, agent_version, vote) "
     "VALUES (%(t)s, 'c', 'a1', 'u', 'aa', 1, 'up')",
+    "approval_policies": "INSERT INTO approval_policies (tenant_id, action, policy) "
+    "VALUES (%(t)s, 'add_comment', 'none')",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
@@ -137,6 +140,7 @@ PRIVILEGES = {
     "agent_health": "SELECT INSERT UPDATE",
     "creator_access": "SELECT INSERT UPDATE DELETE",
     "answer_feedback": "SELECT INSERT UPDATE DELETE",
+    "approval_policies": "SELECT INSERT UPDATE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }
@@ -409,6 +413,7 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "uninstall",
                 "connector",
                 "tenant_settings",
+                "policy_change",
             )
         ],
     ],
@@ -430,3 +435,23 @@ async def test_only_membership_budget_and_switch_events_may_name_no_agent(
         with pytest.raises(errors.CheckViolation):
             async with insert as conn:
                 await conn.execute(statement, args)
+
+
+@pytest.mark.parametrize("outcome", [*AUDIT_OUTCOMES, "maybe"])
+async def test_the_audit_log_accepts_exactly_the_outcomes_the_code_lists(
+    pool, tenant: str, outcome
+):
+    """Fails if the audit log refuses an outcome the code lists, or accepts one it does not."""
+    statement = (
+        "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, agent_version, "
+        "requester_user_id, identity, outcome) "
+        "VALUES (%s, 'e', 'write', 'aa', 1, 'u', 'agent:aa', %s)"
+    )
+    if outcome in AUDIT_OUTCOMES:
+        async with tenant_transaction(pool, tenant) as conn:
+            await conn.execute(statement, (tenant, outcome))
+        assert await count(pool, tenant, "audit_events", "outcome = %s", (outcome,)) == 1
+    else:
+        with pytest.raises(errors.CheckViolation):
+            async with tenant_transaction(pool, tenant) as conn:
+                await conn.execute(statement, (tenant, outcome))

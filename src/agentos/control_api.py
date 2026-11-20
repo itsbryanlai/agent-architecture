@@ -683,6 +683,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.agent_feedback import PostgresAgentFeedbackStore
     from agentos.agent_health import PostgresAgentHealthStore
     from agentos.agent_store import PostgresAgentStore
+    from agentos.approval_policy import PostgresApprovalPolicyStore
     from agentos.audience import SlackAudienceInspector
     from agentos.audience_pauses import PostgresPauseStore
     from agentos.audit import PostgresAuditStore
@@ -787,6 +788,7 @@ async def _real_lifespan(app: FastAPI):
             health=PostgresAgentHealthStore(pool),
             creator_access=PostgresCreatorAccessStore(pool),
             feedback_reads=PostgresAgentFeedbackStore(pool),
+            policies=PostgresApprovalPolicyStore(pool),
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:

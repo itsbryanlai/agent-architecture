@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from agentos.agent_feedback import InMemoryAgentFeedbackStore
 from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.agent_store import InMemoryAgentStore
+from agentos.approval_policy import InMemoryApprovalPolicyStore
 from agentos.audience_pauses import InMemoryPauseStore
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import InMemoryBudgetStore
@@ -139,6 +140,7 @@ class ConsoleHarness:
         self.pauses = InMemoryPauseStore()
         self.switches = InMemorySwitchStore()
         self.health = InMemoryAgentHealthStore()
+        self.policies = InMemoryApprovalPolicyStore()
         self.sessions = InMemorySessionStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
@@ -177,6 +179,7 @@ class ConsoleHarness:
             health=self.health,
             creator_access=creator_access,
             feedback_reads=self.feedback_reads,
+            policies=self.policies,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)

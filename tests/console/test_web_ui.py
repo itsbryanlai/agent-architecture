@@ -234,7 +234,11 @@ async def test_pages_need_a_session(h):
         ):
             response = await c.get(path)
             assert response.status_code == 303 and response.headers["location"] == "/login", path
-        for path in (f"{VERSION}/publish", f"{UI}/settings/routing"):
+        for path in (
+            f"{VERSION}/publish",
+            f"{UI}/settings/routing",
+            f"{UI}/settings/approvals",
+        ):
             posted = await post(c, path, "anything")
             assert posted.status_code == 303 and posted.headers["location"] == "/login", path
     assert await status_of_version(h) == "pending"
@@ -653,6 +657,7 @@ async def test_a_creator_cannot_drive_the_admin_forms(h):
             (f"{UI}/members/{OTHER}/role", {"role": "admin"}),
             (f"{UI}/members/{OTHER}/remove", {}),
             (f"{UI}/settings/routing", {"default_agent": "it-helper"}),
+            (f"{UI}/settings/approvals", {"action": "add_comment", "policy": "none"}),
             (f"{UI}/settings/notion/disconnect", {}),
             (f"{UI}/settings/webhook/reveal", {}),
             (f"{UI}/settings/webhook/confirm", {}),
@@ -716,6 +721,7 @@ FORM_ROUTES = [
     ("switches/off", {"scope": "writes", "target": ""}),
     ("budgets", {"agent_id": "mine", "amount": "5"}),
     ("settings/routing", {"default_agent": "it-helper"}),
+    ("settings/approvals", {"action": "add_comment", "policy": "none"}),
     ("settings/notion/start", {}),
     ("settings/notion/disconnect", {}),
     ("settings/webhook/reveal", {}),

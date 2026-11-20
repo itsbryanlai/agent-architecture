@@ -15,7 +15,8 @@ Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tool
 ## Columns
 
 Every row has `tenant_id`, `seq` (insertion order, may have gaps), `at`, `kind`, `event_key`
-(unique per tenant) and `outcome` (`ok` or `error`). The tables below say what the other
+(unique per tenant) and `outcome` (`ok`, `error`, or `policy` — a write that ran under an
+admin's no-approval policy, D-43). The tables below say what the other
 columns hold for each kind:
 
 - **requester**: `requester_user_id`. **identity**: whose access was used.
@@ -65,6 +66,9 @@ Written when an approved write is carried out, as the agent. Requester is the pe
 the approver is the same person (only the requester can approve). Tool is the write tool's name
 (`add_comment` for a comment, otherwise the create tool the agent's connector declares). Target is the Notion database ID
 for a create or the page ID for a comment (after a create, the new page ID on success).
+A comment that ran under the tenant's approval policy (D-43) is written here too: its `write`
+row has outcome `policy` and an empty approver, and no `approval` row precedes it — the log
+alone shows it ran without approval.
 A nudge (D-41) records one `approval` with tool `nudge` and one `write` per effect: tool
 `nudge_comment` (target the page ID) and, when the assignee matched a Slack user, `nudge_dm`
 (target the assignee's Slack user ID, out the hash of `{ts}`). A nudge with no DM records no
@@ -77,7 +81,7 @@ or an expiry), with its own tool, target and approver as its row states.
 | Kind | Written when | in / out | Refused or failed | Event key |
 |---|---|---|---|---|
 | `approval` | The approved write starts, before anything is sent. Records the exact payload that was approved. | in: hash of the approved payload; out: - | Also written for a write refused later (switch, audience, idempotency method), because the approval did happen | `<task>:audit:approval:<approval nonce>` |
-| `write` | The write finished (or a reconciliation found it done): `ok`. Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}`, `{comment_id}` or `{ts}` (a nudge DM) on `ok`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, Slack refused the nudge DM for good, or no connector manifest declares the idempotency method. Nothing was changed. | `<task>:<create, comment or dm>:audit:write:<outcome>` |
+| `write` | The write finished (or a reconciliation found it done): `ok`, or `policy` when it ran under the admin's no-approval policy (D-43). Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}`, `{comment_id}` or `{ts}` (a nudge DM) on `ok` or `policy`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, Slack refused the nudge DM for good, or no connector manifest declares the idempotency method. Nothing was changed. A refused policy write has no `approval` row either. | `<task>:<create, comment or dm>:audit:write:<outcome>` |
 | `approval_closed` | The approval closed without a write: the requester declined it, or it expired. Recorded before the card is updated. Tool is `declined` or `expired` (not the write tool's name); target is empty; the approver is the requester on a decline, empty on an expiry. | in: hash of the proposed payload (the revision the card named); out: - | Not written if the audit store stayed down through the activity's retries, or if the named draft revision is missing (non-retryable); either way the card still closes | `<task>:audit:approval-closed:<approval nonce>` |
 
 A write that is never approved (declined, expired) records one `approval_closed` event and no `approval` or `write`: nothing ran.
@@ -238,13 +242,14 @@ either.
 ## Tenant settings
 
 Written by the console's settings page (the control plane), in the same transaction as the
-tenants row change. Admin only. Setting what is already in force changes nothing and records
-nothing; a refused change (an unpublished agent, a channel outside its agent's audience)
-records nothing.
+change. Admin only. Setting what is already in force changes nothing and records
+nothing; a refused change (an unpublished agent, a channel outside its agent's audience,
+an action that is not low-risk, an unknown policy) records nothing.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `tenant_settings` | The default agent or the channel routing changes | the admin / `user:<admin>` | none | `routing` | `default=<agent or ->; <channel>-><agent>,...`, cut at 300 characters | `ok` | Control key |
+| `policy_change` | The tenant's approval policy for a low-risk action changes (D-43) | the admin / `user:<admin>` | none | the action's name (`add_comment`) | the new policy: `none` or `requester_approval` | `ok` | Control key |
 
 ## Access review
 
@@ -264,7 +269,8 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 - Rows are exempt from retention and kept until someone removes them outside the app.
 - A refused control-plane action (wrong role, last admin, stale review) is not audited. The refusals that
   are audited are the ones above: `audience_refused`, a refused write as `approval` + `write` with
-  `error`, and a requester's decline as `approval_closed` with tool `declined`.
+  `error` (a refused policy write as `write` with `error` alone), and a requester's decline as
+  `approval_closed` with tool `declined`.
 
 ## How to read it
 
@@ -280,6 +286,8 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
   requester); the reason stays in `answer_feedback`, not in the log.
 - A request that files a Notion item: `approval`, then `write` (`ok`, target the new page ID). If the
   agent was switched off between approval and write: `approval`, then `write` with `error`.
+- A comment on the requester's own item with the admin's approval policy off: `write` with `policy`
+  and no `approval` row; an admin's switch change earlier: `policy_change` (target `none`).
 - A front door that hands off: `hand_off` (front door as the agent, specialist as target), a `notice` (`hand_off`) for the announcement, then the specialist's own `tool_call` and `answer` rows.
 - Someone outside an agent's audience asks it: `audience_refused` (the reason in `tool`).
 - Publishing a version: `agent_publish`, then `widening_confirm` when it widens, then `audience_confirm`

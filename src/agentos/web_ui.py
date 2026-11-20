@@ -130,6 +130,7 @@ NOTICES = {
     "switch-off": "Turned off. It takes effect on the next step.",
     "switch-on": "Turned back on.",
     "routing-saved": "Routing saved. Every process picks it up on its next refresh.",
+    "approval-policy-saved": "Approval policy saved. The next task reads it.",
     "notion-connected": "Notion connected.",
     "notion-disconnected": "Notion disconnected.",
     "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
@@ -328,6 +329,7 @@ class WebUI:
         self.route("POST", base + "/switches/on", self.turn_on)
         self.route("GET", base + "/settings", self.settings)
         self.route("POST", base + "/settings/routing", self.set_routing)
+        self.route("POST", base + "/settings/approvals", self.set_approval_policy)
         self.route("POST", base + "/settings/notion/start", self.notion_connect_start)
         self.route("POST", base + "/settings/notion/disconnect", self.notion_disconnect)
         self.route("POST", base + "/settings/webhook/reveal", self.webhook_reveal)
@@ -1273,6 +1275,24 @@ class WebUI:
 
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.base(ctx) + "/settings?done=routing-saved")
+
+    async def set_approval_policy(self, request: Request, ctx: Ctx) -> Response:
+        """One low-risk action's approval switch; the control plane checks the role."""
+        try:
+            await ctx.plane.set_approval_policy(
+                ctx.tenant_id,
+                ctx.user_id,
+                ctx.get("action").strip(),
+                ctx.get("policy").strip(),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=approval-policy-saved")
 
     async def notion_connect_start(self, request: Request, ctx: Ctx) -> Response:
         """Begin Connect Notion: the picker's state mechanism, purpose ``connect``."""

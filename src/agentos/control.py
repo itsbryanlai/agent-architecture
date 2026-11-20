@@ -79,7 +79,9 @@ inside the agent's audience), audited as ``tenant_settings``; connects the tenan
 workspace (the OAuth workspace bot token stored encrypted as the ``notion`` credential,
 audited as ``connector``, never the token) and disconnects it; and reveals, confirms or
 clears the Notion webhook verification token exactly as the host command does, audited as
-``webhook_token`` as the user instead of the operator.
+``webhook_token`` as the user instead of the operator. An admin also turns requester
+approval off or on per low-risk action (``policy_change``): a comment on an item the
+requester filed may then run without a card (D-43).
 
 Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
 title and parent of each granted object, the creator's label and any mismatch, and the
@@ -134,6 +136,11 @@ from agentos.agent_store import (
     AgentVersionRecord,
     version_changed,
 )
+from agentos.approval_policy import (
+    POLICIES,
+    ApprovalPolicyStore,
+    InMemoryApprovalPolicyStore,
+)
 from agentos.audience import (
     AudienceCheckUnavailable,
     AudienceInspector,
@@ -164,6 +171,7 @@ from agentos.config import (
     channel_audience_problems,
     read_secret,
 )
+from agentos.connectors.manifest import low_risk_actions
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
 from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
@@ -277,6 +285,7 @@ class TenantSettingsView:
     event. ``notion_env_var`` names the environment variable in use when no credential
     is connected; None when Notion is connected or the tenant has no token at all.
     ``health`` holds the worker's last check of each published agent, by agent ID.
+    ``approvals`` holds the tenant's approval policy for each low-risk action (D-43).
     """
 
     default_agent: str | None
@@ -293,6 +302,8 @@ class TenantSettingsView:
     webhook_state: str | None = None
     # The tenant's health rows by agent ID; an agent with no row was never checked.
     health: dict[str, AgentHealth] = field(default_factory=dict)
+    # The approval policy of each low-risk action, by action name.
+    approvals: dict[str, str] = field(default_factory=dict)
 
 
 def _slack_problem(err: Exception) -> str:
@@ -366,8 +377,10 @@ class ControlPlane:
         health: HealthStore | None = None,
         creator_access: CreatorAccessStore | None = None,
         feedback_reads: AgentFeedbackStore | None = None,
+        policies: ApprovalPolicyStore | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
+        self._policies = InMemoryApprovalPolicyStore() if policies is None else policies
         self._creator_access = (
             InMemoryCreatorAccessStore() if creator_access is None else creator_access
         )
@@ -405,6 +418,7 @@ class ControlPlane:
                 self._switches,
                 self._pauses,
                 self._picks,
+                self._policies,
                 *settings_stores,
             )
             if unit_of_work is None
@@ -1317,6 +1331,9 @@ class ControlPlane:
             if self._health is None
             else {h.agent_id: h for h in await self._health.list(tenant_id)}
         )
+        approvals = {
+            action: await self._policies.get(tenant_id, action) for action in low_risk_actions()
+        }
         return TenantSettingsView(
             default_agent=config.default_agent,
             channels=dict(config.channels),
@@ -1331,6 +1348,7 @@ class ControlPlane:
             notion_env_var=notion_env_var,
             webhook_state=webhook_state,
             health=health,
+            approvals=approvals,
         )
 
     async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:
@@ -1391,6 +1409,40 @@ class ControlPlane:
                 actor,
                 tool="routing",
                 target=f"default={default_agent or '-'}; {mapping}"[:300],
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def set_approval_policy(
+        self,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        policy: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Set the tenant's approval policy for one low-risk action. Only an admin.
+
+        The action must be one the manifests mark low-risk (a comment action), and
+        the policy one of the two the store holds. Setting what is already in force
+        changes nothing and records nothing; a real change and its ``policy_change``
+        event commit in one unit of work, with the admin's identity.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if action not in low_risk_actions():
+            raise ConfigError(f"'{action}' is not a low-risk action")
+        if policy not in POLICIES:
+            raise ConfigError(f"'{policy}' is not an approval policy")
+        if await self._policies.get(tenant_id, action) == policy:
+            return
+        async with self._uow.begin(tenant_id) as conn:
+            await self._policies.set(tenant_id, action, policy, conn=conn)
+            await self._record(
+                "policy_change",
+                tenant_id,
+                actor,
+                tool=action,
+                target=policy,
                 request_id=request_id,
                 conn=conn,
             )

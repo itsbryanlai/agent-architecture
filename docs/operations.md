@@ -1478,6 +1478,30 @@ wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level securi
 grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
 app role).
 
+## Approval policy (low-risk comments)
+
+Every write asks the requester to approve before it runs, unless an admin turned
+approval off for that low-risk action (D-43). The manifest's `low_risk` flag marks
+which actions may be relaxed — today only Notion's `add_comment`; loading refuses
+the flag on any create, append or replace. The policy is one row per tenant and
+action in `approval_policies` (migration 040): `requester_approval` (the default,
+also for an action with no row) or `none`. An admin changes it in the **Approvals**
+section of the settings page, audited as `policy_change`; the worker reads it on
+the next comment task, with no restart.
+
+With the policy `none`, a comment runs without a card only when the item was filed
+by the requester: the task reads the platform's own records — the created page's
+link to the task that created it (`task_links`) and that task's requester — never
+the model's word for it. The comment then runs as soon as its draft is resolved,
+through the same agent-effect gate and the same exactly-once lease as an approved
+comment, audited as `write` with outcome `policy`, no approver and no `approval`
+row. The thread line reads "Commented on '<item>' (<link>) (no approval needed:
+your admin's setting)." A switch that covers the write still stops it (the thread
+says why, audited `write` with `error`). In every other case — the default policy, an
+item the requester did not file, an item with no creating task, any create, the
+nudge's comment — the card shows as before. The new workflow commands sit behind
+the `approval-policy` patch marker; tasks recorded before it keep showing the card.
+
 ## Nudge the assignee
 
 A watched item that has not moved for `stale_after_days` posts its "No movement" line with a
@@ -1658,6 +1682,11 @@ process on its next directory refresh, with no restart.
   version, and a mapped channel must be in its agent's audience. Audited as
   `tenant_settings`. A tenant with no default agent sees a "not set up" banner with the
   steps left (create an agent, publish it, choose it here).
+- **Approvals.** Each low-risk action the manifests declare (today `add_comment`, a
+  comment on an item the requester filed) with a switch: requester approval (the
+  default) or no approval. With no approval, the comment runs without a card on the
+  requester's own item; every other write still shows its card. Audited as
+  `policy_change`; see [Approval policy](#approval-policy-low-risk-comments).
 - **Agent health.** Each published agent's status (available / unavailable), the reason
   and when the worker last checked it, read from `agent_health`; an agent no check has
   recorded shows "never checked". Read-only: fix the grant in Notion or the agent's

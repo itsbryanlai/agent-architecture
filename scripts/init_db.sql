@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 039 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 040 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -153,7 +153,8 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
   ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install'),
-  ('uninstall'), ('agent_health'), ('connector'), ('tenant_settings'), ('feedback')
+  ('uninstall'), ('agent_health'), ('connector'), ('tenant_settings'), ('feedback'),
+  ('policy_change')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -176,13 +177,15 @@ CREATE TABLE IF NOT EXISTS audit_events (
   input_sha256       text        CHECK (input_sha256 ~ '^[0-9a-f]{64}$'),
   output_sha256      text        CHECK (output_sha256 ~ '^[0-9a-f]{64}$'),
   approver_user_id   text,
-  outcome            text        NOT NULL CHECK (outcome IN ('ok', 'error')),
+  outcome            text        NOT NULL CONSTRAINT audit_events_outcome_check
+    CHECK (outcome IN ('ok', 'error', 'policy')),
   PRIMARY KEY (tenant_id, event_key),
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
              'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
-             'payload_key', 'install', 'uninstall', 'connector', 'tenant_settings')
+             'payload_key', 'install', 'uninstall', 'connector', 'tenant_settings',
+             'policy_change')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
@@ -1143,6 +1146,27 @@ CREATE POLICY tenant_isolation ON answer_feedback
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Approval policy per low-risk action (D-43): requester_approval (the default, also
+-- for an action with no row) or none, one row per tenant and action. Same as
+-- migration 040.
+CREATE TABLE IF NOT EXISTS approval_policies (
+  tenant_id  text        NOT NULL,
+  action     text        NOT NULL,
+  policy     text        NOT NULL CHECK (policy IN ('requester_approval', 'none')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, action)
+);
+
+REVOKE ALL ON approval_policies FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON approval_policies TO agentos_app;
+
+ALTER TABLE approval_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approval_policies FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON approval_policies;
+CREATE POLICY tenant_isolation ON approval_policies
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1154,5 +1178,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040')
 ON CONFLICT DO NOTHING;

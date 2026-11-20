@@ -150,7 +150,7 @@ class ConversationWorkflow:
 
 ## 4. Actions, approvals, and follow-up (TaskWorkflow)
 
-Status: **partial**. Built: approval by the requester, edit, reminder and expiry, exactly-once create and comment, watch by webhook and polling, a single "no movement" notice. Not built yet: admin-adjustable risk classes and approval policy, a second approver, the nudge offer after "no movement", and follow-up actions that ask for approval again.
+Status: **partial**. Built: approval by the requester, an admin's approval policy per low-risk action, edit, reminder and expiry, exactly-once create and comment, watch by webhook and polling, a single "no movement" notice. Not built yet: admin-adjustable risk classes, a second approver, the nudge offer after "no movement", and follow-up actions that ask for approval again.
 
 This is where shape 3 lives.
 
@@ -168,13 +168,13 @@ stateDiagram-v2
   Watching --> Ended: watch limit, item gone, or agent turned off
 ```
 
-**Action policy.** Each tool in the connector manifest has a risk class: `read` runs at once within the agent's grants; `write_reversible` (a comment) and `write_irreversible` (a new item) both become a task that asks the requester to approve. The manifest's `risk` decides which path a call takes, and its `idempotency` method decides how a write avoids a duplicate; a write whose method no manifest declares is refused.
+**Action policy.** Each tool in the connector manifest has a risk class: `read` runs at once within the agent's grants; `write_reversible` (a comment) and `write_irreversible` (a new item) both become a task that asks the requester to approve, unless an admin turned approval off for that low-risk action (D-43). The manifest's `risk` decides which path a call takes, its `low_risk` flag marks a comment action, and its `idempotency` method decides how a write avoids a duplicate; a write whose method no manifest declares is refused.
 
-Target: the tenant admin adjusts a class's policy, creators make a policy stricter but never looser than the admin's ceiling, and an admin may require a second approver. None exists: the requester is the only approver (D-11, Q-5).
+Built: an admin turns requester approval off per low-risk action on the settings page (D-43). A low-risk action in v1 is a Notion comment on an item the requester filed; it runs without a card only when the policy allows it and the platform's own task records show the requester filed the item. Target: the tenant admin adjusts a class's policy, creators make a policy stricter but never looser than the admin's ceiling, and an admin may require a second approver. The requester is the only approver (D-11, Q-5).
 
 ### Approvals
 
-Intent: nothing is written until the requester has seen exactly what will be written and said yes.
+Intent: nothing is written until the requester has seen exactly what will be written and said yes, unless an admin turned approval off for that low-risk action (D-43).
 
 - An approval is a Slack interactive card whose payload carries `task_id` and an approval nonce. The click arrives at the gateway, which sends it to the task workflow as a signal.
 - The workflow checks that **the person who clicked** is the requester. It doesn't trust which channel the click came from. A click with another nonce is ignored.
@@ -182,6 +182,7 @@ Intent: nothing is written until the requester has seen exactly what will be wri
 - A comment may only target a page in a database the agent was granted: checked before the card is posted and again before the comment is made.
 - Approvals expire and send one reminder using durable timers. An agent definition sets `expires_after_hours` (default 72, at most 168) and `reminder_after_hours` (default 24); each edit restarts the window.
 - **Pending cards do not outlive what let them run.** Just before an approved write, the task checks that the agent is not turned off, the channel is not paused and the requester is still in the audience of the agent's current published version (see §5 and §8). If any fails, nothing is written, the card shows a fixed line and the task ends; a check that cannot be completed stops the write too. A writes or connector switch is applied inside the write activity, before the Notion call, and ends the task the same way.
+- **A low-risk comment may run without a card** (D-43): when the tenant's policy for the comment action is `none` and the item was filed by the requester — read from the platform's own task records, never from the model — the comment runs as soon as the draft is resolved, still through the agent-effect gate and still exactly once. It is audited as `write` with outcome `policy` and no `approval` row, and the thread line says no approval was needed. Every other write shows the card; a nudge's comment always shows its card (D-41).
 
 Where in code: `src/agentos/workflows/task.py`, `AgentActivities.check_before_write` and the write activities in `src/agentos/activities.py`, `src/agentos/gateway/app.py`.
 
@@ -303,10 +304,10 @@ Where in code: `src/agentos/audience_watch.py`, `src/agentos/audience_pauses.py`
 
 ### Writes and attribution
 
-Intent: a write runs as the agent, is attributed to the requester, and needs the requester's approval.
+Intent: a write runs as the agent, is attributed to the requester, and needs the requester's approval unless an admin's policy allows the low-risk action without it (D-43).
 
 - Writes run as the agent's identity. The requester is recorded in the target system where possible: the "Requested by" person property in Notion when the requester's Slack email matches a Notion user, otherwise a "Requested by <name> via <agent>" line in the item's body, shown on the approval card before approval. The audit log always records the requester.
-- Approval is required for every write (D-11). The requester approves; there is no per-action approver (Target) and no admin relaxation (Target).
+- Approval is required for every write (D-11), unless an admin turned approval off for that low-risk action (D-43): a Notion comment on an item the requester filed. The requester approves; there is no per-action approver (Target).
 
 Where in code: `AgentActivities._requester` in `src/agentos/activities.py`, `src/agentos/connectors/notion.py`.
 
@@ -385,7 +386,7 @@ Not built, kept as the design:
 
 Status: **built**, except a token budget per turn, tenant and agent and a cap on writes per task (target).
 
-- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions *always* need approval by the requester, show the exact payload, and can only reach what the agent's grants allow. An injected instruction can at most propose an action the user then sees and rejects.
+- **Prompt injection.** Content from tools and documents is marked untrusted in the prompt. More importantly, the architecture doesn't depend on the model behaving: write actions need approval by the requester, show the exact payload, and can only reach what the agent's grants allow — unless an admin turned approval off for a low-risk comment on the requester's own item (D-43). An injected instruction can at most propose an action the user then sees and rejects, or, under that policy, add a comment to the requester's own item, shown in the thread with a link.
 - **Limits built:** maximum steps per turn, the model's reply token limit (3,072), a history window, `max_writes_per_turn`, at most 5 edits per approval. Not built: a token budget per turn, tenant or agent, and a cap on writes per task.
 
 ### Monthly budgets

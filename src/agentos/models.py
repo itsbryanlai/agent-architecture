@@ -300,6 +300,10 @@ class TaskSpec:
     # Whether the approved nudge includes a DM (the assignee matched a Slack user).
     # Set by the watch from the prepared draft; edits change only the text, not this.
     nudge_dm: bool = False
+    # Set by the workflow when the tenant's policy lets this comment run without the
+    # requester's approval (D-43): the write then records no approval row, no approver,
+    # and outcome 'policy'. Never set from the model's input.
+    under_policy: bool = False
 
 
 @dataclass
@@ -452,6 +456,8 @@ HEALTH_AUDIT_KINDS = ("agent_health",)
 CONNECTOR_AUDIT_KINDS = ("connector",)
 # A tenant's default agent and channel routing, set by an admin in the console.
 TENANT_SETTINGS_AUDIT_KINDS = ("tenant_settings",)
+# A tenant's approval policy for a low-risk action, changed by an admin in the console.
+POLICY_AUDIT_KINDS = ("policy_change",)
 # A person's 👍/👎 on an answer: the agent and version that answered, never the reason text.
 FEEDBACK_AUDIT_KINDS = ("feedback",)
 AUDIT_KINDS = (
@@ -470,9 +476,12 @@ AUDIT_KINDS = (
     + HEALTH_AUDIT_KINDS
     + CONNECTOR_AUDIT_KINDS
     + TENANT_SETTINGS_AUDIT_KINDS
+    + POLICY_AUDIT_KINDS
     + FEEDBACK_AUDIT_KINDS
 )
-AUDIT_OUTCOMES = ("ok", "error")
+# 'policy' marks a write that ran under an admin's no-approval policy (D-43): it
+# succeeded, and no approval row precedes it.
+AUDIT_OUTCOMES = ("ok", "error", "policy")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -490,7 +499,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, uninstall, connector, tenant settings
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, uninstall, connector, tenant settings, approval policy
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -523,6 +532,7 @@ class AuditEvent:
             + INSTALL_AUDIT_KINDS
             + CONNECTOR_AUDIT_KINDS
             + TENANT_SETTINGS_AUDIT_KINDS
+            + POLICY_AUDIT_KINDS
         )
         if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
             if not self.agent_id:

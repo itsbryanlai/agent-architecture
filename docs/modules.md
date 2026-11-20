@@ -25,7 +25,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `workflows/conversation.py` | The turn loop for one thread. Deterministic; carries references, never content; changes to commands sit behind `workflow.patched` | `core/test_conversation_workflow.py`, `core/test_conversation_replay.py`, `core/test_turn_loop.py`, `core/test_turn_limits.py`, `core/test_turn_failure.py`, `core/test_front_door.py` |
-| `workflows/task.py` | One unit of work: approval, write, watch. Only the requester approves; what was approved is what runs. A stale item's nudge is a child task: one card for its comment and DM, the watch keeps polling, the clock restarts from a nudge that ran | `core/test_task_workflow.py`, `core/test_task_actions.py`, `core/test_task_failures.py`, `core/test_task_limits.py`, `core/test_nudge.py`, `connectors/test_restart_write.py` |
+| `workflows/task.py` | One unit of work: approval, write, watch. Only the requester approves; what was approved is what runs, unless an admin's policy lets a low-risk comment on the requester's own item run without a card (D-43, behind the `approval-policy` patch). A stale item's nudge is a child task: one card for its comment and DM, the watch keeps polling, the clock restarts from a nudge that ran | `core/test_task_workflow.py`, `core/test_task_actions.py`, `core/test_task_failures.py`, `core/test_task_limits.py`, `core/test_nudge.py`, `core/test_approval_policy.py`, `connectors/test_restart_write.py` |
 | `workflows/indexing.py` | Indexes one granted root page. History carries page IDs and counts; one bad page never fails the run | `knowledge/test_indexing.py`, `knowledge/test_knowledge_sync.py` |
 | `workflows/page_refresh.py` | Refreshes one page after webhook events, coalescing a burst | `knowledge/test_page_refresh.py` |
 | `workflows/audience_watch.py` | Acts on one `channel_shared` event; one never-reused ID per event | `console/test_audience_watch.py` |
@@ -46,6 +46,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | `agent_feedback.py` | The creator feedback page's reads: one indexed query per section over the audit rows, votes and stored history of one agent, newest first with counts. Selects no requester, identity, approver or voter; a question's text only while retention keeps it, with the stored reference a later test-case action reads | `console/test_web_ui.py`, `pg/test_agent_feedback.py` |
 | `stores.py` | Chat history, idempotency records, task links and external writes. Every call takes `tenant_id` and runs under row-level security | `pg/test_stores.py` |
 | `tasks.py` | The platform's record of each task: the state row the task workflow writes and `my_tasks` reads for the asker, open first, newest first, at most 10; the in-thread poke's lookup and the listed-state mapping | `core/test_my_tasks.py`, `pg/test_store_contracts.py` |
+| `approval_policy.py` | The tenant's approval policy per low-risk action (D-43): requester approval (the default, also for an action with no row) or none; the console writes it with its `policy_change` audit event in one unit of work, the task reads it once per comment | `console/test_tenant_settings.py`, `core/test_approval_policy.py`, `pg/test_store_contracts.py` |
 | `unit_of_work.py` | One transaction and the tenant lock for a change and its audit event | `console/test_control_plane.py`, `pg/test_publish_hash.py` |
 | `threads.py` | The agent a thread was handed to, and the day an agent's owner was last mentioned in a refusal | `pg/test_stores.py` |
 | `audit.py` | Append-only audit events: IDs and hashes only, one row per event key | `console/test_audit_log.py`, `pg/test_policies.py` |
@@ -61,7 +62,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `agent_store.py` | Agent versions and their publish lifecycle; a published version never changes; the one-time YAML import | `console/test_agent_store.py`, `pg/test_publish_hash.py`, `pg/test_agent_id_pattern.py` |
-| `control.py` | The control plane: the only place roles are checked and the only writer (besides the operator command, the install and imports) of agents, members, budgets, switches and tenant settings; one audit event per change in the same transaction | `console/test_control_plane.py`, `console/test_publish_review.py`, `console/test_tenant_settings.py` |
+| `control.py` | The control plane: the only place roles are checked and the only writer (besides the operator command, the install and imports) of agents, members, budgets, switches, tenant settings and the approval policy per low-risk action; one audit event per change in the same transaction | `console/test_control_plane.py`, `console/test_publish_review.py`, `console/test_tenant_settings.py` |
 | `control_errors.py` | Maps control-plane refusals to HTTP statuses, once | `console/test_web_ui.py` |
 | `members.py` | Stored admins and creators; config-file admins are not rows | `console/test_control_plane.py` |
 | `grant_checker.py` | Checks a version's Notion grants against the live objects before publish | `connectors/test_grant_check.py` |
@@ -88,7 +89,7 @@ One line per module under `src/agentos`: its purpose, the invariant it owns, and
 | Module | Purpose and the invariant it owns | Tests |
 |---|---|---|
 | `connectors/notion.py` | The Notion connector. The agent's grants are checked before a call that names a database; an ungranted page is indistinguishable from a missing one | `connectors/test_notion_connector.py`, `knowledge/test_notion_reads.py`, `connectors/test_notion_transport.py` |
-| `connectors/manifest.py`, `connectors/manifests/` | Safety metadata per tool (risk, idempotency, requester scoping, input schema) that the runtime reads | `connectors/test_notion_connector.py`, `core/test_task_actions.py` |
+| `connectors/manifest.py`, `connectors/manifests/` | Safety metadata per tool (risk, idempotency, requester scoping, input schema, the low-risk flag a comment action may carry) that the runtime reads | `connectors/test_manifest.py`, `connectors/test_notion_connector.py`, `core/test_task_actions.py` |
 | `connectors/notion_errors.py` | The one table that says whether a Notion error is worth retrying | `connectors/test_notion_transport.py` |
 | `connectors/notion_limiter.py` | Per-tenant request-rate bucket for Notion, interactive ahead of bulk | `knowledge/test_notion_reads.py`, `connectors/test_notion_transport.py` |
 | `knowledge/store.py` | Indexed pages and chunks; the tenant and scope filter is part of the SQL, never applied to results | `knowledge/test_knowledge_store.py`, `pg/test_stores.py` |

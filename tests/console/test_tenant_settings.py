@@ -381,6 +381,65 @@ async def test_routing_is_validated_like_the_yaml_import_and_audited(case, statu
 
 
 @pytest.mark.parametrize(
+    ("case", "status"),
+    [
+        ("admin turns off", 303),
+        ("admin turns back on", 303),
+        ("unchanged resubmit", 303),
+        ("non-admin", 403),
+        ("not a low-risk action", 422),
+        ("unknown policy", 422),
+    ],
+    ids=["off", "on", "unchanged", "non-admin", "not-low-risk", "bad-policy"],
+)
+async def test_the_approvals_switch_is_admin_only_validated_and_audited(case, status):
+    """Fails if a non-admin changes the policy, a non-low-risk action or an unknown policy is
+    accepted, a real change is not audited with the admin's identity, or an unchanged resubmit
+    records a second event."""
+    h = await build_harness({})
+    actor = OWNER if case == "non-admin" else ROOT
+    c = await h.signed_in(actor)
+    fields = {
+        "admin turns off": {"action": "add_comment", "policy": "none"},
+        "admin turns back on": {"action": "add_comment", "policy": "requester_approval"},
+        "unchanged resubmit": {"action": "add_comment", "policy": "none"},
+        "non-admin": {"action": "add_comment", "policy": "none"},
+        "not a low-risk action": {"action": "create_item", "policy": "none"},
+        "unknown policy": {"action": "add_comment", "policy": "anything"},
+    }[case]
+    async with using(c):
+        if case in ("admin turns back on", "unchanged resubmit"):
+            first = await post(
+                c, f"{SETTINGS}/approvals", await csrf_token(c), action="add_comment", policy="none"
+            )
+            assert first.status_code == 303
+        response = await post(c, f"{SETTINGS}/approvals", await csrf_token(c), **fields)
+        assert response.status_code == status, response.text
+        if status == 303:
+            page = (await c.get(SETTINGS)).text
+            assert "Approvals" in page
+
+    events = [e for e in h.audit.events if e.kind == "policy_change"]
+    stored = await h.policies.get(TENANT, "add_comment")
+    if case in ("admin turns off", "unchanged resubmit"):
+        assert stored == "none"
+        assert [(e.tool, e.target, e.identity) for e in events] == [
+            ("add_comment", "none", f"user:{ROOT}")
+        ]
+        assert '<option value="none" selected>' in page
+    elif case == "admin turns back on":
+        assert stored == "requester_approval"
+        assert [(e.tool, e.target, e.identity) for e in events] == [
+            ("add_comment", "none", f"user:{ROOT}"),
+            ("add_comment", "requester_approval", f"user:{ROOT}"),
+        ]
+        assert '<option value="requester_approval" selected>' in page
+    else:
+        assert stored == "requester_approval"
+        assert events == []
+
+
+@pytest.mark.parametrize(
     ("case", "status_cell"),
     [
         ("available", "<td>available</td>"),

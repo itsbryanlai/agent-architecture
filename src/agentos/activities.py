@@ -129,11 +129,13 @@ from agentos.models import (
     CUT_SHORT,
     EDITABLE_FIELDS,
     NO_ANSWER,
+    NUDGE_NAME_MAX,
     AuditEvent,
     Citation,
     DraftOutcome,
     LLMResponse,
     NotionItem,
+    NudgePrepared,
     StepResult,
     TaskSpec,
     ToolCall,
@@ -436,6 +438,11 @@ class AgentActivities:
             self.record_task_state,
             self.task_in_thread,
             self.wait_task_refresh,
+            self.nudge_offer,
+            self.post_stale_notice,
+            self.prepare_nudge,
+            self.nudge_comment,
+            self.nudge_dm,
         ]
 
     # --- helpers ---------------------------------------------------------------
@@ -578,13 +585,21 @@ class AgentActivities:
             )
         return payload
 
-    async def _gate_write(self, spec: TaskSpec, task_id: str, idem_key: str, target_field: str):
+    async def _gate_write(
+        self,
+        spec: TaskSpec,
+        task_id: str,
+        idem_key: str,
+        target_field: str,
+        tool: str | None = None,
+    ):
         """Refuse an approved write, before any external call, while a switch covers it.
 
         The approval and the refusal are audited (the write as an error), and the
         failure is non-retryable, so the task ends with the reason and nothing was
         changed. The requester can ask again later. ``target_field`` names the payload
-        field that holds what the write is aimed at (a page or a database).
+        field that holds what the write is aimed at (a page or a database). ``tool``
+        overrides the audited write tool (a nudge's two effects have their own names).
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
@@ -593,7 +608,7 @@ class AgentActivities:
         payload = await self._spec_payload(spec)
         target = payload[target_field]
         await self._record_approval(spec, payload, task_id, target)
-        await self._record_write(spec, payload, task_id, idem_key, target, "error")
+        await self._record_write(spec, payload, task_id, idem_key, target, "error", tool=tool)
         raise _non_retryable(refusal)
 
     async def _check_method(
@@ -759,7 +774,7 @@ class AgentActivities:
         )
 
     async def _record_approval(
-        self, spec: TaskSpec, payload: dict, task_id: str, target: str
+        self, spec: TaskSpec, payload: dict, task_id: str, target: str, tool: str | None = None
     ) -> None:
         """Record that the requester approved exactly this payload, before it runs.
 
@@ -773,7 +788,7 @@ class AgentActivities:
             "approval",
             ids.audit_approval_key(task_id, spec.approval_nonce),
             task_id=task_id,
-            tool=spec.tool_name,
+            tool=tool or spec.tool_name,
             target=target,
             input_sha256=canonical_sha256(payload),
             approver_user_id=ctx.requester_user_id,
@@ -788,6 +803,7 @@ class AgentActivities:
         target: str,
         outcome: str,
         output: object = None,
+        tool: str | None = None,
     ) -> None:
         ctx = spec.ctx
         await self._record(
@@ -796,7 +812,7 @@ class AgentActivities:
             ids.audit_write_key(idem_key, outcome),
             outcome=outcome,
             task_id=task_id,
-            tool=spec.tool_name,
+            tool=tool or spec.tool_name,
             target=target,
             input_sha256=canonical_sha256(payload),
             output_sha256=None if output is None else canonical_sha256(output),
@@ -1731,8 +1747,8 @@ class AgentActivities:
     async def _card_requester_line(
         self, spec: TaskSpec, task_id: str, agent: AgentVersion
     ) -> str | None:
-        """The body line the card must show, or None for a comment or a matched requester."""
-        if spec.tool_name == "add_comment":
+        """The body line the card must show, or None for a comment, a nudge or a matched requester."""
+        if spec.tool_name in ("add_comment", "nudge"):
             return None
         return (await self._requester(spec, task_id, agent))["line"]
 
@@ -2104,6 +2120,209 @@ class AgentActivities:
         )
         return comment_id
 
+    # --- nudge -------------------------------------------------------------------
+
+    async def _slack_user_by_email(
+        self, tenant_id: str, slack: SlackPoster, email: str
+    ) -> str | None:
+        """The Slack user for an email. A transient failure is retried (with Slack's
+        Retry-After when it named one); a permanent refusal reads as no match, so the
+        nudge falls back to a comment with a plain-name mention instead of failing."""
+        try:
+            return await slack.user_by_email(email)
+        except SlackLookupError as err:
+            if err.transient:
+                if err.retry_after is not None:
+                    raise ApplicationError(
+                        str(err),
+                        type="SlackLookupError",
+                        next_retry_delay=timedelta(seconds=err.retry_after),
+                    ) from err
+                raise
+            log.warning(
+                "slack email lookup refused; a nudge falls back to a comment tenant_id=%s code=%s",
+                tenant_id,
+                err.code,
+            )
+            return None
+
+    @activity.defn(name="nudge_offer")
+    async def nudge_offer(self, spec: TaskSpec, task_id: str, page_id: str) -> bool:
+        """Whether a stale notice may offer a nudge: the assignee is not the requester.
+
+        Reads the item's assignee when the grant maps one, resolves them to a Slack
+        user by email and compares with the requester. No assignee property, an empty
+        one, no email or no Slack match still offers: the card's fallbacks cover those.
+        """
+        ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        self._log("nudge_offer", ctx.tenant_id, ctx.agent_id)
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        try:
+            assignee = await connector.assignee_user_id(page_id)
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        if assignee is None:
+            return True
+        runtime = self._runtime(ctx.tenant_id)
+        person = await runtime.notion_users.person(runtime.notion_api, assignee)
+        email = (person or {}).get("email")
+        if not email:
+            return True
+        slack_id = await self._slack_user_by_email(ctx.tenant_id, runtime.slack, email)
+        return slack_id != ctx.requester_user_id
+
+    @activity.defn(name="post_stale_notice")
+    async def post_stale_notice(
+        self, spec: TaskSpec, task_id: str, idem_key: str, days: int, nudge_nonce: str
+    ) -> str:
+        """The stale notice, with a "Nudge the assignee" button when an offer is live.
+
+        The button carries the task ID and the offer's nonce; the workflow accepts a
+        click only from the requester on that nonce. The text is the same stale line
+        as before, written from the stored item.
+        """
+        ctx = spec.ctx
+        self._log("post_stale_notice", ctx.tenant_id, ctx.agent_id, kind=task_notices.STALE)
+        payload = await self._spec_payload(spec)
+        subject = task_notices.subject(spec.tool_name, payload)
+        stored = await self.writes.result(ctx.tenant_id, f"{task_id}:create")
+        if stored is not None:
+            subject = _item_from_ref(stored).title
+        text = task_notices.notice_text(task_notices.STALE, subject=subject, days=days)
+        blocks = stale_notice_blocks(task_id, nudge_nonce, text) if nudge_nonce else None
+        return await self._post_once(
+            ctx.tenant_id, idem_key, ctx.channel, text, ctx.thread_ts, blocks
+        )
+
+    @activity.defn(name="prepare_nudge")
+    async def prepare_nudge(
+        self, spec: TaskSpec, task_id: str, page_id: str, child_id: str
+    ) -> NudgePrepared:
+        """Resolve the nudge and freeze it as revision 1 of the nudge task's draft.
+
+        The assignee is resolved now, at click time: the card shows what this found,
+        and the writes run it. The fallbacks are decided here, never by the model:
+        no assignee property or an empty one is a comment without a mention; an
+        assignee with no Slack match is a comment with a plain-name mention and no
+        DM; an assignee who is the requester refuses the nudge altogether. A retry
+        finds the draft stored and changes nothing.
+        """
+        ctx = spec.ctx
+        await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
+        self._log("prepare_nudge", ctx.tenant_id, ctx.agent_id)
+        stored = await self.content.get_draft(ctx.tenant_id, child_id, 1)
+        if stored is not None:
+            return NudgePrepared(dm=bool(stored.get("assignee_slack_id")))
+        connector = await self._connector(ctx.tenant_id, ctx.agent_id)
+        try:
+            item = await connector.resolve_item(page_id)
+            assignee = await connector.assignee_user_id(page_id)
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        runtime = self._runtime(ctx.tenant_id)
+        name, notion_id, slack_id = "", "", ""
+        if assignee:
+            person = await runtime.notion_users.person(runtime.notion_api, assignee)
+            name = ((person or {}).get("name") or "")[:NUDGE_NAME_MAX]
+            notion_id = assignee
+            email = (person or {}).get("email")
+            if email:
+                slack_id = (
+                    await self._slack_user_by_email(ctx.tenant_id, runtime.slack, email) or ""
+                )
+        if slack_id and slack_id == ctx.requester_user_id:
+            return NudgePrepared(refused=True)
+        info = await runtime.slack.user_info(ctx.requester_user_id)
+        payload = {
+            "page_id": item.page_id,
+            "database_id": item.database_id,
+            "item_title": item.title,
+            "item_url": item.url,
+            "comment": "Any update on this?",
+            "assignee_name": name,
+            "assignee_notion_id": notion_id,
+            "assignee_slack_id": slack_id,
+            "requester_name": info.display_name or ctx.requester_user_id,
+        }
+        await self.content.put_draft(ctx.tenant_id, child_id, 1, payload)
+        return NudgePrepared(dm=bool(slack_id))
+
+    @activity.defn(name="nudge_comment")
+    async def nudge_comment(self, spec: TaskSpec, task_id: str) -> str:
+        """The nudge's comment, exactly once through the comment path (marker + lease).
+
+        The approved revision decides the text and the mention: a Slack-matched
+        assignee is mentioned as a Notion user, an unmatched one by plain name, and
+        no assignee means no mention. Audited as the ``nudge_comment`` write.
+        """
+        ctx = spec.ctx
+        idem_key = f"{task_id}:comment"
+        await self._gate_write(spec, task_id, idem_key, "page_id", tool="nudge_comment")
+        self._log("nudge_comment", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        page_id = payload["page_id"]
+        await self._check_method(spec, payload, task_id, page_id, idem_key, "marker_text")
+        # The live published version, not the turn's pinned one: a grant revoked since
+        # this write was approved must stop it.
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent)
+        text, mention = _nudge_comment_text(payload)
+        await self._record_approval(spec, payload, task_id, page_id)
+        try:
+            await connector.resolve_item(page_id)
+            comment_id = await self._write_once(
+                ctx.tenant_id,
+                idem_key,
+                find=lambda: connector.find_comment(page_id, idem_key),
+                write=lambda: connector.create_comment(
+                    page_id, text, idem_key, agent.name, mention_user_id=mention
+                ),
+                to_ref=lambda comment_id: comment_id,
+                from_ref=lambda ref: ref,
+            )
+        except Exception as err:
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(
+                    spec, payload, task_id, idem_key, page_id, "error", tool="nudge_comment"
+                )
+                raise _non_retryable(err) from err
+            _reraise(err)
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            "ok",
+            {"comment_id": comment_id},
+            tool="nudge_comment",
+        )
+        return comment_id
+
+    @activity.defn(name="nudge_dm")
+    async def nudge_dm(self, spec: TaskSpec, task_id: str) -> str:
+        """The nudge's DM, exactly once through the Slack post path (marker + lease +
+        history lookup). The workflow runs it only when the approved nudge has a DM.
+
+        Runs only after the comment landed; a failure here never retries the comment.
+        Audited as the ``nudge_dm`` write.
+        """
+        ctx = spec.ctx
+        idem_key = f"{task_id}:dm"
+        await self._gate_write(spec, task_id, idem_key, "assignee_slack_id", tool="nudge_dm")
+        self._log("nudge_dm", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        assignee = payload["assignee_slack_id"]
+        await self._record_approval(spec, payload, task_id, assignee)
+        slack = self._runtime(ctx.tenant_id).slack
+        channel = await slack.open_dm(assignee)
+        ts = await self._post_once(ctx.tenant_id, idem_key, channel, _nudge_dm_text(payload), None)
+        await self._record_write(
+            spec, payload, task_id, idem_key, assignee, "ok", {"ts": ts}, tool="nudge_dm"
+        )
+        return ts
+
     @activity.defn(name="get_notion_item")
     async def get_notion_item(self, tenant_id: str, agent_id: str, page_id: str) -> NotionItem:
         """Read one item. Takes IDs only: the watch polls this thousands of times."""
@@ -2181,9 +2400,9 @@ class AgentActivities:
 
     async def _task_item_meta(self, spec: TaskSpec, task_id: str) -> tuple[str, str, str]:
         """The item's title, link and page ID: the write's stored result once it exists,
-        else the stored draft (a comment's resolved item carries its own)."""
+        else the stored draft (a comment's or nudge's resolved item carries its own)."""
         payload = await self._spec_payload(spec)
-        if spec.tool_name == "add_comment":
+        if spec.tool_name in ("add_comment", "nudge"):
             return (
                 payload.get("item_title", ""),
                 payload.get("item_url", ""),
@@ -2392,12 +2611,20 @@ class AgentActivities:
             line = no_longer_act_text(agent.name)
         else:
             return None
-        if spec.tool_name == "add_comment":
+        if spec.tool_name in ("add_comment", "nudge"):
             target, idem_key = payload["page_id"], f"{task_id}:comment"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
         await self._record_approval(spec, payload, task_id, target)
-        await self._record_write(spec, payload, task_id, idem_key, target, "error")
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            target,
+            "error",
+            tool="nudge_comment" if spec.tool_name == "nudge" else None,
+        )
         return line
 
     @activity.defn(name="record_audience_refusal")
@@ -2504,7 +2731,59 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
     """The plain-text fallback of the approval card."""
     if spec.tool_name == "add_comment":
         return escape_slack(f"Approve comment on {payload['item_title']}")
+    if spec.tool_name == "nudge":
+        return escape_slack(f"Approve nudge on {payload['item_title']}")
     return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
+
+
+def _nudge_comment_text(payload: dict) -> tuple[str, str | None]:
+    """The comment a nudge posts: its text and the Notion user to mention, if any.
+
+    A Slack-matched assignee is a real Notion mention (the user object, rendered as
+    their name); an assignee with no Slack match is a plain-name mention in the text;
+    no assignee means the text alone. The card previews exactly this.
+    """
+    text = payload["comment"]
+    if payload.get("assignee_slack_id") and payload.get("assignee_notion_id"):
+        return text, payload["assignee_notion_id"]
+    if payload.get("assignee_notion_id") and payload.get("assignee_name"):
+        return f"@{payload['assignee_name']} {text}", None
+    return text, None
+
+
+def _nudge_dm_text(payload: dict) -> str:
+    """The DM a nudge sends: who asked, the item and its link, the approved text.
+
+    Nothing else from the conversation. The card previews exactly this, and the DM
+    activity builds it from the same approved revision.
+    """
+    return (
+        f"{payload['requester_name']} asked me to check on '{payload['item_title']}'\n"
+        f"{payload['item_url']}\n\n{payload['comment']}"
+    )
+
+
+def stale_notice_blocks(task_id: str, nudge_nonce: str, text: str) -> list[dict]:
+    """The stale notice with its "Nudge the assignee" button.
+
+    The button carries the task ID and the offer's nonce; the workflow accepts a
+    click only from the requester on that nonce, once per stale period. ``text`` is
+    the notice line, whose title ``notice_text`` already escaped.
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "task_nudge",
+                    "text": {"type": "plain_text", "text": "Nudge the assignee"},
+                    "value": json.dumps({"task_id": task_id, "nonce": nudge_nonce}),
+                }
+            ],
+        },
+    ]
 
 
 def approval_card_blocks(
@@ -2532,7 +2811,47 @@ def approval_card_blocks(
     payload = {k: escape_slack(v) if isinstance(v, str) else v for k, v in shown.items()}
     agent_name = escape_slack(agent_name)
     db_name = escape_slack(db_name)
-    if spec.tool_name == "add_comment":
+    if spec.tool_name == "nudge":
+        # Both effects previewed exactly as they will run, built from the same approved
+        # revision the write activities read: the comment with its mention, and the DM.
+        comment_text, mention = _nudge_comment_text(shown)
+        preview = f"@{shown['assignee_name']} {comment_text}" if mention else comment_text
+        head = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{agent_name}* wants to nudge the assignee of *{payload['item_title']}*.",
+            },
+        }
+        body = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Comment on the item*\n{escape_slack(preview)}",
+                },
+            }
+        ]
+        if shown.get("assignee_slack_id"):
+            # The DM previewed exactly: its frame and link, then the approved text (the
+            # same text the comment section shows). Two sections, so each fits Slack's
+            # 3000-character limit even at the field caps.
+            dm_text = _nudge_dm_text(shown)
+            frame, _, approved = dm_text.partition("\n\n")
+            body.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Direct message to the assignee*\n{escape_slack(frame)}",
+                    },
+                }
+            )
+            body.append(
+                {"type": "section", "text": {"type": "mrkdwn", "text": escape_slack(approved)}}
+            )
+        note = "Nothing is posted or sent until you click Submit."
+    elif spec.tool_name == "add_comment":
         head = {
             "type": "section",
             "text": {
@@ -2540,10 +2859,12 @@ def approval_card_blocks(
                 "text": f"*{agent_name}* wants to comment on *{payload['item_title']}*",
             },
         }
-        body = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Comment*\n{payload['comment']}"},
-        }
+        body = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Comment*\n{payload['comment']}"},
+            }
+        ]
         note = "Nothing is posted until you click Submit."
     else:
         head = {
@@ -2553,29 +2874,28 @@ def approval_card_blocks(
                 "text": f"*{agent_name}* wants to add an item to *{db_name}* in Notion.",
             },
         }
-        body = {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Title*\n{payload['title']}"},
-                {"type": "mrkdwn", "text": f"*Details*\n{payload['details']}"},
-            ],
-        }
+        body = [
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Title*\n{payload['title']}"},
+                    {"type": "mrkdwn", "text": f"*Details*\n{payload['details']}"},
+                ],
+            }
+        ]
         note = "Nothing is filed until you click Submit."
     if requester_line:
         # The requester has no Notion user, so the page body carries this line. It is
         # shown here so that what is approved is what is written.
-        body = [
-            body,
+        body.append(
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": (f"*Added to the page*\n{escape_slack(requester_line)}"),
                 },
-            },
-        ]
-    else:
-        body = [body]
+            }
+        )
     context = [{"type": "mrkdwn", "text": f"Will run as the {agent_name} agent. {note}"}]
     if edited:
         context.append({"type": "mrkdwn", "text": "Edited — review and approve again"})

@@ -149,6 +149,10 @@ BAD_DEFINITIONS = [
     (_set("follow_up.poll_interval_minutes", 0), "'poll_interval_minutes' must be"),
     (_set("follow_up.stale_after_days", 100000), "'stale_after_days' must be"),
     (_set("approval.expires_after_hours", -1), "'expires_after_hours' must be"),
+    (_set("follow_up.nudge", "yes"), "'nudge' must be true or false"),
+    (_set("follow_up.max_nudges", True), "'max_nudges' must be a whole number"),
+    (_set("follow_up.max_nudges", 11), "'max_nudges' must be"),
+    (_set(f"{DB}.properties.assignee", 7), "'assignee' must be non-empty text"),
     (_drop("max_steps"), "missing required field 'max_steps'"),
 ]
 
@@ -194,3 +198,19 @@ def test_max_writes_per_turn_outside_one_to_ten_is_refused(bad):
     """Fails if a limit that is no whole number from 1 to 10 is accepted."""
     with pytest.raises(ConfigError, match="max_writes_per_turn"):
         parse_agent("it-helper", _helper(max_writes_per_turn=bad), 1)
+
+
+def test_the_assignee_and_nudge_fields_round_trip():
+    """Fails if the assignee mapping or the nudge policy is lost between the definition and the agent."""
+    definition = block()
+    db = definition["grants"]["notion"]["databases"][0]
+    db["properties"]["assignee"] = "Assignee"
+    db["property_ids"]["assignee"] = "asg1"
+    definition["follow_up"] = {**definition["follow_up"], "nudge": False, "max_nudges": 5}
+
+    agent = parse_agent("it-helper", definition, 1)
+
+    grant = agent.grants.notion_databases[0]
+    assert (grant.assignee_prop, grant.assignee_prop_id) == ("Assignee", "asg1")
+    assert (agent.follow_up.nudge, agent.follow_up.max_nudges) == (False, 5)
+    assert parse_agent("it-helper", agent_definition(agent), 1) == agent

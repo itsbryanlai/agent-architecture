@@ -34,7 +34,12 @@ THREAD = "1700000000.000100"
 
 @pytest.mark.parametrize(
     ("tool", "field"),
-    [("create_item", "title"), ("create_item", "details"), ("add_comment", "comment")],
+    [
+        ("create_item", "title"),
+        ("create_item", "details"),
+        ("add_comment", "comment"),
+        ("nudge", "comment"),
+    ],
 )
 def test_check_field_at_and_over_the_limit(tool, field):
     limit = EDITABLE_FIELDS[tool][field]
@@ -48,6 +53,14 @@ def test_check_field_counts_the_escaped_card_text():
     assert check_field("create_item", "details", "&" * 398) is None
     err = check_field("create_item", "details", "&" * 399)
     assert err is not None and "&" in err and "<" in err
+
+
+def test_check_field_leaves_room_for_the_nudge_mention_preview():
+    """Fails if a nudge comment whose card section (label + mention + text) overflows is accepted."""
+    # 579 "&" encode to 2895 characters; with the 21-character label and the 82-character
+    # mention prefix that is 2998, under Slack's 3000. One more "&" goes over.
+    assert check_field("nudge", "comment", "&" * 579) is None
+    assert check_field("nudge", "comment", "&" * 580) is not None
 
 
 def _ctx() -> TurnContext:

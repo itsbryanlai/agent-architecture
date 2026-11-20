@@ -59,6 +59,7 @@ from agentos.models import (
     EditRequest,
     InboundMessage,
     LLMResponse,
+    NudgeRequest,
     TaskSpec,
     ToolCall,
     TurnContext,
@@ -89,12 +90,14 @@ from agentos.workflows.task import TaskWorkflow
 from tests.conftest import (
     ALICE,
     BOB,
+    BOB_NOTION,
     DB_ID,
     ROOT_A,
     ROOT_B,
     TENANT,
     a_tree,
     b_tree,
+    default_schema,
     eventually,
     knowledge_agents_dict,
     make_fake_notion,
@@ -1085,6 +1088,98 @@ async def my_tasks_once(r: Rig, stored: bool) -> list[Recorded]:
     return [await current(r, "", handle.id), await current(r, "conversation", conv)]
 
 
+def _nudge_grant(definition: dict) -> None:
+    db = definition["grants"]["notion"]["databases"][0]
+    db["properties"]["assignee"] = "Assignee"
+    db["property_ids"]["assignee"] = "asg1"
+
+
+async def _stale_nudge_task(r: Rig, stored: bool, thread: str, *, dm: bool):
+    """A watching task gone stale, its nudge approved and run; the clock restarts.
+
+    With ``dm`` the grant maps an assignee who matches a Slack user, so the nudge
+    comments with a mention and sends a DM; without it the nudge is a comment alone.
+    """
+    if dm:
+        r.notion.set_schema(
+            DB_ID, {**default_schema(), "Assignee": {"id": "asg1", "type": "people"}}
+        )
+        await republish(r.acts.agents, "it-helper", _nudge_grant)
+    if stored:
+        handle, nonce = await stored_task(r, thread)
+    else:
+        handle = await start_legacy_task(r, thread)
+        nonce = "nonce-1"
+    await approve(handle, nonce)
+    await wait_state(handle, "watching")
+    page = r.notion.all_pages(DB_ID)[0]
+    if dm:
+        r.notion.set_people(page["id"], "Assignee", [BOB_NOTION])
+    await r.env.sleep(timedelta(days=4))
+    stale = await eventually(
+        lambda: [p for p in r.slack.posts() if p["thread_ts"] and "No movement" in p["text"]],
+        timeout=30,
+    )
+    button = next(b for b in stale[-1]["blocks"] if b["type"] == "actions")
+    value = json.loads(button["elements"][0]["value"])
+    await handle.signal(TaskWorkflow.nudge, NudgeRequest(value["nonce"], ALICE))
+    cards = await eventually(
+        lambda: [
+            p
+            for p in r.slack.posts()
+            if p["blocks"] and "wants to nudge" in json.dumps(p["blocks"])
+        ],
+        timeout=30,
+    )
+    actions = next(b for b in cards[-1]["blocks"] if b["type"] == "actions")
+    child_value = json.loads(actions["elements"][0]["value"])
+    child = r.client.get_workflow_handle(child_value["task_id"])
+    await wait_state(child, "awaiting_approval")
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(child_value["nonce"], ALICE, True))
+    assert await child.result() == "done"
+    # Settle the restart: the next stale period's notice proves the watch carried the
+    # report, and fixes the parent's history before it is recorded.
+    await r.env.sleep(timedelta(days=4))
+    await eventually(
+        lambda: (
+            len([p for p in r.slack.posts() if p["thread_ts"] and "No movement" in p["text"]]) == 2
+        ),
+        timeout=30,
+    )
+    return handle, child, page
+
+
+async def task_nudge(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(272 if stored else 271)
+    handle, child, page = await _stale_nudge_task(r, stored, thread, dm=True)
+    comments = r.notion.comments[page["id"].replace("-", "")]
+    assert len(comments) == 1
+    assert comments[0]["rich_text"][0]["mention"]["user"]["id"] == BOB_NOTION
+    dms = [p for p in r.slack.posts() if p["channel"] == f"D-{BOB}"]
+    assert len(dms) == 1 and "asked me to check on 'New monitor'" in dms[0]["text"]
+    out = [await current(r, "", handle.id), await current(r, "nudge", child.id)]
+    if stored:
+        out.append(
+            await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread))
+        )
+    return out
+
+
+async def task_nudge_comment_only(r: Rig, stored: bool) -> list[Recorded]:
+    thread = thread_ts(282 if stored else 281)
+    handle, child, page = await _stale_nudge_task(r, stored, thread, dm=False)
+    comments = r.notion.comments[page["id"].replace("-", "")]
+    assert len(comments) == 1
+    assert all("mention" not in t for t in comments[0]["rich_text"])
+    assert [p for p in r.slack.posts() if p["channel"] == f"D-{BOB}"] == []
+    out = [await current(r, "", handle.id), await current(r, "nudge", child.id)]
+    if stored:
+        out.append(
+            await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread))
+        )
+    return out
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1432,6 +1527,8 @@ for _name, _fn in {
     "task_recorded": task_recorded,
     "my_tasks": my_tasks,
     "my_tasks_once": my_tasks_once,
+    "task_nudge": task_nudge,
+    "task_nudge_comment_only": task_nudge_comment_only,
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run

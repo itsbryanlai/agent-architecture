@@ -9,8 +9,8 @@ import uuid
 
 import pytest
 
-from agentos import ids
-from agentos.activities import approval_card_blocks
+from agentos import ids, task_notices
+from agentos.activities import approval_card_blocks, stale_notice_blocks
 from agentos.config import TASK_QUEUE
 from agentos.knowledge.search import searched_footer, sources_footer
 from agentos.models import ApprovalDecision, Citation, TaskSpec, TurnContext
@@ -88,6 +88,21 @@ def _card_text(blocks: list) -> str:
     [
         ("create_item", {"title": HOSTILE, "details": HOSTILE, "database_id": DB_ID}, 2),
         ("add_comment", {"item_title": HOSTILE, "comment": HOSTILE, "item_url": "u"}, 2),
+        (
+            "nudge",
+            {
+                "item_title": HOSTILE,
+                "comment": HOSTILE,
+                "item_url": "u",
+                "page_id": "p",
+                "database_id": DB_ID,
+                "assignee_name": HOSTILE,
+                "assignee_notion_id": "n1",
+                "assignee_slack_id": "U2",
+                "requester_name": HOSTILE,
+            },
+            6,
+        ),
     ],
 )
 def test_approval_card_escapes_every_model_written_field(tool, payload, occurrences):
@@ -95,6 +110,13 @@ def test_approval_card_escapes_every_model_written_field(tool, payload, occurren
     text = _card_text(approval_card_blocks(_spec(tool, payload), "t1", "IT helper", "Requests"))
     assert "<!channel>" not in text and "<@U1>" not in text and "<https" not in text
     assert text.count(ESCAPED) == occurrences
+
+
+def test_the_stale_notice_block_carries_the_line_escaped_once():
+    """Fails if the stale notice's button block double-escapes the title or leaves it live."""
+    text = task_notices.notice_text(task_notices.STALE, subject=HOSTILE, days=3)
+    blocks = stale_notice_blocks("t1", "nonce", text)
+    assert blocks[0]["text"]["text"] == f"No movement on '{ESCAPED}' in 3 days."
 
 
 async def test_thread_and_card_lines_are_escaped(harness):

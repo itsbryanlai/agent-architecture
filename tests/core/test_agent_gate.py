@@ -419,6 +419,7 @@ NOT_GATED = {
     "post_final_searched_model_reply": "posts that same reply as a new message when a progress edit was dropped",
     "apply_edit": "stores the requester's saved edit as the next draft revision; no model or connector",
     "post_task_notice": "posts a fixed line about a task in its thread; no agent effect",
+    "post_stale_notice": "posts the fixed stale line (with the nudge offer's button); no agent effect",
     "record_task_state": "stores the task's state row in the platform's store; no model, connector or post",
     "task_in_thread": "reads the asker's task row to poke its watch; no model or connector",
     "wait_task_refresh": "reads the task row until the poke's poll reports; no model or connector",

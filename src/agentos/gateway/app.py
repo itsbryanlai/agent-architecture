@@ -88,6 +88,7 @@ from agentos.models import (
     DraftView,
     EditRequest,
     ExternalUpdate,
+    NudgeRequest,
     field_error,
 )
 from agentos.notion_webhook import WebhookTokens
@@ -117,6 +118,7 @@ NOTION_PAGE_EVENTS = {
 }
 EDIT_ACTION = "task_edit"
 EDIT_CALLBACK = "task_edit"
+NUDGE_ACTION = "task_nudge"
 STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
 FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
 MULTILINE_FIELDS = {"details", "comment"}
@@ -380,6 +382,9 @@ async def _handle_actions(d: GatewayDeps, tenant: str, payload: dict, clicker: s
     for action in payload.get("actions") or []:
         if action.get("action_id") == EDIT_ACTION:
             await _open_edit_form(d, tenant, payload, action, clicker)
+            continue
+        if action.get("action_id") == NUDGE_ACTION:
+            await _nudge_clicked(d, tenant, action, clicker)
             continue
         vote = FEEDBACK_ACTIONS.get(action.get("action_id"))
         if vote is not None:
@@ -754,6 +759,25 @@ def _write_token_file(configured: str, token: str) -> str:
     with os.fdopen(fd, "w") as f:
         f.write(token)
     return path
+
+
+async def _nudge_clicked(d: GatewayDeps, tenant: str, action: dict, clicker: str) -> None:
+    """Signal the task whose stale notice offered a nudge.
+
+    Like an approval click, the gateway passes on who clicked and the button's nonce;
+    the workflow accepts it only from the requester on the live offer. Nothing is
+    written by the click itself: the nudge drafts an approval card first.
+    """
+    try:
+        value = json.loads(action.get("value") or "{}")
+        task_id, nonce = value["task_id"], value["nonce"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored nudge click with a bad value", tenant)
+        return
+    if not task_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored nudge click for another tenant", tenant)
+        return
+    await _signal(d, tenant, task_id, "nudge", NudgeRequest(nonce, clicker))
 
 
 async def _open_edit_form(

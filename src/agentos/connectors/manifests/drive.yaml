@@ -1,0 +1,8 @@
+# Google Drive connector manifest. The runtime reads it (see agentos.connectors.manifest).
+#
+# Drive reads are knowledge: the indexed folders and files are searched through
+# search_knowledge, not a Drive tool. No tool is offered to the model yet; the write
+# actions (comment, append a row, create from a template, replace a section) arrive with
+# their own tickets and declare their risk, idempotency and preview shape here then.
+connector: drive
+tools: {}

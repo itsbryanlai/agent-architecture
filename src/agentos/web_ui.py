@@ -42,6 +42,7 @@ from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
+from agentos.connectors.google_iam import GoogleError
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -137,6 +138,8 @@ NOTICES = {
     "notion-disconnected": "Notion disconnected.",
     "drive-connected": "Google Drive connected. Share folders and files with the address on this page.",
     "drive-disconnected": "Google Drive disconnected. The organisation's account was deleted at Google.",
+    "drive-picked": "Google Drive grants added to the draft.",
+    "drive-removed": "Google Drive grant removed from the draft.",
     "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
     "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
     "case-added": "Test case added to the draft. Choose its expected behaviour.",
@@ -321,6 +324,9 @@ class WebUI:
         self.route("GET", version + "/pick", self.pick_page)
         self.route("POST", version + "/pick/choose", self.pick_choose)
         self.route("POST", version + "/pick/revoke", self.pick_revoke)
+        self.route("GET", version + "/drive/pick", self.drive_pick_page)
+        self.route("POST", version + "/drive/pick/choose", self.drive_pick_choose)
+        self.route("POST", version + "/drive/remove", self.drive_remove)
         self.route("POST", version + "/test-cases", self.add_test_case)
         self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
         self.route("POST", version + "/test-cases/{case_id}/remove", self.remove_test_case)
@@ -856,6 +862,11 @@ class WebUI:
         run_review = await ctx.plane.test_run_review(
             ctx.tenant_id, ctx.principal, agent_id, version
         )
+        drive_configured = drive_connected = False
+        if editor or ctx.is_admin:
+            drive_configured, drive_connected = await ctx.plane.drive_connection_state(
+                ctx.tenant_id, ctx.principal
+            )
         return _page(
             "version.html",
             status,
@@ -864,6 +875,9 @@ class WebUI:
             audience=audience,
             review=review,
             grant_rows=grant_rows(record.agent(), review, creator_access),
+            drive_grants=record.agent().grants.drive,
+            drive_configured=drive_configured,
+            drive_connected=drive_connected,
             widens=bool(review and review.diff and review.diff.widens),
             picker_enabled=picker is not None,
             creator_consented=creator_consented,
@@ -1174,6 +1188,53 @@ class WebUI:
                 "Nothing is stored to revoke: you have not kept your Notion sign-in.",
             )
         return _redirect(self.version_url(ctx, agent_id, version, "consent-revoked"))
+
+    # --- Choose from Google Drive -----------------------------------------------------
+    # The workspace's Drive account, not a per-creator sign-in: the picker lists what the
+    # account can see and a click grants it. The admin's approval at publish is the check.
+
+    async def drive_pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        return _page(
+            "drive_pick.html",
+            ctx=ctx,
+            listing=listing,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=self.version_url(ctx, agent_id, version),
+        )
+
+    async def drive_pick_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        # Only a position in the listing the workspace's account produced can be chosen.
+        chosen = [item for i, item in enumerate(listing.items) if ctx.get(f"pick_{i}") == "yes"]
+        await ctx.plane.add_drive_grants(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_remove(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        await ctx.plane.remove_drive_grant(
+            ctx.tenant_id,
+            ctx.user_id,
+            agent_id,
+            version,
+            ctx.get("grant_id"),
+            _form_request_id(ctx),
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-removed"))
 
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
         plane = ctx.plane

@@ -25,20 +25,23 @@ from temporalio.client import Client
 from agentos.agent_store import AgentStore, with_published_agents
 from agentos.config import AgentsConfig
 from agentos.creator_access import apply_schedule as apply_creator_access_schedule
+from agentos.index_knowledge import apply_drive_schedules
 from agentos.index_knowledge import apply_schedules as apply_index_schedules
 from agentos.retention import apply_schedule as apply_retention_schedule
-from agentos.tenants import TenantRegistry, granted_roots
+from agentos.tenants import TenantRegistry, granted_drive_roots, granted_roots
 
 log = logging.getLogger("agentos.schedules")
 
 
 def scope_fingerprint(agents: AgentsConfig) -> tuple[tuple[str, str], ...]:
-    """The tenant's granted scopes and their roots, ordered.
+    """The tenant's granted scopes and their roots, ordered, Notion and Drive together.
 
     Equal fingerprints mean the tenant's index schedules stand; a publish that changes
-    no page grant (a prompt, an audience) causes no schedule call.
+    no page or Drive grant (a prompt, an audience) causes no schedule call.
     """
-    return tuple(sorted(granted_roots(agents).items()))
+    roots = dict(granted_roots(agents))
+    roots.update({scope: grant.id for scope, grant in granted_drive_roots(agents).items()})
+    return tuple(sorted(roots.items()))
 
 
 async def ensure_tenant_schedules(client: Client, agents: AgentsConfig) -> None:
@@ -52,6 +55,7 @@ async def ensure_tenant_schedules(client: Client, agents: AgentsConfig) -> None:
     await apply_retention_schedule(client, agents.tenant_id)
     await apply_creator_access_schedule(client, agents.tenant_id)
     await apply_index_schedules(client, agents)
+    await apply_drive_schedules(client, agents)
 
 
 async def refresh_schedules_once(
@@ -81,6 +85,7 @@ async def refresh_schedules_once(
                 continue
             if tenant_id in ensured:
                 await apply_index_schedules(client, config)
+                await apply_drive_schedules(client, config)
             else:
                 await ensure_tenant_schedules(client, config)
             ensured[tenant_id] = fingerprint

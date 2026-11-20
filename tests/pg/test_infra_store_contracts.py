@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from agentos import ids
 from agentos.content_store import InMemoryContentStore, PostgresContentStore, StoredStep
 from agentos.knowledge.store import InMemoryKnowledgeStore, PageSync, PostgresKnowledgeStore
 from agentos.stores import (
@@ -197,6 +198,36 @@ async def test_knowledge_search_is_scoped_to_the_tenant_and_ordered_by_distance(
     assert (hits[0].title, hits[0].url) == ("Fruit", "https://n/p1")
     assert await knowledge.search(tenant, [], unit_vector(1), limit=5) == []
     assert len(await knowledge.search(tenant, ["s1", "s2"], unit_vector(0), limit=5)) == 3
+
+
+async def test_knowledge_search_filters_drive_scopes_by_tenant_and_grant(
+    knowledge, tenant: str, other_tenant: str
+):
+    """Fails if a Drive search returns another tenant's Drive rows, or a Drive scope the
+    agent was not granted."""
+    granted = ids.drive_scope("folder-1")
+    ungranted = ids.drive_scope("folder-2")
+    chunks = [("drive text", unit_vector(0))]
+    await knowledge.replace_page(
+        tenant, granted, "file-1", "Doc", "https://drive/file-1", "h1", chunks
+    )
+    await knowledge.replace_page(
+        tenant, ungranted, "file-2", "Other", "https://drive/file-2", "h2", chunks
+    )
+    await knowledge.replace_page(
+        other_tenant, granted, "file-3", "Theirs", "https://drive/file-3", "h3", chunks
+    )
+
+    assert [
+        h.page_id for h in await knowledge.search(tenant, [granted], unit_vector(0), limit=5)
+    ] == ["file-1"]
+    assert [
+        h.page_id for h in await knowledge.search(other_tenant, [granted], unit_vector(0), limit=5)
+    ] == ["file-3"]
+    assert (
+        await knowledge.search(tenant, [ids.drive_scope("not-granted")], unit_vector(0), limit=5)
+        == []
+    )
 
 
 async def test_reindexing_a_page_replaces_its_chunks_and_details(

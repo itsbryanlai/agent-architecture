@@ -403,9 +403,23 @@ class NotionPageGrant:
 
 
 @dataclass
+class DriveGrant:
+    """A Google Drive folder or file the agent may read, shared with the tenant's account.
+
+    A folder grants everything under it (recursively); a file grants just that file. Each
+    grant is one scope that searches are filtered by. ``kind`` is ``folder`` or ``file``.
+    """
+
+    id: str
+    name: str
+    kind: str = "folder"
+
+
+@dataclass
 class Grants:
     notion_databases: list[NotionDatabaseGrant] = field(default_factory=list)
     notion_pages: list[NotionPageGrant] = field(default_factory=list)
+    drive: list[DriveGrant] = field(default_factory=list)
 
 
 # The most an agent definition may ask for. A task lives at most one approval window plus one
@@ -578,10 +592,13 @@ _AGENT_KEYS = frozenset(
         "team",
     }
 )
-_GRANT_KEYS = frozenset({"notion"})
+_GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
+_DRIVE_KEYS = frozenset({"folders", "files"})
+_DRIVE_ITEM_KEYS = frozenset({"id", "name"})
+DRIVE_GRANT_KINDS = ("folder", "file")
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -703,6 +720,32 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> Not
     )
 
 
+def _parse_drive_grant(agent_id: str, raw: dict[str, Any], kind: str, index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.{kind}s[{index}]"
+    _mapping(where, raw, _DRIVE_ITEM_KEYS)
+    return DriveGrant(
+        id=_text(where, "id", _require(raw, "id", where)),
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind=kind,
+    )
+
+
+def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
+    where = f"agent '{agent_id}' grants.drive"
+    drive = _mapping(where, raw, _DRIVE_KEYS)
+    grants: list[DriveGrant] = []
+    for kind in DRIVE_GRANT_KINDS:
+        key = f"{kind}s"
+        for i, item in enumerate(_list_of(f"{where}.{key}", drive.get(key))):
+            grants.append(_parse_drive_grant(agent_id, item, kind, i))
+    seen: set[str] = set()
+    for grant in grants:
+        if grant.id in seen:
+            raise ConfigError(f"{where}: '{grant.id}' is granted more than once")
+        seen.add(grant.id)
+    return grants
+
+
 def _parse_policy(
     where: str,
     raw: Any,
@@ -746,6 +789,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         _parse_page_grant(agent_id, pg, i)
         for i, pg in enumerate(_list_of(f"{where} grants.notion.pages", notion.get("pages")))
     ]
+    drive = _parse_drive_grants(agent_id, grants_raw.get("drive"))
     description = raw.get("description")
     if description is not None and not isinstance(description, str):
         raise ConfigError(f"{where}: 'description' must be text")
@@ -756,7 +800,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         name=_text(where, "name", _require(raw, "name", where)),
         system_prompt=_text(where, "system_prompt", _require(raw, "system_prompt", where)),
         max_steps=_whole(where, "max_steps", _require(raw, "max_steps", where), *MAX_STEPS_RANGE),
-        grants=Grants(notion_databases=databases, notion_pages=pages),
+        grants=Grants(notion_databases=databases, notion_pages=pages, drive=drive),
         follow_up=_parse_policy(
             f"{where} follow_up",
             raw.get("follow_up"),
@@ -824,6 +868,13 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
     }
     if agent.audience is not None:
         definition["audience"] = _audience_definition(agent.audience)
+    if agent.grants.drive:
+        definition["grants"]["drive"] = {
+            "folders": [
+                {"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == "folder"
+            ],
+            "files": [{"id": g.id, "name": g.name} for g in agent.grants.drive if g.kind == "file"],
+        }
     return definition
 
 

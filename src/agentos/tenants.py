@@ -27,10 +27,12 @@ from agentos import ids
 from agentos.config import (
     AgentsConfig,
     ConfigError,
+    DriveGrant,
     Settings,
     TenantsConfig,
     read_secret,
 )
+from agentos.connectors.drive import DriveReader
 from agentos.connectors.notion import NotionAPI, NotionUserCache, normalize_id
 from agentos.slack_client import SlackPoster
 from agentos.tenant_store import TenantSource
@@ -73,6 +75,9 @@ class TenantRuntime:
     # The token the Notion client was built with, so a sync rebuilds it when Connect
     # Notion replaces the credential. In memory only, like the client's own copy.
     notion_token: str = field(default="", repr=False)
+    # The tenant's Drive reader (the deployment client bound to its account email), or
+    # None when Drive is not connected or not set up on the deployment.
+    drive: DriveReader | None = field(default=None, repr=False)
 
 
 def runtime_for(
@@ -81,10 +86,11 @@ def runtime_for(
     notion_api: NotionAPI | None = None,
     slack_token: str = "",
     notion_token: str = "",
+    drive: DriveReader | None = None,
 ) -> TenantRuntime:
     """Build a tenant's runtime."""
     return TenantRuntime(
-        config, slack, notion_api, slack_token=slack_token, notion_token=notion_token
+        config, slack, notion_api, slack_token=slack_token, notion_token=notion_token, drive=drive
     )
 
 
@@ -310,4 +316,18 @@ def granted_roots(agents: AgentsConfig) -> dict[str, str]:
     for agent in agents.agents.values():
         for grant in agent.grants.notion_pages:
             roots.setdefault(ids.knowledge_scope(grant.id), normalize_id(grant.id))
+    return roots
+
+
+def granted_drive_roots(agents: AgentsConfig) -> dict[str, DriveGrant]:
+    """Scope to Drive grant, for every distinct folder or file granted to any agent of a tenant.
+
+    Pass a config whose ``agents`` are the tenant's published set
+    (``agent_store.with_published_agents``). The grant carries its kind (folder or file),
+    which the walk uses to decide whether to list children or index the one file.
+    """
+    roots: dict[str, DriveGrant] = {}
+    for agent in agents.agents.values():
+        for grant in agent.grants.drive:
+            roots.setdefault(ids.drive_scope(grant.id), grant)
     return roots

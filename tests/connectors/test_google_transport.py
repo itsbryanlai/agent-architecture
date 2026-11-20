@@ -16,6 +16,11 @@ from google.oauth2 import service_account
 from agentos.connectors.google_iam import (
     CLOUD_PLATFORM,
     DRIVE_SCOPES,
+    MIME_DOC,
+    MIME_SHEET,
+    MIME_SLIDES,
+    DriveFile,
+    DriveSection,
     GoogleError,
     RealGoogleAccounts,
 )
@@ -449,3 +454,160 @@ async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(de
     assert len(files) == 2
     assert "sharedWithMe" in files[0].path_url
     assert "includeItemsFromAllDrives=true" in files[0].path_url
+
+
+# --- the Drive read surface (knowledge) ---------------------------------------------------
+
+
+def _mint(request):
+    if request.path_url == MINT_PATH:
+        return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+    return None
+
+
+async def test_list_children_pages_through_and_returns_metadata(deployment_key):
+    """Fails if listing a folder's children stops at the first page, does not ask for the
+    folder's non-trashed children, or drops the metadata the walk needs."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files"):
+            if "pageToken=p2" in request.path_url:
+                return reply(
+                    request,
+                    200,
+                    {
+                        "files": [
+                            {"id": "f2", "name": "Sheet", "mimeType": MIME_SHEET, "version": "3"}
+                        ]
+                    },
+                )
+            return reply(
+                request,
+                200,
+                {
+                    "files": [{"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "version": "2"}],
+                    "nextPageToken": "p2",
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    children = await client.list_children(EMAIL, "folder-1")
+    assert [(c.id, c.mime_type, c.version) for c in children] == [
+        ("f1", MIME_DOC, "2"),
+        ("f2", MIME_SHEET, "3"),
+    ]
+    lists = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert len(lists) == 2
+    assert "folder-1" in lists[0].path_url and "trashed" in lists[0].path_url
+
+
+@pytest.mark.parametrize(("status", "gone"), [(200, False), (404, True), (403, True)])
+async def test_get_file_returns_metadata_or_maps_gone_and_refused(deployment_key, status, gone):
+    """Fails if files.get does not return the metadata, or a 404/403 is not a GoogleError
+    carrying its status so the caller can drop the file."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if status == 200:
+            return reply(
+                request,
+                200,
+                {
+                    "id": "f1",
+                    "name": "Doc",
+                    "mimeType": MIME_DOC,
+                    "version": "7",
+                    "webViewLink": "https://drive/f1",
+                    "trashed": False,
+                },
+            )
+        return reply(request, status, {"error": {"status": "NOT_FOUND"}})
+
+    client, _sent = client_with(handler, deployment_key)
+    if not gone:
+        assert await client.get_file(EMAIL, "f1") == DriveFile(
+            "f1", "Doc", MIME_DOC, version="7", web_view_link="https://drive/f1"
+        )
+    else:
+        with pytest.raises(GoogleError) as err:
+            await client.get_file(EMAIL, "f1")
+        assert err.value.status == status
+
+
+@pytest.mark.parametrize("mime", [MIME_DOC, MIME_SLIDES], ids=["doc", "slides"])
+async def test_export_doc_and_slides_as_plain_text(deployment_key, mime):
+    """Fails if a Doc or Slides export does not ask Drive for text/plain, or returns
+    anything but the exported text."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files/f1/export"):
+            return reply(request, 200, "the exported text")
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    sections = await client.export_file(EMAIL, "f1", mime)
+    assert sections == [DriveSection("", "the exported text")]
+    exports = [r for r in sent if "/export" in r.path_url]
+    assert len(exports) == 1 and "mimeType=text" in exports[0].path_url
+
+
+async def test_export_sheet_reads_every_tab_as_csv_with_its_name(deployment_key):
+    """Fails if a Sheet export uses Drive's first-tab-only CSV export, or drops a tab's
+    name or rows."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v4/spreadsheets/f1"):
+            return reply(
+                request,
+                200,
+                {
+                    "sheets": [
+                        {
+                            "properties": {"title": "Q1"},
+                            "data": [
+                                {
+                                    "rowData": [
+                                        {
+                                            "values": [
+                                                {"formattedValue": "name"},
+                                                {"formattedValue": "role"},
+                                            ]
+                                        },
+                                        {
+                                            "values": [
+                                                {"formattedValue": "alice"},
+                                                {"formattedValue": "eng"},
+                                            ]
+                                        },
+                                    ]
+                                }
+                            ],
+                        },
+                        {
+                            "properties": {"title": "Q2"},
+                            "data": [{"rowData": [{"values": [{"formattedValue": "bob"}]}]}],
+                        },
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    sections = await client.export_file(EMAIL, "f1", MIME_SHEET)
+    assert [(s.heading, s.text) for s in sections] == [
+        ("Q1", "name,role\nalice,eng\n"),
+        ("Q2", "bob\n"),
+    ]
+    assert not any("/export" in r.path_url for r in sent)

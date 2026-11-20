@@ -37,12 +37,25 @@ def knowledge_scope(page_id: str) -> str:
     return f"notion:page:{normalize_id(page_id)}"
 
 
+def drive_scope(granted_id: str) -> str:
+    """The scope name for a granted Drive folder or file: everything under it shares it."""
+    return f"drive:{granted_id}"
+
+
 def index_workflow_id(tenant: str, scope: str) -> str:
     return f"{tenant}:index:{scope}"
 
 
 def index_schedule_id(tenant: str, scope: str) -> str:
     return f"{tenant}:index-schedule:{scope}"
+
+
+def drive_index_workflow_id(tenant: str, scope: str) -> str:
+    return f"{tenant}:drive-index:{scope}"
+
+
+def drive_index_schedule_id(tenant: str, scope: str) -> str:
+    return f"{tenant}:drive-index-schedule:{scope}"
 
 
 def retention_workflow_id(tenant: str) -> str:

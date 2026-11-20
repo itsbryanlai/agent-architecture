@@ -87,6 +87,33 @@
 {% if review and review.live_problem %}<p class="error">{{ review.live_problem }}; the live titles are missing.</p>{% endif %}
 {% endif %}
 
+<h2>Google Drive</h2>
+{% if drive_grants %}
+<table>
+  <tr><th>Creator's label</th><th>Kind</th><th>Drive ID</th>{% if editor and is_draft %}<th></th>{% endif %}</tr>
+  {% for g in drive_grants %}
+  <tr>
+    <td>{{ g.name }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
+    {% if editor and is_draft %}<td>{{ post_button(version_url ~ "/drive/remove", ctx.csrf, "Remove", {"grant_id": g.id, "request_id": new_token()}) }}</td>{% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">This version has no Google Drive grants.</p>
+{% endif %}
+{% if editor %}
+  {% if not drive_configured %}
+<p class="muted">Google Drive is not set up on this deployment.</p>
+  {% elif not drive_connected %}
+<p class="muted">Google Drive is not connected. <a href="{{ base }}/settings">Connect it in Settings</a>, then share folders and files with the workspace's Drive address.</p>
+  {% else %}
+<p class="muted">Anything shared with this workspace's Drive address is available to every agent creator in this workspace; an admin approves each agent before it reads it.</p>
+    {% if is_draft %}
+<div class="actions"><a href="{{ version_url }}/drive/pick"><button type="button">Choose from Google Drive</button></a></div>
+    {% endif %}
+  {% endif %}
+{% endif %}
+
 {% if review and review.diff and review.diff.changes %}
 <h2>Changes against the published version</h2>
 {% if not review.diff.baseline %}<p class="muted">Nothing is published yet, so all of it is new.</p>{% endif %}

@@ -48,7 +48,9 @@ from agentos.connectors.notion import normalize_id
 from agentos.creator_access import CreatorAccessActivities, InMemoryCreatorAccessStore
 from agentos.credentials import InMemoryCredentialStore, TenantCredentials
 from agentos.crypto_keys import LocalKeyStore
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.grant_picks import InMemoryGrantPickStore, PickedObject
+from agentos.knowledge.drive_indexing import DriveIndexActivities
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -95,6 +97,7 @@ from agentos.workflows.conversation import (
     ConversationWorkflow,
 )
 from agentos.workflows.creator_access import CreatorAccessWorkflow
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
@@ -116,6 +119,7 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.helpers.agents import republish
+from tests.helpers.drive import DRIVE_FOLDER, drive_account_email, make_drive_google
 from tests.helpers.health import FlipsAfterReads
 from tests.helpers.llm_errors import StatusError
 
@@ -186,6 +190,8 @@ class Rig:
     # reads with it, so a scenario can lose the creator's access while the grants pass.
     creator_notion: object
     health: InMemoryAgentHealthStore
+    google: object
+    drive_connections: InMemoryDriveConnectionStore
 
     @property
     def client(self) -> Client:
@@ -257,6 +263,18 @@ async def rig(key_dir: Path, *, workflows=None):
         health_checker,
         client_for=lambda _token, _tenant: creator_notion,
     )
+    google = make_drive_google()
+    drive_connections = InMemoryDriveConnectionStore()
+    drive_index = DriveIndexActivities(
+        registry,
+        knowledge,
+        embedder,
+        agent_store,
+        google,
+        drive_connections,
+        switches=switches,
+        budgets=BudgetGuard(budgets, usage, ttl_seconds=0),
+    )
     worker = Worker(
         env.client,
         task_queue=TASK_QUEUE,
@@ -268,8 +286,9 @@ async def rig(key_dir: Path, *, workflows=None):
             PageRefreshWorkflow,
             CreatorAccessWorkflow,
             TestRunWorkflow,
+            DriveIndexingWorkflow,
         ],
-        activities=acts.all() + index.all() + creator_access_acts.all(),
+        activities=acts.all() + index.all() + creator_access_acts.all() + drive_index.all(),
     )
     async with worker:
         try:
@@ -288,6 +307,8 @@ async def rig(key_dir: Path, *, workflows=None):
                 access,
                 creator_notion,
                 health,
+                google,
+                drive_connections,
             )
         finally:
             await env.shutdown()
@@ -1718,6 +1739,30 @@ async def test_run_tenant_disabled(r: Rig) -> list[Recorded]:
     return [await current(r, "", run_id)]
 
 
+async def drive_indexing(r: Rig) -> list[Recorded]:
+    """One nightly Drive walk: a granted folder's Doc, Sheet and Slides are indexed, a
+    non-exportable type is counted, and the walk's outcome is recorded on the connection."""
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: d["grants"].update(
+            drive={"folders": [{"id": DRIVE_FOLDER, "name": "Team folder"}]}
+        ),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 20, tzinfo=UTC)
+    )
+    scope = ids.drive_scope(DRIVE_FOLDER)
+    summary = await r.client.execute_workflow(
+        DriveIndexingWorkflow.run,
+        args=[TENANT, scope, DRIVE_FOLDER],
+        id=ids.drive_index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    assert (summary.files, summary.changed, summary.skipped_type, summary.failed) == (5, 4, 1, 0)
+    return [await current(r, "", ids.drive_index_workflow_id(TENANT, scope))]
+
+
 def _both(fn):
     return {
         False: lambda r: fn(r, False),
@@ -1774,6 +1819,8 @@ SCENARIOS["creator_access_tenant_disabled"] = creator_access_tenant_disabled
 # A test run carries references only: one shape, like the creator-access passes.
 SCENARIOS["test_run"] = test_run
 SCENARIOS["test_run_tenant_disabled"] = test_run_tenant_disabled
+# The Drive walk carries references only: one shape, like the Notion index runs.
+SCENARIOS["drive_indexing"] = drive_indexing
 
 
 # --- files --------------------------------------------------------------------------------
@@ -1812,7 +1859,13 @@ async def replay(path: Path, key_dir: Path):
     """Replay one fixture on the current workflow code; raises on non-determinism."""
     history, header = load_fixture(path)
     replayer = Replayer(
-        workflows=[ConversationWorkflow, TaskWorkflow, CreatorAccessWorkflow, TestRunWorkflow],
+        workflows=[
+            ConversationWorkflow,
+            TaskWorkflow,
+            CreatorAccessWorkflow,
+            TestRunWorkflow,
+            DriveIndexingWorkflow,
+        ],
         # An old file was recorded with the default converter; a new one with the encrypting one.
         data_converter=converter(key_dir) if header else DataConverter.default,
     )

@@ -23,6 +23,8 @@ from agentos.config import (
     parse_agents_config,
 )
 from agentos.connectors.notion import FakeNotionAPI, text_block
+from agentos.drive_connections import InMemoryDriveConnectionStore
+from agentos.knowledge.drive_indexing import DriveIndexActivities
 from agentos.knowledge.embedder import FakeEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import InMemoryKnowledgeStore
@@ -39,6 +41,7 @@ from agentos.switches import InMemorySwitchStore
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.usage import InMemoryUsageStore
 from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.task import TaskWorkflow
@@ -373,6 +376,82 @@ async def kharness(temporal_scope):
         task_queue=wf_env.task_queue,
         workflows=[ConversationWorkflow, TaskWorkflow, IndexingWorkflow, PageRefreshWorkflow],
         activities=h.acts.all() + index_acts.all(),
+        interceptors=[wf_env.children],
+    )
+    async with worker:
+        yield h
+
+
+# --- Drive fixtures: an agent with a Drive folder grant, indexed from a fake Drive tree.
+
+
+@dataclass
+class DriveHarness(KnowledgeHarness):
+    google: object = None  # type: ignore[assignment]
+    drive_connections: InMemoryDriveConnectionStore = None  # type: ignore[assignment]
+
+
+@pytest.fixture
+async def dharness(temporal_scope):
+    from agentos.usage import utcnow
+    from tests.helpers.drive import drive_account_email, drive_agents_dict, make_drive_google
+
+    cfg = parse_agents_config(drive_agents_dict())
+    wf_env = temporal_scope
+    google = make_drive_google()
+    email = drive_account_email(google)
+    drive_connections = InMemoryDriveConnectionStore()
+    await drive_connections.connect(TENANT, email, utcnow())
+    h = DriveHarness(
+        wf_env=wf_env,
+        agents=cfg,
+        llm=ScriptedLLMClient(),
+        slack=FakeSlack(emails={ALICE: "alice@example.com", BOB: "bob@example.com"}),
+        notion=make_fake_notion(),
+        history=InMemoryHistoryStore(),
+        idem=InMemoryIdempotencyStore(),
+        links=InMemoryTaskLinkStore(),
+        tool_outputs=InMemoryToolOutputStore(),
+        knowledge=InMemoryKnowledgeStore(),
+        embedder=FakeEmbedder(),
+        agent_store=seeded_agent_store(cfg),
+        budgets=InMemoryBudgetStore(),
+        usage_store=InMemoryUsageStore(),
+        google=google,
+        drive_connections=drive_connections,
+    )
+    registry = TenantRegistry({TENANT: runtime_for(cfg, h.slack, h.notion)})
+    h.acts = AgentActivities(
+        settings=Settings(),
+        registry=registry,
+        history=h.history,
+        idem=h.idem,
+        links=h.links,
+        llm=h.llm,
+        tool_outputs=h.tool_outputs,
+        audit=h.audit,
+        agents=h.agent_store,
+        knowledge=h.knowledge,
+        embedder=h.embedder,
+        switches=h.switches,
+        google=google,
+        drive_connections=drive_connections,
+    )
+    drive_acts = DriveIndexActivities(
+        registry,
+        h.knowledge,
+        h.embedder,
+        h.agent_store,
+        google,
+        drive_connections,
+        switches=h.switches,
+        budgets=BudgetGuard(h.budgets, h.usage_store, ttl_seconds=0),
+    )
+    worker = Worker(
+        wf_env.client,
+        task_queue=wf_env.task_queue,
+        workflows=[ConversationWorkflow, TaskWorkflow, DriveIndexingWorkflow],
+        activities=h.acts.all() + drive_acts.all(),
         interceptors=[wf_env.children],
     )
     async with worker:

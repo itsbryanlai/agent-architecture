@@ -174,10 +174,17 @@ from agentos.config import (
     AgentVersion,
     ConfigError,
     TenantsConfig,
+    agent_definition,
     channel_audience_problems,
     read_secret,
 )
-from agentos.connectors.google_iam import DriveItem, GoogleAccounts, GoogleError, problem_text
+from agentos.connectors.google_iam import (
+    DriveItem,
+    DriveListing,
+    GoogleAccounts,
+    GoogleError,
+    problem_text,
+)
 from agentos.connectors.manifest import low_risk_actions
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
@@ -2006,6 +2013,97 @@ class ControlPlane:
                 conn=conn,
             )
         return True
+
+    # --- Drive grants (the picker) ----------------------------------------------------
+    # A creator picks any folder or file shared with the workspace's Drive address; the
+    # admin's approval at publish is the check, so there is no per-creator sign-in and no
+    # pick gate (the Notion ``_require_picked`` does not apply to Drive grants).
+
+    async def drive_connection_state(self, tenant_id: str, actor: Actor) -> tuple[bool, bool]:
+        """(configured, connected) for the version page's Drive section. Configured means the
+        deployment has a Google client; connected means the tenant has a connection row."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        configured = self._drive is not None and self._google is not None
+        row = None if self._drive is None else await self._drive.get(tenant_id)
+        return configured, row is not None
+
+    async def drive_picker_listing(self, tenant_id: str, actor: Actor) -> DriveListing:
+        """What the workspace's Drive account can see, for the grant picker (the capped D-2
+        list). A read of Google; nothing is stored. Refused when Drive is not set up or not
+        connected."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        return await self._google.list_shared(row.service_account_email)
+
+    async def add_drive_grants(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        items: list[DriveItem],
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Add the picked folders/files to the draft's Drive grants. ``items`` come from a
+        listing of the workspace's account (the picker matches them), so only what is shared
+        with the address is granted. An item already granted is not added twice."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        if not items:
+            return record
+        definition = agent_definition(record.agent())
+        drive_block = definition["grants"].setdefault("drive", {"folders": [], "files": []})
+        existing = {g.id for g in record.agent().grants.drive}
+        for item in items:
+            if item.id in existing:
+                continue
+            key = "folders" if item.kind == "folder" else "files"
+            drive_block[key].append({"id": item.id, "name": item.name})
+            existing.add(item.id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.replace_draft(
+                tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
+        return record
+
+    async def remove_drive_grant(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        grant_id: str,
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Remove one Drive grant from the draft. Removing what is not granted changes nothing."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        definition = agent_definition(record.agent())
+        drive_block = definition.get("grants", {}).get("drive")
+        if drive_block is not None:
+            for key in ("folders", "files"):
+                drive_block[key] = [g for g in drive_block.get(key, []) if g["id"] != grant_id]
+            if not drive_block["folders"] and not drive_block["files"]:
+                del definition["grants"]["drive"]
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.replace_draft(
+                tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
+        return record
 
     async def creator_consent(self, tenant_id: str, actor: Actor) -> bool:
         """Whether the actor's Notion sign-in is kept for the nightly check. Reads no token."""

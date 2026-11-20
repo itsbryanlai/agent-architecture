@@ -63,10 +63,18 @@ from agentos.config import (
 from agentos.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import load_stored_tenants
-from agentos.tenants import granted_roots
+from agentos.tenants import granted_drive_roots, granted_roots
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 
-__all__ = ["apply_schedules", "granted_roots", "plan_schedules", "start_indexing"]
+__all__ = [
+    "apply_drive_schedules",
+    "apply_schedules",
+    "granted_roots",
+    "plan_schedules",
+    "start_drive_indexing",
+    "start_indexing",
+]
 
 
 async def start_indexing(
@@ -160,11 +168,91 @@ async def apply_schedules(
     for schedule_id in plan.delete:
         await client.get_schedule_handle(schedule_id).delete()
     if store is not None:
-        granted = granted_roots(agents)
+        # A stored scope is kept while any agent grants it, whether it is a Notion page
+        # or a Drive folder/file; only a scope neither connector grants any more is purged.
+        granted = set(granted_roots(agents)) | set(granted_drive_roots(agents))
         for scope in await store.scopes(agents.tenant_id):
             if scope not in granted:
                 await store.delete_scope(agents.tenant_id, scope)
                 plan.purged.append(scope)
+    return plan
+
+
+# The walk state of a Drive run that has only begun: nothing seen, no counts, no start time.
+_DRIVE_FRESH_RUN = (None, None, None, 0, 0, 0, 0, 0, None, False)
+
+
+async def start_drive_indexing(
+    client: Client, agents: AgentsConfig, confirm_gone: bool = False
+) -> list[tuple[str, WorkflowHandle]]:
+    """Start one DriveIndexingWorkflow per distinct Drive scope; reuse a run already going."""
+    started = []
+    for scope, grant in granted_drive_roots(agents).items():
+        workflow_id = ids.drive_index_workflow_id(agents.tenant_id, scope)
+        handle = await client.start_workflow(
+            DriveIndexingWorkflow.run,
+            args=[agents.tenant_id, scope, grant.id, *_DRIVE_FRESH_RUN, confirm_gone],
+            id=workflow_id,
+            task_queue=TASK_QUEUE,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+        started.append((workflow_id, handle))
+    return started
+
+
+def plan_drive_schedules(agents: AgentsConfig, existing_ids: list[str]) -> SchedulePlan:
+    """One nightly schedule per granted Drive scope; stale ones of this tenant are deleted.
+
+    Only IDs with this tenant's Drive-index-schedule prefix are considered.
+    """
+    prefix = ids.drive_index_schedule_id(agents.tenant_id, "")
+    wanted = [
+        ids.drive_index_schedule_id(agents.tenant_id, scope)
+        for scope in granted_drive_roots(agents)
+    ]
+    ours = {i for i in existing_ids if i.startswith(prefix)}
+    return SchedulePlan(
+        create=[i for i in wanted if i not in ours],
+        update=[i for i in wanted if i in ours],
+        delete=sorted(ours - set(wanted)),
+    )
+
+
+def _drive_schedule(agents: AgentsConfig, scope: str, root_id: str) -> Schedule:
+    return Schedule(
+        action=ScheduleActionStartWorkflow(
+            DriveIndexingWorkflow.run,
+            args=[agents.tenant_id, scope, root_id],
+            id=ids.drive_index_workflow_id(agents.tenant_id, scope),
+            task_queue=TASK_QUEUE,
+        ),
+        # Every day at 03:00 UTC, like the Notion walk; a run still going is skipped.
+        spec=ScheduleSpec(
+            calendars=[ScheduleCalendarSpec(hour=[ScheduleRange(3)], minute=[ScheduleRange(0)])]
+        ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+    )
+
+
+async def apply_drive_schedules(client: Client, agents: AgentsConfig) -> SchedulePlan:
+    """Create or update one nightly schedule per granted Drive scope and delete stale ones.
+
+    Stored Drive pages of revoked scopes are purged by ``apply_schedules`` (which keeps a
+    scope granted by either connector), so this only manages the schedules.
+    """
+    existing = [s.id async for s in await client.list_schedules()]
+    plan = plan_drive_schedules(agents, existing)
+    for scope, grant in granted_drive_roots(agents).items():
+        schedule_id = ids.drive_index_schedule_id(agents.tenant_id, scope)
+        schedule = _drive_schedule(agents, scope, grant.id)
+        if schedule_id in plan.create:
+            await client.create_schedule(schedule_id, schedule)
+        elif schedule_id in plan.update:
+            await client.get_schedule_handle(schedule_id).update(
+                lambda _input, schedule=schedule: ScheduleUpdate(schedule=schedule)
+            )
+    for schedule_id in plan.delete:
+        await client.get_schedule_handle(schedule_id).delete()
     return plan
 
 

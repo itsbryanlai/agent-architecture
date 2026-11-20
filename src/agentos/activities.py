@@ -101,6 +101,8 @@ from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors.base import Connector, ConnectorError, Entry
+from agentos.connectors.drive import DriveReader
+from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.manifest import (
     MANIFEST_DIR,
     TOOLS,
@@ -111,8 +113,10 @@ from agentos.connectors.manifest import (
 from agentos.connectors.notion import normalize_id, nudge_comment_text
 from agentos.connectors.registry import connector_for, error_classes
 from agentos.content_store import ContentStore, InMemoryContentStore, StoredStep
+from agentos.drive_connections import DriveConnectionStore
 from agentos.feedback import answer_blocks
 from agentos.history_view import prepare_for_model
+from agentos.knowledge.drive_search import DriveChecker, ScopeChecker
 from agentos.knowledge.embedder import Embedder
 from agentos.knowledge.search import (
     ITEM_RULES,
@@ -171,6 +175,7 @@ from agentos.stores import (
     ToolOutputStore,
 )
 from agentos.switches import (
+    DRIVE,
     NOTION,
     SWITCHED_OFF,
     AgentOff,
@@ -390,8 +395,12 @@ class AgentActivities:
         tasks: TaskStore | None = None,
         policies: ApprovalPolicyStore | None = None,
         test_sets: TestSetStore | None = None,
+        google: GoogleAccounts | None = None,
+        drive_connections: DriveConnectionStore | None = None,
     ):
         self.settings = settings
+        self.google = google
+        self.drive_connections = drive_connections
         self.test_sets = test_sets or InMemoryTestSetStore()
         self.content = content or InMemoryContentStore()
         self.threads = threads or InMemoryThreadStore()
@@ -1080,8 +1089,8 @@ class AgentActivities:
             tools = tools + [TOOLS[MY_TASKS_TOOL].llm_definition()]
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
-        if agent.grants.notion_pages:
-            # Search is offered only to an agent that was granted pages, and
+        if agent.grants.notion_pages or agent.grants.drive:
+            # Search is offered only to an agent that was granted pages or Drive files, and
             # the model is told to treat what it returns as data.
             tools = tools + [self.knowledge_tool.llm_definition()]
             system = f"{system}\n\n{KNOWLEDGE_RULES}"
@@ -1588,7 +1597,19 @@ class AgentActivities:
 
     async def _granted_scopes(self, tenant_id: str, agent_id: str) -> list[str]:
         agent = await self._agent(tenant_id, agent_id)
-        return [ids.knowledge_scope(g.id) for g in agent.grants.notion_pages]
+        return [ids.knowledge_scope(g.id) for g in agent.grants.notion_pages] + [
+            ids.drive_scope(g.id) for g in agent.grants.drive
+        ]
+
+    async def _drive_checker(self, tenant_id: str) -> DriveChecker:
+        """The Drive re-check for a search, with the tenant's own account. No connection or
+        no Google client means Drive hits cannot be confirmed, so they are dropped."""
+        if self.google is None or self.drive_connections is None:
+            return DriveChecker(None)
+        row = await self.drive_connections.get(tenant_id)
+        if row is None:
+            return DriveChecker(None)
+        return DriveChecker(DriveReader(self.google, row.service_account_email))
 
     @activity.defn(name="run_read_tool")
     async def run_read_tool(
@@ -1678,19 +1699,32 @@ class AgentActivities:
         first_marker: int,
         pinned: AgentVersion | None = None,
     ) -> tuple[str, bool, list[Citation]]:
-        """Search the agent's own granted pages and number the passages found.
+        """Search the agent's own granted pages and Drive files and number the passages found.
 
-        The scopes come from this agent's page grants, and the store filters by
-        them inside its query, and only chunks of the embedding model in use count.
-        Chunks beyond the model's distance cut-off are dropped. Each page found is then
-        re-checked with Notion (not trashed, still where it was indexed under its granted
-        root) before it can reach the model. The numbered passages are stored as the tool output; only the
-        citation numbers and page IDs go back to the workflow.
+        The scopes come from this agent's Notion page grants and Drive grants, and the store
+        filters by them inside its query, and only chunks of the embedding model in use count.
+        A scope whose connector an admin turned off is left out (Notion scopes answer to the
+        Notion switch, Drive scopes to the Drive switch). Chunks beyond the model's distance
+        cut-off are dropped. Each page found is then re-checked with its source — Notion (not
+        trashed, still where it was indexed) or Drive (a live ``files.get``) — before it can
+        reach the model. The numbered passages are stored as the tool output; only the citation
+        numbers and page IDs go back to the workflow.
         """
         agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
-        roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
+        notion_roots = {ids.knowledge_scope(g.id): g.id for g in agent.grants.notion_pages}
+        drive_roots = {ids.drive_scope(g.id): g.id for g in agent.grants.drive}
+        state = await read_state(self.switches, ctx.tenant_id)
+        roots: dict[str, str] = {}
+        if not state.connector_off(NOTION):
+            roots.update(notion_roots)
+        if not state.connector_off(DRIVE):
+            roots.update(drive_roots)
         if not roots or self.knowledge is None or self.embedder is None:
             self._log_search(ctx, len(roots), 0, 0, [])
+            if notion_roots and state.connector_off(NOTION):
+                return connector_off_text(NOTION), True, []
+            if drive_roots and state.connector_off(DRIVE):
+                return connector_off_text(DRIVE), True, []
             return "This agent has no documents to search.", True, []
         query = call.input.get("query")
         if not isinstance(query, str) or not query.strip():
@@ -1710,7 +1744,12 @@ class AgentActivities:
         cutoff = embed_max_distance(model, self.settings.embed_max_distance)
         if cutoff is not None:
             hits = [hit for hit in hits if hit.distance <= cutoff]
-        checker = PageChecker(self._runtime(ctx.tenant_id).notion_api)
+        drive_checker = (
+            await self._drive_checker(ctx.tenant_id)
+            if any(scope.startswith("drive:") for scope in roots)
+            else None
+        )
+        checker = ScopeChecker(PageChecker(self._runtime(ctx.tenant_id).notion_api), drive_checker)
         kept = await select_passages(hits, checker, roots)
         self._log_search(ctx, len(roots), candidates, candidates - len(hits), kept)
         citations = [

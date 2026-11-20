@@ -1725,10 +1725,45 @@ The page never shows who asked or who voted: no user IDs, no names, no thread li
 A question's text is shown only while retention keeps the stored message, and only for
 a row whose turn stored one; otherwise the row keeps its count, date and agent version.
 Each stored question row carries the question's reference (conversation and message)
-beside the version — the seam a later "make a test case" action reads; there is no
-button yet. The reads are one indexed query per section over the rows the worker and
-the gateway already write (`audit_events`, `answer_feedback`, `conversation_messages`;
-migration `039` adds the per-agent indexes): no new data collection.
+beside the version, and a **Make a test case** button: one click adds the question to
+the agent's next draft — its newest draft, or one made from the published version when
+none exists — with the expected behaviour left for the creator to choose on the version
+page. A question retention has purged cannot become a case. The reads are one indexed
+query per section over the rows the worker and the gateway already write
+(`audit_events`, `answer_feedback`, `conversation_messages`; migration `039` adds the
+per-agent indexes): no new data collection.
+
+**Creator test sets.** On a draft's version page, the agent's creator and admins write
+test cases: a question and an expected behaviour — answers citing a granted page, drafts
+a write to a granted database, refuses, or hands off to a listed specialist (the target
+must be one the draft grants or lists). Cases are stored per version and copied forward
+when a new draft is made. **Run tests** runs them against the **draft** definition, not
+the published one: a dedicated workflow on its own task queue (`agentos-tests`) runs each
+case as a turn through the same model and read path as a real turn, with the draft's
+grants and the runner as the requester in a direct message. Writes never run: when the
+model drafts a write, the run records the drafted action (tool and target database) and
+stops that case — no approval card, no task, nothing written, and nothing at all posts to
+Slack. A hand-off is recorded and stops the case too. Every case needs an expectation
+chosen before a run starts.
+
+A run spends at most **$0.20**, counted in the tenant's usage like any model call; a
+check after every model step stops the run at the cap (unknown spend stops it too), and
+the cases not run are reported. One call may take the run past the cap by its own cost,
+the same bound the monthly budgets keep. Each case comes back pass/fail with a reason
+(expected source not cited, wrong action, did not refuse, wrong hand-off), shown on the
+version page with the run's time and spend; a refusal is the provider's `refusal` stop
+reason or one of the runtime's fixed refusal texts — a model's plain-text refusal is not
+detected. The run's question and answer text stays in Postgres (its conversations are
+purged by the normal retention); the results are references and fixed codes.
+
+The approving admin's view of a **pending** version shows the latest run (pass/fail
+counts, failures expanded) and warns when there is no run or the draft was edited after
+it ran — the run records the definition hash it ran against. Cases and runs are audited
+(`test_case`, `test_run`) with references and hashes only; a run's reads write no
+`tool_call` rows, so a creator's tests stay out of the feedback page. Run
+`uv run python scripts/migrate.py` for migration `041` on an existing database. The
+console connects to Temporal on the first run; with Temporal down a run cannot start and
+its row is closed as failed, while every other page keeps working.
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or

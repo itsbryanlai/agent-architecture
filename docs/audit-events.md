@@ -6,7 +6,7 @@ table by `scripts/init_db.sql` and the migrations. A kind that is not in both ca
 
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
 [Feedback](#feedback) ·
-[Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
+[Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Test sets](#test-sets) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
 [Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) ·
 [Uninstall](#uninstall) · [Connector](#connector) · [Tenant settings](#tenant-settings) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
@@ -105,6 +105,19 @@ random and a retry records again. A refused action (wrong role, bad state) write
 | `agent_reject` | An admin rejects a pending version | actor / - | Admin only |
 | `agent_publish` | An admin publishes a pending version | the submitter / the admin (may be the same person) | Admin only. Written first; `widening_confirm` and `audience_confirm` follow it in the same transaction when they apply |
 | `agent_import` | The one-time YAML import inserts an agent as published version 1 | `import:yaml` / `import:yaml` | Identity `user:import:yaml`. Key `<tenant>:audit:import:<agent id>`: once per agent, ever |
+
+## Test sets
+
+Written by the control plane in the same transaction as the change (D-44). Requester and identity:
+the person acting, as `user:<Slack ID>`. Each row names the agent and the draft version it concerns.
+A refused action (wrong role, bad case, no expectations chosen) writes nothing.
+
+| Kind | Written when | tool | target | in | Notes |
+|---|---|---|---|---|---|
+| `test_case` | A case is added to a draft, its expectation chosen, or it is removed | `add`, `expect` or `remove` | the case ID | hash of the case's question and expectation (`add`), of the expectation (`expect`), of the case ID (`remove`) — never the text | The feedback page's "Make a test case" records `add` on the draft the question landed on; a draft made for it records `agent_draft` first |
+| `test_run` | A run of a draft's cases starts | - | the run ID | hash of the draft definition the run runs against | The run's results, spend and finish are the run row's, not the log's; a start that fails closes the row as failed. The run's own reads and drafted writes write no `tool_call` rows: a creator's tests stay out of the feedback page's reads |
+
+Event key: the control key, `<tenant>:audit:control:<kind>:<request ID>`.
 
 ## Members
 

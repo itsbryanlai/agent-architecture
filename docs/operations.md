@@ -1496,8 +1496,9 @@ history lookup in the DM channel). A DM that fails after the comment is reported
 effects pass the agent-effect gate: an agent turned off, unavailable, a paused channel or a lost
 audience before the write cancels both, as for other writes. A nudge that ran restarts the stale
 clock from the nudge, so a later stale period can offer again. One offer per stale period; a
-declined, expired or failed nudge spends it. The watch keeps polling while the card waits (the
-nudge is a child task), and the nudge records its own row in `tasks`.
+declined, expired or failed nudge spends it, and a spent offer (clicked, prepare failed, nudge
+done) drops its button from the stale notice, best-effort. The watch keeps polling while the card
+waits (the nudge is a child task), and the nudge records its own row in `tasks`.
 
 **In the agent definition**, the assignee is an optional people property per database grant,
 mapped like the other roles (first person only):
@@ -1522,9 +1523,10 @@ follow_up:
 The fallbacks are decided in the card text, never by the model: no assignee property or an empty
 one → a comment without a mention; an assignee with no Slack match → a comment with a plain-name
 mention and no DM; the assignee is the requester → no button at all. A configured assignee
-mapping is checked like the other roles (a people property, an ID configured); a broken one
-disables the agent through the usual grant check, and adding the mapping is a widening the
-publish approver acknowledges.
+mapping is checked like the other roles (a people property, an ID configured), but a broken one
+disables only the nudge, never the agent: it is reported in the console's grant check and the
+health log, and the nudge then treats the mapping as absent (a comment without a mention).
+Adding the mapping is a widening the publish approver acknowledges.
 
 **Maintainer steps:**
 
@@ -1537,9 +1539,10 @@ publish approver acknowledges.
    current manifest needs no change. An older app missing them: add the scopes and reinstall.
 
 Audited as one `approval` (tool `nudge`) plus one `write` per effect (`nudge_comment`,
-`nudge_dm`); a decline or expiry as `approval_closed`. All new workflow commands sit behind the
-`nudge` patch marker: a task already watching when this deployed keeps its old shape (one plain
-stale line, no offer) until it ends.
+`nudge_dm`); a decline or expiry as `approval_closed`. A DM Slack refuses for good (a gone
+channel or user, an inactive account) records its `write` as `error` and is not retried. All new
+workflow commands sit behind the `nudge` patch marker: a task already watching when this deployed
+keeps its old shape (one plain stale line, no offer) until it ends.
 
 ## Answer feedback
 

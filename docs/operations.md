@@ -1806,7 +1806,10 @@ Slack. A hand-off is recorded and stops the case too. Every case needs an expect
 chosen before a run starts, and with the picker required every grant new since the
 published version must have been chosen from the creator's Notion, the same rule as at
 submit. One run of a version goes at a time — a second start while one is running is
-refused — and a retried start with the same request ID returns the first run.
+refused — and a retried start with the same request ID returns the first run. A run's
+workflow has a one-hour execution timeout; a running row older than that plus ten minutes
+is shown as failed on the version page and closed as failed by the next run start, so a run whose workflow died
+or whose final write could not land never blocks the version.
 
 A run spends at most **$0.20**, counted in the tenant's usage like any model call; a
 check after every model step stops the run at the cap (unknown spend stops it too), and

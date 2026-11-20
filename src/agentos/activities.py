@@ -2693,14 +2693,15 @@ class AgentActivities:
 
     @activity.defn(name="check_before_write")
     async def check_before_write(self, spec: TaskSpec, task_id: str) -> str | None:
-        """Just before an approved write: may the agent still act for the requester here?
+        """Just before a write: may the agent still act for the requester here?
 
         None means go on. Otherwise the line the card shows, and nothing is to be written:
         the agent was turned off, the agent is unavailable (its grant check failed), the
         agent's channel was paused, or the requester is no longer in the audience of the
         agent's current published version. A switch that covers the write itself (writes,
         the connector) is left to the write activity, which says so in its own words. A
-        lookup that fails for good fails the activity.
+        lookup that fails for good fails the activity. A write under the policy (D-43)
+        had no approval, so only the refusal is audited.
         """
         ctx = spec.ctx
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.WRITE)
@@ -2719,7 +2720,8 @@ class AgentActivities:
             target, idem_key = payload["page_id"], f"{task_id}:comment"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
-        await self._record_approval(spec, payload, task_id, target)
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, target)
         await self._record_write(
             spec,
             payload,

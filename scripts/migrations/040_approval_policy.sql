@@ -5,7 +5,7 @@
 -- page; it belongs to the tenant, so it joins the kinds that need no agent. A write
 -- that ran under the policy records outcome 'policy' (no approval row), so the outcome
 -- CHECK widens.
--- Run as the owner role, after 038. Safe to run more than once.
+-- Run as the owner role, after 039. Safe to run more than once.
 
 CREATE TABLE IF NOT EXISTS approval_policies (
   tenant_id  text        NOT NULL,

@@ -25,6 +25,9 @@ FAILED_COMMENT = "failed_comment"
 NOT_CONFIRMED_COMMENT = "not_confirmed_comment"
 COMMENTED = "commented"
 COMMENTED_NO_APPROVAL = "commented_no_approval"
+# The fixed line a card shows when a write is stopped before it runs; a policy write
+# has no card, so the line goes to the thread as it is.
+STOPPED_COMMENT = "stopped_comment"
 NUDGED = "nudged"
 NUDGE_COMMENTED = "nudge_commented"
 NUDGE_NO_DM = "nudge_no_dm"
@@ -88,7 +91,9 @@ def notice_text(
     if kind == COMMENTED:
         return f"Commented on {name} ({url})."
     if kind == COMMENTED_NO_APPROVAL:
-        return f"Commented on '{name}' (no approval needed: your admin's setting)."
+        return f"Commented on '{name}' ({url}) (no approval needed: your admin's setting)."
+    if kind == STOPPED_COMMENT:
+        return reason
     if kind == NUDGED:
         return f"Nudged the assignee about '{name}': commented on the item and sent a DM."
     if kind == NUDGE_COMMENTED:

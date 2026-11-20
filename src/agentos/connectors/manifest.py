@@ -85,15 +85,19 @@ def load_manifest(path: str | Path) -> Manifest:
     connector = str(raw["connector"])
     tools = {}
     for name, spec in (raw.get("tools") or {}).items():
+        risk = RiskClass(spec["risk"])
         low_risk = bool(spec.get("low_risk", False))
-        if low_risk and WRITE_KINDS.get(spec.get("idempotency") or "") != "add_comment":
+        if low_risk and (
+            risk is RiskClass.READ
+            or WRITE_KINDS.get(spec.get("idempotency") or "") != "add_comment"
+        ):
             raise ValueError(
                 f"tool '{name}': low_risk may only mark a comment action, "
                 "never a create, append or replace"
             )
         tools[name] = ToolSpec(
             name=name,
-            risk=RiskClass(spec["risk"]),
+            risk=risk,
             description=str(spec.get("description", "")).strip(),
             input_schema=spec.get("input_schema") or {"type": "object", "properties": {}},
             requester_scoped=spec.get("requester_scoped"),

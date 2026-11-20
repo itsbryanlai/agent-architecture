@@ -16,8 +16,18 @@ from agentos.connectors.manifest import load_manifest
         ("write_irreversible", "append_text", True, "refused"),
         ("write_irreversible", "replace_body", True, "refused"),
         ("read", None, True, "refused"),
+        ("read", "marker_text", True, "refused"),
     ],
-    ids=["comment", "comment-default", "create", "create-reversible", "append", "replace", "read"],
+    ids=[
+        "comment",
+        "comment-default",
+        "create",
+        "create-reversible",
+        "append",
+        "replace",
+        "read",
+        "read-marker-text",
+    ],
 )
 def test_the_low_risk_flag_is_accepted_only_on_a_comment_action(
     tmp_path, risk, idempotency, flag, expected

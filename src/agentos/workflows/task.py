@@ -834,9 +834,26 @@ class TaskWorkflow:
         """Post the comment the tenant's policy allows, without a card (D-43).
 
         The write is the same exactly-once comment write, with no approval row and
-        outcome 'policy'. There is no card to update, so a refusal or a failure says
-        so in the thread. There is nothing to watch afterwards.
+        outcome 'policy'. The same pre-write re-check a carded write gets runs first,
+        without the approval row: a channel paused or an audience lost since the turn's
+        check stops the comment, and the thread carries the line the card would show.
+        There is no card to update, so a refusal or a failure says so in the thread.
+        There is nothing to watch afterwards.
         """
+        try:
+            stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            # The check could not be completed: fail closed, nothing is written.
+            stopped = UNCHECKED_CARD_TEXT
+        if stopped is not None:
+            await self._notice(
+                task_notices.STOPPED_COMMENT, f"{task_id}:failed", task_id, reason=stopped
+            )
+            self._state = "cancelled"
+            await self._record()
+            return self._state
         self._state = "executing"
         await self._record()
         payload = {} if self._refs else spec.payload

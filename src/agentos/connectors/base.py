@@ -156,6 +156,11 @@ class Connector(Protocol):
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:
         """The marker lookup of a write kind: what an earlier attempt made under
         ``idem_key``, if the target shows it yet. The reconcile lookup is the same one.
+
+        A write whose lock is the target's own state rather than a marker may carry its
+        approved payload instead of an idempotency key (Drive's ``replace_section`` compares
+        the section's text with the approved text); such a kind uses its own payload-carrying
+        lookup and is not routed through here.
         """
         ...
 

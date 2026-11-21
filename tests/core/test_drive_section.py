@@ -241,14 +241,24 @@ async def test_a_republished_heading_refuses_the_replace_with_nothing_written(dh
         ({"section": "  ", "text": NEW_TEXT}, "needs a non-empty 'section'"),
         ({"section": "drive-nope-0001", "text": NEW_TEXT}, "not been granted a section"),
         ({"section": DRIVE_SECTION, "text": "x" * 2001}, "the limit is 2000"),
+        ({"section": DRIVE_SECTION, "text": "bad\x00char"}, "Google Docs removes"),
+        ({"section": DRIVE_SECTION, "text": "private\uf8ffuse"}, "Google Docs removes"),
     ],
-    ids=["empty-text", "empty-section", "unknown-section", "text-too-long"],
+    ids=[
+        "empty-text",
+        "empty-section",
+        "unknown-section",
+        "text-too-long",
+        "control-char",
+        "private-use",
+    ],
 )
 async def test_bad_section_input_refuses_the_draft_so_the_model_can_correct(
     dharness, tool_input, needle
 ):
-    """Fails if a draft with an empty text or section, an ungranted section, or an over-long
-    text still posts a card, instead of telling the model what to correct."""
+    """Fails if a draft with an empty text or section, an ungranted section, an over-long
+    text, or a character Google Docs strips still posts a card, instead of telling the model
+    what to correct."""
     h = dharness
     await grant_section(h)
     h.llm.queue(
@@ -309,3 +319,64 @@ async def test_an_edited_replace_writes_the_edited_text_after_a_fresh_approval(d
     assert paras[1]["text"] == "The VPN is degraded.\n"
     assert paras[0]["text"] == "Status\n"
     assert len(h.google.doc_replace_calls) == 1
+
+
+async def test_an_edit_keeps_the_read_revision_so_a_moved_doc_still_refuses(dharness):
+    """Fails if an edit re-reads the Doc and refreshes the read revision, so a Doc a
+    collaborator moved after the edit is written instead of refused: the write must still
+    lock to the draft's old revision and refuse with nothing written."""
+    h = dharness
+    await grant_section(h)
+    handle = await start_replace_task(h)
+    await wait_state(handle, "awaiting_approval")
+    edit_id = ids.edit_event_id(uuid.uuid4().hex)
+    await h.acts.content.put_inbound(
+        TENANT,
+        edit_id,
+        {"kind": "edit", "task_id": handle.id, "fields": {"text": "The VPN is degraded."}},
+        delivered=True,
+    )
+    await handle.signal(TaskWorkflow.edit, EditRequest(NONCE, ALICE, {}, edit_id))
+
+    async def redrawn():
+        updates = h.slack.updates()
+        if updates and "The VPN is degraded." in json.dumps(updates[-1]["blocks"]):
+            return updates[-1]
+        return None
+
+    card = await eventually(redrawn)
+    actions = next(b for b in card["blocks"] if b["type"] == "actions")
+    nonce = json.loads(actions["elements"][0]["value"])["nonce"]
+    # A collaborator moves the Doc after the edit: the revision the edit kept no longer holds,
+    # and the section is not the approved text.
+    h.google.set_doc_revision(DRIVE_SECTION, "9")
+    h.google.docs[DRIVE_SECTION]["paragraphs"][1]["text"] = "Someone else changed this.\n"
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+
+    assert await handle.result() == "failed"
+    assert h.google.docs[DRIVE_SECTION]["paragraphs"][1]["text"] == "Someone else changed this.\n"
+    assert h.google.docs[DRIVE_SECTION]["revision_id"] == "9"
+    [told] = thread_posts(h, "I couldn't replace the section in 'VPN guide'")
+    assert DOC_MOVED_TEXT in told["text"]
+
+
+async def test_the_card_shows_the_whole_before_text_spread_over_blocks(dharness):
+    """Fails if the card silently cuts a long before text instead of showing it whole, spread
+    over section blocks that each fit Slack's 3000-character limit."""
+    h = dharness
+    await grant_section(h)
+    long_text = "word " * 800  # 4000 characters: over one block, under the 5000 draft bound
+    h.google.docs[DRIVE_SECTION]["paragraphs"][1]["text"] = long_text + "\n"
+    await start_replace_task(h)
+    [card] = await eventually(lambda: cards(h))
+
+    texts = [b["text"]["text"] for b in card["blocks"] if b["type"] == "section" and "text" in b]
+    new_idx = next(i for i, t in enumerate(texts) if t.startswith("*New text*"))
+    before_blocks = texts[1:new_idx]  # texts[0] is the card's head
+    assert len(before_blocks) >= 2
+    assert all(len(t) <= 3000 for t in before_blocks)
+    assert before_blocks[0].startswith("*Before*\n")
+    joined = before_blocks[0][len("*Before*\n") :] + "".join(before_blocks[1:])
+    assert long_text.strip() in joined
+    assert joined.endswith("Restart the router.")

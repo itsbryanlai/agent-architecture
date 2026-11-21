@@ -427,11 +427,13 @@ class DriveGrant:
 
     A ``section`` is a granted Doc the agent may replace one headed section of: ``id``
     is the Doc's file ID (granted as for reads, indexed like any file), ``doc_id`` the
-    same Doc's file ID named for the write, and ``heading`` the heading the creator
-    names. The section is everything under that heading up to the next heading of the
-    same or higher level. Submit checks the heading exists exactly once. The write
-    refuses when the live grant's heading no longer matches the draft's, the heading is
-    gone or duplicated, or the Doc moved since the read revision.
+    same Doc's file ID named for the write (it must equal ``id``), and ``heading`` the
+    heading the creator names, stripped of surrounding whitespace. The section is
+    everything under that heading up to the next heading of the same or higher level
+    (``TITLE`` and ``SUBTITLE`` are the highest level). Submit checks the heading exists
+    exactly once and the section is plain paragraphs only. The write refuses when the
+    live grant's heading no longer matches the draft's, the heading is gone or duplicated,
+    the section holds a table or image, or the Doc moved since the read revision.
     """
 
     id: str
@@ -871,7 +873,9 @@ def _parse_drive_section(agent_id: str, raw: dict[str, Any], index: int = 0) -> 
         raise ConfigError(
             f"{where}: 'doc_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
         )
-    heading = _text(where, "heading", _require(raw, "heading", where))
+    if doc_id != grant_id:
+        raise ConfigError(f"{where}: 'doc_id' must be the same Doc as 'id'")
+    heading = _text(where, "heading", _require(raw, "heading", where)).strip()
     if len(heading) > MAX_HEADING_NAME:
         raise ConfigError(f"{where}: a heading name may be at most {MAX_HEADING_NAME} characters")
     return DriveGrant(

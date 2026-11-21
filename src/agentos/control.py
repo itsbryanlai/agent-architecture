@@ -186,8 +186,10 @@ from agentos.connectors.drive import (
     SHARED_DRIVE_FOLDER_TEXT,
     DriveReader,
     heading_duplicated_text,
+    heading_level,
     heading_matches,
     heading_missing_text,
+    section_plain_error,
     template_blank_names,
 )
 from agentos.connectors.google_iam import (
@@ -1224,11 +1226,13 @@ class ControlPlane:
         return reads
 
     async def _section_reads(self, tenant_id: str, agent_id: str, version: int) -> None:
-        """Check each granted section's heading exists exactly once in its Doc (D-50), reading
-        the Doc once (``documents.get``). The creator names the heading; submit verifies it so the
-        admin reviews a section the agent can actually replace. Refuses when Drive is not set up
-        or connected, the Doc is not an untrashed Google Doc, or the heading is missing or appears
-        more than once. Nothing is merged: the heading is the creator's, frozen as typed."""
+        """Check each granted section's heading exists exactly once in its Doc and the section
+        is plain paragraphs (D-50), reading the Doc's metadata (``files.get``) and its body
+        (``documents.get``). The creator names the heading; submit verifies it so the admin
+        reviews a section the agent can actually replace. Refuses when Drive is not set up or
+        connected, the Doc is not an untrashed Google Doc, the heading is missing or appears more
+        than once, or the section holds a table or image. Nothing is merged: the heading is the
+        creator's, frozen as typed (stripped of surrounding whitespace at parse)."""
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None or record.status != "draft":
             return
@@ -1257,6 +1261,8 @@ class ControlPlane:
                 raise ConfigError(heading_missing_text(grant.heading, grant.name))
             if len(matches) > 1:
                 raise ConfigError(heading_duplicated_text(grant.heading, grant.name))
+            if error := section_plain_error(doc, grant.heading, matches[0]):
+                raise ConfigError(error)
 
     async def _check_template_folders(self, tenant_id: str, agent: AgentVersion) -> None:
         """Refuse a publish whose template destination folder is not in a shared drive (D-49).
@@ -2285,6 +2291,26 @@ class ControlPlane:
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
         return await self._google.list_sheet_tabs(row.service_account_email, file_id)
+
+    async def drive_doc_headings(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
+        """The heading names of a Doc shared with the workspace's account, for the picker's
+        heading step (one ``documents.get`` of the body, the heading paragraphs' text). The
+        names are distinct, in first-seen order; the creator picks one or types it. Refused
+        when Drive is not set up or connected (D-50)."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        doc = await self._google.read_doc(row.service_account_email, file_id)
+        names: list[str] = []
+        for p in doc.paragraphs:
+            if heading_level(p.style) is not None:
+                name = p.text.strip()
+                if name and name not in names:
+                    names.append(name)
+        return names
 
     async def add_drive_grants(
         self,

@@ -106,6 +106,7 @@ from agentos.connectors.drive import (
     SECTION_SHAPE_CHANGED_TEXT,
     DriveReader,
     fill_markup_error,
+    section_control_char_error,
 )
 from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.manifest import (
@@ -2580,7 +2581,9 @@ class AgentActivities:
             if not isinstance(text, str) or not text.strip():
                 return DraftOutcome(error=f"{call.name} needs a non-empty 'text'.")
             text_text = text.strip()
-            if error := check_field(kind, "text", text_text):
+            if error := check_field(kind, "text", text_text) or section_control_char_error(
+                text_text
+            ):
                 return DraftOutcome(error=error)
             read_refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, DRIVE)
             if read_refusal is not None:
@@ -2678,7 +2681,11 @@ class AgentActivities:
                         "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
                     )
                     return False
-            elif not text or check_field(spec.tool_name, key, text):
+            elif (
+                not text
+                or check_field(spec.tool_name, key, text)
+                or (spec.tool_name == "replace_section" and section_control_char_error(text))
+            ):
                 log.warning("ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id)
                 return False
             clean[key] = text
@@ -3890,6 +3897,37 @@ def stale_notice_blocks(task_id: str, nudge_nonce: str, text: str) -> list[dict]
     ]
 
 
+def _section_before_blocks(before: str) -> list[dict]:
+    """The section's current text as Slack section blocks: the whole before text, escaped,
+    spread over blocks that each fit Slack's 3000-character section text, never silently cut.
+    The first block carries the *Before* label; an escape entity is never split across blocks
+    (D-50). The draft bounds the raw before text, so the blocks always fit the card."""
+    escaped = escape_slack(before)
+    label = "*Before*\n"
+    room = 3000 - len(label)
+    chunks: list[str] = []
+    cur = ""
+    i = 0
+    while i < len(escaped):
+        if escaped[i] == "&":
+            end = escaped.find(";", i)
+            token = escaped[i : end + 1] if end != -1 else escaped[i]
+        else:
+            token = escaped[i]
+        if cur and len(cur) + len(token) > room:
+            chunks.append(cur)
+            cur = ""
+        cur += token
+        i += len(token)
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        chunks = [""]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": label + chunks[0]}}]
+    blocks += [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks[1:]]
+    return blocks
+
+
 def approval_card_blocks(
     spec: TaskSpec,
     task_id: str,
@@ -4018,8 +4056,8 @@ def approval_card_blocks(
         note = "Nothing is created until you click Submit."
     elif spec.tool_name == "replace_section":
         # The Doc is named with its link, kept live like the comment's; the section's heading
-        # is named beside it. The card previews the section's current text (before, read from
-        # the Doc and truncated for display) and the approved replacement (after).
+        # is named beside it. The card previews the section's whole current text (before, read
+        # from the Doc and spread over section blocks, never cut) and the approved replacement.
         target = f"<{shown['item_url']}|{payload['item_title']}>"
         head = {
             "type": "section",
@@ -4029,11 +4067,8 @@ def approval_card_blocks(
                 f"*{escape_slack(shown['heading'])}* in *{target}*.",
             },
         }
-        before = escape_slack(shown.get("before", ""))
-        if len(before) > 2900:
-            before = before[:2900]
         body = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Before*\n{before}"}},
+            *_section_before_blocks(shown.get("before", "")),
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": f"*New text*\n{payload['text']}"},

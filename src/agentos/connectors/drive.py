@@ -60,6 +60,7 @@ from agentos.connectors.google_iam import (
     GoogleError,
     SheetMetadata,
     SheetTab,
+    utf16_len,
 )
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, ToolSpec, load_manifest
 from agentos.connectors.notion import comment_ref
@@ -106,6 +107,29 @@ SECTION_SHAPE_CHANGED_TEXT = (
 # The refusal when the Doc moved since the read revision and the section's text is not the
 # approved text: nothing is written, the requester is told to draft again (D-50).
 DOC_MOVED_TEXT = "The document changed since you approved; I'll draft it again"
+# The longest current section text a replace drafts: a longer section is refused at draft so
+# the card never previews a body it cannot show whole (D-50).
+MAX_SECTION_BEFORE = 5000
+# The refusal for a section that is not plain paragraphs: a table, an inline image or any
+# other non-paragraph element under the heading. The replace only writes plain text (D-50).
+SECTION_NOT_PLAIN_TEXT = (
+    "I can only replace a section made of plain paragraphs; "
+    "'{doc}' has a table or image under '{heading}'"
+)
+# The refusal for a section whose current text is longer than the draft bound (D-50).
+SECTION_TOO_LONG_TEXT = (
+    "The section under '{heading}' in '{doc}' is too long to replace "
+    "(over {limit} characters); pick a smaller section"
+)
+# The refusal for new text carrying a character Google Docs strips (a control character or a
+# private-use code point): it would not land literally, so the draft and the edit refuse it.
+SECTION_CONTROL_CHAR_TEXT = (
+    "The new text has a character Google Docs removes (a control or private-use character); "
+    "write it without that character."
+)
+# Characters Google Docs strips from inserted text: U+0000-U+0008 and U+000C-U+001F (newline
+# U+000A and tab U+0009 are kept), and the private-use area U+E000-U+F8FF.
+_STRIPPED_CHAR = re.compile("[\x00-\x08\x0c-\x1f\ue000-\uf8ff]")
 # A template blank: ``{{field name}}``. The name is the inner text, trimmed; duplicate
 # names collapse to one. The fill replaces every raw form found for a name, spaced or not.
 _BLANK = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -170,6 +194,76 @@ def section_bounds(
         end = p.end_index
         parts.append(p.text)
     return start, end, "".join(parts).strip()
+
+
+def section_span(paragraphs: tuple[DocParagraph, ...], heading_index: int) -> tuple[int, int]:
+    """The full index span under the heading at ``heading_index``: from the heading's end to
+    the next heading of the same or higher level's start (or the body's end). Unlike the
+    content range, it includes any non-paragraph element between the last content paragraph
+    and the next heading, so a trailing table or image is refused too (D-50)."""
+    level = heading_level(paragraphs[heading_index].style)
+    start = paragraphs[heading_index].end_index
+    for p in paragraphs[heading_index + 1 :]:
+        nxt = heading_level(p.style)
+        if nxt is not None and level is not None and nxt <= level:
+            return start, p.start_index
+    return start, paragraphs[-1].end_index
+
+
+def section_plain_error(doc: DocRead, heading: str, heading_index: int) -> str | None:
+    """The refusal for a section that is not plain paragraphs, or None: a table, an inline
+    image or any other non-paragraph element whose index range falls inside the section's
+    full span under the heading. The replace writes plain text only, so such a section is
+    refused at submit, at draft and at the write (D-50)."""
+    start, end = section_span(doc.paragraphs, heading_index)
+    if any(fs < end and fe > start for fs, fe in doc.foreign):
+        return SECTION_NOT_PLAIN_TEXT.format(doc=doc.title, heading=heading)
+    return None
+
+
+def section_control_char_error(text: str) -> str | None:
+    """The refusal for new text carrying a character Google Docs strips (a control character
+    other than newline and tab, or a private-use code point), or None. Such a character would
+    not land literally, so the draft and the edit refuse it (D-50)."""
+    return SECTION_CONTROL_CHAR_TEXT if _STRIPPED_CHAR.search(text) else None
+
+
+def section_write_plan(
+    doc: DocRead, start: int, end: int, text: str
+) -> tuple[int, str, int, int, int, int]:
+    """The Docs batchUpdate plan that replaces the section ``[start, end)`` with ``text`` and
+    keeps the heading, as real Google accepts it (D-50): ``(insert_index, insert_text,
+    delete_start, delete_end, style_start, style_end)``.
+
+    The new text is inserted FIRST at the start of the section's first content paragraph, so
+    the new paragraphs take that paragraph's NORMAL style; the old range is then deleted at
+    its shifted position (``+ utf16_len(insert_text)``). An empty section has no content
+    paragraph to inherit from, so the inserted range is normalised to NORMAL_TEXT and its
+    bullets cleared (``style_start``/``style_end``); a section that ends at the body end keeps
+    the body's final newline (delete up to ``end - 1``, insert without a trailing newline); a
+    heading that is the Doc's last paragraph inserts before that final newline, with a leading
+    newline to start the new paragraph. ``style_start == style_end`` means no normalisation.
+    """
+    body_end = doc.paragraphs[-1].end_index
+    if start == end and start == body_end:
+        # The heading is the Doc's last paragraph: insert before the body's final newline.
+        insert_index = body_end - 1
+        insert_text = "\n" + text
+        length = utf16_len(insert_text)
+        return insert_index, insert_text, 0, 0, insert_index + 1, insert_index + length
+    if start == end:
+        # An empty section before another heading: insert, then normalise the inserted range.
+        insert_text = text + "\n"
+        length = utf16_len(insert_text)
+        return start, insert_text, 0, 0, start, start + length
+    if end == body_end:
+        # The section ends at the body end: keep the final newline, insert without a trailing one.
+        insert_text = text
+        length = utf16_len(insert_text)
+        return start, insert_text, start + length, end - 1 + length, 0, 0
+    insert_text = text + "\n"
+    length = utf16_len(insert_text)
+    return start, insert_text, start + length, end + length, 0, 0
 
 
 def sheet_marker(idem_key: str) -> str:
@@ -322,6 +416,8 @@ class DriveReader:
         insert_text: str,
         delete_start: int,
         delete_end: int,
+        style_start: int = 0,
+        style_end: int = 0,
     ) -> str:
         return await self._google.replace_doc_section(
             self._email,
@@ -331,6 +427,8 @@ class DriveReader:
             insert_text,
             delete_start,
             delete_end,
+            style_start,
+            style_end,
         )
 
 
@@ -704,10 +802,12 @@ class DriveConnector:
 
     async def read_section(self, grant: DriveGrant) -> dict:
         """The section's current text and the Doc's read revision, for the draft and the card
-        (D-50): one ``documents.get`` of the granted Doc, the heading found exactly once, the
+        (D-50): a ``documents.get`` of the granted Doc, the heading found exactly once, the
         text under it (the card's "before") and the content range the write replaces. The
-        revisionId is the lock the write names; the range and the before text are frozen into
-        the draft so what was approved is what runs."""
+        section must be plain paragraphs and its current text within the draft bound, so a
+        table, an image or an over-long section refuses here in plain words before any card.
+        The revisionId is the lock the write names; the range and the before text are frozen
+        into the draft so what was approved is what runs. The link is the Doc's webViewLink."""
         doc = await self._reader.read_doc(grant.doc_id)
         matches = heading_matches(doc.paragraphs, grant.heading)
         if not matches:
@@ -715,20 +815,30 @@ class DriveConnector:
         if len(matches) > 1:
             raise ConnectorError(heading_duplicated_text(grant.heading, doc.title))
         start, end, before = section_bounds(doc.paragraphs, matches[0])
+        if error := section_plain_error(doc, grant.heading, matches[0]):
+            raise ConnectorError(error)
+        if len(before) > MAX_SECTION_BEFORE:
+            raise ConnectorError(
+                SECTION_TOO_LONG_TEXT.format(
+                    heading=grant.heading, doc=doc.title, limit=MAX_SECTION_BEFORE
+                )
+            )
+        file = await self._reader.get_file(grant.doc_id)
         return {
             "revision_id": doc.revision_id,
             "before": before,
             "content_start": start,
             "content_end": end,
             "item_title": doc.title,
-            "item_url": f"https://drive.google.com/file/d/{grant.doc_id}",
+            "item_url": file.web_view_link or f"https://drive.google.com/file/d/{grant.doc_id}",
         }
 
-    async def check_section_shape(self, doc_id: str, heading: str) -> None:
+    async def check_section_shape(self, doc_id: str, heading: str) -> DocRead:
         """The write's shape check without the write (D-50), run before the write and before
         reconcile looks: the approved heading must still be the live grant's (a republish
-        since the draft refuses), and the Doc must still have that heading exactly once (a
-        renamed, removed or duplicated heading refuses in plain words)."""
+        since the draft refuses), the Doc must still have that heading exactly once (a
+        renamed, removed or duplicated heading refuses in plain words), and the section must
+        be plain paragraphs (a table or image refuses). Returns the Doc read for the check."""
         grant = self._grants.get(doc_id)
         if grant is None or grant.kind != "section":
             raise GrantDenied("This agent has not been granted that Doc section to replace.")
@@ -740,16 +850,21 @@ class DriveConnector:
             raise ConnectorError(heading_missing_text(heading, doc.title))
         if len(matches) > 1:
             raise ConnectorError(heading_duplicated_text(heading, doc.title))
+        if error := section_plain_error(doc, heading, matches[0]):
+            raise ConnectorError(error)
+        return doc
 
     async def find_replaced_section(self, doc_id: str, payload: dict) -> str | None:
         """Whether the section already holds the approved text (D-50): the revision write's
-        look-before-write and reconcile lookup. The Doc is read and the section's current text
-        compared with the approved text — equal means an earlier attempt landed (the revision
-        is the lock, so no marker is needed); different (or the heading gone) means not seen."""
+        look-before-write and reconcile lookup. The shape check runs first, as reconcile's
+        does (a republish, a heading gone or duplicated, or a table or image refuses). The Doc
+        is read and the section's current text compared with the approved text — equal means
+        an earlier attempt landed (the revision is the lock, so no marker is needed);
+        different means not seen."""
         grant = self._grants.get(doc_id)
         if grant is None or grant.kind != "section":
             return None
-        doc = await self._reader.read_doc(doc_id)
+        doc = await self.check_section_shape(doc_id, payload["heading"])
         matches = heading_matches(doc.paragraphs, payload["heading"])
         if len(matches) != 1:
             return None
@@ -759,22 +874,20 @@ class DriveConnector:
     async def replace_section(self, doc_id: str, payload: dict, idem_key: str) -> str:
         """Replace the approved section's content as the tenant's account, keeping the heading
         (D-50). The approved shape is the written shape: the draft's heading must still be the
-        live grant's and the Doc must still have it exactly once. The batchUpdate carries
-        ``writeControl.requiredRevisionId`` = the stored read revision, deleting the frozen
-        content range and inserting the new text after the heading. The revision is the lock:
-        a retry after a lost response, or a Doc someone else moved, gets a revision mismatch;
-        the Doc is then read and the section's text compared with the approved text — equal
-        means the earlier attempt landed (done), different refuses with nothing written."""
-        await self.check_section_shape(doc_id, payload["heading"])
+        live grant's, the Doc must still have it exactly once, and the section must be plain
+        paragraphs. The batchUpdate carries ``writeControl.requiredRevisionId`` = the stored
+        read revision and inserts the new text first at the section's first content paragraph,
+        then deletes the shifted old range (``section_write_plan``), so the new paragraphs keep
+        the NORMAL style and the body's final newline is never deleted. The revision is the
+        lock: a retry after a lost response, or a Doc someone else moved, gets a revision
+        mismatch; the Doc is then read and the section's text compared with the approved text —
+        equal means the earlier attempt landed (done), different refuses with nothing written."""
+        doc = await self.check_section_shape(doc_id, payload["heading"])
+        plan = section_write_plan(
+            doc, payload["content_start"], payload["content_end"], payload["text"]
+        )
         try:
-            return await self._reader.replace_doc_section(
-                doc_id,
-                payload["revision_id"],
-                payload["content_start"],
-                payload["text"] + "\n",
-                payload["content_start"],
-                payload["content_end"],
-            )
+            return await self._reader.replace_doc_section(doc_id, payload["revision_id"], *plan)
         except GoogleError as err:
             if err.code != "revision_mismatch":
                 raise
@@ -787,6 +900,8 @@ class DriveConnector:
             raise ConnectorError(DOC_MOVED_TEXT) from err
 
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:
+        # replace_section is not here: its look carries the approved payload (the heading and
+        # the new text), so it uses find_replaced_section directly, not this idem-key lookup.
         if kind == "add_comment":
             return await self.find_comment(target, idem_key)
         if kind == "append_row":

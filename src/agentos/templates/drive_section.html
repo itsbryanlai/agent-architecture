@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Choose a Doc to replace a section of{% endblock %}
+{% block body %}
+<p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
+<h1>Choose a Doc to replace a section of</h1>
+<p>Pick a Doc shared with this workspace's Drive address. Next you choose the heading whose section the agent may replace; the section must be plain paragraphs (no table or image). Share the Doc as Editor for the write; an admin approves the agent before it writes.</p>
+{% if docs %}
+<form method="post" action="{{ version_url }}/drive/pick/section">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <p>
+    <label for="doc">Doc</label>
+    <select name="doc" id="doc">
+      {% for d in docs %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+    </select>
+  </p>
+  <p><button type="submit">Choose a heading</button></p>
+</form>
+{% else %}
+<p class="muted">Share a Doc with this workspace's Drive address, then choose again.</p>
+{% endif %}
+{% endblock %}

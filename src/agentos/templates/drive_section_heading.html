@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Choose the section's heading{% endblock %}
+{% block body %}
+<p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
+<h1>Choose the section's heading in {{ doc.name }}</h1>
+<p>Pick the heading whose section the agent may replace, or type its name. The section is everything under that heading up to the next heading of the same or higher level; it must be plain paragraphs (no table or image). The heading is checked when the version is submitted.</p>
+<form method="post" action="{{ version_url }}/drive/pick/section">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="doc" value="{{ doc.id }}">
+  {% if headings %}
+  <p>
+    {% for h in headings %}
+    <label><input type="radio" name="heading_pos" value="{{ loop.index0 }}"> {{ h }}</label><br>
+    {% endfor %}
+  </p>
+  {% else %}
+  <p class="muted">This Doc has no headings yet; type the heading's name.</p>
+  {% endif %}
+  <p>
+    <label for="heading_text">Or type the heading's name</label>
+    <input type="text" name="heading_text" id="heading_text">
+  </p>
+  <p><button type="submit">Add to this agent</button></p>
+</form>
+{% endblock %}

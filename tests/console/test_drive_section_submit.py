@@ -27,12 +27,19 @@ def section_definition() -> dict:
 
 @pytest.mark.parametrize(
     "case",
-    ["heading exists once", "missing heading", "duplicated heading", "not connected"],
-    ids=["ok", "missing", "duplicated", "not-connected"],
+    [
+        "heading exists once",
+        "missing heading",
+        "duplicated heading",
+        "table under heading",
+        "not connected",
+    ],
+    ids=["ok", "missing", "duplicated", "table", "not-connected"],
 )
 async def test_submit_checks_the_section_heading_exists_exactly_once(case):
-    """Fails if submit does not read the Doc once and accept a heading present exactly once,
-    or accepts a heading the Doc lacks or has twice, or accepts an unconnected Drive."""
+    """Fails if submit does not read the Doc and accept a heading present exactly once in a
+    plain-paragraph section, or accepts a heading the Doc lacks or has twice, a section holding
+    a table, or an unconnected Drive."""
     h, _drive, google = section_harness()
     await h.seed_members()
     if case != "not connected":
@@ -44,6 +51,8 @@ async def test_submit_checks_the_section_heading_exists_exactly_once(case):
         google.docs[DRIVE_SECTION]["paragraphs"].append(
             {"text": f"{SECTION_HEADING}\n", "style": "HEADING_1"}
         )
+    elif case == "table under heading":
+        google.docs[DRIVE_SECTION]["paragraphs"].insert(2, {"kind": "table", "size": 5})
     await h.plane.add_agent(TENANT, OWNER, "it-helper", section_definition())
 
     if case == "not connected":
@@ -63,6 +72,10 @@ async def test_submit_checks_the_section_heading_exists_exactly_once(case):
 
     with pytest.raises(ConfigError) as err:
         await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
-    needle = "I can't find the heading" if case == "missing heading" else "appears more than once"
-    assert needle in str(err.value)
+    needles = {
+        "missing heading": "I can't find the heading",
+        "duplicated heading": "appears more than once",
+        "table under heading": "plain paragraphs",
+    }
+    assert needles[case] in str(err.value)
     assert (await h.agents.get_version(TENANT, "it-helper", 1)).status == "draft"

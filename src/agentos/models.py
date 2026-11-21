@@ -281,9 +281,10 @@ class NudgePrepared:
 @dataclass
 class TaskSpec:
     ctx: TurnContext
-    # The kind of task: "create_item", "add_comment", "append_row" or "nudge" — what the
-    # workflow routes on and the editable fields are keyed by. A Drive comment is an
-    # "add_comment" task too; a Drive sheet append is an "append_row" task.
+    # The kind of task: "create_item", "add_comment", "append_row", "create_doc",
+    # "replace_section" or "nudge" — what the workflow routes on and the editable fields
+    # are keyed by. A Drive comment is an "add_comment" task too; a Drive sheet append is
+    # an "append_row" task; a Drive section replace is a "replace_section" task.
     tool_name: str
     # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
     # ``revision``). A task recorded before that carries its frozen payload here.
@@ -335,6 +336,11 @@ SIGNATURE_NAME_MAX = 26
 # frozen. A Notion name can be all "&", which escape to five characters each on the card.
 NUDGE_NAME_MAX = 80
 
+# The new text a section replace inserts: bounded so the approval card (a Slack section
+# text field holds 3000 characters) and the Edit form always fit. The before text the card
+# shows is read from the Doc and truncated for display, not capped here.
+SECTION_TEXT_MAX = 2000
+
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's
 # first draft, an edit) checks ``check_field``, so an accepted value always fits
@@ -355,6 +361,9 @@ EDITABLE_FIELDS = {
     # named by the stored draft, not a fixed set here. The empty map marks create_doc a
     # write kind; ``blank_limits`` builds the limits from the draft's blanks.
     "create_doc": {},
+    # A section replace edits only the new text; the heading, the before text and the read
+    # revision are the draft's, fixed (an edit keeps the same read revision).
+    "replace_section": {"text": SECTION_TEXT_MAX},
 }
 
 # One cell of an appended row: the raw character cap, and the room its escaped value has
@@ -384,6 +393,7 @@ _CARD_ROOM = {
     "title": 2000 - len("*Title*\n"),
     "details": 2000 - len("*Details*\n"),
     "comment": 3000 - len("*Comment*\n"),
+    "text": 3000 - len("*New text*\n"),
 }
 # A nudge's comment preview shares its section with the mention ("@<name> ") behind a
 # longer label. The name is Notion-written, so its worst escaped size (five characters

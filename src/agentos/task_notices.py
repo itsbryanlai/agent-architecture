@@ -34,6 +34,11 @@ NOT_CONFIRMED_APPEND = "not_confirmed_append"
 CREATED = "created"
 FAILED_CREATE_DOC = "failed_create_doc"
 NOT_CONFIRMED_CREATE_DOC = "not_confirmed_create_doc"
+# The section-replace write's lines (D-50): a headed section of a granted Doc replaced,
+# no watch afterwards.
+REPLACED = "replaced"
+FAILED_REPLACE_SECTION = "failed_replace_section"
+NOT_CONFIRMED_REPLACE_SECTION = "not_confirmed_replace_section"
 # The fixed line a card shows when a write is stopped before it runs; a policy write
 # has no card, so the line goes to the thread as it is.
 STOPPED_COMMENT = "stopped_comment"
@@ -49,7 +54,7 @@ ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE, CREATED)
 
 def subject(tool_name: str, payload: dict) -> str:
     """The short name of what a task is about, for card and thread lines."""
-    if tool_name in ("add_comment", "append_row", "nudge"):
+    if tool_name in ("add_comment", "append_row", "nudge", "replace_section"):
         return payload.get("item_title") or payload.get("item") or ""
     return payload.get("title", "")
 
@@ -113,6 +118,12 @@ def notice_text(
         return f"I couldn't create '{name}': {escape_slack(reason)}"
     if kind == NOT_CONFIRMED_CREATE_DOC:
         return f"I couldn't confirm whether the Doc was created; please check {url}"
+    if kind == REPLACED:
+        return f"Replaced a section of {name} ({url})."
+    if kind == FAILED_REPLACE_SECTION:
+        return f"I couldn't replace the section in '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_REPLACE_SECTION:
+        return f"I couldn't confirm whether the section was replaced; please check {url}"
     if kind == STOPPED_COMMENT:
         return reason
     if kind == NUDGED:

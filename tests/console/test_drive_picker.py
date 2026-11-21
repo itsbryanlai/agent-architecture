@@ -220,3 +220,78 @@ async def test_the_template_picker_offers_only_shared_drive_folders(folder, acce
     else:
         assert resp.status_code == 409
         assert record.agent().grants.drive == []
+
+
+@pytest.mark.parametrize(
+    "case", ["from list", "typed", "already granted"], ids=["list", "typed", "already-granted"]
+)
+async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_grant(case):
+    """Fails if the section picker grants a Doc without asking for its heading, does not offer
+    the Doc's headings from one read (or a typed name), adds the wrong heading, or accepts a
+    Doc already granted as a read file instead of showing a plain message."""
+    h, google = await picker_harness()
+    google.shared[tenant_email()] = [
+        DriveItem(
+            DRIVE_DOC,
+            "Guide",
+            f"https://drive.google.com/file/d/{DRIVE_DOC}",
+            "file",
+            mime_type=MIME_DOC,
+        )
+    ]
+    google.add_drive_folder(DRIVE_FOLDER, "Team folder")
+    google.add_drive_doc(
+        DRIVE_DOC,
+        "Guide",
+        [
+            {"text": "Status\n", "style": "HEADING_1"},
+            {"text": "Old.\n", "style": "NORMAL_TEXT"},
+            {"text": "Other\n", "style": "HEADING_1"},
+        ],
+        DRIVE_FOLDER,
+    )
+    if case == "already granted":
+        await h.plane.add_drive_grants(
+            TENANT, ROOT, "it-helper", 1, [DriveItem(DRIVE_DOC, "Guide", "https://x", "file")]
+        )
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        pick = (await c.get(VERSION + "/drive/pick/section")).text
+        assert "Guide" in pick
+        resp = await post(
+            c, VERSION + "/drive/pick/section", csrf_in(pick), doc=DRIVE_DOC, request_id="r1"
+        )
+        if case == "already granted":
+            assert resp.status_code == 409
+            assert "already granted" in resp.text
+            record = await h.agents.get_version(TENANT, "it-helper", 1)
+            assert [(g.id, g.kind) for g in record.agent().grants.drive] == [(DRIVE_DOC, "file")]
+            return
+        assert resp.status_code == 200
+        heading_page = resp.text
+        assert "Status" in heading_page and "Other" in heading_page
+        if case == "from list":
+            resp = await post(
+                c,
+                VERSION + "/drive/pick/section",
+                csrf_in(heading_page),
+                doc=DRIVE_DOC,
+                heading_pos="0",
+                request_id="r2",
+            )
+            expected_heading = "Status"
+        else:
+            resp = await post(
+                c,
+                VERSION + "/drive/pick/section",
+                csrf_in(heading_page),
+                doc=DRIVE_DOC,
+                heading_text="Overview",
+                request_id="r2",
+            )
+            expected_heading = "Overview"
+        assert resp.status_code == 303
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    assert [(g.id, g.kind, g.heading, g.doc_id) for g in record.agent().grants.drive] == [
+        (DRIVE_DOC, "section", expected_heading, DRIVE_DOC)
+    ]

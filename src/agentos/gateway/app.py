@@ -125,8 +125,10 @@ EDIT_ACTION = "task_edit"
 EDIT_CALLBACK = "task_edit"
 NUDGE_ACTION = "task_nudge"
 STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
-FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
-MULTILINE_FIELDS = {"details", "comment"}
+# Fixed-field labels. "text" is the section replace's new text only: a dynamic form's column
+# or blank named "text" keeps its own name (the label is chosen per tool in ``_edit_view``).
+FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment", "text": "New text"}
+MULTILINE_FIELDS = {"details", "comment", "text"}
 # Slack wants an answer to a click within 3 seconds and does not repeat it. The click's work
 # gets this long, and the "try again" notice a little less than what is left.
 CLICK_TIMEOUT_SECONDS = 2.0
@@ -900,12 +902,20 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     else:
         limits = EDITABLE_FIELDS[draft.tool_name]
     blocks = []
+    dynamic = draft.tool_name in ("append_row", "create_doc")
     for name, current in fields.items():
+        # A dynamic form's fields are the sheet's columns / the template's blanks: they keep
+        # their own names (a blank named "text" is not the section replace's new text). Only
+        # the create's title is a fixed field; the fixed tools use their field labels.
+        if dynamic:
+            label = "Title" if draft.tool_name == "create_doc" and name == "title" else name
+        else:
+            label = FIELD_LABELS.get(name, name)
         blocks.append(
             {
                 "type": "input",
                 "block_id": name,
-                "label": {"type": "plain_text", "text": FIELD_LABELS.get(name, name)},
+                "label": {"type": "plain_text", "text": label},
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "value",

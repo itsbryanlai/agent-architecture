@@ -158,6 +158,22 @@ def _drive_template(**overrides):
     return apply
 
 
+def _drive_section(**overrides):
+    """A definition whose one Drive section grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        section = {
+            "id": "drive-section-0001",
+            "name": "VPN guide",
+            "doc_id": "drive-section-0001",
+            "heading": "Status",
+        }
+        section.update(overrides)
+        definition["grants"]["drive"] = {"sections": [section]}
+
+    return apply
+
+
 DB = "grants.notion.databases.0"
 BAD_DEFINITIONS = [
     # An unknown key at the top, inside a grant, and three levels down.
@@ -210,6 +226,8 @@ BAD_DEFINITIONS = [
     (_drive_template(blanks=["b" * 201]), "at most 200 characters"),
     (_drive_template(drive_id="short"), "'drive_id' must be a Drive ID"),
     (_drive_template(colours=["name"]), "unknown field 'colours'"),
+    # A section grant's doc_id is the same Doc as its id: the write names the granted Doc.
+    (_drive_section(doc_id="drive-other-0001"), "'doc_id' must be the same Doc as 'id'"),
 ]
 
 

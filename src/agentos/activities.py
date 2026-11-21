@@ -102,7 +102,12 @@ from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors.base import Connector, ConnectorError, Entry
-from agentos.connectors.drive import DriveReader, fill_markup_error
+from agentos.connectors.drive import (
+    SECTION_SHAPE_CHANGED_TEXT,
+    DriveReader,
+    fill_markup_error,
+    section_control_char_error,
+)
 from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.manifest import (
     MANIFEST_DIR,
@@ -497,6 +502,9 @@ class AgentActivities:
             self.prepare_stored_create_doc,
             self.create_drive_doc,
             self.reconcile_drive_doc,
+            self.prepare_stored_replace_section,
+            self.replace_doc_section,
+            self.reconcile_drive_section,
             self.comment_approval_policy,
             self.apply_edit,
             self.post_task_notice,
@@ -2009,6 +2017,18 @@ class AgentActivities:
                     return DraftedWrite(call.kind)
                 return DraftedWrite(call.kind, grant.id)
             return DraftedWrite(call.kind)
+        if call.kind == "replace_section":
+            # A section replace names its target 'section' (a granted section's ID or name);
+            # the drafted write's target is the section's Doc ID, kept as it is (D-50).
+            section = tool_input.get("section")
+            if refusal is None and isinstance(section, str) and section.strip():
+                connector = self._connector_for(ctx.tenant_id, agent, connector_name)
+                try:
+                    grant = connector.section_for(section.strip())
+                except ConnectorError:
+                    return DraftedWrite(call.kind)
+                return DraftedWrite(call.kind, grant.doc_id)
+            return DraftedWrite(call.kind)
         if agent.grants.notion_databases:
             return DraftedWrite(call.kind, normalize_id(agent.grants.notion_databases[0].id))
         return DraftedWrite(call.kind)
@@ -2133,8 +2153,14 @@ class AgentActivities:
         self, spec: TaskSpec, task_id: str, agent: AgentVersion
     ) -> str | None:
         """The body line the card must show, or None for a comment, an append, a nudge, a
-        create-from-template or a matched requester."""
-        if spec.tool_name in ("add_comment", "append_row", "nudge", "create_doc"):
+        create-from-template, a section replace or a matched requester."""
+        if spec.tool_name in (
+            "add_comment",
+            "append_row",
+            "nudge",
+            "create_doc",
+            "replace_section",
+        ):
             return None
         return (await self._requester(spec, task_id, agent))["line"]
 
@@ -2328,6 +2354,51 @@ class AgentActivities:
             "item_url": folder.web_view_link,
         }
 
+    @activity.defn(name="prepare_stored_replace_section")
+    async def prepare_stored_replace_section(self, spec: TaskSpec) -> DraftOutcome:
+        """``prepare_stored_create_doc`` for a section replace (D-50): check the section grant
+        and read the heading's current text and the Doc's revision, storing the resolved payload
+        as the next revision, which the card then shows (before and after) and the approval names.
+        A retry finds it stored. The grant and heading are checked here before any card, and again
+        just before the write."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("prepare_stored_replace_section", ctx.tenant_id, ctx.agent_id)
+        revision = spec.revision + 1
+        resolved = await self.content.get_draft(ctx.tenant_id, spec.draft_ref, revision)
+        if resolved is None:
+            resolved = await self._resolve_replace_section(spec, await self._spec_payload(spec))
+            await self.content.put_draft(ctx.tenant_id, spec.draft_ref, revision, resolved)
+        return DraftOutcome(revision=revision, database_id="")
+
+    async def _resolve_replace_section(self, spec: TaskSpec, payload: dict) -> dict:
+        ctx = spec.ctx
+        try:
+            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+            grant = connector.section_for(payload["section_id"])
+            if grant.heading != payload["heading"]:
+                raise ConnectorError(SECTION_SHAPE_CHANGED_TEXT)
+            section = await connector.read_section(grant)
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            _reraise(err)
+        return {
+            **payload,
+            "page_id": grant.doc_id,
+            "before": section["before"],
+            "revision_id": section["revision_id"],
+            "content_start": section["content_start"],
+            "content_end": section["content_end"],
+            "item_title": section["item_title"],
+            "item_url": section["item_url"],
+        }
+
     @activity.defn(name="comment_approval_policy")
     async def comment_approval_policy(self, spec: TaskSpec) -> bool:
         """Whether this comment may run without the requester's approval card (D-43).
@@ -2503,6 +2574,33 @@ class AgentActivities:
                 "title": title.strip(),
                 "values": clean_values,
             }
+        elif kind == "replace_section":
+            section_ref, text = tool_input.get("section"), tool_input.get("text")
+            if not isinstance(section_ref, str) or not section_ref.strip():
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'section'.")
+            if not isinstance(text, str) or not text.strip():
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'text'.")
+            text_text = text.strip()
+            if error := check_field(kind, "text", text_text) or section_control_char_error(
+                text_text
+            ):
+                return DraftOutcome(error=error)
+            read_refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, DRIVE)
+            if read_refusal is not None:
+                return DraftOutcome(error=str(read_refusal))
+            connector = self._connector_for(ctx.tenant_id, agent, DRIVE)
+            try:
+                grant = connector.section_for(section_ref.strip())
+            except ConnectorError as err:
+                return DraftOutcome(error=str(err))
+            # Frozen here: the section's heading and the new text. The prepare step reads the
+            # section's current text and the Doc's revision for the card and the write (D-50).
+            payload = {
+                "section_id": grant.id,
+                "doc_id": grant.doc_id,
+                "heading": grant.heading,
+                "text": text_text,
+            }
         elif kind in EDITABLE_FIELDS:
             title, details = tool_input.get("title"), tool_input.get("details")
             if not isinstance(title, str) or not title.strip():
@@ -2583,7 +2681,11 @@ class AgentActivities:
                         "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
                     )
                     return False
-            elif not text or check_field(spec.tool_name, key, text):
+            elif (
+                not text
+                or check_field(spec.tool_name, key, text)
+                or (spec.tool_name == "replace_section" and section_control_char_error(text))
+            ):
                 log.warning("ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id)
                 return False
             clean[key] = text
@@ -2802,6 +2904,61 @@ class AgentActivities:
         )
         return _without_content(spec, item)
 
+    @activity.defn(name="replace_doc_section")
+    async def replace_doc_section(self, spec: TaskSpec, task_id: str) -> str:
+        """Replace the approved section's content once, keeping the heading (D-50).
+
+        The connector is the tool's manifest connector (Drive's ``replace_section``). The gate,
+        the lease and the look-before-write are the other writes'; the idempotency lock is the
+        Doc's read revision (``writeControl.requiredRevisionId``), so the look compares the
+        section's current text with the approved text. The write checks the draft's heading still
+        matches the live grant's and the Doc still has it exactly once, so a republish or a renamed
+        heading since the draft refuses before this attempt writes. A task with a stored draft gets
+        back the Doc's ID only: the section text is content.
+        """
+        ctx = spec.ctx
+        idem_key = f"{task_id}:replace"
+        await self._gate_write(spec, task_id, idem_key, "page_id")
+        self._log("replace_doc_section", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        page_id = payload["page_id"]
+        await self._check_method(spec, payload, task_id, page_id, idem_key, "revision")
+        # The live published version, not the turn's pinned one: a grant revoked since this
+        # write was approved must stop it.
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, page_id)
+        try:
+            ref = cast(
+                str,
+                await self._write_once(
+                    ctx.tenant_id,
+                    idem_key,
+                    find=lambda: connector.find_replaced_section(page_id, payload),
+                    write=lambda: connector.write(
+                        "replace_section", page_id, payload, idem_key, agent_name=agent.name
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=lambda ref: ref,
+                ),
+            )
+        except Exception as err:
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, payload, task_id, idem_key, page_id, "error")
+                raise _non_retryable(err) from err
+            _reraise(err)
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"page_id": ref},
+        )
+        return ref
+
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         """Create the approved item once. A task with a stored draft gets back the page ID and
@@ -2989,6 +3146,43 @@ class AgentActivities:
             {"page_id": item.page_id},
         )
         return _without_content(spec, item)
+
+    @activity.defn(name="reconcile_drive_section")
+    async def reconcile_drive_section(self, spec: TaskSpec, task_id: str) -> str | None:
+        """The section-replace counterpart of ``reconcile_drive_doc`` (D-50): the Doc's ID when
+        the section already holds the approved text, or None for "not seen". Reads only, one look,
+        the tool's connector. The write's shape check runs first: a draft whose heading no longer
+        matches the live grant, or a heading gone or duplicated, refuses, and the task says it could
+        not confirm."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("reconcile_drive_section", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        idem_key = f"{task_id}:replace"
+        page_id = payload["page_id"]
+        ref = await self.writes.result(ctx.tenant_id, idem_key)
+        if ref is None:
+            # The approved shape must still hold: a republish since the draft, or a heading
+            # renamed, removed or duplicated, stops the look, which the task reads as "not
+            # confirmed", never as "nothing written".
+            await connector.check_section_shape(page_id, payload["heading"])
+            ref = await connector.find_replaced_section(page_id, payload)
+        if ref is None:
+            return None
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"page_id": ref},
+        )
+        return ref
 
     # --- nudge -------------------------------------------------------------------
 
@@ -3317,7 +3511,7 @@ class AgentActivities:
         """The item's title, link and page ID: the write's stored result once it exists,
         else the stored draft (a comment's or nudge's resolved item carries its own)."""
         payload = await self._spec_payload(spec)
-        if spec.tool_name in ("add_comment", "append_row", "nudge"):
+        if spec.tool_name in ("add_comment", "append_row", "nudge", "replace_section"):
             return (
                 payload.get("item_title", ""),
                 payload.get("item_url", ""),
@@ -3533,6 +3727,8 @@ class AgentActivities:
             target, idem_key = payload["page_id"], f"{task_id}:append"
         elif spec.tool_name == "create_doc":
             target, idem_key = payload["page_id"], f"{task_id}:create"
+        elif spec.tool_name == "replace_section":
+            target, idem_key = payload["page_id"], f"{task_id}:replace"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
         if not spec.under_policy:
@@ -3656,6 +3852,8 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
         return escape_slack(f"Approve row append to {payload['item_title']}")
     if spec.tool_name == "create_doc":
         return escape_slack(f"Approve new Doc: {payload['title']}")
+    if spec.tool_name == "replace_section":
+        return escape_slack(f"Approve section replace in {payload['item_title']}")
     if spec.tool_name == "nudge":
         return escape_slack(f"Approve nudge on {payload['item_title']}")
     return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
@@ -3697,6 +3895,37 @@ def stale_notice_blocks(task_id: str, nudge_nonce: str, text: str) -> list[dict]
             ],
         },
     ]
+
+
+def _section_before_blocks(before: str) -> list[dict]:
+    """The section's current text as Slack section blocks: the whole before text, escaped,
+    spread over blocks that each fit Slack's 3000-character section text, never silently cut.
+    The first block carries the *Before* label; an escape entity is never split across blocks
+    (D-50). The draft bounds the raw before text, so the blocks always fit the card."""
+    escaped = escape_slack(before)
+    label = "*Before*\n"
+    room = 3000 - len(label)
+    chunks: list[str] = []
+    cur = ""
+    i = 0
+    while i < len(escaped):
+        if escaped[i] == "&":
+            end = escaped.find(";", i)
+            token = escaped[i : end + 1] if end != -1 else escaped[i]
+        else:
+            token = escaped[i]
+        if cur and len(cur) + len(token) > room:
+            chunks.append(cur)
+            cur = ""
+        cur += token
+        i += len(token)
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        chunks = [""]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": label + chunks[0]}}]
+    blocks += [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks[1:]]
+    return blocks
 
 
 def approval_card_blocks(
@@ -3825,6 +4054,27 @@ def approval_card_blocks(
             pairs.append({"type": "mrkdwn", "text": escape_slack(str(values.get(blank, "")))})
         body = [{"type": "section", "fields": pairs[i : i + 10]} for i in range(0, len(pairs), 10)]
         note = "Nothing is created until you click Submit."
+    elif spec.tool_name == "replace_section":
+        # The Doc is named with its link, kept live like the comment's; the section's heading
+        # is named beside it. The card previews the section's whole current text (before, read
+        # from the Doc and spread over section blocks, never cut) and the approved replacement.
+        target = f"<{shown['item_url']}|{payload['item_title']}>"
+        head = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{agent_name}* wants to replace the section "
+                f"*{escape_slack(shown['heading'])}* in *{target}*.",
+            },
+        }
+        body = [
+            *_section_before_blocks(shown.get("before", "")),
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*New text*\n{payload['text']}"},
+            },
+        ]
+        note = "Nothing is written until you click Submit."
     else:
         head = {
             "type": "section",

@@ -4,7 +4,7 @@ under a granted root, and the comment marker counts only the account's own comme
 import pytest
 
 from agentos.config import DriveGrant
-from agentos.connectors.base import GrantDenied, UnknownItem
+from agentos.connectors.base import ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.drive import DriveConnector, DriveReader
 from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts, GoogleError
 from agentos.connectors.notion import comment_ref
@@ -111,6 +111,9 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
         ("sheet", "ID of one of two", "drive-sheet-0002", "drive-sheet-0002"),
         ("template", "unique name", "Offer template", "drive-template-0001"),
         ("template", "shared name", "Offer template", None),
+        ("section", "unique name", "VPN guide", "drive-section-0001"),
+        ("section", "shared name", "VPN guide", None),
+        ("section", "file grant by ID", "drive-file-0001", None),
     ],
     ids=[
         "sheet-unique-name",
@@ -118,18 +121,22 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
         "sheet-by-id",
         "template-unique-name",
         "template-shared-name",
+        "section-unique-name",
+        "section-shared-name",
+        "section-file-grant-by-id",
     ],
 )
 def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case, ref, expected):
-    """Fails if sheet_for or template_for picks one of two granted Sheets or templates that
-    share a name instead of refusing so the model uses the ID, or a unique name or an ID
-    does not resolve."""
+    """Fails if sheet_for, template_for or section_for picks one of two granted Sheets,
+    templates or sections that share a name instead of refusing so the model uses the ID, or
+    a unique name or an ID does not resolve, or section_for accepts a read-only file grant by
+    ID instead of refusing it (only a section grant replaces a section)."""
     google = FakeGoogleAccounts()
     if kind == "sheet":
         grants = [DriveGrant("drive-sheet-0001", "Roster", "sheet", tab="Q1")]
         if case != "unique name":
             grants.append(DriveGrant("drive-sheet-0002", "Roster", "sheet", tab="Q1"))
-    else:
+    elif kind == "template":
         grants = [
             DriveGrant(
                 "drive-template-0001",
@@ -149,8 +156,33 @@ def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case,
                     blanks=("name",),
                 )
             )
+    elif case == "file grant by ID":
+        # A read-only file grant is not a section grant: section_for refuses it by ID.
+        grants = [DriveGrant("drive-file-0001", "Guide", "file")]
+    else:
+        grants = [
+            DriveGrant(
+                "drive-section-0001",
+                "VPN guide",
+                "section",
+                doc_id="drive-section-0001",
+                heading="Status",
+            )
+        ]
+        if case != "unique name":
+            grants.append(
+                DriveGrant(
+                    "drive-section-0002",
+                    "VPN guide",
+                    "section",
+                    doc_id="drive-section-0002",
+                    heading="Status",
+                )
+            )
     conn = DriveConnector(DriveReader(google, EMAIL), grants)
-    lookup = conn.sheet_for if kind == "sheet" else conn.template_for
+    lookup = {"sheet": conn.sheet_for, "template": conn.template_for, "section": conn.section_for}[
+        kind
+    ]
 
     if expected is None:
         with pytest.raises(GrantDenied) as err:
@@ -158,3 +190,156 @@ def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case,
         assert "ID" in str(err.value)
     else:
         assert lookup(ref).id == expected
+
+
+# --- the section write sequence and the plain-paragraph refusals (D-50) ---------------------
+
+SECTION_DOC = "drive-section-0001"
+
+
+def section_conn(paragraphs: list[dict]):
+    """A connector granted the VPN guide's Status section, and the Doc as Google serves it."""
+    google = FakeGoogleAccounts()
+    google.add_drive_folder(FOLDER, "Team folder")
+    google.add_drive_doc(SECTION_DOC, "VPN guide", paragraphs, FOLDER)
+    grant = DriveGrant(SECTION_DOC, "VPN guide", "section", doc_id=SECTION_DOC, heading="Status")
+    return DriveConnector(DriveReader(google, EMAIL), [grant]), google, grant
+
+
+def _p(text: str, style: str = "NORMAL_TEXT") -> dict:
+    return {"text": text, "style": style}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "last section",
+        "empty section",
+        "heading last",
+        "lower-level heading",
+        "style stays NORMAL_TEXT",
+        "table refusal",
+        "image refusal",
+    ],
+)
+async def test_the_section_write_inserts_first_and_keeps_the_text_plain(case):
+    """Fails if the replace does not insert the new text first and delete the shifted old
+    range keeping the heading and the body's final newline (a section ending at the body end,
+    an empty section, a heading that is the Doc's last paragraph, a section spanning a
+    lower-level heading), if the new paragraphs do not stay NORMAL_TEXT, or if a section
+    holding a table or an inline image is accepted instead of refused as not plain paragraphs."""
+    cases = {
+        "last section": (
+            [_p("Status\n", "HEADING_1"), _p("Old text.\n")],
+            "New text.",
+            [("Status\n", "HEADING_1"), ("New text.\n", "NORMAL_TEXT")],
+        ),
+        "empty section": (
+            [_p("Status\n", "HEADING_1"), _p("Other\n", "HEADING_1"), _p("Keep.\n")],
+            "New text.",
+            [
+                ("Status\n", "HEADING_1"),
+                ("New text.\n", "NORMAL_TEXT"),
+                ("Other\n", "HEADING_1"),
+                ("Keep.\n", "NORMAL_TEXT"),
+            ],
+        ),
+        "heading last": (
+            [_p("Status\n", "HEADING_1")],
+            "New text.",
+            [("Status\n", "HEADING_1"), ("New text.\n", "NORMAL_TEXT")],
+        ),
+        "lower-level heading": (
+            [
+                _p("Status\n", "HEADING_1"),
+                _p("The VPN is down.\n"),
+                _p("Steps\n", "HEADING_2"),
+                _p("Restart the router.\n"),
+                _p("Other\n", "HEADING_1"),
+                _p("Keep this.\n"),
+            ],
+            "The VPN is back up.",
+            [
+                ("Status\n", "HEADING_1"),
+                ("The VPN is back up.\n", "NORMAL_TEXT"),
+                ("Other\n", "HEADING_1"),
+                ("Keep this.\n", "NORMAL_TEXT"),
+            ],
+        ),
+        "style stays NORMAL_TEXT": (
+            [_p("Status\n", "HEADING_1"), _p("Old.\n"), _p("Other\n", "HEADING_1")],
+            "Line one.\nLine two.",
+            [
+                ("Status\n", "HEADING_1"),
+                ("Line one.\n", "NORMAL_TEXT"),
+                ("Line two.\n", "NORMAL_TEXT"),
+                ("Other\n", "HEADING_1"),
+            ],
+        ),
+        "table refusal": (
+            [
+                _p("Status\n", "HEADING_1"),
+                _p("Intro.\n"),
+                {"kind": "table", "size": 5},
+                _p("More.\n"),
+                _p("Other\n", "HEADING_1"),
+            ],
+            "New text.",
+            None,
+        ),
+        "image refusal": (
+            [
+                _p("Status\n", "HEADING_1"),
+                {"text": "Caption.\n", "style": "NORMAL_TEXT", "image": True},
+                _p("Other\n", "HEADING_1"),
+            ],
+            "New text.",
+            None,
+        ),
+    }
+    paragraphs, new_text, expected = cases[case]
+    conn, google, grant = section_conn(paragraphs)
+
+    if expected is None:
+        with pytest.raises(ConnectorError) as err:
+            await conn.read_section(grant)
+        assert "plain paragraphs" in str(err.value)
+        assert google.doc_replace_calls == []
+        return
+
+    section = await conn.read_section(grant)
+    payload = {
+        "heading": "Status",
+        "text": new_text,
+        "revision_id": section["revision_id"],
+        "content_start": section["content_start"],
+        "content_end": section["content_end"],
+    }
+    assert await conn.replace_section(SECTION_DOC, payload, "idem") == SECTION_DOC
+    assert [(p["text"], p["style"]) for p in google.docs[SECTION_DOC]["paragraphs"]] == expected
+    assert len(google.doc_replace_calls) == 1
+
+
+async def test_a_moved_doc_whose_section_already_holds_the_approved_text_is_done():
+    """Fails if a replace whose revision lock refuses (the Doc moved since the read) but whose
+    section already holds the approved text writes again or refuses, instead of reading the
+    section and returning done with nothing written."""
+    conn, google, grant = section_conn(
+        [_p("Status\n", "HEADING_1"), _p("Old text.\n"), _p("Other\n", "HEADING_1"), _p("Keep.\n")]
+    )
+    section = await conn.read_section(grant)
+    # An earlier attempt landed: the section holds the approved text and the revision moved on.
+    google.docs[SECTION_DOC]["paragraphs"][1]["text"] = "New text.\n"
+    google.set_doc_revision(SECTION_DOC, "moved-9")
+    payload = {
+        "heading": "Status",
+        "text": "New text.",
+        "revision_id": section["revision_id"],
+        "content_start": section["content_start"],
+        "content_end": section["content_end"],
+    }
+
+    assert await conn.replace_section(SECTION_DOC, payload, "idem") == SECTION_DOC
+    assert google.docs[SECTION_DOC]["revision_id"] == "moved-9"
+    assert google.docs[SECTION_DOC]["paragraphs"][1]["text"] == "New text.\n"
+    assert len(google.doc_replace_calls) == 1

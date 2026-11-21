@@ -330,6 +330,8 @@ class WebUI:
         self.route("POST", version + "/drive/pick/tabs", self.drive_tab_choose)
         self.route("GET", version + "/drive/pick/template", self.drive_template_page)
         self.route("POST", version + "/drive/pick/template", self.drive_template_choose)
+        self.route("GET", version + "/drive/pick/section", self.drive_section_page)
+        self.route("POST", version + "/drive/pick/section", self.drive_section_choose)
         self.route("POST", version + "/drive/remove", self.drive_remove)
         self.route("POST", version + "/test-cases", self.add_test_case)
         self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
@@ -1373,6 +1375,89 @@ class WebUI:
                 link=template.link,
                 kind="template",
                 folder_id=folder.id,
+            )
+        ]
+        await ctx.plane.add_drive_grants(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_section_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The section step's first page: pick a granted Doc to replace a section of (D-50).
+        Only Docs the account sees are offered; the next step reads the chosen Doc's headings."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        docs = [item for item in listing.items if item.mime_type == MIME_DOC]
+        return _page(
+            "drive_section.html",
+            ctx=ctx,
+            docs=docs,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
+        )
+
+    async def drive_section_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The section step: read the chosen Doc's headings once and offer them (or a typed
+        name); the chosen heading creates the section grant. A Doc already granted to the
+        agent (a read file) shows a plain message: a Doc is granted once across kinds (D-50)."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        doc = next(
+            (i for i in listing.items if i.id == ctx.get("doc") and i.mime_type == MIME_DOC),
+            None,
+        )
+        if doc is None:
+            return _message("Choose again", "Pick a Doc from the Drive list.", 409, ctx, back=back)
+        record = await ctx.plane.get_version(ctx.tenant_id, ctx.principal, agent_id, version)
+        if record is not None and any(g.id == doc.id for g in record.agent().grants.drive):
+            return _message(
+                "Already granted",
+                f"'{doc.name}' is already granted to this agent. A Doc is granted once; "
+                "remove its read grant first to replace a section of it.",
+                409,
+                ctx,
+                back=back,
+            )
+        try:
+            headings = await ctx.plane.drive_doc_headings(ctx.tenant_id, ctx.principal, doc.id)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        typed = ctx.get("heading_text").strip()
+        position = ctx.get("heading_pos")
+        heading = ""
+        if typed:
+            heading = typed
+        elif position.isdigit() and int(position) < len(headings):
+            heading = headings[int(position)]
+        if not heading:
+            # No heading chosen yet: show the Doc's headings (one read) and a type-it field.
+            return _page(
+                "drive_section_heading.html",
+                ctx=ctx,
+                doc=doc,
+                headings=headings,
+                agent_id=agent_id,
+                version=version,
+                base=self.base(ctx),
+                version_url=back,
+            )
+        chosen = [
+            DriveItem(
+                id=doc.id,
+                name=doc.name,
+                link=doc.link,
+                kind="section",
+                heading=heading,
             )
         ]
         await ctx.plane.add_drive_grants(

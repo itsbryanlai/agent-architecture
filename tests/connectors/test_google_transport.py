@@ -1213,3 +1213,137 @@ async def test_fill_sends_one_batchupdate_of_ordered_literal_replacements(deploy
             },
         ]
     }
+
+
+async def test_read_doc_returns_the_revision_title_and_paragraphs(deployment_key):
+    """Fails if documents.get does not return the revisionId, title and body paragraphs (each
+    with its text, named style and UTF-16 indices) with the tenant's token, asking for the
+    revisionId (D-50)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v1/documents/f1"):
+            return reply(
+                request,
+                200,
+                {
+                    "documentId": "f1",
+                    "title": "Guide",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 0,
+                                "endIndex": 7,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": "Status\n"}}],
+                                    "paragraphStyle": {"namedStyleType": "HEADING_1"},
+                                },
+                            },
+                            {
+                                "startIndex": 7,
+                                "endIndex": 16,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": "old line\n"}}],
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                },
+                            },
+                        ]
+                    },
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    doc = await client.read_doc(EMAIL, "f1")
+
+    assert (doc.revision_id, doc.title) == ("rev-1", "Guide")
+    assert [(p.text, p.style, p.start_index, p.end_index) for p in doc.paragraphs] == [
+        ("Status\n", "HEADING_1", 0, 7),
+        ("old line\n", "NORMAL_TEXT", 7, 16),
+    ]
+    [get] = [r for r in sent if r.method == "GET" and r.path_url.startswith("/v1/documents/f1")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    assert "revisionId" in get.path_url
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["writes", "insert-only", "normalize", "status mismatch", "reason-only mismatch"],
+    ids=["writes", "insert-only", "normalize", "status-mismatch", "reason-only"],
+)
+async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deployment_key, case):
+    """Fails if the section replace is not one Docs batchUpdate carrying writeControl with the
+    read revision and the tenant's token, inserting the new text first then deleting the
+    shifted old range (insert-only when nothing is deleted, NORMAL_TEXT style and bullets
+    cleared over the inserted range for an empty section), or a 400 failedPrecondition — by
+    status or by reason alone — is not a revision_mismatch GoogleError (D-50)."""
+    # insert_index, insert_text, delete_start, delete_end, style_start, style_end
+    plans = {
+        "writes": (7, "new line\n", 16, 25, 0, 0),
+        "insert-only": (7, "new line\n", 7, 7, 0, 0),
+        "normalize": (7, "new line\n", 0, 0, 7, 16),
+        "status mismatch": (7, "new line\n", 16, 25, 0, 0),
+        "reason-only mismatch": (7, "new line\n", 16, 25, 0, 0),
+    }
+    expected_requests = {
+        "writes": [
+            {"insertText": {"location": {"index": 7}, "text": "new line\n"}},
+            {"deleteContentRange": {"range": {"startIndex": 16, "endIndex": 25}}},
+        ],
+        "insert-only": [{"insertText": {"location": {"index": 7}, "text": "new line\n"}}],
+        "normalize": [
+            {"insertText": {"location": {"index": 7}, "text": "new line\n"}},
+            {
+                "updateParagraphStyle": {
+                    "range": {"startIndex": 7, "endIndex": 16},
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType",
+                }
+            },
+            {"deleteParagraphBullets": {"range": {"startIndex": 7, "endIndex": 16}}},
+        ],
+    }
+    mismatch = case in ("status mismatch", "reason-only mismatch")
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v1/documents/f1:batchUpdate":
+            if case == "status mismatch":
+                return reply(
+                    request,
+                    400,
+                    {
+                        "error": {
+                            "status": "FAILED_PRECONDITION",
+                            "errors": [{"reason": "failedPrecondition"}],
+                        }
+                    },
+                )
+            if case == "reason-only mismatch":
+                return reply(
+                    request, 400, {"error": {"errors": [{"reason": "failedPrecondition"}]}}
+                )
+            return reply(request, 200, {"documentId": "f1", "replies": [{}, {}]})
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    if mismatch:
+        with pytest.raises(GoogleError) as err:
+            await client.replace_doc_section(EMAIL, "f1", "rev-1", *plans[case])
+        assert err.value.code == "revision_mismatch"
+    else:
+        assert await client.replace_doc_section(EMAIL, "f1", "rev-1", *plans[case]) == "f1"
+
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v1/documents/f1:batchUpdate"
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    body = json.loads(post.body)
+    assert body["writeControl"] == {"requiredRevisionId": "rev-1"}
+    if not mismatch:
+        assert body["requests"] == expected_requests[case]

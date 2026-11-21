@@ -40,6 +40,7 @@ from tests.helpers.console_harness import (
 from tests.helpers.control_api import JSON
 from tests.helpers.drive import (
     DRIVE_FOLDER,
+    DRIVE_SECTION,
     DRIVE_SHEET,
     DRIVE_TEMPLATE,
     TEMPLATE_FOLDER,
@@ -159,6 +160,8 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
         ("sheet_changed_tab", BASE, True),
         ("add_drive_template", BASE, True),
         ("template_changed_folder", BASE, True),
+        ("add_drive_section", BASE, True),
+        ("section_changed_heading", BASE, True),
         ("other_properties", BASE, True),
         ("none", replace(BASE, channels=("C111", "C222")), True),
         ("none", replace(BASE, dm_everyone=True), True),
@@ -172,9 +175,10 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ],
 )
 def test_which_changes_widen_access(grant_change, audience, widens):
-    """Fails if a new grant (a Drive folder, sheet or template included), other properties
-    (a sheet's tab or a template's folder included), a new channel, wider direct messages or
-    guests do not count as widening, or if a removal, a relabel or no change does."""
+    """Fails if a new grant (a Drive folder, sheet, template or section included), other
+    properties (a sheet's tab, a template's folder or a section's heading included), a new
+    channel, wider direct messages or guests do not count as widening, or if a removal, a
+    relabel or no change does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
@@ -219,6 +223,23 @@ def test_which_changes_widen_access(grant_change, audience, widens):
                 "template",
                 folder_id=TEMPLATE_PLAIN_FOLDER,
                 blanks=("name", "role"),
+            )
+        )
+    elif grant_change == "add_drive_section":
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Status"
+            )
+        )
+    elif grant_change == "section_changed_heading":
+        old.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Status"
+            )
+        )
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Overview"
             )
         )
     elif grant_change == "other_properties":

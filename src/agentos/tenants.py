@@ -343,10 +343,11 @@ def granted_drive_roots(agents: AgentsConfig) -> dict[str, DriveGrant]:
     """Scope to Drive grant, for every distinct folder or file granted to any agent of a tenant.
 
     Pass a config whose ``agents`` are the tenant's published set
-    (``agent_store.with_published_agents``). The grant carries its kind (folder or file),
-    which the walk uses to decide whether to list children or index the one file. A
-    ``template`` grant is skipped: its boilerplate is not knowledge, never indexed or
-    cited (D-49).
+    (``agent_store.with_published_agents``). The grant carries its kind, which the walk uses
+    to decide whether to list children (a folder or shared drive) or index the one file (a
+    file, sheet or section). A ``section`` grant is indexed like any file: its Doc is read
+    knowledge, citable, unlike a template (D-50). A ``template`` grant is skipped: its
+    boilerplate is not knowledge, never indexed or cited (D-49).
     """
     roots: dict[str, DriveGrant] = {}
     for agent in agents.agents.values():

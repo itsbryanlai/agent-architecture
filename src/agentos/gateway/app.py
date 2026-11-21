@@ -91,6 +91,7 @@ from agentos.models import (
     EditRequest,
     ExternalUpdate,
     NudgeRequest,
+    blank_limits,
     field_error,
     row_limits,
 )
@@ -861,6 +862,11 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
         # cell the row left out — the same set apply_edit checks against.
         row = stored.get("row", {})
         return {column: str(row.get(column, "")) for column in stored.get("columns", [])}
+    if draft.tool_name == "create_doc":
+        # A create-from-template's editable fields are its draft's blanks — one input each,
+        # empty for a blank the values left out — the same set apply_edit checks against.
+        values = stored.get("values", {})
+        return {blank: str(values.get(blank, "")) for blank in stored.get("blanks", [])}
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -879,8 +885,11 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     """The Edit form: one input per editable field, prefilled from the draft."""
     if draft.tool_name == "append_row":
         limits = row_limits(list(fields))
+    elif draft.tool_name == "create_doc":
+        limits = blank_limits(list(fields))
     else:
         limits = EDITABLE_FIELDS[draft.tool_name]
+    dynamic = draft.tool_name in ("append_row", "create_doc")
     blocks = []
     for name, current in fields.items():
         blocks.append(
@@ -893,7 +902,7 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
                     "action_id": "value",
                     "initial_value": current,
                     "max_length": limits[name],
-                    "multiline": name in MULTILINE_FIELDS or draft.tool_name == "append_row",
+                    "multiline": name in MULTILINE_FIELDS or dynamic,
                 },
             }
         )
@@ -942,11 +951,12 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         errors = {next(iter(fields), ""): "This request can no longer be edited."}
     else:
         # The workflow checks every field again; this is the same check, shown here.
+        dynamic = draft.tool_name in ("append_row", "create_doc")
         for name, value in fields.items():
-            # An append's empty cell clears the column; every other field needs a value.
-            if not value and draft.tool_name != "append_row":
+            # An empty cell clears the column / blank; every other field needs a value.
+            if not value and not dynamic:
                 errors[name] = "This can't be empty."
-            known = draft.tool_name == "append_row" or name in EDITABLE_FIELDS[draft.tool_name]
+            known = dynamic or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):
                 errors[name] = message
     if errors:

@@ -399,6 +399,45 @@ class TaskWorkflow:
                 await self._record()
                 return self._state
             self._spec = dataclasses.replace(spec, revision=appended.revision)
+        elif spec.tool_name == "create_doc":
+            # Check the template grant and resolve its folder before any card (D-49). A
+            # create-from-template is always a stored draft; there is no legacy inline shape.
+            try:
+                prepared: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_create_doc, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't create a Doc from that template: I couldn't find it, or it "
+                    "isn't a template I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=prepared.revision)
         # The policy may let this comment run without a card (D-43): the activity reads
         # the tenant's setting and the platform's own record of who filed the item.
         # Histories recorded before the policy never ask and always show the card.
@@ -493,6 +532,8 @@ class TaskWorkflow:
             return await self._run_comment(spec, task_id, card_ts, agent.name)
         if spec.tool_name == "append_row":
             return await self._run_append(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "create_doc":
+            return await self._run_create_doc(spec, task_id, card_ts, agent.name)
         if spec.tool_name == "nudge":
             return await self._run_nudge(spec, task_id, card_ts, agent.name)
 
@@ -931,6 +972,65 @@ class TaskWorkflow:
         await self._notice(
             task_notices.APPENDED,
             f"{task_id}:appended",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_create_doc(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """Copy the approved template into its folder once (D-49). Nothing to watch after."""
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.create_drive_doc, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(AgentActivities.reconcile_drive_doc, spec, task_id)
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_CREATE_DOC,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_CREATE_DOC,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Created")
+        await self._notice(
+            task_notices.CREATED,
+            f"{task_id}:created",
             task_id,
             subject=title,
             url=item_url,

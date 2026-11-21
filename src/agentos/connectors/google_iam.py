@@ -58,6 +58,7 @@ IAM = "https://iam.googleapis.com/v1"
 IAM_CREDENTIALS = "https://iamcredentials.googleapis.com/v1"
 DRIVE = "https://www.googleapis.com/drive/v3"
 SHEETS = "https://sheets.googleapis.com/v4"
+DOCS = "https://docs.googleapis.com/v1"
 CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform"
 
 # Google's native mime types. Only Docs, Sheets and Slides export to text; a folder is
@@ -146,7 +147,9 @@ class DriveItem:
 
     ``kind`` is ``folder``, ``file``, ``shared_drive`` or ``sheet``, so the grant picker
     knows which grant to add. ``tab`` is empty on a listing; the picker's tab step fills
-    it for a Sheet before the grant is added.
+    it for a Sheet before the grant is added. ``mime_type`` is the file's Drive mime type
+    (the template picker offers Docs only); ``folder_id`` is empty on a listing, the
+    template picker's folder step fills it before the grant is added.
     """
 
     id: str
@@ -154,6 +157,8 @@ class DriveItem:
     link: str
     kind: str = "file"
     tab: str = ""
+    mime_type: str = ""
+    folder_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -172,7 +177,9 @@ class DriveFile:
     indexer re-exports a file only when it changes. ``mime_type`` decides whether the
     node is a folder (walked), an exportable Doc/Sheet/Slides, or a skipped type.
     ``parents`` are the folder IDs the file sits in (``files.get`` only); the search
-    re-check walks them up to the granted root.
+    re-check walks them up to the granted root. ``drive_id`` is the shared drive the file
+    sits in (``files.get`` only), empty for a file in My Drive; the template write's publish
+    check refuses a destination folder whose ``drive_id`` is empty (D-49).
     """
 
     id: str
@@ -182,6 +189,7 @@ class DriveFile:
     web_view_link: str = ""
     trashed: bool = False
     parents: tuple[str, ...] = ()
+    drive_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -329,6 +337,29 @@ class GoogleAccounts(Protocol):
         response never leaves an unmarked row. A text cell is sent as ``stringValue`` and
         lands literally (never parsed into a formula or another type); a number as
         ``numberValue``. Returns the created metadata's ID."""
+        ...
+
+    async def copy_file(
+        self, email: str, template_id: str, folder_id: str, title: str, key: str, value: str
+    ) -> DriveFile:
+        """Copy a template Doc into a folder as a new Doc titled ``title``, carrying the
+        marker appProperty (``key``: ``value``) in the SAME ``files.copy`` request, so a lost
+        response never leaves an unmarked copy a retry would make again. Returns the new
+        Doc's metadata (D-49)."""
+        ...
+
+    async def search_app_properties(
+        self, email: str, folder_id: str, drive_id: str, key: str, value: str
+    ) -> list[DriveFile]:
+        """The non-trashed files in ``folder_id`` carrying the appProperty ``key``: ``value``
+        (``files.list`` with ``appProperties has``, drive-scoped): the marker lookup of a
+        create-from-template write (D-49)."""
+        ...
+
+    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
+        """Fill a copied template's ``{{blank}}`` placeholders with ``values`` (one Docs
+        ``documents.batchUpdate`` ``replaceAllText`` per blank, literal text). Idempotent:
+        a blank already filled no longer matches, so a retry fills only what is left (D-49)."""
         ...
 
 
@@ -570,7 +601,11 @@ class RealGoogleAccounts:
                                 if mime == MIME_SHEET
                                 else "file"
                             )
-                            items.append(DriveItem(file["id"], file["name"], link, kind))
+                            items.append(
+                                DriveItem(
+                                    file["id"], file["name"], link, kind, mime_type=mime or ""
+                                )
+                            )
                     except (KeyError, TypeError) as err:
                         raise GoogleError("unavailable") from err
                     page_token = body.get("nextPageToken")
@@ -678,7 +713,7 @@ class RealGoogleAccounts:
             try:
                 headers = {"Authorization": f"Bearer {token}"}
                 params = {
-                    "fields": "id,name,mimeType,version,webViewLink,trashed,parents",
+                    "fields": "id,name,mimeType,version,webViewLink,trashed,parents,driveId",
                     "supportsAllDrives": "true",
                 }
                 response = self._send(
@@ -1088,6 +1123,122 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
+    # --- the create-from-template write surface (D-49) ---------------------------------
+    # These carry the TENANT account's minted token, like the reads and the other writes, so
+    # a new Doc is created as the account the template and folder are shared with.
+
+    async def copy_file(
+        self, email: str, template_id: str, folder_id: str, title: str, key: str, value: str
+    ) -> DriveFile:
+        token = await self._drive_token(email)
+
+        def call() -> DriveFile:
+            session = self._drive_session_for_call()
+            try:
+                # The marker appProperty lands in the same request as the copy, so a lost
+                # response never leaves an unmarked copy a retry would make again.
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{DRIVE}/files/{template_id}/copy",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"fields": "id,name,mimeType,webViewLink", "supportsAllDrives": "true"},
+                    json={
+                        "name": title,
+                        "parents": [folder_id],
+                        "appProperties": {key: value},
+                    },
+                )
+                self._check_drive(response)
+                try:
+                    return _drive_file(_json_object(response))
+                except (KeyError, TypeError) as err:
+                    raise GoogleError("unavailable") from err
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def search_app_properties(
+        self, email: str, folder_id: str, drive_id: str, key: str, value: str
+    ) -> list[DriveFile]:
+        token = await self._drive_token(email)
+
+        def call() -> list[DriveFile]:
+            session = self._drive_session_for_call()
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                found: list[DriveFile] = []
+                page_token = None
+                while True:
+                    params = {
+                        "q": (
+                            f"'{folder_id}' in parents and trashed=false and "
+                            f"appProperties has {{ key='{key}' and value='{value}' }}"
+                        ),
+                        "corpora": "drive",
+                        "driveId": drive_id,
+                        "fields": "nextPageToken,files(id,name,mimeType,webViewLink)",
+                        "includeItemsFromAllDrives": "true",
+                        "supportsAllDrives": "true",
+                        "pageSize": "1000",
+                    }
+                    if page_token:
+                        params["pageToken"] = page_token
+                    response = self._send(
+                        session, "GET", f"{DRIVE}/files", headers=headers, params=params
+                    )
+                    self._check_drive(response)
+                    body = _json_object(response)
+                    try:
+                        for file in body.get("files", []):
+                            found.append(_drive_file(file))
+                    except (KeyError, TypeError) as err:
+                        raise GoogleError("unavailable") from err
+                    page_token = body.get("nextPageToken")
+                    if not page_token:
+                        break
+                return found
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
+        token = await self._drive_token(email)
+
+        def call() -> None:
+            session = self._drive_session_for_call()
+            try:
+                # One replaceAllText per blank, literal text (no markup interpretation). A
+                # blank already filled no longer matches, so a retry fills only what is left.
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "requests": [
+                            {
+                                "replaceAllText": {
+                                    "containsText": {"text": "{{" + name + "}}", "matchCase": True},
+                                    "replaceText": value,
+                                }
+                            }
+                            for name, value in values.items()
+                        ]
+                    },
+                )
+                self._check_drive(response)
+                _json_object(response)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
 
 def _trim_trailing_empty(values: list[str]) -> list[str]:
     end = len(values)
@@ -1127,6 +1278,7 @@ def _drive_file(file: dict) -> DriveFile:
         web_view_link=file.get("webViewLink", ""),
         trashed=bool(file.get("trashed", False)),
         parents=tuple(file.get("parents") or ()),
+        drive_id=file.get("driveId", ""),
     )
 
 
@@ -1141,16 +1293,26 @@ class FakeGoogleAccounts:
         self.created: list[str] = []
         self.create_calls: list[str] = []
         self.delete_calls: list[str] = []
-        self._fail_after_write = {"create": 0, "delete": 0, "comment": 0, "append": 0}
+        self._fail_after_write = {
+            "create": 0,
+            "delete": 0,
+            "comment": 0,
+            "append": 0,
+            "copy": 0,
+            "fill": 0,
+        }
         self._hang_after_write: dict[str, list[Hang]] = {
             "create": [],
             "delete": [],
             "comment": [],
             "append": [],
+            "copy": [],
+            "fill": [],
         }
         self._visibility_delay = 0
         self._hidden_comments: dict[str, int] = {}
         self._hidden_metadata: dict[int, int] = {}
+        self._hidden_copies: dict[str, int] = {}
         self._sheet_read_hangs: list[Hang] = []
         self._list_error: Exception | None = None
         self._delete_error: Exception | None = None
@@ -1181,6 +1343,15 @@ class FakeGoogleAccounts:
         self.metadata_search_calls: list[tuple[str, str]] = []
         self._next_sheet_id = 1
         self._next_metadata_id = 1
+        # The create-from-template surface (D-49): each file's appProperties, and the
+        # (email, ID) of every copy, appProperty search and fill, so a test sees whose account
+        # wrote and that a lookup ran. A copied Doc's text lives in ``drive_content`` like any
+        # Doc's; ``fill_doc`` replaces its ``{{blank}}`` placeholders there. The copy and fill
+        # failure injections live in ``_after_write``.
+        self.drive_app_properties: dict[str, dict[str, str]] = {}
+        self.copy_calls: list[tuple[str, str]] = []
+        self.app_search_calls: list[tuple[str, str]] = []
+        self.fill_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
@@ -1195,8 +1366,8 @@ class FakeGoogleAccounts:
         self.drive_get_errors: dict[str, Exception] = {}
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
-        """The next ``times`` writes of ``kind`` ("create", "delete", "comment" or
-        "append") take effect and then raise, as when the response is lost."""
+        """The next ``times`` writes of ``kind`` ("create", "delete", "comment", "append",
+        "copy" or "fill") take effect and then raise, as when the response is lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
@@ -1207,8 +1378,9 @@ class FakeGoogleAccounts:
         return hang
 
     def delay_visibility(self, calls: int) -> None:
-        """A comment or appended row created from now on is left out of the next ``calls``
-        comment lists or metadata searches, as when Google's search lags a write."""
+        """A comment, appended row or copied Doc created from now on is left out of the next
+        ``calls`` comment lists, metadata searches or appProperty searches, as when Google's
+        search lags a write."""
         self._visibility_delay = calls
 
     def hang_next_sheet_read(self) -> Hang:
@@ -1274,13 +1446,19 @@ class FakeGoogleAccounts:
 
     # --- the Drive tree, for the read surface -----------------------------------------
 
-    def add_drive_folder(self, folder_id: str, name: str, parent: str | None = None) -> None:
+    def add_drive_folder(
+        self, folder_id: str, name: str, parent: str | None = None, drive_id: str = ""
+    ) -> None:
+        # A node under a shared-drive root inherits its driveId, as Google reports it.
+        if not drive_id and parent is not None and parent in self.drive_files:
+            drive_id = self.drive_files[parent].drive_id
         self.drive_files[folder_id] = DriveFile(
             folder_id,
             name,
             MIME_FOLDER,
             web_view_link=f"https://drive.google.com/drive/folders/{folder_id}",
             parents=(parent,) if parent is not None else (),
+            drive_id=drive_id,
         )
         self.drive_children.setdefault(folder_id, [])
         if parent is not None:
@@ -1294,7 +1472,10 @@ class FakeGoogleAccounts:
         parent: str,
         sections: list[DriveSection],
         version: str = "1",
+        drive_id: str = "",
     ) -> None:
+        if not drive_id and parent in self.drive_files:
+            drive_id = self.drive_files[parent].drive_id
         self.drive_files[file_id] = DriveFile(
             file_id,
             name,
@@ -1302,6 +1483,7 @@ class FakeGoogleAccounts:
             version=version,
             web_view_link=f"https://drive.google.com/file/d/{file_id}",
             parents=(parent,),
+            drive_id=drive_id,
         )
         self.drive_content[file_id] = list(sections)
         self.drive_children.setdefault(parent, []).append(file_id)
@@ -1568,6 +1750,78 @@ class FakeGoogleAccounts:
             self._hidden_metadata[metadata_id] = self._visibility_delay
         await self._after_write("append")
         return str(metadata_id)
+
+    async def copy_file(
+        self, email: str, template_id: str, folder_id: str, title: str, key: str, value: str
+    ) -> DriveFile:
+        self.copy_calls.append((email, template_id))
+        if template_id in self.drive_refused or folder_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if template_id not in self.drive_files or folder_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        folder = self.drive_files[folder_id]
+        new_id = f"new-doc-{uuid.uuid4().hex}"
+        copied = DriveFile(
+            new_id,
+            title,
+            MIME_DOC,
+            version="1",
+            web_view_link=f"https://drive.google.com/file/d/{new_id}",
+            parents=(folder_id,),
+            drive_id=folder.drive_id,
+        )
+        self.drive_files[new_id] = copied
+        self.drive_content[new_id] = list(self.drive_content.get(template_id, []))
+        self.drive_children.setdefault(folder_id, []).append(new_id)
+        # The marker lands with the copy, as the one files.copy request carries it.
+        self.drive_app_properties.setdefault(new_id, {})[key] = value
+        if self._visibility_delay:
+            self._hidden_copies[new_id] = self._visibility_delay
+        await self._after_write("copy")
+        return copied
+
+    async def search_app_properties(
+        self, email: str, folder_id: str, drive_id: str, key: str, value: str
+    ) -> list[DriveFile]:
+        self.app_search_calls.append((email, folder_id))
+        if folder_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if folder_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        found = [
+            self.drive_files[c]
+            for c in self.drive_children.get(folder_id, [])
+            if c in self.drive_files
+            and not self.drive_files[c].trashed
+            and c not in self._hidden_copies
+            and self.drive_app_properties.get(c, {}).get(key) == value
+        ]
+        self._tick(self._hidden_copies)
+        return found
+
+    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
+        self.fill_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        sections = self.drive_content.get(file_id, [])
+        filled = [
+            DriveSection(
+                s.heading,
+                _replace_blanks(s.text, values),
+            )
+            for s in sections
+        ]
+        self.drive_content[file_id] = filled
+        await self._after_write("fill")
+
+
+def _replace_blanks(text: str, values: dict[str, str]) -> str:
+    """Fill ``{{blank}}`` placeholders literally; a blank already filled no longer matches."""
+    for name, value in values.items():
+        text = text.replace("{{" + name + "}}", value)
+    return text
 
 
 def accounts_from_settings(

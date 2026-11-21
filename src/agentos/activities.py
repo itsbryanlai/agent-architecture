@@ -152,6 +152,7 @@ from agentos.models import (
     ToolResult,
     TurnContext,
     assistant_blocks,
+    blank_limits,
     check_field,
     row_limits,
 )
@@ -493,6 +494,9 @@ class AgentActivities:
             self.prepare_stored_append,
             self.append_sheet_row,
             self.reconcile_sheet_append,
+            self.prepare_stored_create_doc,
+            self.create_drive_doc,
+            self.reconcile_drive_doc,
             self.comment_approval_policy,
             self.apply_edit,
             self.post_task_notice,
@@ -1993,6 +1997,18 @@ class AgentActivities:
                     return DraftedWrite(call.kind)
                 return DraftedWrite(call.kind, grant.id)
             return DraftedWrite(call.kind)
+        if call.kind == "create_doc":
+            # A create-from-template names its target 'template' (a granted template's ID or
+            # name); the drafted write's target is the granted template's file ID, kept as it is.
+            template = tool_input.get("template")
+            if refusal is None and isinstance(template, str) and template.strip():
+                connector = self._connector_for(ctx.tenant_id, agent, connector_name)
+                try:
+                    grant = connector.template_for(template.strip())
+                except ConnectorError:
+                    return DraftedWrite(call.kind)
+                return DraftedWrite(call.kind, grant.id)
+            return DraftedWrite(call.kind)
         if agent.grants.notion_databases:
             return DraftedWrite(call.kind, normalize_id(agent.grants.notion_databases[0].id))
         return DraftedWrite(call.kind)
@@ -2116,9 +2132,9 @@ class AgentActivities:
     async def _card_requester_line(
         self, spec: TaskSpec, task_id: str, agent: AgentVersion
     ) -> str | None:
-        """The body line the card must show, or None for a comment, an append, a nudge or a
-        matched requester."""
-        if spec.tool_name in ("add_comment", "append_row", "nudge"):
+        """The body line the card must show, or None for a comment, an append, a nudge, a
+        create-from-template or a matched requester."""
+        if spec.tool_name in ("add_comment", "append_row", "nudge", "create_doc"):
             return None
         return (await self._requester(spec, task_id, agent))["line"]
 
@@ -2271,6 +2287,47 @@ class AgentActivities:
             "item_url": item.url,
         }
 
+    @activity.defn(name="prepare_stored_create_doc")
+    async def prepare_stored_create_doc(self, spec: TaskSpec) -> DraftOutcome:
+        """``prepare_stored_append`` for a create-from-template (D-49): check the template
+        grant and resolve its destination folder for the card, storing the resolved payload
+        as the next revision, which the card then shows and the approval names. A retry finds
+        it stored. The grant is checked here before any card, and again just before the write."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("prepare_stored_create_doc", ctx.tenant_id, ctx.agent_id)
+        revision = spec.revision + 1
+        resolved = await self.content.get_draft(ctx.tenant_id, spec.draft_ref, revision)
+        if resolved is None:
+            resolved = await self._resolve_create_doc(spec, await self._spec_payload(spec))
+            await self.content.put_draft(ctx.tenant_id, spec.draft_ref, revision, resolved)
+        return DraftOutcome(revision=revision, database_id="")
+
+    async def _resolve_create_doc(self, spec: TaskSpec, payload: dict) -> dict:
+        ctx = spec.ctx
+        try:
+            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+            folder = await connector.resolve_doc_folder(
+                payload["template_id"], payload["folder_id"]
+            )
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            _reraise(err)
+        return {
+            **payload,
+            "page_id": payload["template_id"],
+            "folder_name": folder.name,
+            "folder_url": folder.web_view_link,
+            "item_title": payload["title"],
+            "item_url": folder.web_view_link,
+        }
+
     @activity.defn(name="comment_approval_policy")
     async def comment_approval_policy(self, spec: TaskSpec) -> bool:
         """Whether this comment may run without the requester's approval card (D-43).
@@ -2392,6 +2449,57 @@ class AgentActivities:
                 "columns": columns,
                 "row": clean_row,
             }
+        elif kind == "create_doc":
+            template_ref = tool_input.get("template")
+            title, values = tool_input.get("title"), tool_input.get("values")
+            if not isinstance(template_ref, str) or not template_ref.strip():
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'template'.")
+            if not isinstance(title, str) or not title.strip():
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'title'.")
+            if not isinstance(values, dict):
+                return DraftOutcome(error=f"{call.name} needs a 'values' object.")
+            read_refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, DRIVE)
+            if read_refusal is not None:
+                return DraftOutcome(error=str(read_refusal))
+            connector = self._connector_for(ctx.tenant_id, agent, DRIVE)
+            try:
+                grant = connector.template_for(template_ref.strip())
+            except ConnectorError as err:
+                return DraftOutcome(error=str(err))
+            if error := check_field(kind, "title", title.strip()):
+                return DraftOutcome(error=error)
+            blanks = list(grant.blanks)
+            for name in values:
+                if name not in blanks:
+                    return DraftOutcome(
+                        error=f"'{name}' is not a blank of template '{grant.name}'. "
+                        f"Its blanks: {', '.join(blanks)}."
+                    )
+            clean_values: dict = {}
+            for blank in blanks:
+                if blank not in values:
+                    return DraftOutcome(
+                        error=f"template '{grant.name}' needs a value for blank '{blank}'."
+                    )
+                value = values[blank]
+                if not isinstance(value, str):
+                    return DraftOutcome(error=f"'{blank}' must be text.")
+                text = value.strip()
+                if not text:
+                    return DraftOutcome(error=f"'{blank}' needs a non-empty value.")
+                if error := check_field(kind, blank, text):
+                    return DraftOutcome(error=error)
+                clean_values[blank] = text
+            # Frozen here: the card shows this title and these values, and the task copies
+            # the template and fills them as they are. The blanks are the grant's, read at
+            # submit; the write checks they still match the live grant's.
+            payload = {
+                "template_id": grant.id,
+                "folder_id": grant.folder_id,
+                "blanks": blanks,
+                "title": title.strip(),
+                "values": clean_values,
+            }
         elif kind in EDITABLE_FIELDS:
             title, details = tool_input.get("title"), tool_input.get("details")
             if not isinstance(title, str) or not title.strip():
@@ -2431,23 +2539,23 @@ class AgentActivities:
             return True  # a retry: the revision is stored and the form's values are cleared
         row = await self.content.get_inbound(ctx.tenant_id, edit_id)
         current = await self._spec_payload(spec)
-        # An append's editable fields are its sheet's columns, named by the draft; every
-        # other tool's are the fixed set its kind declares.
+        # An append's editable fields are its sheet's columns and a create-from-template's
+        # are its template's blanks, named by the draft; every other tool's are the fixed
+        # set its kind declares.
+        dynamic = spec.tool_name in ("append_row", "create_doc")
         if spec.tool_name == "append_row":
             limits = row_limits(current.get("columns", []))
+        elif spec.tool_name == "create_doc":
+            limits = blank_limits(current.get("blanks", []))
         else:
             limits = EDITABLE_FIELDS.get(spec.tool_name, {})
         fields = (row or {}).get("fields")
         if not row or row.get("task_id") != spec.draft_ref or not isinstance(fields, dict):
             log.warning("ignored edit: no stored form for this task tenant_id=%s", ctx.tenant_id)
             return False
-        # An append may edit any subset of its draft's columns (a cell the form left out
-        # keeps its value); every other tool's edit names exactly its editable fields.
-        fits = (
-            set(fields) <= set(limits)
-            if spec.tool_name == "append_row"
-            else set(fields) == set(limits)
-        )
+        # A dynamic draft may edit any subset of its fields (one the form left out keeps
+        # its value); every other tool's edit names exactly its editable fields.
+        fits = set(fields) <= set(limits) if dynamic else set(fields) == set(limits)
         if not fits:
             log.warning(
                 "ignored edit: fields are not the editable ones tenant_id=%s", ctx.tenant_id
@@ -2456,8 +2564,8 @@ class AgentActivities:
         clean: dict = {}
         for key, value in fields.items():
             text = value.strip() if isinstance(value, str) else ""
-            if spec.tool_name == "append_row":
-                # An empty cell clears the column; a value must still fit the card.
+            if dynamic:
+                # An empty cell clears the column / blank; a value must still fit the card.
                 if text and check_field(spec.tool_name, key, text):
                     log.warning(
                         "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
@@ -2470,6 +2578,9 @@ class AgentActivities:
         if spec.tool_name == "append_row":
             # The edited cells replace the row's values; the columns themselves are fixed.
             updated = {**current, "row": {**current.get("row", {}), **clean}}
+        elif spec.tool_name == "create_doc":
+            # The edited values replace the blanks' values; the blanks themselves are fixed.
+            updated = {**current, "values": {**current.get("values", {}), **clean}}
         else:
             updated = {**current, **clean}
         await self.content.put_draft(ctx.tenant_id, spec.draft_ref, spec.revision + 1, updated)
@@ -2620,6 +2731,59 @@ class AgentActivities:
         )
         return metadata_id
 
+    @activity.defn(name="create_drive_doc")
+    async def create_drive_doc(self, spec: TaskSpec, task_id: str) -> NotionItem:
+        """Copy the approved template into its shared-drive folder once, filling its blanks (D-49).
+
+        The connector is the tool's manifest connector (Drive's ``create_doc_from_template``).
+        The gate, the lease and the look-before-write are the other writes'; the marker is an
+        appProperty on the copied Doc, and the write checks the draft's blanks and folder still
+        match the live grant's so a republish since the draft refuses with nothing written. A
+        task with a stored draft gets back the page ID only: the title and link are content.
+        """
+        ctx = spec.ctx
+        idem_key = f"{task_id}:create"
+        await self._gate_write(spec, task_id, idem_key, "page_id")
+        self._log("create_drive_doc", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        page_id = payload["page_id"]
+        await self._check_method(spec, payload, task_id, page_id, idem_key, "app_properties")
+        # The live published version, not the turn's pinned one: a grant revoked since this
+        # write was approved must stop it.
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, page_id)
+        try:
+            item = cast(
+                NotionItem,
+                await self._write_once(
+                    ctx.tenant_id,
+                    idem_key,
+                    find=lambda: connector.find_write("create_doc", page_id, idem_key),
+                    write=lambda: connector.write(
+                        "create_doc", page_id, payload, idem_key, agent_name=agent.name
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=_item_from_ref,
+                ),
+            )
+        except Exception as err:
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, payload, task_id, idem_key, page_id, "error")
+                raise _non_retryable(err) from err
+            _reraise(err)
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            item.page_id,
+            self._write_outcome(spec),
+            {"page_id": item.page_id},
+        )
+        return _without_content(spec, item)
+
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
         """Create the approved item once. A task with a stored draft gets back the page ID and
@@ -2767,6 +2931,44 @@ class AgentActivities:
             {"metadata_id": metadata_id},
         )
         return metadata_id
+
+    @activity.defn(name="reconcile_drive_doc")
+    async def reconcile_drive_doc(self, spec: TaskSpec, task_id: str) -> NotionItem | None:
+        """The create-from-template counterpart of ``reconcile_sheet_append`` (D-49): the
+        copied Doc, or None for "not seen". Reads only, one look, the tool's connector. The
+        write's shape check runs first: a draft whose blanks or folder no longer match the
+        live grant refuses, and the task says it could not confirm."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("reconcile_drive_doc", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        idem_key = f"{task_id}:create"
+        page_id = payload["page_id"]
+        ref = await self.writes.result(ctx.tenant_id, idem_key)
+        item = _item_from_ref(ref) if ref is not None else None
+        if item is None:
+            # The approved shape must still hold: a republish since the draft stops the
+            # look, which the task reads as "not confirmed", never as "nothing created".
+            connector.check_doc_shape(page_id, payload["blanks"], payload["folder_id"])
+            item = cast(
+                NotionItem | None, await connector.find_write("create_doc", page_id, idem_key)
+            )
+        if item is None:
+            return None
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            item.page_id,
+            self._write_outcome(spec),
+            {"page_id": item.page_id},
+        )
+        return _without_content(spec, item)
 
     # --- nudge -------------------------------------------------------------------
 
@@ -3309,6 +3511,8 @@ class AgentActivities:
             target, idem_key = payload["page_id"], f"{task_id}:comment"
         elif spec.tool_name == "append_row":
             target, idem_key = payload["page_id"], f"{task_id}:append"
+        elif spec.tool_name == "create_doc":
+            target, idem_key = payload["page_id"], f"{task_id}:create"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
         if not spec.under_policy:
@@ -3430,6 +3634,8 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
         return escape_slack(f"Approve comment on {payload['item_title']}")
     if spec.tool_name == "append_row":
         return escape_slack(f"Approve row append to {payload['item_title']}")
+    if spec.tool_name == "create_doc":
+        return escape_slack(f"Approve new Doc: {payload['title']}")
     if spec.tool_name == "nudge":
         return escape_slack(f"Approve nudge on {payload['item_title']}")
     return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
@@ -3580,6 +3786,25 @@ def approval_card_blocks(
             pairs.append({"type": "mrkdwn", "text": escape_slack(str(row.get(column, "")))})
         body = [{"type": "section", "fields": pairs[i : i + 10]} for i in range(0, len(pairs), 10)]
         note = "Nothing is appended until you click Submit."
+    elif spec.tool_name == "create_doc":
+        # The new Doc's title is named, and the destination folder with its link, kept live
+        # like the comment's. The filled blanks preview as a two-column table (blank, value):
+        # a pair of section fields per blank, at most ten fields (five blanks) to a section.
+        folder = f"<{shown['folder_url']}|{payload['folder_name']}>"
+        head = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{agent_name}* wants to create *{payload['title']}* in {folder}.",
+            },
+        }
+        values = shown.get("values", {})
+        pairs = []
+        for blank in shown.get("blanks", []):
+            pairs.append({"type": "mrkdwn", "text": f"*{escape_slack(blank)}*"})
+            pairs.append({"type": "mrkdwn", "text": escape_slack(str(values.get(blank, "")))})
+        body = [{"type": "section", "fields": pairs[i : i + 10]} for i in range(0, len(pairs), 10)]
+        note = "Nothing is created until you click Submit."
     else:
         head = {
             "type": "section",

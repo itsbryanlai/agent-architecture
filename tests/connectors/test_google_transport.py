@@ -1059,3 +1059,133 @@ async def test_list_sheet_tabs_reads_only_the_titles_with_the_tenant_token(deplo
     query = parse_qs(urlsplit(get.path_url).query)
     assert query["fields"] == ["sheets.properties.title"]
     assert "rowData" not in get.path_url
+
+
+# --- the create-from-template write surface (D-49) ---------------------------------------
+
+
+async def test_copy_sends_the_title_folder_and_marker_appproperty_in_one_request(deployment_key):
+    """Fails if the copy does not POST the title, the destination folder and the marker
+    appProperty in one files.copy with supportsAllDrives and the tenant's token, or does not
+    return the new Doc's metadata."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files/tpl1/copy"):
+            return reply(
+                request,
+                200,
+                {
+                    "id": "new1",
+                    "name": "Offer for Bob",
+                    "mimeType": MIME_DOC,
+                    "webViewLink": "https://drive/new1",
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    made = await client.copy_file(
+        EMAIL, "tpl1", "folder1", "Offer for Bob", "agentos_write", "hash"
+    )
+
+    assert (made.id, made.name, made.web_view_link) == (
+        "new1",
+        "Offer for Bob",
+        "https://drive/new1",
+    )
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url.startswith("/drive/v3/files/tpl1/copy")
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    assert "supportsAllDrives=true" in post.path_url
+    assert json.loads(post.body) == {
+        "name": "Offer for Bob",
+        "parents": ["folder1"],
+        "appProperties": {"agentos_write": "hash"},
+    }
+
+
+@pytest.mark.parametrize("found", [True, False], ids=["found", "not-found"])
+async def test_app_property_search_lists_the_folder_drive_scoped(deployment_key, found):
+    """Fails if the marker lookup does not search the destination folder for the appProperty
+    key and value, drive-scoped with supportsAllDrives and includeItemsFromAllDrives and the
+    tenant's token, or returns anything but the matching files (none when absent)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files"):
+            if not found:
+                return reply(request, 200, {"files": []})
+            return reply(
+                request,
+                200,
+                {
+                    "files": [
+                        {
+                            "id": "new1",
+                            "name": "Offer for Bob",
+                            "mimeType": MIME_DOC,
+                            "webViewLink": "https://drive/new1",
+                        }
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    matches = await client.search_app_properties(
+        EMAIL, "folder1", "drive1", "agentos_write", "hash"
+    )
+
+    assert [m.id for m in matches] == (["new1"] if found else [])
+    [get] = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    query = parse_qs(urlsplit(get.path_url).query)
+    assert query["corpora"] == ["drive"]
+    assert query["driveId"] == ["drive1"]
+    assert query["supportsAllDrives"] == ["true"]
+    assert query["includeItemsFromAllDrives"] == ["true"]
+    assert "'folder1' in parents" in query["q"][0]
+    assert "appProperties has { key='agentos_write' and value='hash' }" in query["q"][0]
+
+
+async def test_fill_sends_one_literal_replacealltext_per_blank(deployment_key):
+    """Fails if the fill is not one Docs batchUpdate with a replaceAllText per blank, matching
+    the {{blank}} case-sensitively and replacing with the literal value, with the tenant's token."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v1/documents/new1:batchUpdate":
+            return reply(request, 200, {"replies": [{}, {}]})
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    await client.fill_doc(EMAIL, "new1", {"name": "Bob", "role": "engineer"})
+
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v1/documents/new1:batchUpdate"
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    assert json.loads(post.body) == {
+        "requests": [
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "{{name}}", "matchCase": True},
+                    "replaceText": "Bob",
+                }
+            },
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "{{role}}", "matchCase": True},
+                    "replaceText": "engineer",
+                }
+            },
+        ]
+    }

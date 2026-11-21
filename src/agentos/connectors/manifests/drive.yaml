@@ -2,10 +2,10 @@
 #
 # Drive reads are knowledge: the indexed folders and files are searched through
 # search_knowledge, not a Drive tool. The write actions declare their risk, idempotency
-# and preview shape here; comment is the first (D-47), append a row the second (D-48). A
-# Drive write always asks the requester's approval: neither tool carries low_risk
-# (maintainer, 2026-11-21 / 2026-11-19). Create from a template and replace a section
-# arrive with their own tickets.
+# and preview shape here; comment is the first (D-47), append a row the second (D-48),
+# create a Doc from a template the third (D-49). A Drive write always asks the requester's
+# approval: no tool carries low_risk (maintainer, 2026-11-21 / 2026-11-19). Replace a
+# section arrives with its own ticket.
 connector: drive
 tools:
   comment_on_file:
@@ -44,3 +44,27 @@ tools:
             The row to append, as column name to value (text or a number). Use only the
             sheet's columns; a column left out is appended empty.
       required: [sheet, row]
+
+  create_doc_from_template:
+    risk: write_irreversible
+    idempotency: app_properties
+    description: >-
+      Draft a new Google Doc copied from one of the agent's granted templates, into the
+      template's shared-drive folder. Nothing is created until the requester approves the
+      draft in Slack. Give the new Doc a title and a value for every blank of the chosen
+      template; the granted templates and their blanks are listed below.
+    input_schema:
+      type: object
+      properties:
+        template:
+          type: string
+          description: ID or name of one of the granted templates listed in this description.
+        title:
+          type: string
+          description: The title of the new Doc.
+        values:
+          type: object
+          description: >-
+            The value for every blank of the template, as blank name to text. Use only the
+            template's blanks; every blank needs a value.
+      required: [template, title, values]

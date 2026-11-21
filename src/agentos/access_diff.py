@@ -54,6 +54,7 @@ _DRIVE_KIND_LABELS = {
     "file": "drive file",
     "shared_drive": "drive shared drive",
     "sheet": "drive sheet",
+    "template": "drive template",
 }
 
 
@@ -74,7 +75,14 @@ def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
     for grant in agent.grants.drive:
         # A sheet's mapping is its tab and columns: pointing the append at another tab or
         # other columns reads as "uses other properties", a widening the approver sees.
-        mapping = (grant.tab, *grant.columns) if grant.kind == "sheet" else ()
+        # A template's mapping is its folder and blanks: another folder or other blanks
+        # reads the same way.
+        if grant.kind == "sheet":
+            mapping = (grant.tab, *grant.columns)
+        elif grant.kind == "template":
+            mapping = (grant.folder_id, *grant.blanks)
+        else:
+            mapping = ()
         found[grant.id] = (_DRIVE_KIND_LABELS[grant.kind], grant.name, mapping)
     return found
 

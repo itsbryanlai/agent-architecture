@@ -29,6 +29,11 @@ COMMENTED_NO_APPROVAL = "commented_no_approval"
 APPENDED = "appended"
 FAILED_APPEND = "failed_append"
 NOT_CONFIRMED_APPEND = "not_confirmed_append"
+# The create-from-template write's lines (D-49): a Doc copied into a shared-drive folder,
+# no watch afterwards.
+CREATED = "created"
+FAILED_CREATE_DOC = "failed_create_doc"
+NOT_CONFIRMED_CREATE_DOC = "not_confirmed_create_doc"
 # The fixed line a card shows when a write is stopped before it runs; a policy write
 # has no card, so the line goes to the thread as it is.
 STOPPED_COMMENT = "stopped_comment"
@@ -39,7 +44,7 @@ NUDGE_SELF = "nudge_self"
 NUDGE_PREPARE_FAILED = "nudge_prepare_failed"
 
 # Kinds about the item a create made, not about the draft.
-ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE)
+ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE, CREATED)
 
 
 def subject(tool_name: str, payload: dict) -> str:
@@ -102,6 +107,12 @@ def notice_text(
         return f"I couldn't append a row to '{name}': {escape_slack(reason)}"
     if kind == NOT_CONFIRMED_APPEND:
         return f"I couldn't confirm whether the row was appended; please check {url}"
+    if kind == CREATED:
+        return f"Created {name} ({url})."
+    if kind == FAILED_CREATE_DOC:
+        return f"I couldn't create '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_CREATE_DOC:
+        return f"I couldn't confirm whether the Doc was created; please check {url}"
     if kind == STOPPED_COMMENT:
         return reason
     if kind == NUDGED:

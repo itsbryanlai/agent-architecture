@@ -415,6 +415,12 @@ class DriveGrant:
     A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
     ``columns`` is its header row, read once when the version is submitted and frozen
     into the definition. The write refuses when the live header no longer matches.
+
+    A ``template`` is a granted Doc the agent may copy into a new Doc: ``id`` is the
+    template's file ID, ``folder_id`` the shared-drive folder new Docs land in, and
+    ``blanks`` the template's ``{{field name}}`` placeholders, read once when the version
+    is submitted and frozen into the definition. The write refuses when the live grant's
+    blanks or folder no longer match the draft's.
     """
 
     id: str
@@ -422,6 +428,8 @@ class DriveGrant:
     kind: str = "folder"
     tab: str = ""
     columns: tuple[str, ...] = ()
+    folder_id: str = ""
+    blanks: tuple[str, ...] = ()
 
 
 @dataclass
@@ -605,10 +613,11 @@ _GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
-_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets"})
+_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
 _DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
-DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet")
+_DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks"})
+DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template")
 # A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
 # The connector's link parser uses the same shape, so a grant and a resolved link agree.
 DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
@@ -617,6 +626,11 @@ DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
 # characters. The submit step refuses a wider header rather than store a card Slack rejects.
 MAX_SHEET_COLUMNS = 50
 MAX_COLUMN_NAME = 200
+# A template grant's blanks are bounded like a sheet's columns so the approval card and the
+# Edit form always fit: at most 50 blanks, each name at most 200 characters. The submit step
+# refuses a wider template rather than store a card Slack rejects.
+MAX_TEMPLATE_BLANKS = 50
+MAX_BLANK_NAME = 200
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -782,6 +796,40 @@ def _parse_drive_sheet(agent_id: str, raw: dict[str, Any], index: int = 0) -> Dr
     )
 
 
+def _parse_drive_template(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.templates[{index}]"
+    _mapping(where, raw, _DRIVE_TEMPLATE_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    folder_id = _text(where, "folder_id", _require(raw, "folder_id", where))
+    if not DRIVE_ID.fullmatch(folder_id):
+        raise ConfigError(
+            f"{where}: 'folder_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    blanks_raw = raw.get("blanks")
+    blanks: tuple[str, ...] = ()
+    if blanks_raw is not None:
+        if not isinstance(blanks_raw, list) or not all(
+            isinstance(b, str) and b.strip() for b in blanks_raw
+        ):
+            raise ConfigError(f"{where}: 'blanks' must be a list of non-empty blank names")
+        if len(blanks_raw) > MAX_TEMPLATE_BLANKS:
+            raise ConfigError(f"{where}: a template may name at most {MAX_TEMPLATE_BLANKS} blanks")
+        if any(len(b) > MAX_BLANK_NAME for b in blanks_raw):
+            raise ConfigError(f"{where}: a blank name may be at most {MAX_BLANK_NAME} characters")
+        blanks = tuple(blanks_raw)
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="template",
+        folder_id=folder_id,
+        blanks=blanks,
+    )
+
+
 def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
     where = f"agent '{agent_id}' grants.drive"
     drive = _mapping(where, raw, _DRIVE_KEYS)
@@ -791,6 +839,8 @@ def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
         for i, item in enumerate(_list_of(f"{where}.{key}", drive.get(key))):
             if kind == "sheet":
                 grants.append(_parse_drive_sheet(agent_id, item, i))
+            elif kind == "template":
+                grants.append(_parse_drive_template(agent_id, item, i))
             else:
                 grants.append(_parse_drive_grant(agent_id, item, kind, i))
     seen: set[str] = set()
@@ -937,6 +987,10 @@ def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
         entry["tab"] = grant.tab
         if grant.columns:
             entry["columns"] = list(grant.columns)
+    if grant.kind == "template":
+        entry["folder_id"] = grant.folder_id
+        if grant.blanks:
+            entry["blanks"] = list(grant.blanks)
     return entry
 
 

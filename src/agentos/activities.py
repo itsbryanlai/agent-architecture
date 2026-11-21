@@ -2540,8 +2540,8 @@ class AgentActivities:
         row = await self.content.get_inbound(ctx.tenant_id, edit_id)
         current = await self._spec_payload(spec)
         # An append's editable fields are its sheet's columns and a create-from-template's
-        # are its template's blanks, named by the draft; every other tool's are the fixed
-        # set its kind declares.
+        # are its title and its template's blanks, named by the draft; every other tool's
+        # are the fixed set its kind declares.
         dynamic = spec.tool_name in ("append_row", "create_doc")
         if spec.tool_name == "append_row":
             limits = row_limits(current.get("columns", []))
@@ -2566,6 +2566,10 @@ class AgentActivities:
             text = value.strip() if isinstance(value, str) else ""
             if dynamic:
                 # An empty cell clears the column / blank; a value must still fit the card.
+                # A create's title is the new Doc's name: it cannot be cleared.
+                if not text and spec.tool_name == "create_doc" and key == "title":
+                    log.warning("ignored edit: the title is empty tenant_id=%s", ctx.tenant_id)
+                    return False
                 if text and check_field(spec.tool_name, key, text):
                     log.warning(
                         "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
@@ -2580,7 +2584,12 @@ class AgentActivities:
             updated = {**current, "row": {**current.get("row", {}), **clean}}
         elif spec.tool_name == "create_doc":
             # The edited values replace the blanks' values; the blanks themselves are fixed.
-            updated = {**current, "values": {**current.get("values", {}), **clean}}
+            # The title edits the Doc's name, not a blank (a blank named title shares its
+            # input, so it keeps its draft value).
+            edited_values = {k: v for k, v in clean.items() if k != "title"}
+            updated = {**current, "values": {**current.get("values", {}), **edited_values}}
+            if "title" in clean:
+                updated["title"] = clean["title"]
         else:
             updated = {**current, **clean}
         await self.content.put_draft(ctx.tenant_id, spec.draft_ref, spec.revision + 1, updated)

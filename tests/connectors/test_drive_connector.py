@@ -104,26 +104,57 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
 
 
 @pytest.mark.parametrize(
-    ("case", "ref", "expected"),
+    ("kind", "case", "ref", "expected"),
     [
-        ("unique name", "Roster", "drive-sheet-0001"),
-        ("shared name", "Roster", None),
-        ("ID of one of two", "drive-sheet-0002", "drive-sheet-0002"),
+        ("sheet", "unique name", "Roster", "drive-sheet-0001"),
+        ("sheet", "shared name", "Roster", None),
+        ("sheet", "ID of one of two", "drive-sheet-0002", "drive-sheet-0002"),
+        ("template", "unique name", "Offer template", "drive-template-0001"),
+        ("template", "shared name", "Offer template", None),
     ],
-    ids=["unique-name", "shared-name", "by-id"],
+    ids=[
+        "sheet-unique-name",
+        "sheet-shared-name",
+        "sheet-by-id",
+        "template-unique-name",
+        "template-shared-name",
+    ],
 )
-def test_sheet_for_refuses_a_name_two_granted_sheets_share(case, ref, expected):
-    """Fails if sheet_for picks one of two granted Sheets that share a name instead of
-    refusing so the model uses the ID, or a unique name or an ID does not resolve."""
+def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case, ref, expected):
+    """Fails if sheet_for or template_for picks one of two granted Sheets or templates that
+    share a name instead of refusing so the model uses the ID, or a unique name or an ID
+    does not resolve."""
     google = FakeGoogleAccounts()
-    grants = [DriveGrant("drive-sheet-0001", "Roster", "sheet", tab="Q1")]
-    if case != "unique name":
-        grants.append(DriveGrant("drive-sheet-0002", "Roster", "sheet", tab="Q1"))
+    if kind == "sheet":
+        grants = [DriveGrant("drive-sheet-0001", "Roster", "sheet", tab="Q1")]
+        if case != "unique name":
+            grants.append(DriveGrant("drive-sheet-0002", "Roster", "sheet", tab="Q1"))
+    else:
+        grants = [
+            DriveGrant(
+                "drive-template-0001",
+                "Offer template",
+                "template",
+                folder_id=FOLDER,
+                blanks=("name",),
+            )
+        ]
+        if case != "unique name":
+            grants.append(
+                DriveGrant(
+                    "drive-template-0002",
+                    "Offer template",
+                    "template",
+                    folder_id=FOLDER,
+                    blanks=("name",),
+                )
+            )
     conn = DriveConnector(DriveReader(google, EMAIL), grants)
+    lookup = conn.sheet_for if kind == "sheet" else conn.template_for
 
     if expected is None:
         with pytest.raises(GrantDenied) as err:
-            conn.sheet_for(ref)
+            lookup(ref)
         assert "ID" in str(err.value)
     else:
-        assert conn.sheet_for(ref).id == expected
+        assert lookup(ref).id == expected

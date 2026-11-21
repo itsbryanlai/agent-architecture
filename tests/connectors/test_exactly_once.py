@@ -14,7 +14,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.config import TASK_QUEUE
-from agentos.connectors.google_iam import GoogleError
+from agentos.connectors.google_iam import DriveSection, GoogleError
 from agentos.connectors.notion import comment_ref
 from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
@@ -698,3 +698,33 @@ async def test_a_drive_create_whose_marker_lags_is_found_by_the_retry_looking_ag
     [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
     assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
     assert len(h.google.copy_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "template_text",
+    [
+        "Dear {{name}},\nYou are hired as {{role}}.",
+        "Dear {{ name }},\nYou are hired as {{ role }}.",
+    ],
+    ids=["canonical", "spaced"],
+)
+async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_the_retry(
+    dharness, template_text
+):
+    """Fails if the retry of a create whose fill response was lost fills the copy a second
+    time or copies a second Doc, or a spaced blank is left unfilled so the filled copy
+    reads as not done."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_content(DRIVE_TEMPLATE, [DriveSection("", template_text)])
+    task_id = ids.task_id(TENANT, "drive-create-fill-lost")
+    h.google.fail_after_write("fill")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+    assert len(h.google.fill_calls) == 1

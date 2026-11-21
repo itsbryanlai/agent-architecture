@@ -256,9 +256,24 @@ async def test_a_republished_grant_refuses_the_create_with_nothing_written(dharn
     assert DOC_SHAPE_CHANGED_TEXT in told["text"]
 
 
-async def test_an_edited_blank_writes_the_edited_value_after_a_fresh_approval(dharness):
-    """Fails if a create card cannot be edited per blank, or the Doc fills the pre-edit
-    values or runs without a fresh approval."""
+@pytest.mark.parametrize(
+    ("fields", "expected_title", "expected_text"),
+    [
+        ({"name": "Bobby", "role": "engineer"}, TITLE, "Dear Bobby,\nYou are hired as engineer."),
+        (
+            {"title": "Offer for Robert"},
+            "Offer for Robert",
+            "Dear Bob,\nYou are hired as engineer.",
+        ),
+        ({"role": ""}, TITLE, "Dear Bob,\nYou are hired as ."),
+    ],
+    ids=["edit-blank", "edit-title", "clear-blank"],
+)
+async def test_an_edited_create_writes_the_edited_values_after_a_fresh_approval(
+    dharness, fields, expected_title, expected_text
+):
+    """Fails if a create card cannot be edited per blank or by title, an edit cannot clear
+    a blank, or the Doc writes the pre-edit values or runs without a fresh approval."""
     h = dharness
     await grant_template(h)
     handle = await start_create_task(h)
@@ -267,7 +282,7 @@ async def test_an_edited_blank_writes_the_edited_value_after_a_fresh_approval(dh
     await h.acts.content.put_inbound(
         TENANT,
         edit_id,
-        {"kind": "edit", "task_id": handle.id, "fields": {"name": "Bobby", "role": "engineer"}},
+        {"kind": "edit", "task_id": handle.id, "fields": fields},
         delivered=True,
     )
 
@@ -275,14 +290,19 @@ async def test_an_edited_blank_writes_the_edited_value_after_a_fresh_approval(dh
 
     async def redrawn():
         updates = h.slack.updates()
-        if updates and "Bobby" in json.dumps(updates[-1]["blocks"]):
+        if updates and "Edited — review and approve again" in json.dumps(
+            updates[-1]["blocks"], ensure_ascii=False
+        ):
             return updates[-1]
         return None
 
     card = await eventually(redrawn)
     text = json.dumps(card["blocks"], ensure_ascii=False)
-    assert "Edited — review and approve again" in text
+    assert expected_title in text
     assert "*name*" in text and "*role*" in text
+    for value in fields.values():
+        if value:
+            assert value in text
     actions = next(b for b in card["blocks"] if b["type"] == "actions")
     nonce = json.loads(actions["elements"][0]["value"])["nonce"]
     assert nonce != NONCE
@@ -291,4 +311,68 @@ async def test_an_edited_blank_writes_the_edited_value_after_a_fresh_approval(dh
     assert await handle.result() == "done"
 
     [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_files[new_id].name == expected_title
+    assert h.google.drive_content[new_id][0].text == expected_text
+
+
+async def test_an_edit_cannot_clear_the_title(dharness):
+    """Fails if an edit with an empty title is accepted instead of ignored."""
+    h = dharness
+    await grant_template(h)
+    handle = await start_create_task(h)
+    await wait_state(handle, "awaiting_approval")
+    edit_id = ids.edit_event_id(uuid.uuid4().hex)
+    await h.acts.content.put_inbound(
+        TENANT,
+        edit_id,
+        {"kind": "edit", "task_id": handle.id, "fields": {"title": "   "}},
+        delivered=True,
+    )
+    await handle.signal(TaskWorkflow.edit, EditRequest(NONCE, ALICE, {}, edit_id))
+    # The settle: a valid edit on the original nonce still redraws the card, which it
+    # could not if the empty-title edit had taken the nonce. It is re-sent until the
+    # first edit has been processed (an edit arriving mid-save is ignored), so a redraw
+    # proves the first edit was refused, not merely late.
+    edit_id = ids.edit_event_id(uuid.uuid4().hex)
+    await h.acts.content.put_inbound(
+        TENANT,
+        edit_id,
+        {"kind": "edit", "task_id": handle.id, "fields": {"name": "Bobby"}},
+        delivered=True,
+    )
+
+    async def redrawn():
+        await handle.signal(TaskWorkflow.edit, EditRequest(NONCE, ALICE, {}, edit_id))
+        updates = h.slack.updates()
+        if updates and "Bobby" in json.dumps(updates[-1]["blocks"]):
+            return updates[-1]
+        return None
+
+    card = await eventually(redrawn)
+    actions = next(b for b in card["blocks"] if b["type"] == "actions")
+    nonce = json.loads(actions["elements"][0]["value"])["nonce"]
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+    assert await handle.result() == "done"
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_files[new_id].name == TITLE
     assert h.google.drive_content[new_id][0].text == "Dear Bobby,\nYou are hired as engineer."
+
+
+@pytest.mark.parametrize("order", ["name-first", "role-first"])
+async def test_a_value_containing_another_blanks_placeholder_lands_literally(dharness, order):
+    """Fails if a fill value containing another blank's placeholder is replaced again
+    instead of landing literally, in either order of the values."""
+    h = dharness
+    await grant_template(h)
+    values = {"name": "{{role}}", "role": "engineer"}
+    if order == "role-first":
+        values = {"role": "engineer", "name": "{{role}}"}
+    handle = await start_create_task(h, values)
+    await wait_state(handle, "awaiting_approval")
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+    assert await handle.result() == "done"
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear {{role}},\nYou are hired as engineer."

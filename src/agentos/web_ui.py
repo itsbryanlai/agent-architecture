@@ -1317,7 +1317,8 @@ class WebUI:
 
     async def drive_template_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         """The template step: pick a granted Doc as the template and a folder as the
-        destination of the new Docs (D-49). Only Docs and folders the account sees are offered."""
+        destination of the new Docs (D-49). Only Docs and shared-drive folders the account
+        sees are offered: a destination outside a shared drive cannot hold a new Doc."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         try:
@@ -1325,7 +1326,7 @@ class WebUI:
         except GoogleError as err:
             return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
         templates = [item for item in listing.items if item.mime_type == MIME_DOC]
-        folders = [item for item in listing.items if item.kind == "folder"]
+        folders = [item for item in listing.items if item.kind == "folder" and item.drive_id]
         return _page(
             "drive_template.html",
             ctx=ctx,
@@ -1350,7 +1351,11 @@ class WebUI:
             None,
         )
         folder = next(
-            (i for i in listing.items if i.id == ctx.get("folder") and i.kind == "folder"),
+            (
+                i
+                for i in listing.items
+                if i.id == ctx.get("folder") and i.kind == "folder" and i.drive_id
+            ),
             None,
         )
         if template is None or folder is None:

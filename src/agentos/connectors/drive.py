@@ -16,8 +16,10 @@ the live grant's (a republish since the draft) or the tab's header no longer mat
 columns the definition froze at publish. The third is ``create_doc_from_template`` (D-49),
 a create task on a granted template: the copied Doc carries an appProperty holding the key's
 hash, the marker lookup searches the destination folder for it before a retry copies again,
-and the copy carries its marker in the same request while the blank fill is idempotent. The
-write refuses when the draft's blanks or folder no longer match the live grant's.
+and the copy carries its marker in the same request while the fill replaces every raw blank
+form with a sentinel and each sentinel with its value in one batchUpdate, so values land
+literally and a retry fills only what is left. The write refuses when the draft's blanks or
+folder no longer match the live grant's.
 ``resolve_item`` walks a file's parents up to
 a granted root — the same walk the search re-check makes — so a file inside a granted
 folder or shared drive resolves, and one moved out of it does not; the granted root is
@@ -72,7 +74,7 @@ DOC_SHAPE_CHANGED_TEXT = (
     "ask the creator to republish"
 )
 # A template blank: ``{{field name}}``. The name is the inner text, trimmed; duplicate
-# names collapse to one. The fill replaces the canonical ``{{name}}`` form literally.
+# names collapse to one. The fill replaces every raw form found for a name, spaced or not.
 _BLANK = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 
@@ -94,6 +96,29 @@ def template_blank_names(text: str) -> tuple[str, ...]:
         if name and name not in names:
             names.append(name)
     return tuple(names)
+
+
+def template_blank_forms(text: str) -> dict[str, tuple[str, ...]]:
+    """Every raw ``{{field name}}`` form per trimmed blank name, in first-seen order: the
+    fill replaces each form the text actually writes (``{{name}}``, ``{{ name }}``, ...),
+    so detection and fill agree (D-49)."""
+    forms: dict[str, list[str]] = {}
+    for match in _BLANK.finditer(text):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        found = forms.setdefault(name, [])
+        if match.group(0) not in found:
+            found.append(match.group(0))
+    return {name: tuple(raw) for name, raw in forms.items()}
+
+
+def fill_sentinel(name: str) -> str:
+    """The unique sentinel a blank's forms are replaced with before the value pass: a hash
+    of the blank's name in mathematical brackets, a string no template writes, so it does
+    not occur in the template's text and the value pass only touches what the form pass
+    marked (D-49)."""
+    return "⟦agentos-fill:" + hashlib.sha256(name.encode()).hexdigest() + "⟧"
 
 
 def drive_file_id(ref: str) -> str | None:
@@ -171,8 +196,8 @@ class DriveReader:
             self._email, folder_id, drive_id, key, value
         )
 
-    async def fill_doc(self, file_id: str, values: dict[str, str]) -> None:
-        return await self._google.fill_doc(self._email, file_id, values)
+    async def fill_doc(self, file_id: str, replacements: list[tuple[str, str]]) -> None:
+        return await self._google.fill_doc(self._email, file_id, replacements)
 
 
 class DriveConnector:
@@ -442,8 +467,9 @@ class DriveConnector:
 
     async def find_created_doc(self, template_id: str, idem_key: str) -> NotionItem | None:
         """The copied Doc an earlier attempt made under ``idem_key``, if it is visible AND
-        filled. A copy whose blanks are not all filled yet reads as not done, so the write
-        runs and fills it (a lost response between the copy and the fill)."""
+        filled. A copy still carrying a blank's form or fill sentinel reads as not done, so
+        the write runs and fills what is left (a lost response between the copy and the
+        fill, or between the fill's two passes)."""
         grant = self._grants.get(template_id)
         if grant is None or grant.kind != "template":
             raise GrantDenied("This agent has not been granted that template to copy.")
@@ -452,6 +478,8 @@ class DriveConnector:
             return None
         sections = await self._reader.export_file(copy.id, MIME_DOC)
         text = "\n".join(section.text for section in sections)
+        if any(fill_sentinel(blank) in text for blank in grant.blanks):
+            return None
         if set(template_blank_names(text)) & set(grant.blanks):
             return None
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
@@ -462,8 +490,10 @@ class DriveConnector:
 
         The approved shape is the written shape: the draft's blanks and folder must still be
         the live grant's (a republish since the draft refuses). The copy carries its marker in
-        the same request, and the fill is idempotent, so a lost response never leaves an
-        unmarked copy and a retry fills a copy an earlier attempt left unfilled.
+        the same request. The fill reads the copy's text for every raw form of each blank and
+        replaces them in two passes in one batchUpdate: each form to the blank's sentinel,
+        then each sentinel to its value — so a value containing another blank's placeholder
+        is kept exactly, and a retry fills only what is left.
         """
         self.check_doc_shape(template_id, payload["blanks"], payload["folder_id"])
         grant = self._grants[template_id]
@@ -476,8 +506,15 @@ class DriveConnector:
                 DOC_APP_PROPERTY_KEY,
                 doc_marker(idem_key),
             )
-        values = {blank: payload["values"].get(blank, "") for blank in payload["blanks"]}
-        await self._reader.fill_doc(copy.id, values)
+        sections = await self._reader.export_file(copy.id, MIME_DOC)
+        forms = template_blank_forms("\n".join(section.text for section in sections))
+        replacements: list[tuple[str, str]] = []
+        for blank in payload["blanks"]:
+            for form in forms.get(blank, ()):
+                replacements.append((form, fill_sentinel(blank)))
+        for blank in payload["blanks"]:
+            replacements.append((fill_sentinel(blank), payload["values"].get(blank, "")))
+        await self._reader.fill_doc(copy.id, replacements)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:

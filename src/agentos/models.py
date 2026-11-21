@@ -351,10 +351,9 @@ EDITABLE_FIELDS = {
     # draft (they differ per grant), not a fixed set here. The empty map marks append_row
     # a write kind; ``row_limits`` builds the per-column limits from the draft's columns.
     "append_row": {},
-    # A create-from-template's editable fields are the template's blanks, named by the
-    # stored draft, not a fixed set here. The empty map marks create_doc a write kind;
-    # ``blank_limits`` builds the per-blank limits from the draft's blanks. The title is
-    # fixed at draft time (checked via ``check_field``), not an editable field.
+    # A create-from-template's editable fields are the title and the template's blanks,
+    # named by the stored draft, not a fixed set here. The empty map marks create_doc a
+    # write kind; ``blank_limits`` builds the limits from the draft's blanks.
     "create_doc": {},
 }
 
@@ -374,8 +373,10 @@ def row_limits(columns: list[str]) -> dict[str, int]:
 
 
 def blank_limits(blanks: list[str]) -> dict[str, int]:
-    """The editable limits of a create-from-template draft: one value per template blank."""
-    return {blank: BLANK_VALUE_MAX for blank in blanks}
+    """The editable limits of a create-from-template draft: the new Doc's title and one
+    value per template blank. A blank named ``title`` shares the title's input: the form
+    edits the Doc's name, and that blank keeps its draft value."""
+    return {**{blank: BLANK_VALUE_MAX for blank in blanks}, "title": DOC_TITLE_MAX}
 
 
 # Room on the card for the escaped value, after the bold label above it.

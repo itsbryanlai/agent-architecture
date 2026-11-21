@@ -149,7 +149,9 @@ class DriveItem:
     knows which grant to add. ``tab`` is empty on a listing; the picker's tab step fills
     it for a Sheet before the grant is added. ``mime_type`` is the file's Drive mime type
     (the template picker offers Docs only); ``folder_id`` is empty on a listing, the
-    template picker's folder step fills it before the grant is added.
+    template picker's folder step fills it before the grant is added. ``drive_id`` is the
+    shared drive the item sits in, empty for one in My Drive; the template picker offers
+    only folders with one as destinations (D-49).
     """
 
     id: str
@@ -159,6 +161,7 @@ class DriveItem:
     tab: str = ""
     mime_type: str = ""
     folder_id: str = ""
+    drive_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -356,10 +359,13 @@ class GoogleAccounts(Protocol):
         create-from-template write (D-49)."""
         ...
 
-    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
-        """Fill a copied template's ``{{blank}}`` placeholders with ``values`` (one Docs
-        ``documents.batchUpdate`` ``replaceAllText`` per blank, literal text). Idempotent:
-        a blank already filled no longer matches, so a retry fills only what is left (D-49)."""
+    async def fill_doc(self, email: str, file_id: str, replacements: list[tuple[str, str]]) -> None:
+        """Apply the ordered ``(old, new)`` literal replacements in ONE Docs
+        ``documents.batchUpdate`` (one ``replaceAllText`` per pair, ``matchCase``): the
+        create write's two passes — every raw ``{{blank}}`` form to its sentinel, then each
+        sentinel to its value — so a value containing another blank's placeholder lands
+        literally (D-49). A string no longer present is a no-op, so a retry fills only what
+        is left."""
         ...
 
 
@@ -575,7 +581,7 @@ class RealGoogleAccounts:
                 while True:
                     params = {
                         "q": "sharedWithMe and trashed=false",
-                        "fields": "nextPageToken,files(id,name,mimeType,webViewLink)",
+                        "fields": "nextPageToken,files(id,name,mimeType,webViewLink,driveId)",
                         "includeItemsFromAllDrives": "true",
                         "supportsAllDrives": "true",
                         "pageSize": str(LIST_CAP),
@@ -603,7 +609,12 @@ class RealGoogleAccounts:
                             )
                             items.append(
                                 DriveItem(
-                                    file["id"], file["name"], link, kind, mime_type=mime or ""
+                                    file["id"],
+                                    file["name"],
+                                    link,
+                                    kind,
+                                    mime_type=mime or "",
+                                    drive_id=file.get("driveId") or "",
                                 )
                             )
                     except (KeyError, TypeError) as err:
@@ -1206,14 +1217,16 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
-    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
+    async def fill_doc(self, email: str, file_id: str, replacements: list[tuple[str, str]]) -> None:
         token = await self._drive_token(email)
 
         def call() -> None:
             session = self._drive_session_for_call()
             try:
-                # One replaceAllText per blank, literal text (no markup interpretation). A
-                # blank already filled no longer matches, so a retry fills only what is left.
+                # One replaceAllText per replacement, in order, literal text (no markup
+                # interpretation): the create write's two passes — blank forms to sentinels,
+                # sentinels to values. A string no longer present is a no-op, so a retry
+                # fills only what is left.
                 response = self._send(
                     session,
                     "POST",
@@ -1223,11 +1236,11 @@ class RealGoogleAccounts:
                         "requests": [
                             {
                                 "replaceAllText": {
-                                    "containsText": {"text": "{{" + name + "}}", "matchCase": True},
-                                    "replaceText": value,
+                                    "containsText": {"text": old, "matchCase": True},
+                                    "replaceText": new,
                                 }
                             }
-                            for name, value in values.items()
+                            for old, new in replacements
                         ]
                     },
                 )
@@ -1307,7 +1320,6 @@ class FakeGoogleAccounts:
             "comment": [],
             "append": [],
             "copy": [],
-            "fill": [],
         }
         self._visibility_delay = 0
         self._hidden_comments: dict[str, int] = {}
@@ -1346,8 +1358,8 @@ class FakeGoogleAccounts:
         # The create-from-template surface (D-49): each file's appProperties, and the
         # (email, ID) of every copy, appProperty search and fill, so a test sees whose account
         # wrote and that a lookup ran. A copied Doc's text lives in ``drive_content`` like any
-        # Doc's; ``fill_doc`` replaces its ``{{blank}}`` placeholders there. The copy and fill
-        # failure injections live in ``_after_write``.
+        # Doc's; ``fill_doc`` applies the ordered literal replacements there. The copy and
+        # fill failure injections live in ``_after_write``.
         self.drive_app_properties: dict[str, dict[str, str]] = {}
         self.copy_calls: list[tuple[str, str]] = []
         self.app_search_calls: list[tuple[str, str]] = []
@@ -1371,8 +1383,9 @@ class FakeGoogleAccounts:
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
-        """The next write of ``kind`` takes effect, then waits until the returned ``Hang``
-        is released. Another attempt meanwhile runs normally: this is how two overlap."""
+        """The next write of ``kind`` ("create", "delete", "comment", "append" or "copy")
+        takes effect, then waits until the returned ``Hang`` is released. Another attempt
+        meanwhile runs normally: this is how two overlap."""
         hang = Hang()
         self._hang_after_write[kind].append(hang)
         return hang
@@ -1434,8 +1447,9 @@ class FakeGoogleAccounts:
         if self._fail_after_write[kind]:
             self._fail_after_write[kind] -= 1
             raise GoogleError("unavailable")
-        if self._hang_after_write[kind]:
-            await self._hang_after_write[kind].pop(0).wait()
+        hangs = self._hang_after_write.get(kind)
+        if hangs:
+            await hangs.pop(0).wait()
 
     async def list_shared(self, email: str) -> DriveListing:
         if self._list_error is not None:
@@ -1799,29 +1813,20 @@ class FakeGoogleAccounts:
         self._tick(self._hidden_copies)
         return found
 
-    async def fill_doc(self, email: str, file_id: str, values: dict[str, str]) -> None:
+    async def fill_doc(self, email: str, file_id: str, replacements: list[tuple[str, str]]) -> None:
         self.fill_calls.append((email, file_id))
         if file_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         if file_id not in self.drive_files:
             raise GoogleError("not_found", status=404)
-        sections = self.drive_content.get(file_id, [])
-        filled = [
-            DriveSection(
-                s.heading,
-                _replace_blanks(s.text, values),
-            )
-            for s in sections
-        ]
+        filled = []
+        for section in self.drive_content.get(file_id, []):
+            text = section.text
+            for old, new in replacements:
+                text = text.replace(old, new)
+            filled.append(DriveSection(section.heading, text))
         self.drive_content[file_id] = filled
         await self._after_write("fill")
-
-
-def _replace_blanks(text: str, values: dict[str, str]) -> str:
-    """Fill ``{{blank}}`` placeholders literally; a blank already filled no longer matches."""
-    for name, value in values.items():
-        text = text.replace("{{" + name + "}}", value)
-    return text
 
 
 def accounts_from_settings(

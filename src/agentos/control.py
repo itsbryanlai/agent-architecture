@@ -1731,9 +1731,8 @@ class ControlPlane:
         if not target:
             raise TestSetError("choose the source, database, Drive file or agent this case expects")
         if expect == CITE:
-            drive_files = {
-                g.id for g in agent.grants.drive if g.kind in ("file", "sheet", "template")
-            }
+            # A template's boilerplate is not knowledge (D-49): it is never cited.
+            drive_files = {g.id for g in agent.grants.drive if g.kind in ("file", "sheet")}
             if target in drive_files:
                 return expect, target
             granted = {normalize_id(g.id) for g in agent.grants.notion_pages}

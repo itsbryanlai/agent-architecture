@@ -863,10 +863,19 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
         row = stored.get("row", {})
         return {column: str(row.get(column, "")) for column in stored.get("columns", [])}
     if draft.tool_name == "create_doc":
-        # A create-from-template's editable fields are its draft's blanks — one input each,
-        # empty for a blank the values left out — the same set apply_edit checks against.
+        # A create-from-template's editable fields are the title and its draft's blanks —
+        # one input each, empty for a blank the values left out — the same set apply_edit
+        # checks against. A blank named title shares the title's input (the Doc's name).
         values = stored.get("values", {})
-        return {blank: str(values.get(blank, "")) for blank in stored.get("blanks", [])}
+        fields = {"title": str(stored.get("title", ""))}
+        fields.update(
+            {
+                blank: str(values.get(blank, ""))
+                for blank in stored.get("blanks", [])
+                if blank != "title"
+            }
+        )
+        return fields
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -902,7 +911,7 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
                     "action_id": "value",
                     "initial_value": current,
                     "max_length": limits[name],
-                    "multiline": name in MULTILINE_FIELDS or dynamic,
+                    "multiline": name in MULTILINE_FIELDS or (dynamic and name != "title"),
                 },
             }
         )
@@ -953,8 +962,10 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         # The workflow checks every field again; this is the same check, shown here.
         dynamic = draft.tool_name in ("append_row", "create_doc")
         for name, value in fields.items():
-            # An empty cell clears the column / blank; every other field needs a value.
-            if not value and not dynamic:
+            # An empty cell clears the column / blank; a create's title and every other
+            # field needs a value.
+            titled = draft.tool_name == "create_doc" and name == "title"
+            if not value and (not dynamic or titled):
                 errors[name] = "This can't be empty."
             known = dynamic or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):

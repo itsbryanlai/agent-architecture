@@ -5,12 +5,19 @@ from __future__ import annotations
 import pytest
 
 from agentos import ids
-from agentos.connectors.google_iam import MIME_SHEET, DriveItem, FakeGoogleAccounts
+from agentos.connectors.google_iam import MIME_DOC, MIME_SHEET, DriveItem, FakeGoogleAccounts
 from agentos.drive_connections import InMemoryDriveConnectionStore
 from tests.conftest import TENANT
 from tests.helpers.agents import helper_block
 from tests.helpers.console_harness import ROOT, ConsoleHarness, csrf_in, post, using
-from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, DRIVE_SHARED, DRIVE_SHEET
+from tests.helpers.drive import (
+    DRIVE_DOC,
+    DRIVE_FOLDER,
+    DRIVE_SHARED,
+    DRIVE_SHEET,
+    TEMPLATE_DRIVE,
+    TEMPLATE_FOLDER,
+)
 
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
 
@@ -158,3 +165,58 @@ async def test_removing_a_drive_grant():
         assert "no Google Drive grants" in page
     record = await h.agents.get_version(TENANT, "it-helper", 1)
     assert record.agent().grants.drive == []
+
+
+@pytest.mark.parametrize(
+    ("folder", "accepted"),
+    [(TEMPLATE_FOLDER, True), (DRIVE_FOLDER, False)],
+    ids=["shared-drive-folder", "plain-folder"],
+)
+async def test_the_template_picker_offers_only_shared_drive_folders(folder, accepted):
+    """Fails if the template picker offers a folder outside a shared drive as a destination
+    or refuses one inside a shared drive."""
+    h, google = await picker_harness()
+    google.shared[tenant_email()] = [
+        DriveItem(
+            DRIVE_DOC,
+            "Guide",
+            f"https://drive.google.com/file/d/{DRIVE_DOC}",
+            "file",
+            mime_type=MIME_DOC,
+        ),
+        DriveItem(
+            TEMPLATE_FOLDER,
+            "Offer letters",
+            f"https://drive.google.com/drive/folders/{TEMPLATE_FOLDER}",
+            "folder",
+            drive_id=TEMPLATE_DRIVE,
+        ),
+        DriveItem(
+            DRIVE_FOLDER,
+            "Team folder",
+            f"https://drive.google.com/drive/folders/{DRIVE_FOLDER}",
+            "folder",
+        ),
+    ]
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        pick = (await c.get(VERSION + "/drive/pick/template")).text
+        assert "Offer letters" in pick
+        assert "Team folder" not in pick
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/template",
+            csrf_in(pick),
+            template=DRIVE_DOC,
+            folder=folder,
+            request_id="r1",
+        )
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    if accepted:
+        assert resp.status_code == 303
+        assert [(g.id, g.kind, g.folder_id) for g in record.agent().grants.drive] == [
+            (DRIVE_DOC, "template", TEMPLATE_FOLDER)
+        ]
+    else:
+        assert resp.status_code == 409
+        assert record.agent().grants.drive == []

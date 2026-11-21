@@ -1,6 +1,6 @@
 # Product
 
-Status: draft · Last updated 2026-11-21 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (admin-adjustable risk classes, the console's connectors page, the Drive section-replace write) are marked `target` there.
+Status: draft · Last updated 2026-11-21 · What is built today: [status.md](status.md). Items in the v1 scope that are not in the code yet (admin-adjustable risk classes and the console's connectors page) are marked `target` there.
 
 ## One-line pitch
 

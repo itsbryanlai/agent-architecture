@@ -590,6 +590,41 @@ copy an earlier attempt left unfilled is found and filled, so an approved create
 makes one Doc. There is no follow-up watch on a create. The Drive connector
 switch and the writes switch stop it while off.
 
+**Drive writes (replace a section, D-50).** An agent granted a section is offered
+`replace_section`: it drafts a replacement for one headed section of a granted
+Google Doc, and nothing is written until the requester approves the card in Slack
+— a replace always asks, never low-risk. The section is a **heading** the creator
+names: everything under that heading up to the next heading of the same or higher
+level (a deeper heading is part of the section); the heading itself is kept. To
+grant it, the creator shares the Doc with the workspace's Drive address **as
+Editor** (Viewer is enough for reading, but replacing writes the body), picks the
+Doc and types the heading's name — the definition editor can also add it directly
+as `grants.drive.sections` with the Doc's file ID, a label, the same Doc ID as
+`doc_id` and the heading (`{id, name, doc_id, heading}`). The Doc is granted as for
+reads: it is indexed and citable like any file. When the version is submitted, the
+platform reads the Doc once and checks the heading exists exactly once: a missing
+heading refuses with "I can't find the heading '<name>' in <doc>; ask the creator
+to update the agent", a duplicated one with "The heading '<name>' appears more
+than once in <doc>; ask the creator to update the agent". The version page shows
+the heading. The card previews the Doc (name and link), the section's heading, the
+current text (before) and the replacement (after); Edit changes the new text and
+needs a fresh approval, keeping the same read revision. The new text is inserted
+literally as plain text (bounded to 2000 characters). The model sees the granted
+sections and their headings in the tool's description; a name two granted sections
+share is refused, and the model must use the section's ID. The write is one Docs
+`batchUpdate` locked to the revision read at the draft
+(`writeControl.requiredRevisionId`): it deletes the section's content and inserts
+the new text after the heading. If the Doc moved since the read — a collaborator
+edited it, or a retry follows a lost response — the revision no longer holds and
+nothing is written; the platform reads the section and compares it with the
+approved text: equal means the earlier attempt landed (done), different refuses
+with "The document changed since you approved; I'll draft it again". If the
+definition was republished with another heading between the draft and the
+approval, or the heading was renamed, removed or duplicated, the replace is
+refused with nothing written. The replacement lands as the workspace's Drive
+account. There is no follow-up watch on a replace. The Drive connector switch and
+the writes switch stop it while off.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,

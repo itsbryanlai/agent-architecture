@@ -857,8 +857,10 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
         return {}
     stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
     if draft.tool_name == "append_row":
-        # An append's editable values are its row's cells, keyed by the sheet's columns.
-        return dict(stored.get("row", {}))
+        # An append's editable fields are its draft's columns — one input each, empty for a
+        # cell the row left out — the same set apply_edit checks against.
+        row = stored.get("row", {})
+        return {column: str(row.get(column, "")) for column in stored.get("columns", [])}
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -909,8 +911,9 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
 async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Response:
     """Handle the saved Edit form: keep the form open on a bad value, else signal ``edit``.
 
-    A value is bad when it is empty or does not fit once escaped, and the whole form is
-    stale when the draft has moved on. Only a valid edit reaches the workflow.
+    A value is bad when it is empty (an append's cell excepted: empty clears it) or does
+    not fit once escaped, and the whole form is stale when the draft has moved on. Only a
+    valid edit reaches the workflow.
     """
     view = payload.get("view") or {}
     if view.get("callback_id") != EDIT_CALLBACK:
@@ -926,16 +929,11 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         return Response(status_code=200)
     values = (view.get("state") or {}).get("values") or {}
     fields: dict[str, str] = {}
-    errors: dict[str, str] = {}
     for block_id, actions in values.items():
         raw = (actions.get("value") or {}).get("value")
-        text = raw.strip() if isinstance(raw, str) else ""
-        if not text:
-            errors[block_id] = "This can't be empty."
-        fields[block_id] = text
-    if errors:
-        return _form_errors(errors)
+        fields[block_id] = raw.strip() if isinstance(raw, str) else ""
     draft = await _query_draft(d, tenant, task_id)
+    errors: dict[str, str] = {}
     if draft is None:
         errors = {next(iter(fields), ""): "This request is no longer open."}
     elif nonce != draft.nonce:
@@ -945,6 +943,9 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
     else:
         # The workflow checks every field again; this is the same check, shown here.
         for name, value in fields.items():
+            # An append's empty cell clears the column; every other field needs a value.
+            if not value and draft.tool_name != "append_row":
+                errors[name] = "This can't be empty."
             known = draft.tool_name == "append_row" or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):
                 errors[name] = message

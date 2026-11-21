@@ -591,3 +591,22 @@ async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
     assert len(rows) == 3
     assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+async def test_a_drive_append_whose_marker_lags_is_found_by_the_retry_looking_again(dharness):
+    """Fails if a retry whose metadata search lags the append appends the row a second time,
+    instead of looking again until the marker is visible."""
+    h = dharness
+    h.acts.visibility_interval = 0
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-lag")
+    h.google.delay_visibility(2)
+    h.google.fail_after_write("append")
+    with pytest.raises(GoogleError):
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1

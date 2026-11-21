@@ -6,7 +6,7 @@
 {% if not listing.items %}
 <p>Nothing is shared with this workspace's Drive address yet. Share a folder or file with the address on the Settings page, then choose again.</p>
 {% else %}
-<p>These are the folders and files shared with this workspace's Drive address. Anything shared with it is available to every agent creator here; tick the ones this agent may read. An admin approves the agent before it reads them.</p>
+<p>These are the folders, files and Sheets shared with this workspace's Drive address. Anything shared with it is available to every agent creator here; tick the ones this agent may read, and the Sheets it may append a row to (a Sheet asks for its tab next). An admin approves the agent before it reads or writes them.</p>
 <form method="post" action="{{ version_url }}/drive/pick/choose">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">

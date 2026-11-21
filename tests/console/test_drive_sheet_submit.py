@@ -1,6 +1,9 @@
 """Submitting a version with a Drive sheet grant reads the tab's header once and stores it
 as the grant's columns, so the admin reviews the columns the agent will write (D-48)."""
 
+import asyncio
+import copy
+
 import pytest
 
 from agentos import ids
@@ -36,18 +39,50 @@ def serve_sheet(google: FakeGoogleAccounts, header: list[str]) -> None:
     google.add_sheet_tab(DRIVE_SHEET, SHEET_TAB, header, [["alice", "engineer"]])
 
 
-@pytest.mark.parametrize("case", ["reads and stores", "no header row", "not connected"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reads and stores",
+        "no header row",
+        "not connected",
+        "duplicate columns",
+        "edit while reading",
+    ],
+    ids=["stores", "no-header", "not-connected", "duplicates", "concurrent-edit"],
+)
 async def test_submit_reads_the_sheets_header_once_and_stores_the_columns(case):
-    """Fails if submit does not read the tab's header and store it as the grant's columns,
-    reads it more than once, or accepts a tab with no header row or an unconnected Drive."""
+    """Fails if submit does not read the tab's header once and store it as the grant's
+    columns, accepts a tab with no header row, a duplicate column name or an unconnected
+    Drive, or drops an edit made while the header read was in flight."""
     h, _drive, google = sheet_harness()
     await h.seed_members()
     if case != "not connected":
         await h.plane.connect_drive(TENANT, ROOT)
-    serve_sheet(google, ["name", "role"] if case != "no header row" else [])
+    header = (
+        []
+        if case == "no header row"
+        else ["name", "name"]
+        if case == "duplicate columns"
+        else ["name", "role"]
+    )
+    serve_sheet(google, header)
     await h.plane.add_agent(TENANT, OWNER, "it-helper", sheet_definition())
 
-    if case == "reads and stores":
+    if case == "edit while reading":
+        hang = google.hang_next_sheet_read()
+        submit = asyncio.create_task(h.plane.submit_version(TENANT, OWNER, "it-helper", 1))
+        await hang.reached.wait()
+        record = await h.agents.get_version(TENANT, "it-helper", 1)
+        definition = copy.deepcopy(record.definition)
+        definition["system_prompt"] = "Edited while the header read was in flight."
+        await h.plane.edit_draft(TENANT, OWNER, "it-helper", 1, definition)
+        hang.release()
+        await submit
+        record = await h.agents.get_version(TENANT, "it-helper", 1)
+        assert record.status == "pending"
+        assert record.definition["system_prompt"] == "Edited while the header read was in flight."
+        assert record.agent().grants.drive[0].columns == ("name", "role")
+    elif case == "reads and stores":
         await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
         record = await h.agents.get_version(TENANT, "it-helper", 1)
         [sheet] = record.agent().grants.drive
@@ -58,7 +93,12 @@ async def test_submit_reads_the_sheets_header_once_and_stores_the_columns(case):
     else:
         with pytest.raises(ConfigError) as err:
             await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
-        assert ("no header row" if case == "no header row" else "not connected") in str(err.value)
+        expected = {
+            "no header row": "no header row",
+            "not connected": "not connected",
+            "duplicate columns": "duplicate column name",
+        }[case]
+        assert expected in str(err.value)
         record = await h.agents.get_version(TENANT, "it-helper", 1)
         assert record.status == "draft"
         assert record.agent().grants.drive[0].columns == ()

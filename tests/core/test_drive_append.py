@@ -119,14 +119,19 @@ async def test_the_append_tool_is_offered_only_to_an_agent_with_a_granted_sheet(
 
 
 async def test_an_approved_append_writes_one_marked_row_and_the_card_previews_it(dharness):
-    """Fails if an approved append writes no row, writes it twice, leaves it unmarked, or
-    the card does not preview the sheet, the tab and the exact row that is written."""
+    """Fails if an approved append writes no row, writes it twice, leaves it unmarked, turns
+    a model's JSON number into text, or the card does not preview the sheet, the tab and the
+    exact row that is written."""
     h = dharness
     await grant_sheet(h)
     h.llm.queue(
         LLMResponse(
             text=None,
-            tool_calls=[ToolCall("tu_1", "append_row", {"sheet": DRIVE_SHEET, "row": dict(ROW)})],
+            tool_calls=[
+                ToolCall(
+                    "tu_1", "append_row", {"sheet": DRIVE_SHEET, "row": {"name": "bob", "role": 42}}
+                )
+            ],
             stop_reason="tool_use",
         ),
         LLMResponse(text="Drafted.", tool_calls=[], stop_reason="end_turn"),
@@ -138,7 +143,7 @@ async def test_an_approved_append_writes_one_marked_row_and_the_card_previews_it
     text = json.dumps(card["blocks"])
     assert f"wants to append a row to *<{SHEET_LINK}|Roster>*" in text
     assert "Q1" in text
-    assert "*name*" in text and "bob" in text and "*role*" in text and "people" in text
+    assert "*name*" in text and "bob" in text and "*role*" in text and "42" in text
     actions = next(b for b in card["blocks"] if b["type"] == "actions")
     value = json.loads(actions["elements"][0]["value"])
     handle = h.client.get_workflow_handle(value["task_id"])
@@ -148,7 +153,7 @@ async def test_an_approved_append_writes_one_marked_row_and_the_card_previews_it
     assert await handle.result() == "done"
 
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
-    assert rows == [["name", "role"], ["alice", "engineer"], ["bob", "people"]]
+    assert rows == [["name", "role"], ["alice", "engineer"], ["bob", 42]]
     [meta] = h.google.sheet_metadata[DRIVE_SHEET]
     assert meta["metadataKey"] == SHEET_METADATA_KEY
     assert len(meta["metadataValue"]) == 64
@@ -164,14 +169,27 @@ async def test_an_approved_append_writes_one_marked_row_and_the_card_previews_it
     assert task_events[1].outcome == "ok"
 
 
-async def test_a_changed_header_refuses_the_append_with_nothing_written(dharness):
-    """Fails if a sheet whose header changed since publish still gets the row appended, or
-    the refusal does not tell the requester to ask the creator to republish."""
+@pytest.mark.parametrize(
+    "case", ["live header changed", "republished columns"], ids=["header-changed", "republished"]
+)
+async def test_a_changed_header_refuses_the_append_with_nothing_written(dharness, case):
+    """Fails if a sheet whose header changed since publish, or a definition republished with
+    other columns between draft and approval, still gets the row appended, or the refusal
+    does not tell the requester to ask the creator to republish."""
     h = dharness
     await grant_sheet(h)
     handle = await start_append_task(h)
     await wait_state(handle, "awaiting_approval")
     h.google.set_sheet_header(DRIVE_SHEET, SHEET_TAB, ["name", "role", "team"])
+    if case == "republished columns":
+        # The live header matches the NEW grant, so only the draft's frozen columns catch it.
+        await republish(
+            h.agent_store,
+            "it-helper",
+            lambda d: d["grants"]["drive"].update(
+                sheets=[{**sheet_grant_block(), "columns": ["name", "role", "team"]}]
+            ),
+        )
 
     await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
 
@@ -215,22 +233,29 @@ async def test_a_changed_header_refuses_the_draft_so_the_model_can_redraft(dharn
     assert h.google.append_calls == []
 
 
-async def test_an_edited_append_row_writes_the_edited_values_after_a_fresh_approval(dharness):
-    """Fails if an append card cannot be edited per column, or the row writes the pre-edit
-    values or runs without a fresh approval."""
+@pytest.mark.parametrize(
+    ("draft_row", "fields", "expected"),
+    [
+        (dict(ROW), {"name": "bob edited", "role": "people"}, ["bob edited", "people"]),
+        ({"name": "bob"}, {"name": "bob edited", "role": ""}, ["bob edited", ""]),
+    ],
+    ids=["full-row", "partial-row"],
+)
+async def test_an_edited_append_row_writes_the_edited_values_after_a_fresh_approval(
+    dharness, draft_row, fields, expected
+):
+    """Fails if an append card cannot be edited per column — including a column the draft
+    left out, whose cell an edit may clear — or the row writes the pre-edit values or runs
+    without a fresh approval."""
     h = dharness
     await grant_sheet(h)
-    handle = await start_append_task(h)
+    handle = await start_append_task(h, draft_row)
     await wait_state(handle, "awaiting_approval")
     edit_id = ids.edit_event_id(uuid.uuid4().hex)
     await h.acts.content.put_inbound(
         TENANT,
         edit_id,
-        {
-            "kind": "edit",
-            "task_id": handle.id,
-            "fields": {"name": "bob edited", "role": "people"},
-        },
+        {"kind": "edit", "task_id": handle.id, "fields": fields},
         delivered=True,
     )
 
@@ -245,6 +270,8 @@ async def test_an_edited_append_row_writes_the_edited_values_after_a_fresh_appro
     card = await eventually(redrawn)
     text = json.dumps(card["blocks"], ensure_ascii=False)
     assert "Edited — review and approve again" in text
+    # The card previews every column of the draft, the cleared one included.
+    assert "*name*" in text and "*role*" in text
     actions = next(b for b in card["blocks"] if b["type"] == "actions")
     nonce = json.loads(actions["elements"][0]["value"])["nonce"]
     assert nonce != NONCE
@@ -253,4 +280,4 @@ async def test_an_edited_append_row_writes_the_edited_values_after_a_fresh_appro
     assert await handle.result() == "done"
 
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
-    assert rows[-1] == ["bob edited", "people"]
+    assert rows[-1] == expected

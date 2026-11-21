@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 import yaml
 from fastapi import FastAPI
@@ -42,7 +42,7 @@ from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
-from agentos.connectors.google_iam import GoogleError
+from agentos.connectors.google_iam import DriveItem, GoogleError
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -326,6 +326,8 @@ class WebUI:
         self.route("POST", version + "/pick/revoke", self.pick_revoke)
         self.route("GET", version + "/drive/pick", self.drive_pick_page)
         self.route("POST", version + "/drive/pick/choose", self.drive_pick_choose)
+        self.route("GET", version + "/drive/pick/tabs", self.drive_tab_page)
+        self.route("POST", version + "/drive/pick/tabs", self.drive_tab_choose)
         self.route("POST", version + "/drive/remove", self.drive_remove)
         self.route("POST", version + "/test-cases", self.add_test_case)
         self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
@@ -1219,9 +1221,96 @@ class WebUI:
             return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
         # Only a position in the listing the workspace's account produced can be chosen.
         chosen = [item for i, item in enumerate(listing.items) if ctx.get(f"pick_{i}") == "yes"]
-        await ctx.plane.add_drive_grants(
-            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        sheets = [item for item in chosen if item.kind == "sheet"]
+        others = [item for item in chosen if item.kind != "sheet"]
+        if others:
+            await ctx.plane.add_drive_grants(
+                ctx.tenant_id, ctx.user_id, agent_id, version, others, _form_request_id(ctx)
+            )
+        if not sheets:
+            return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+        # A Sheet is granted for one tab: the next step reads its tabs and asks which one.
+        query = urlencode([("sheet", item.id) for item in sheets])
+        return _redirect(f"{back}/drive/pick/tabs?{query}")
+
+    async def drive_tab_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The tab step: each chosen Sheet with its live tab titles, one pick per Sheet."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            wanted = request.query_params.getlist("sheet")
+            sheets = []
+            for item in listing.items:
+                if item.kind != "sheet" or item.id not in wanted:
+                    continue
+                tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, item.id)
+                sheets.append({"item": item, "tabs": tabs})
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        if not sheets:
+            return _message(
+                "Choose again",
+                "Pick a Sheet from the Drive list first.",
+                409,
+                ctx,
+                back=back,
+            )
+        return _page(
+            "drive_tabs.html",
+            ctx=ctx,
+            sheets=sheets,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
         )
+
+    async def drive_tab_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        by_id = {item.id: item for item in listing.items if item.kind == "sheet"}
+        chosen: list[DriveItem] = []
+        i = 0
+        while sheet_id := ctx.get(f"sheet_id_{i}"):
+            item = by_id.get(sheet_id)
+            if item is None:
+                return _message(
+                    "Choose again",
+                    "That Sheet is no longer in the workspace's Drive list. Choose from "
+                    "Google Drive again.",
+                    409,
+                    ctx,
+                    back=back,
+                )
+            try:
+                tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, sheet_id)
+            except GoogleError as err:
+                return _message(
+                    "Google Drive unavailable", str(err), page_status(502), ctx, back=back
+                )
+            # Only a position in the tab list the account's read produced can be chosen.
+            position = ctx.get(f"tab_{i}")
+            if not position.isdigit() or int(position) >= len(tabs):
+                return _message("Choose again", "Pick a tab for each Sheet.", 409, ctx, back=back)
+            chosen.append(
+                DriveItem(
+                    id=item.id,
+                    name=item.name,
+                    link=item.link,
+                    kind="sheet",
+                    tab=tabs[int(position)],
+                )
+            )
+            i += 1
+        if chosen:
+            await ctx.plane.add_drive_grants(
+                ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+            )
         return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
 
     async def drive_remove(self, request: Request, ctx: Ctx, agent_id: str, version: int):

@@ -11,8 +11,9 @@ ends with the key's reference, and the marker lookup scans the file's comments f
 before a retry posts again. The second is ``append_row`` (D-48), an append task on a
 granted Sheet: the appended row carries developer metadata holding the key's hash, the
 marker lookup searches for it before a retry appends again, and the row and its marker
-land in one atomic batchUpdate. The write refuses when the tab's header no longer matches
-the columns the definition froze at publish. ``resolve_item`` walks a file's parents up to
+land in one atomic batchUpdate. The write refuses when the draft's columns no longer match
+the live grant's (a republish since the draft) or the tab's header no longer matches the
+columns the definition froze at publish. ``resolve_item`` walks a file's parents up to
 a granted root — the same walk the search re-check makes — so a file inside a granted
 folder or shared drive resolves, and one moved out of it does not; the granted root is
 matched by ID and never fetched, as a shared drive's root is not a file. The connector
@@ -105,8 +106,8 @@ class DriveReader:
     async def create_comment(self, file_id: str, content: str) -> str:
         return await self._google.create_comment(self._email, file_id, content)
 
-    async def read_sheet(self, file_id: str, tab: str) -> SheetTab:
-        return await self._google.read_sheet(self._email, file_id, tab)
+    async def read_sheet(self, file_id: str, tab: str, header_only: bool = False) -> SheetTab:
+        return await self._google.read_sheet(self._email, file_id, tab, header_only)
 
     async def search_sheet_metadata(
         self, file_id: str, key: str, value: str
@@ -117,7 +118,7 @@ class DriveReader:
         self,
         file_id: str,
         sheet_id: int,
-        row: list[str],
+        row: list[str | int | float],
         row_index: int,
         key: str,
         value: str,
@@ -187,22 +188,37 @@ class DriveConnector:
 
     def sheet_for(self, ref: str) -> DriveGrant:
         """The granted Sheet a name or ID names, or ``GrantDenied``. Only a sheet grant
-        appends; a folder, file or shared drive grant is not a Sheet to append to."""
+        appends; a folder, file or shared drive grant is not a Sheet to append to. A name
+        two granted sheets share is refused: the model must use the ID, never a guess."""
         ref = (ref or "").strip()
-        for grant in self._grants.values():
-            if grant.kind == "sheet" and ref in (grant.id, grant.name):
-                return grant
+        matches = [g for g in self._grants.values() if g.kind == "sheet" and ref in (g.id, g.name)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise GrantDenied(f"More than one granted Sheet is named '{ref}'; use the sheet's ID.")
         raise GrantDenied(
             "This agent has not been granted a Sheet by that name or ID to append to."
         )
 
-    async def read_checked_sheet(self, grant: DriveGrant) -> SheetTab:
+    async def read_checked_sheet(self, grant: DriveGrant, *, header_only: bool = False) -> SheetTab:
         """The tab as it is now, refusing when its header no longer matches the columns the
-        definition froze at publish (D-48). The write reads this just before appending."""
-        sheet = await self._reader.read_sheet(grant.id, grant.tab)
+        definition froze at publish (D-48). The write reads this just before appending; a
+        draft reads only row 1 (``header_only``), the header alone."""
+        sheet = await self._reader.read_sheet(grant.id, grant.tab, header_only=header_only)
         if tuple(sheet.header) != grant.columns:
             raise ConnectorError(HEADER_CHANGED_TEXT)
         return sheet
+
+    async def check_append_shape(self, file_id: str, columns: list[str]) -> None:
+        """The write's shape check without the write (D-48), run before reconcile looks for
+        the marker: the approved columns must still be the live grant's, and the tab's live
+        header must still match them. A republish between draft and approval refuses here."""
+        grant = self._grants.get(file_id)
+        if grant is None or grant.kind != "sheet":
+            raise GrantDenied("This agent has not been granted that Sheet to append to.")
+        if tuple(columns) != grant.columns:
+            raise ConnectorError(HEADER_CHANGED_TEXT)
+        await self.read_checked_sheet(grant, header_only=True)
 
     async def read(
         self, tool: str, tool_input: dict, requester_email: str | None = None
@@ -285,15 +301,20 @@ class DriveConnector:
     async def append_row(self, file_id: str, payload: dict, idem_key: str) -> str:
         """Append the approved row as the tenant's account, marking it with the key's hash.
 
-        The header is read just before the append and must still match the published
-        columns; a changed header refuses with nothing written. The row and its marker
-        land in one atomic batchUpdate, so a lost response never leaves an unmarked row.
+        The approved shape is the written shape: the draft's columns must still be the live
+        grant's (a republish since the draft refuses), and the tab's header, read just before
+        the append, must still match them. The row is built from the draft's columns — a text
+        cell lands literally, a model's JSON number as a number — and lands with its marker
+        in one atomic batchUpdate, so a lost response never leaves an unmarked row.
         """
         grant = self._grants.get(file_id)
         if grant is None or grant.kind != "sheet":
             raise GrantDenied("This agent has not been granted that Sheet to append to.")
+        columns = payload["columns"]
+        if tuple(columns) != grant.columns:
+            raise ConnectorError(HEADER_CHANGED_TEXT)
         sheet = await self.read_checked_sheet(grant)
-        row = [str(payload["row"].get(column, "")) for column in grant.columns]
+        row = [payload["row"].get(column, "") for column in columns]
         return await self._reader.append_sheet_row(
             file_id,
             sheet.sheet_id,

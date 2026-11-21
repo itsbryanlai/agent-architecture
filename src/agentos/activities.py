@@ -2362,16 +2362,23 @@ class AgentActivities:
                     )
                 if isinstance(value, bool) or not isinstance(value, (str, int, float)):
                     return DraftOutcome(error=f"'{column}' must be text or a number.")
-                text = str(value).strip()
-                if not text:
-                    return DraftOutcome(error=f"'{column}' needs a non-empty value.")
-                if error := check_field(kind, column, text):
-                    return DraftOutcome(error=error)
-                clean_row[column] = text
+                if isinstance(value, str):
+                    text = value.strip()
+                    if not text:
+                        return DraftOutcome(error=f"'{column}' needs a non-empty value.")
+                    if error := check_field(kind, column, text):
+                        return DraftOutcome(error=error)
+                    clean_row[column] = text
+                else:
+                    # A JSON number stays a number: the cell is written as numberValue and
+                    # the card shows it as that number. Its text form must still fit.
+                    if error := check_field(kind, column, str(value)):
+                        return DraftOutcome(error=error)
+                    clean_row[column] = value
             # Read the header now so a changed sheet refuses the draft and the model can
             # re-draft (D-48); the write reads it again just before appending.
             try:
-                await connector.read_checked_sheet(grant)
+                await connector.read_checked_sheet(grant, header_only=True)
             except ConnectorError as err:
                 return DraftOutcome(error=str(err))
             except Exception as err:
@@ -2415,7 +2422,8 @@ class AgentActivities:
         The values come from the ``inbound_events`` row the gateway wrote (``edit_id``); the
         workflow only names it. Every field is checked again as the model's first draft is,
         so an accepted value always fits Notion and the card. The new revision is the old one
-        with the edited fields replaced; the old one is left as it is.
+        with the edited fields replaced; the old one is left as it is. An append's edit may
+        name any subset of the draft's columns, and an empty cell clears that column.
         """
         ctx = spec.ctx
         self._log("apply_edit", ctx.tenant_id, ctx.agent_id)
@@ -2433,7 +2441,14 @@ class AgentActivities:
         if not row or row.get("task_id") != spec.draft_ref or not isinstance(fields, dict):
             log.warning("ignored edit: no stored form for this task tenant_id=%s", ctx.tenant_id)
             return False
-        if set(fields) != set(limits):
+        # An append may edit any subset of its draft's columns (a cell the form left out
+        # keeps its value); every other tool's edit names exactly its editable fields.
+        fits = (
+            set(fields) <= set(limits)
+            if spec.tool_name == "append_row"
+            else set(fields) == set(limits)
+        )
+        if not fits:
             log.warning(
                 "ignored edit: fields are not the editable ones tenant_id=%s", ctx.tenant_id
             )
@@ -2441,7 +2456,14 @@ class AgentActivities:
         clean: dict = {}
         for key, value in fields.items():
             text = value.strip() if isinstance(value, str) else ""
-            if not text or check_field(spec.tool_name, key, text):
+            if spec.tool_name == "append_row":
+                # An empty cell clears the column; a value must still fit the card.
+                if text and check_field(spec.tool_name, key, text):
+                    log.warning(
+                        "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
+                    )
+                    return False
+            elif not text or check_field(spec.tool_name, key, text):
                 log.warning("ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id)
                 return False
             clean[key] = text
@@ -2711,7 +2733,9 @@ class AgentActivities:
     @activity.defn(name="reconcile_sheet_append")
     async def reconcile_sheet_append(self, spec: TaskSpec, task_id: str) -> str | None:
         """The append counterpart of ``reconcile_notion_comment`` (D-48): the marker's
-        metadata ID, or None for "not seen". Reads only, one look, the tool's connector."""
+        metadata ID, or None for "not seen". Reads only, one look, the tool's connector.
+        The write's shape check runs first: a draft whose columns no longer match the live
+        grant or header refuses, and the task says it could not confirm."""
         ctx = spec.ctx
         await self._gate(
             ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
@@ -2725,6 +2749,9 @@ class AgentActivities:
         metadata_id = await self.writes.result(ctx.tenant_id, idem_key)
         if metadata_id is None:
             await connector.resolve_item(page_id)
+            # The approved shape must still hold: a republish since the draft stops the
+            # look, which the task reads as "not confirmed", never as "nothing appended".
+            await connector.check_append_shape(page_id, payload["columns"])
             metadata_id = cast(
                 str | None, await connector.find_write("append_row", page_id, idem_key)
             )

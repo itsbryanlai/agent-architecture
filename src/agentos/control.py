@@ -1071,35 +1071,43 @@ class ControlPlane:
         # A sheet grant's header row is read once here, as the definition is frozen for the
         # admin's review, and stored as its columns (D-48): the creator names no columns, and
         # the admin approves the columns the agent will write. The Google read runs outside
-        # the unit of work; the definition update and the submit commit together, so the
-        # hash the admin reviews covers the columns.
-        definition = await self._sheet_columns_definition(tenant_id, agent_id, version)
+        # the unit of work; inside it the draft is re-read and only the columns merged, so an
+        # edit made during the read survives, and the merged definition and the submit commit
+        # together — the hash the admin reviews covers the columns.
+        columns = await self._sheet_columns(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
-            if definition is not None:
-                await self._agents.replace_draft(
-                    tenant_id, agent_id, version, definition, conn=conn
-                )
+            if columns is not None:
+                fresh = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
+                if fresh is not None and fresh.status == "draft":
+                    definition = agent_definition(fresh.agent())
+                    entries = definition.get("grants", {}).get("drive", {}).get("sheets", [])
+                    for entry in entries:
+                        if entry["id"] in columns:
+                            entry["columns"] = columns[entry["id"]]
+                    await self._agents.replace_draft(
+                        tenant_id, agent_id, version, definition, conn=conn
+                    )
             record = await self._agents.submit(tenant_id, agent_id, version, actor, conn=conn)
             await self._record(
                 "agent_submit", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
         return record
 
-    async def _sheet_columns_definition(
+    async def _sheet_columns(
         self, tenant_id: str, agent_id: str, version: int
-    ) -> dict[str, Any] | None:
-        """The draft's definition with each granted sheet's live header row stored as its
-        columns, or None when there is nothing to read (no sheet grant, or not a draft).
+    ) -> dict[str, list[str]] | None:
+        """Each granted sheet's live header row by sheet ID, or None when there is nothing
+        to read (no sheet grant, or not a draft).
 
-        Refuses when Drive is not set up or connected, or a sheet's header cannot be read or
-        does not fit the card and the Edit form (D-48). The write reads the header again just
-        before appending, so a column changed after this still refuses the append.
+        Refuses when Drive is not set up or connected, or a sheet's header cannot be read,
+        does not fit the card and the Edit form, or repeats a column name (D-48). The write
+        reads the header again just before appending, so a column changed after this still
+        refuses the append.
         """
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None or record.status != "draft":
             return None
-        agent = record.agent()
-        sheets = [g for g in agent.grants.drive if g.kind == "sheet"]
+        sheets = [g for g in record.agent().grants.drive if g.kind == "sheet"]
         if not sheets:
             return None
         if self._drive is None or self._google is None:
@@ -1108,11 +1116,10 @@ class ControlPlane:
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
         reader = DriveReader(self._google, row.service_account_email)
-        definition = agent_definition(agent)
-        entries = definition["grants"]["drive"]["sheets"]
-        for grant, entry in zip(sheets, entries):
+        columns: dict[str, list[str]] = {}
+        for grant in sheets:
             try:
-                tab = await reader.read_sheet(grant.id, grant.tab)
+                tab = await reader.read_sheet(grant.id, grant.tab, header_only=True)
             except GoogleError as err:
                 raise ConfigError(
                     f"could not read the header row of sheet '{grant.name}': {err}"
@@ -1126,6 +1133,12 @@ class ControlPlane:
                 raise ConfigError(
                     f"the header row of sheet '{grant.name}' has an empty column name"
                 )
+            duplicates = [name for i, name in enumerate(header) if name in header[:i]]
+            if duplicates:
+                raise ConfigError(
+                    f"the header row of sheet '{grant.name}' has a duplicate column name "
+                    f"('{duplicates[0]}'); each column needs its own name"
+                )
             if len(header) > MAX_SHEET_COLUMNS:
                 raise ConfigError(f"sheet '{grant.name}' has more than {MAX_SHEET_COLUMNS} columns")
             if any(len(name) > MAX_COLUMN_NAME for name in header):
@@ -1133,8 +1146,8 @@ class ControlPlane:
                     f"a column name of sheet '{grant.name}' is longer than "
                     f"{MAX_COLUMN_NAME} characters"
                 )
-            entry["columns"] = header
-        return definition
+            columns[grant.id] = header
+        return columns
 
     async def _require_picked(
         self, tenant_id: str, agent_id: str, version: int, action: str = "submit again"
@@ -2110,6 +2123,18 @@ class ControlPlane:
             raise ConfigError("Google Drive is not connected for this organisation")
         return await self._google.list_shared(row.service_account_email)
 
+    async def drive_sheet_tabs(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
+        """The tab titles of a Sheet shared with the workspace's account, for the picker's
+        tab step (one ``spreadsheets.get`` of the titles only). Refused when Drive is not
+        set up or not connected."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        return await self._google.list_sheet_tabs(row.service_account_email, file_id)
+
     async def add_drive_grants(
         self,
         tenant_id: str,
@@ -2119,10 +2144,11 @@ class ControlPlane:
         items: list[DriveItem],
         request_id: str | None = None,
     ) -> AgentVersionRecord:
-        """Add the picked folders/files/shared drives to the draft's Drive grants. ``items``
-        come from a listing of the workspace's account (the picker matches them), so only
-        what is shared with the address is granted. An item already granted is not added
-        twice."""
+        """Add the picked folders/files/shared drives/sheets to the draft's Drive grants.
+        ``items`` come from a listing of the workspace's account (the picker matches them),
+        so only what is shared with the address is granted. A sheet carries the tab its
+        picker step chose; its columns are read at submit. An item already granted is not
+        added twice."""
         await self._require_editor(tenant_id, actor, agent_id)
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None:
@@ -2132,11 +2158,19 @@ class ControlPlane:
         definition = agent_definition(record.agent())
         drive_block = definition["grants"].setdefault("drive", {})
         existing = {g.id for g in record.agent().grants.drive}
-        keys = {"folder": "folders", "file": "files", "shared_drive": "shared_drives"}
+        keys = {
+            "folder": "folders",
+            "file": "files",
+            "shared_drive": "shared_drives",
+            "sheet": "sheets",
+        }
         for item in items:
             if item.id in existing:
                 continue
-            drive_block.setdefault(keys[item.kind], []).append({"id": item.id, "name": item.name})
+            entry = {"id": item.id, "name": item.name}
+            if item.kind == "sheet":
+                entry["tab"] = item.tab
+            drive_block.setdefault(keys[item.kind], []).append(entry)
             existing.add(item.id)
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.replace_draft(

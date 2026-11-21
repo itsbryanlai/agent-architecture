@@ -5,12 +5,12 @@ from __future__ import annotations
 import pytest
 
 from agentos import ids
-from agentos.connectors.google_iam import DriveItem, FakeGoogleAccounts
+from agentos.connectors.google_iam import MIME_SHEET, DriveItem, FakeGoogleAccounts
 from agentos.drive_connections import InMemoryDriveConnectionStore
 from tests.conftest import TENANT
 from tests.helpers.agents import helper_block
 from tests.helpers.console_harness import ROOT, ConsoleHarness, csrf_in, post, using
-from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, DRIVE_SHARED
+from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, DRIVE_SHARED, DRIVE_SHEET
 
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
 
@@ -40,7 +40,13 @@ async def picker_harness(connected: bool = True):
                 f"https://drive.google.com/drive/folders/{DRIVE_SHARED}",
                 "shared_drive",
             ),
+            DriveItem(
+                DRIVE_SHEET, "Roster", f"https://drive.google.com/file/d/{DRIVE_SHEET}", "sheet"
+            ),
         ]
+        google.add_drive_file(DRIVE_SHEET, "Roster", MIME_SHEET, DRIVE_FOLDER, [])
+        google.add_sheet_tab(DRIVE_SHEET, "Q1", ["name", "role"])
+        google.add_sheet_tab(DRIVE_SHEET, "Q2", ["name", "role"])
     await h.agents.create_agent(TENANT, "it-helper", helper_block(), ROOT)
     return h, google
 
@@ -94,6 +100,39 @@ async def test_the_picker_lists_the_account_items_and_adds_a_grant_in_one_click(
     assert [(g.id, g.kind) for g in record.agent().grants.drive] == [
         (DRIVE_FOLDER, "folder"),
         (DRIVE_SHARED, "shared_drive"),
+    ]
+
+
+async def test_picking_a_sheet_asks_for_its_tab_and_adds_the_sheet_grant():
+    """Fails if the picker does not list a shared Sheet, grants it without asking for its
+    tab, or the added sheet grant does not carry the chosen tab."""
+    h, _ = await picker_harness()
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        pick = (await c.get(VERSION + "/drive/pick")).text
+        assert "Roster" in pick and "sheet" in pick
+        resp = await post(
+            c, VERSION + "/drive/pick/choose", csrf_in(pick), pick_3="yes", request_id="r1"
+        )
+        assert resp.status_code == 303
+        tabs_url = resp.headers["location"]
+        assert "/drive/pick/tabs" in tabs_url and DRIVE_SHEET in tabs_url
+        tabs_page = (await c.get(tabs_url)).text
+        assert "Q1" in tabs_page and "Q2" in tabs_page
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/tabs",
+            csrf_in(tabs_page),
+            sheet_id_0=DRIVE_SHEET,
+            tab_0="1",
+            request_id="r2",
+        )
+        assert resp.status_code == 303
+        page = (await c.get(VERSION)).text
+        assert DRIVE_SHEET in page and "Q2" in page
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    assert [(g.id, g.kind, g.tab) for g in record.agent().grants.drive] == [
+        (DRIVE_SHEET, "sheet", "Q2")
     ]
 
 

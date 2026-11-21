@@ -38,7 +38,7 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_api import JSON
-from tests.helpers.drive import DRIVE_FOLDER
+from tests.helpers.drive import DRIVE_FOLDER, DRIVE_SHEET
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
@@ -149,6 +149,8 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     [
         ("add_page", BASE, True),
         ("add_drive_folder", BASE, True),
+        ("add_drive_sheet", BASE, True),
+        ("sheet_changed_tab", BASE, True),
         ("other_properties", BASE, True),
         ("none", replace(BASE, channels=("C111", "C222")), True),
         ("none", replace(BASE, dm_everyone=True), True),
@@ -162,15 +164,26 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ],
 )
 def test_which_changes_widen_access(grant_change, audience, widens):
-    """Fails if a new grant (a Drive folder included), other properties, a new channel,
-    wider direct messages or guests do not count as widening, or if a removal, a relabel
-    or no change does."""
+    """Fails if a new grant (a Drive folder or sheet included), other properties (a sheet's
+    tab included), a new channel, wider direct messages or guests do not count as widening,
+    or if a removal, a relabel or no change does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
         new.grants.notion_pages.append(NotionPageGrant(PAGE, "Handbook"))
     elif grant_change == "add_drive_folder":
         new.grants.drive.append(DriveGrant(DRIVE_FOLDER, "Team folder", "folder"))
+    elif grant_change == "add_drive_sheet":
+        new.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q1", columns=("name", "role"))
+        )
+    elif grant_change == "sheet_changed_tab":
+        old.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q1", columns=("name", "role"))
+        )
+        new.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q2", columns=("name", "role"))
+        )
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"
     elif grant_change == "remove_database":

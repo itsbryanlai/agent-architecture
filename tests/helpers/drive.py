@@ -95,7 +95,29 @@ def drive_grants_dict() -> dict:
     raw["agents"]["it-helper"]["grants"]["drive"]["shared_drives"] = [
         {"id": DRIVE_SHARED, "name": "Team drive"}
     ]
+    raw["agents"]["it-helper"]["grants"]["drive"]["sheets"] = [sheet_grant_block()]
     return raw
+
+
+# The Roster sheet's append target: its tab and the header row a published definition froze.
+SHEET_TAB = "Q1"
+SHEET_COLUMNS = ["name", "role"]
+
+
+def sheet_grant_block() -> dict:
+    """A Drive sheet grant naming the Roster's Q1 tab and its published columns."""
+    return {
+        "id": DRIVE_SHEET,
+        "name": "Roster",
+        "tab": SHEET_TAB,
+        "columns": list(SHEET_COLUMNS),
+    }
+
+
+def add_roster_sheet(google: FakeGoogleAccounts) -> int:
+    """The Roster's Q1 tab as Google would serve it: a header row and one data row, so an
+    append lands at row index 2. Returns the tab's numeric sheet ID."""
+    return google.add_sheet_tab(DRIVE_SHEET, SHEET_TAB, SHEET_COLUMNS, [["alice", "engineer"]])
 
 
 def add_shared_drive_tree(google: FakeGoogleAccounts) -> None:

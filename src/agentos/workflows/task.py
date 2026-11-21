@@ -360,6 +360,45 @@ class TaskWorkflow:
                 )
             else:
                 self._spec = dataclasses.replace(spec, payload=payload)
+        elif spec.tool_name == "append_row":
+            # Resolve the granted sheet before any card (D-48). An append is always a stored
+            # draft, as a Drive comment is; there is no legacy inline shape to carry.
+            try:
+                appended: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_append, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't append to that sheet: I couldn't find it, or it isn't a sheet "
+                    "I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=appended.revision)
         # The policy may let this comment run without a card (D-43): the activity reads
         # the tenant's setting and the platform's own record of who filed the item.
         # Histories recorded before the policy never ask and always show the card.
@@ -452,6 +491,8 @@ class TaskWorkflow:
 
         if spec.tool_name == "add_comment":
             return await self._run_comment(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "append_row":
+            return await self._run_append(spec, task_id, card_ts, agent.name)
         if spec.tool_name == "nudge":
             return await self._run_nudge(spec, task_id, card_ts, agent.name)
 
@@ -833,6 +874,63 @@ class TaskWorkflow:
         await self._notice(
             task_notices.COMMENTED,
             f"{task_id}:commented",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_append(self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str) -> str:
+        """Append the approved row to the granted Sheet once (D-48). Nothing to watch after."""
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.append_sheet_row, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(AgentActivities.reconcile_sheet_append, spec, task_id)
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_APPEND,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_APPEND,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Appended")
+        await self._notice(
+            task_notices.APPENDED,
+            f"{task_id}:appended",
             task_id,
             subject=title,
             url=item_url,

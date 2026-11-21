@@ -4,7 +4,7 @@ under a granted root, and the comment marker counts only the account's own comme
 import pytest
 
 from agentos.config import DriveGrant
-from agentos.connectors.base import UnknownItem
+from agentos.connectors.base import GrantDenied, UnknownItem
 from agentos.connectors.drive import DriveConnector, DriveReader
 from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts, GoogleError
 from agentos.connectors.notion import comment_ref
@@ -101,3 +101,29 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
     assert comments[1]["id"] == made
     assert comments[1]["content"].startswith("Any update?")
     assert ref in comments[1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("case", "ref", "expected"),
+    [
+        ("unique name", "Roster", "drive-sheet-0001"),
+        ("shared name", "Roster", None),
+        ("ID of one of two", "drive-sheet-0002", "drive-sheet-0002"),
+    ],
+    ids=["unique-name", "shared-name", "by-id"],
+)
+def test_sheet_for_refuses_a_name_two_granted_sheets_share(case, ref, expected):
+    """Fails if sheet_for picks one of two granted Sheets that share a name instead of
+    refusing so the model uses the ID, or a unique name or an ID does not resolve."""
+    google = FakeGoogleAccounts()
+    grants = [DriveGrant("drive-sheet-0001", "Roster", "sheet", tab="Q1")]
+    if case != "unique name":
+        grants.append(DriveGrant("drive-sheet-0002", "Roster", "sheet", tab="Q1"))
+    conn = DriveConnector(DriveReader(google, EMAIL), grants)
+
+    if expected is None:
+        with pytest.raises(GrantDenied) as err:
+            conn.sheet_for(ref)
+        assert "ID" in str(err.value)
+    else:
+        assert conn.sheet_for(ref).id == expected

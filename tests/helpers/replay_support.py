@@ -120,7 +120,16 @@ from tests.conftest import (
     make_fake_notion,
 )
 from tests.helpers.agents import republish
-from tests.helpers.drive import DRIVE_DOC, DRIVE_FOLDER, drive_account_email, make_drive_google
+from tests.helpers.drive import (
+    DRIVE_DOC,
+    DRIVE_FOLDER,
+    DRIVE_SHEET,
+    SHEET_TAB,
+    add_roster_sheet,
+    drive_account_email,
+    make_drive_google,
+    sheet_grant_block,
+)
 from tests.helpers.health import FlipsAfterReads
 from tests.helpers.llm_errors import StatusError
 
@@ -1316,6 +1325,47 @@ async def drive_comment(r: Rig) -> list[Recorded]:
     ]
 
 
+async def drive_append(r: Rig) -> list[Recorded]:
+    """A Drive sheet append task (D-48): the model drafts append_row on a granted Sheet, the
+    requester approves the card, and the row appends once with its developer metadata."""
+    thread = thread_ts(322)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sheets=[sheet_grant_block()]),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 21, tzinfo=UTC)
+    )
+    add_roster_sheet(r.google)
+    r.llm.queue(
+        tool_turn(
+            ToolCall(
+                "tu_da",
+                "append_row",
+                {"sheet": DRIVE_SHEET, "row": {"name": "bob", "role": "people"}},
+            )
+        ),
+        answer("Sent you a card."),
+    )
+    await start_conversation(r, "it-helper", thread, "add bob to the roster", stored=True)
+    cards = await eventually(lambda: [p for p in r.slack.posts() if p["blocks"]], timeout=30)
+    actions = next(b for b in cards[0]["blocks"] if b["type"] == "actions")
+    value = json.loads(actions["elements"][0]["value"])
+    handle = r.client.get_workflow_handle(value["task_id"])
+    await wait_state(handle, "awaiting_approval")
+    await approve(handle, value["nonce"])
+    assert await handle.result() == "done"
+    rows = r.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert rows[-1] == ["bob", "people"]
+    assert len(r.google.sheet_metadata[DRIVE_SHEET]) == 1
+    assert any(p["thread_ts"] and "Appended a row to Roster" in p["text"] for p in r.slack.posts())
+    return [
+        await current(r, "", handle.id),
+        await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
+    ]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1873,6 +1923,8 @@ SCENARIOS["test_run_tenant_disabled"] = test_run_tenant_disabled
 SCENARIOS["drive_indexing"] = drive_indexing
 # A Drive comment task is new: one shape (the stored draft), no legacy inline history exists.
 SCENARIOS["drive_comment"] = drive_comment
+# A Drive sheet append task is new too: one shape (the stored draft), no legacy inline history.
+SCENARIOS["drive_append"] = drive_append
 
 
 # --- files --------------------------------------------------------------------------------

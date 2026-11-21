@@ -53,6 +53,7 @@ _DRIVE_KIND_LABELS = {
     "folder": "drive folder",
     "file": "drive file",
     "shared_drive": "drive shared drive",
+    "sheet": "drive sheet",
 }
 
 
@@ -71,7 +72,10 @@ def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
     for page in agent.grants.notion_pages:
         found[normalize_id(page.id)] = ("page", page.name, ())
     for grant in agent.grants.drive:
-        found[grant.id] = (_DRIVE_KIND_LABELS[grant.kind], grant.name, ())
+        # A sheet's mapping is its tab and columns: pointing the append at another tab or
+        # other columns reads as "uses other properties", a widening the approver sees.
+        mapping = (grant.tab, *grant.columns) if grant.kind == "sheet" else ()
+        found[grant.id] = (_DRIVE_KIND_LABELS[grant.kind], grant.name, mapping)
     return found
 
 

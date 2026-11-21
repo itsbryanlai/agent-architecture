@@ -153,6 +153,7 @@ from agentos.models import (
     TurnContext,
     assistant_blocks,
     check_field,
+    row_limits,
 )
 from agentos.slack_client import (
     PERMANENT_DM_ERRORS,
@@ -489,6 +490,9 @@ class AgentActivities:
             self.run_stored_read_tool,
             self.draft_task,
             self.prepare_stored_comment,
+            self.prepare_stored_append,
+            self.append_sheet_row,
+            self.reconcile_sheet_append,
             self.comment_approval_policy,
             self.apply_edit,
             self.post_task_notice,
@@ -1977,6 +1981,18 @@ class AgentActivities:
                 )
                 return DraftedWrite(call.kind, target)
             return DraftedWrite(call.kind)
+        if call.kind == "append_row":
+            # A sheet append names its target 'sheet' (a granted sheet's ID or name); the
+            # drafted write's target is the granted sheet's file ID, kept as it is.
+            sheet = tool_input.get("sheet")
+            if refusal is None and isinstance(sheet, str) and sheet.strip():
+                connector = self._connector_for(ctx.tenant_id, agent, connector_name)
+                try:
+                    grant = connector.sheet_for(sheet.strip())
+                except ConnectorError:
+                    return DraftedWrite(call.kind)
+                return DraftedWrite(call.kind, grant.id)
+            return DraftedWrite(call.kind)
         if agent.grants.notion_databases:
             return DraftedWrite(call.kind, normalize_id(agent.grants.notion_databases[0].id))
         return DraftedWrite(call.kind)
@@ -2100,8 +2116,9 @@ class AgentActivities:
     async def _card_requester_line(
         self, spec: TaskSpec, task_id: str, agent: AgentVersion
     ) -> str | None:
-        """The body line the card must show, or None for a comment, a nudge or a matched requester."""
-        if spec.tool_name in ("add_comment", "nudge"):
+        """The body line the card must show, or None for a comment, an append, a nudge or a
+        matched requester."""
+        if spec.tool_name in ("add_comment", "append_row", "nudge"):
             return None
         return (await self._requester(spec, task_id, agent))["line"]
 
@@ -2217,6 +2234,43 @@ class AgentActivities:
             resolved["database_id"] = item.database_id
         return resolved
 
+    @activity.defn(name="prepare_stored_append")
+    async def prepare_stored_append(self, spec: TaskSpec) -> DraftOutcome:
+        """``prepare_stored_comment`` for a sheet append (D-48): resolve the granted sheet
+        and store the resolved payload as the next revision, which the card then shows and
+        the approval names. A retry finds it stored. The grant is checked here before any
+        card, and again just before the write."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("prepare_stored_append", ctx.tenant_id, ctx.agent_id)
+        revision = spec.revision + 1
+        resolved = await self.content.get_draft(ctx.tenant_id, spec.draft_ref, revision)
+        if resolved is None:
+            resolved = await self._resolve_append(spec, await self._spec_payload(spec))
+            await self.content.put_draft(ctx.tenant_id, spec.draft_ref, revision, resolved)
+        return DraftOutcome(revision=revision, database_id="")
+
+    async def _resolve_append(self, spec: TaskSpec, payload: dict) -> dict:
+        ctx = spec.ctx
+        try:
+            agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+            connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+            item = await connector.resolve_item(payload["sheet_id"])
+        except ConnectorError as err:
+            raise _non_retryable(err) from err
+        except Exception as err:
+            if _is_client_error(err):
+                raise _non_retryable(err) from err
+            _reraise(err)
+        return {
+            **payload,
+            "page_id": item.page_id,
+            "item_title": item.title,
+            "item_url": item.url,
+        }
+
     @activity.defn(name="comment_approval_policy")
     async def comment_approval_policy(self, spec: TaskSpec) -> bool:
         """Whether this comment may run without the requester's approval card (D-43).
@@ -2284,6 +2338,60 @@ class AgentActivities:
                 return DraftOutcome(error=error)
             # The task resolves the item and checks the grant before any card.
             payload = {"item": item.strip(), "comment": comment.strip()}
+        elif kind == "append_row":
+            sheet_ref, row = tool_input.get("sheet"), tool_input.get("row")
+            if not isinstance(sheet_ref, str) or not sheet_ref.strip():
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'sheet'.")
+            if not isinstance(row, dict) or not row:
+                return DraftOutcome(error=f"{call.name} needs a non-empty 'row' object.")
+            read_refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.READ, DRIVE)
+            if read_refusal is not None:
+                return DraftOutcome(error=str(read_refusal))
+            connector = self._connector_for(ctx.tenant_id, agent, DRIVE)
+            try:
+                grant = connector.sheet_for(sheet_ref.strip())
+            except ConnectorError as err:
+                return DraftOutcome(error=str(err))
+            columns = list(grant.columns)
+            clean_row: dict = {}
+            for column, value in row.items():
+                if column not in columns:
+                    return DraftOutcome(
+                        error=f"'{column}' is not a column of sheet '{grant.name}'. "
+                        f"Its columns: {', '.join(columns)}."
+                    )
+                if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                    return DraftOutcome(error=f"'{column}' must be text or a number.")
+                if isinstance(value, str):
+                    text = value.strip()
+                    if not text:
+                        return DraftOutcome(error=f"'{column}' needs a non-empty value.")
+                    if error := check_field(kind, column, text):
+                        return DraftOutcome(error=error)
+                    clean_row[column] = text
+                else:
+                    # A JSON number stays a number: the cell is written as numberValue and
+                    # the card shows it as that number. Its text form must still fit.
+                    if error := check_field(kind, column, str(value)):
+                        return DraftOutcome(error=error)
+                    clean_row[column] = value
+            # Read the header now so a changed sheet refuses the draft and the model can
+            # re-draft (D-48); the write reads it again just before appending.
+            try:
+                await connector.read_checked_sheet(grant, header_only=True)
+            except ConnectorError as err:
+                return DraftOutcome(error=str(err))
+            except Exception as err:
+                if _is_client_error(err):
+                    return DraftOutcome(error=str(err))
+                raise
+            # Frozen here: the card shows this row and the task appends it as it is.
+            payload = {
+                "sheet_id": grant.id,
+                "tab": grant.tab,
+                "columns": columns,
+                "row": clean_row,
+            }
         elif kind in EDITABLE_FIELDS:
             title, details = tool_input.get("title"), tool_input.get("details")
             if not isinstance(title, str) or not title.strip():
@@ -2314,19 +2422,33 @@ class AgentActivities:
         The values come from the ``inbound_events`` row the gateway wrote (``edit_id``); the
         workflow only names it. Every field is checked again as the model's first draft is,
         so an accepted value always fits Notion and the card. The new revision is the old one
-        with the edited fields replaced; the old one is left as it is.
+        with the edited fields replaced; the old one is left as it is. An append's edit may
+        name any subset of the draft's columns, and an empty cell clears that column.
         """
         ctx = spec.ctx
         self._log("apply_edit", ctx.tenant_id, ctx.agent_id)
         if await self.content.get_draft(ctx.tenant_id, spec.draft_ref, spec.revision + 1):
             return True  # a retry: the revision is stored and the form's values are cleared
         row = await self.content.get_inbound(ctx.tenant_id, edit_id)
-        limits = EDITABLE_FIELDS.get(spec.tool_name, {})
+        current = await self._spec_payload(spec)
+        # An append's editable fields are its sheet's columns, named by the draft; every
+        # other tool's are the fixed set its kind declares.
+        if spec.tool_name == "append_row":
+            limits = row_limits(current.get("columns", []))
+        else:
+            limits = EDITABLE_FIELDS.get(spec.tool_name, {})
         fields = (row or {}).get("fields")
         if not row or row.get("task_id") != spec.draft_ref or not isinstance(fields, dict):
             log.warning("ignored edit: no stored form for this task tenant_id=%s", ctx.tenant_id)
             return False
-        if set(fields) != set(limits):
+        # An append may edit any subset of its draft's columns (a cell the form left out
+        # keeps its value); every other tool's edit names exactly its editable fields.
+        fits = (
+            set(fields) <= set(limits)
+            if spec.tool_name == "append_row"
+            else set(fields) == set(limits)
+        )
+        if not fits:
             log.warning(
                 "ignored edit: fields are not the editable ones tenant_id=%s", ctx.tenant_id
             )
@@ -2334,14 +2456,23 @@ class AgentActivities:
         clean: dict = {}
         for key, value in fields.items():
             text = value.strip() if isinstance(value, str) else ""
-            if not text or check_field(spec.tool_name, key, text):
+            if spec.tool_name == "append_row":
+                # An empty cell clears the column; a value must still fit the card.
+                if text and check_field(spec.tool_name, key, text):
+                    log.warning(
+                        "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
+                    )
+                    return False
+            elif not text or check_field(spec.tool_name, key, text):
                 log.warning("ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id)
                 return False
             clean[key] = text
-        current = await self._spec_payload(spec)
-        await self.content.put_draft(
-            ctx.tenant_id, spec.draft_ref, spec.revision + 1, {**current, **clean}
-        )
+        if spec.tool_name == "append_row":
+            # The edited cells replace the row's values; the columns themselves are fixed.
+            updated = {**current, "row": {**current.get("row", {}), **clean}}
+        else:
+            updated = {**current, **clean}
+        await self.content.put_draft(ctx.tenant_id, spec.draft_ref, spec.revision + 1, updated)
         await self._consume(ctx.tenant_id, edit_id, row, True)
         return True
 
@@ -2435,6 +2566,59 @@ class AgentActivities:
             {"comment_id": comment_id},
         )
         return comment_id
+
+    @activity.defn(name="append_sheet_row")
+    async def append_sheet_row(self, spec: TaskSpec, task_id: str) -> str:
+        """Append the approved row to the granted Sheet once (D-48).
+
+        The connector is the tool's manifest connector (Drive's ``append_row``). The gate,
+        the lease and the look-before-write are the comment write's; the marker is developer
+        metadata on the appended row, and the header is read just before the append so a
+        sheet whose columns changed refuses with nothing written.
+        """
+        ctx = spec.ctx
+        idem_key = f"{task_id}:append"
+        await self._gate_write(spec, task_id, idem_key, "page_id")
+        self._log("append_sheet_row", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        page_id = payload["page_id"]
+        await self._check_method(spec, payload, task_id, page_id, idem_key, "developer_metadata")
+        # The live published version, not the turn's pinned one: a grant revoked since this
+        # write was approved must stop it.
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        if not spec.under_policy:
+            await self._record_approval(spec, payload, task_id, page_id)
+        try:
+            await connector.resolve_item(page_id)
+            metadata_id = cast(
+                str,
+                await self._write_once(
+                    ctx.tenant_id,
+                    idem_key,
+                    find=lambda: connector.find_write("append_row", page_id, idem_key),
+                    write=lambda: connector.write(
+                        "append_row", page_id, payload, idem_key, agent_name=agent.name
+                    ),
+                    to_ref=_write_ref,
+                    from_ref=lambda ref: ref,
+                ),
+            )
+        except Exception as err:
+            if isinstance(err, ConnectorError) or _is_client_error(err):
+                await self._record_write(spec, payload, task_id, idem_key, page_id, "error")
+                raise _non_retryable(err) from err
+            _reraise(err)
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"metadata_id": metadata_id},
+        )
+        return metadata_id
 
     @activity.defn(name="create_notion_item")
     async def create_notion_item(self, spec: TaskSpec, task_id: str) -> NotionItem:
@@ -2545,6 +2729,44 @@ class AgentActivities:
             {"comment_id": comment_id},
         )
         return comment_id
+
+    @activity.defn(name="reconcile_sheet_append")
+    async def reconcile_sheet_append(self, spec: TaskSpec, task_id: str) -> str | None:
+        """The append counterpart of ``reconcile_notion_comment`` (D-48): the marker's
+        metadata ID, or None for "not seen". Reads only, one look, the tool's connector.
+        The write's shape check runs first: a draft whose columns no longer match the live
+        grant or header refuses, and the task says it could not confirm."""
+        ctx = spec.ctx
+        await self._gate(
+            ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
+        )
+        self._log("reconcile_sheet_append", ctx.tenant_id, ctx.agent_id)
+        payload = await self._spec_payload(spec)
+        agent = await self._agent(ctx.tenant_id, ctx.agent_id)
+        connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
+        idem_key = f"{task_id}:append"
+        page_id = payload["page_id"]
+        metadata_id = await self.writes.result(ctx.tenant_id, idem_key)
+        if metadata_id is None:
+            await connector.resolve_item(page_id)
+            # The approved shape must still hold: a republish since the draft stops the
+            # look, which the task reads as "not confirmed", never as "nothing appended".
+            await connector.check_append_shape(page_id, payload["columns"])
+            metadata_id = cast(
+                str | None, await connector.find_write("append_row", page_id, idem_key)
+            )
+        if metadata_id is None:
+            return None
+        await self._record_write(
+            spec,
+            payload,
+            task_id,
+            idem_key,
+            page_id,
+            self._write_outcome(spec),
+            {"metadata_id": metadata_id},
+        )
+        return metadata_id
 
     # --- nudge -------------------------------------------------------------------
 
@@ -2873,7 +3095,7 @@ class AgentActivities:
         """The item's title, link and page ID: the write's stored result once it exists,
         else the stored draft (a comment's or nudge's resolved item carries its own)."""
         payload = await self._spec_payload(spec)
-        if spec.tool_name in ("add_comment", "nudge"):
+        if spec.tool_name in ("add_comment", "append_row", "nudge"):
             return (
                 payload.get("item_title", ""),
                 payload.get("item_url", ""),
@@ -3085,6 +3307,8 @@ class AgentActivities:
             return None
         if spec.tool_name in ("add_comment", "nudge"):
             target, idem_key = payload["page_id"], f"{task_id}:comment"
+        elif spec.tool_name == "append_row":
+            target, idem_key = payload["page_id"], f"{task_id}:append"
         else:
             target, idem_key = payload["database_id"], f"{task_id}:create"
         if not spec.under_policy:
@@ -3204,6 +3428,8 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
     """The plain-text fallback of the approval card."""
     if spec.tool_name == "add_comment":
         return escape_slack(f"Approve comment on {payload['item_title']}")
+    if spec.tool_name == "append_row":
+        return escape_slack(f"Approve row append to {payload['item_title']}")
     if spec.tool_name == "nudge":
         return escape_slack(f"Approve nudge on {payload['item_title']}")
     return escape_slack(f"Approve new item in {db_name}: {payload['title']}")
@@ -3334,6 +3560,26 @@ def approval_card_blocks(
             }
         ]
         note = "Nothing is posted until you click Submit."
+    elif spec.tool_name == "append_row":
+        # The Sheet is named with its link, kept live like the comment's; the tab is named
+        # beside it. The row previews as a two-column table (column, value): a pair of
+        # section fields per column, at most ten fields (five columns) to a section.
+        target = f"<{shown['item_url']}|{payload['item_title']}>"
+        head = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{agent_name}* wants to append a row to *{target}* "
+                f'(tab "{payload["tab"]}").',
+            },
+        }
+        row = shown.get("row", {})
+        pairs: list[dict] = []
+        for column in shown.get("columns", []):
+            pairs.append({"type": "mrkdwn", "text": f"*{escape_slack(column)}*"})
+            pairs.append({"type": "mrkdwn", "text": escape_slack(str(row.get(column, "")))})
+        body = [{"type": "section", "fields": pairs[i : i + 10]} for i in range(0, len(pairs), 10)]
+        note = "Nothing is appended until you click Submit."
     else:
         head = {
             "type": "section",

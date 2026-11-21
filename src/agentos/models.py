@@ -281,8 +281,9 @@ class NudgePrepared:
 @dataclass
 class TaskSpec:
     ctx: TurnContext
-    # The kind of task: "create_item", "add_comment" or "nudge" — what the workflow routes
-    # on and the editable fields are keyed by. A Drive comment is an "add_comment" task too.
+    # The kind of task: "create_item", "add_comment", "append_row" or "nudge" — what the
+    # workflow routes on and the editable fields are keyed by. A Drive comment is an
+    # "add_comment" task too; a Drive sheet append is an "append_row" task.
     tool_name: str
     # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
     # ``revision``). A task recorded before that carries its frozen payload here.
@@ -346,7 +347,22 @@ EDITABLE_FIELDS = {
     # carries a mention: worst case a plain-name one ("@<name> ", the name capped) or a
     # real one's leading space, so the cap leaves its room under Notion's 2000 as well.
     "nudge": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX - (NUDGE_NAME_MAX + len("@ "))},
+    # An append's editable fields are the granted sheet's columns, named by the stored
+    # draft (they differ per grant), not a fixed set here. The empty map marks append_row
+    # a write kind; ``row_limits`` builds the per-column limits from the draft's columns.
+    "append_row": {},
 }
+
+# One cell of an appended row: the raw character cap, and the room its escaped value has
+# on the approval card (a Slack section field holds 2000 characters).
+ROW_CELL_MAX = 1000
+_ROW_CELL_ROOM = 2000
+
+
+def row_limits(columns: list[str]) -> dict[str, int]:
+    """The editable limits of an append draft: one cell per column of the granted sheet."""
+    return {column: ROW_CELL_MAX for column in columns}
+
 
 # Room on the card for the escaped value, after the bold label above it.
 _CARD_ROOM = {
@@ -362,13 +378,17 @@ _NUDGE_COMMENT_ROOM = 3000 - len("*Comment on the item*\n") - (len("@ ") + 5 * N
 
 def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:
     """Why ``value`` does not fit, and what the model should do about it."""
-    limit = EDITABLE_FIELDS[tool_name][name]
+    if tool_name == "append_row":
+        # A row cell is keyed by its column name, which the draft names, not a fixed field.
+        limit, room = ROW_CELL_MAX, _ROW_CELL_ROOM
+    else:
+        limit = EDITABLE_FIELDS[tool_name][name]
+        room = _NUDGE_COMMENT_ROOM if tool_name == "nudge" else _CARD_ROOM[name]
     if len(value) > limit:
         return (
             f"'{name}' is {len(value)} characters; the limit is {limit}.",
             "Shorten it and call the tool again.",
         )
-    room = _NUDGE_COMMENT_ROOM if tool_name == "nudge" else _CARD_ROOM[name]
     if len(escape_slack(value)) > room:
         what = (
             f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "

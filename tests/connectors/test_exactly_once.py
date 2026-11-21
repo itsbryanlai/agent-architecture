@@ -31,7 +31,15 @@ from tests.conftest import (
     eventually,
     title_prop,
 )
-from tests.helpers.drive import DRIVE_DOC
+from tests.helpers.agents import republish
+from tests.helpers.drive import (
+    DRIVE_DOC,
+    DRIVE_SHEET,
+    SHEET_COLUMNS,
+    SHEET_TAB,
+    add_roster_sheet,
+    sheet_grant_block,
+)
 from tests.helpers.slack import slack_error
 
 NONCE = "nonce-eo"
@@ -519,3 +527,86 @@ async def test_a_second_drive_comment_attempt_beside_a_running_one_writes_nothin
 
     assert await run(h.acts.add_notion_comment, drive_comment_spec(), task_id) == comment_id
     assert len(h.google.drive_comments[DRIVE_DOC]) == 1
+
+
+# --- a Drive sheet append (D-48) -------------------------------------------------------
+
+
+async def grant_append_sheet(h):
+    """Publish it-helper with the Roster sheet grant and serve its Q1 tab from the fake."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sheets=[sheet_grant_block()]),
+    )
+    add_roster_sheet(h.google)
+
+
+def append_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_SHEET,
+        "sheet_id": DRIVE_SHEET,
+        "tab": SHEET_TAB,
+        "columns": list(SHEET_COLUMNS),
+        "row": {"name": "bob", "role": "people"},
+        "item_title": "Roster",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_SHEET}",
+    }
+    return TaskSpec(ctx, "append_row", payload, NONCE, tool="append_row")
+
+
+async def test_a_drive_append_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a Drive append whose response was lost appends the row a second time."""
+    h = dharness
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-lost")
+    h.google.fail_after_write("append")
+    with pytest.raises(GoogleError):
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a Drive append attempt starting while another is mid-write appends a second row."""
+    h = dharness
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-overlap")
+    hang = h.google.hang_after_write("append")
+    first = asyncio.create_task(run(h.acts.append_sheet_row, append_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    metadata_id = await first
+
+    assert await run(h.acts.append_sheet_row, append_spec(), task_id) == metadata_id
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+async def test_a_drive_append_whose_marker_lags_is_found_by_the_retry_looking_again(dharness):
+    """Fails if a retry whose metadata search lags the append appends the row a second time,
+    instead of looking again until the marker is visible."""
+    h = dharness
+    h.acts.visibility_interval = 0
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-lag")
+    h.google.delay_visibility(2)
+    h.google.fail_after_write("append")
+    with pytest.raises(GoogleError):
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1

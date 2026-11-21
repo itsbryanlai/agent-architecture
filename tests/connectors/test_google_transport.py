@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -27,6 +28,8 @@ from agentos.connectors.google_iam import (
     DriveSection,
     GoogleError,
     RealGoogleAccounts,
+    SheetMetadata,
+    SheetTab,
 )
 from tests.helpers.console_harness import Clock
 
@@ -814,3 +817,245 @@ async def test_comments_create_and_list_page_with_the_tenant_token_and_map_refus
                 await client.list_comments(EMAIL, "f1")
         assert err.value.status == int(case.split()[-1])
         assert drive_errors.is_gone(err.value)
+
+
+# --- the Sheet append write surface (D-48) -----------------------------------------------
+
+
+async def test_append_sends_one_atomic_batchupdate_with_the_row_and_its_metadata(deployment_key):
+    """Fails if the append is not one batchUpdate carrying appendCells and
+    createDeveloperMetadata on the appended row, with the tenant's token, or the created
+    metadata's ID is not returned."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v4/spreadsheets/f1:batchUpdate":
+            return reply(
+                request,
+                200,
+                {
+                    "replies": [
+                        {},
+                        {"createDeveloperMetadata": {"developerMetadata": {"metadataId": 7}}},
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    made = await client.append_sheet_row(
+        EMAIL, "f1", 42, ["bob", "people"], 2, "agentos-write", "hash"
+    )
+
+    assert made == "7"
+    posts = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v4/spreadsheets/f1:batchUpdate"
+    ]
+    assert len(posts) == 1
+    assert posts[0].headers["Authorization"] == "Bearer tenant-token"
+    requests = json.loads(posts[0].body)["requests"]
+    assert requests[0] == {
+        "appendCells": {
+            "sheetId": 42,
+            "rows": [
+                {
+                    "values": [
+                        {"userEnteredValue": {"stringValue": "bob"}},
+                        {"userEnteredValue": {"stringValue": "people"}},
+                    ]
+                }
+            ],
+            "fields": "userEnteredValue",
+        }
+    }
+    assert requests[1] == {
+        "createDeveloperMetadata": {
+            "developerMetadata": {
+                "metadataKey": "agentos-write",
+                "metadataValue": "hash",
+                "visibility": "DOCUMENT",
+                "location": {
+                    "dimensionRange": {
+                        "sheetId": 42,
+                        "dimension": "ROWS",
+                        "startIndex": 2,
+                        "endIndex": 3,
+                    }
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("found", [True, False], ids=["found", "not-found"])
+async def test_metadata_search_posts_the_key_and_value_and_maps_matches(deployment_key, found):
+    """Fails if the marker lookup does not search developer metadata by the key and value
+    with the tenant's token, or returns anything but the matching entries (none when absent)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v4/spreadsheets/f1/developerMetadata:search":
+            if not found:
+                return reply(request, 200, {"matchedDeveloperMetadata": []})
+            return reply(
+                request,
+                200,
+                {
+                    "matchedDeveloperMetadata": [
+                        {
+                            "developerMetadata": {
+                                "metadataId": 7,
+                                "metadataKey": "agentos-write",
+                                "metadataValue": "hash",
+                                "location": {"dimensionRange": {"startIndex": 2}},
+                            }
+                        }
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    matches = await client.search_sheet_metadata(EMAIL, "f1", "agentos-write", "hash")
+
+    assert matches == ([SheetMetadata(7, "agentos-write", "hash", 2)] if found else [])
+    posts = [r for r in sent if r.path_url == "/v4/spreadsheets/f1/developerMetadata:search"]
+    assert len(posts) == 1
+    assert posts[0].headers["Authorization"] == "Bearer tenant-token"
+    assert json.loads(posts[0].body) == {
+        "dataFilters": [
+            {"developerMetadataLookup": {"metadataKey": "agentos-write", "metadataValue": "hash"}}
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "case", ["tab", "header only", "missing tab"], ids=["tab", "header-only", "missing-tab"]
+)
+async def test_read_sheet_returns_the_tabs_id_header_and_data_row_count(deployment_key, case):
+    """Fails if the header read asks for every tab instead of the granted one (ranges), asks
+    for more than row 1 on a header check, drops the tab's ID, header or data-row count, or a
+    missing tab reads as anything but a refusal."""
+    header_row = {"values": [{"formattedValue": "name"}, {"formattedValue": "role"}]}
+    data_row = {"values": [{"formattedValue": "alice"}, {"formattedValue": "eng"}]}
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v4/spreadsheets/f1"):
+            query = parse_qs(urlsplit(request.path_url).query)
+            # Google answers a ranges read with the asked rows alone.
+            rows = [header_row] if query.get("ranges") == ["'Q1'!1:1"] else [header_row, data_row]
+            return reply(
+                request,
+                200,
+                {
+                    "sheets": [
+                        {
+                            "properties": {"sheetId": 42, "title": "Q1"},
+                            "data": [{"rowData": rows}],
+                        }
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    if case == "tab":
+        assert await client.read_sheet(EMAIL, "f1", "Q1") == SheetTab(42, ("name", "role"), 2)
+    elif case == "header only":
+        assert await client.read_sheet(EMAIL, "f1", "Q1", header_only=True) == SheetTab(
+            42, ("name", "role"), 1
+        )
+    else:
+        with pytest.raises(GoogleError) as err:
+            await client.read_sheet(EMAIL, "f1", "Q9")
+        assert err.value.status == 400
+    gets = [r for r in sent if r.path_url.startswith("/v4/spreadsheets/f1")]
+    assert gets[0].headers["Authorization"] == "Bearer tenant-token"
+    assert "sheetId" in gets[0].path_url and "rowData" in gets[0].path_url
+    query = parse_qs(urlsplit(gets[0].path_url).query)
+    if case == "tab":
+        assert query["ranges"] == ["'Q1'"]
+    elif case == "header only":
+        assert query["ranges"] == ["'Q1'!1:1"]
+    else:
+        assert query["ranges"] == ["'Q9'"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("=1+1", {"stringValue": "=1+1"}),
+        (
+            '=HYPERLINK("http://example.com","click")',
+            {"stringValue": '=HYPERLINK("http://example.com","click")'},
+        ),
+        ("007", {"stringValue": "007"}),
+        ("TRUE", {"stringValue": "TRUE"}),
+        (42, {"numberValue": 42}),
+    ],
+    ids=["formula-text", "hyperlink-text", "leading-zero", "bool-text", "number"],
+)
+async def test_append_cells_send_text_literally_and_a_number_as_a_number(
+    deployment_key, value, expected
+):
+    """Fails if a text cell is sent as anything but stringValue (a formula, a number or a
+    boolean), or a JSON number as anything but numberValue: the cell must land as approved."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v4/spreadsheets/f1:batchUpdate":
+            return reply(
+                request,
+                200,
+                {
+                    "replies": [
+                        {},
+                        {"createDeveloperMetadata": {"developerMetadata": {"metadataId": 7}}},
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    await client.append_sheet_row(EMAIL, "f1", 42, [value], 2, "agentos-write", "hash")
+
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v4/spreadsheets/f1:batchUpdate"
+    ]
+    requests = json.loads(post.body)["requests"]
+    assert requests[0]["appendCells"]["rows"][0]["values"] == [{"userEnteredValue": expected}]
+
+
+async def test_list_sheet_tabs_reads_only_the_titles_with_the_tenant_token(deployment_key):
+    """Fails if the picker's tab read asks for the tabs' content, uses the deployment's
+    token instead of the tenant's, or drops a tab title."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v4/spreadsheets/f1"):
+            return reply(
+                request,
+                200,
+                {"sheets": [{"properties": {"title": "Q1"}}, {"properties": {"title": "Q2"}}]},
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    assert await client.list_sheet_tabs(EMAIL, "f1") == ["Q1", "Q2"]
+
+    [get] = [r for r in sent if r.path_url.startswith("/v4/spreadsheets/f1")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    query = parse_qs(urlsplit(get.path_url).query)
+    assert query["fields"] == ["sheets.properties.title"]
+    assert "rowData" not in get.path_url

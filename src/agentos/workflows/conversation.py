@@ -1406,6 +1406,11 @@ def _drafted_text(kind: str, ctx: TurnContext) -> str:
             f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
             "Nothing is posted until they click Submit."
         )
+    if kind == "append_row":
+        return (
+            f"Drafted the row and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is appended until they click Submit."
+        )
     return (
         f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
         "Nothing is filed until they click Submit."

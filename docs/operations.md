@@ -436,8 +436,8 @@ before the product outgrows it; the account ID is deterministic from the
 tenant, so a retried connect always finds the same account. The settings page
 lists at most the **first 100 items** shared with the address (files and
 shared drives together) and says so when more are shared. Service accounts
-created after 2025-04-15 cannot own Drive files: create-from-template (a
-later write ticket) works only in Workspace shared drives. Disconnect deletes
+created after 2025-04-15 cannot own Drive files: create-from-template (D-49)
+works only in Workspace shared drives. Disconnect deletes
 the account at Google and the row; files shared with the address keep their
 sharing until their owners remove it. A reconnect right after a disconnect
 can be refused with "Google is still removing this workspace's previous
@@ -529,6 +529,44 @@ the row; the row and its metadata land in one atomic Sheets `batchUpdate`, and a
 retry searches that metadata before appending again, so an approved row appends
 once. There is no follow-up watch on an append. The Drive connector switch and
 the writes switch stop it while off.
+
+**Drive writes (create a Doc from a template, D-49).** An agent granted a
+template is offered `create_doc_from_template`: it drafts a new Doc copied from
+that template into the template's folder, and nothing is created until the
+requester approves the card in Slack — a create always asks, never low-risk.
+The creator writes `{{field name}}` blanks in a Google Doc (the template) and
+names a shared-drive folder where the new Docs will land. To grant it, the
+creator picks the template Doc and the destination folder from what the account
+can see on the version page (**Choose a template**); the definition editor can
+also add it directly as `grants.drive.templates` with the template's file ID, a
+label and the folder's ID (`{id, name, folder_id}`). Two shares are needed: the
+template Doc shared with the workspace's Drive address (Viewer is enough to read
+and copy it), and the address added as **Content manager** of the shared drive
+that holds the destination folder (creating a Doc writes into the folder). New
+Docs can only be created in a shared drive folder — the pilot's service account
+cannot own files — so a destination folder outside a shared drive refuses the
+publish with "New Docs can only be created in a shared drive folder; pick a
+folder inside a shared drive." The creator names no blanks: when the version is
+submitted, the platform reads the template's text once and stores its
+`{{field name}}` names as the grant's `blanks` (duplicates collapse to one), so
+the admin approves the blanks the agent will fill and the version page shows
+them. The card previews the new Doc's title, the destination folder (name and
+link) and every blank with its value as a two-column table; Edit shows one input
+per blank and needs a fresh approval. The model sees the granted templates and
+their blanks in the tool's description, and must give a value for every blank —
+a missing or unknown blank is refused for it to correct; a name two granted
+templates share is refused, and the model must use the template's ID. The values
+are inserted literally (a value is never read as markup). If the definition was
+republished with other blanks or another folder between the draft and the
+approval, the create is refused with "The template's blanks or folder changed
+since this agent was published; ask the creator to republish" and nothing is
+written. The new Doc is created as the workspace's Drive account and carries an
+invisible appProperty (key `agentos_write`, the write key's hash) set in the same
+`files.copy` request that makes it; the blanks are then filled with one Docs
+`batchUpdate`, and a retry searches that appProperty before copying again — a
+copy an earlier attempt left unfilled is found and filled, so an approved create
+makes one Doc. There is no follow-up watch on a create. The Drive connector
+switch and the writes switch stop it while off.
 
 ## Encrypted workflow data
 

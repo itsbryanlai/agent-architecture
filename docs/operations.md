@@ -535,37 +535,53 @@ template is offered `create_doc_from_template`: it drafts a new Doc copied from
 that template into the template's folder, and nothing is created until the
 requester approves the card in Slack — a create always asks, never low-risk.
 The creator writes `{{field name}}` blanks in a Google Doc (the template) and
-names a shared-drive folder where the new Docs will land. To grant it, the
-creator picks the template Doc and the destination folder from what the account
-can see on the version page (**Choose a template**) — only folders inside a
-shared drive are offered as destinations; the definition editor can
-also add it directly as `grants.drive.templates` with the template's file ID, a
-label and the folder's ID (`{id, name, folder_id}`). Two shares are needed: the
-template Doc shared with the workspace's Drive address (Viewer is enough to read
-and copy it), and the address added as **Content manager** of the shared drive
-that holds the destination folder (creating a Doc writes into the folder). New
-Docs can only be created in a shared drive folder — the pilot's service account
-cannot own files — so a destination folder outside a shared drive refuses the
-publish with "New Docs can only be created in a shared drive folder; pick a
-folder inside a shared drive." The creator names no blanks: when the version is
-submitted, the platform reads the template's text once and stores its
-`{{field name}}` names as the grant's `blanks` (duplicates collapse to one), so
-the admin approves the blanks the agent will fill and the version page shows
-them. The card previews the new Doc's title, the destination folder (name and
-link) and every blank with its value as a two-column table; Edit shows the title
-and one input per blank (an empty value clears that blank; the title cannot be
-empty) and needs a fresh approval. The model sees the granted templates and
-their blanks in the tool's description, and must give a value for every blank —
-a missing or unknown blank is refused for it to correct; a name two granted
-templates share is refused, and the model must use the template's ID. The values
-are inserted literally (a value is never read as markup): every form of a blank
-is filled, spaced (`{{ name }}`) or not, and a value containing another blank's
-placeholder is kept exactly. The template itself is not knowledge: its
-boilerplate is not indexed or cited. If the definition was
-republished with other blanks or another folder between the draft and the
-approval, the create is refused with "The template's blanks or folder changed
-since this agent was published; ask the creator to republish" and nothing is
-written. The new Doc is created as the workspace's Drive account and carries an
+names a shared-drive folder where the new Docs will land. Keep the blanks in
+the Doc's body: the platform reads the exported body text, so blanks written
+only in a header or footer are not read. To grant it, the creator picks the
+template Doc and the destination folder from what the account can see on the
+version page (**Choose a template**) — only Google Docs are offered as
+templates and only folders inside a shared drive as destinations; the
+definition editor can also add it directly as `grants.drive.templates` with the
+template's file ID, a label and the folder's ID (`{id, name, folder_id}`). Two
+shares are needed: the template Doc shared with the workspace's Drive address
+(Viewer is enough to read and copy it), and the address added as **Content
+manager** of the shared drive that holds the destination folder (creating a Doc
+writes into the folder). New Docs can only be created in a shared drive folder
+— the pilot's service account cannot own files — so a destination folder
+outside a shared drive refuses the publish with "New Docs can only be created
+in a shared drive folder; pick a folder inside a shared drive." The creator
+names no blanks and no drive: when the version is submitted, the platform
+checks the template is an untrashed Google Doc (anything else refuses with
+"template '<name>' must be a Google Doc"), reads its text once and stores its
+`{{field name}}` names as the grant's `blanks` (duplicates collapse to one),
+and reads the destination folder's shared drive as the grant's `drive_id`, so
+the admin approves the blanks the agent will fill and the drive they land in,
+and the version page shows them. A folder that moved out of its recorded shared
+drive after the publish refuses the create before any card, and again at the
+write: one now in My Drive refuses with the publish's plain words, one in
+another shared drive refuses as a changed shape. The card previews the new
+Doc's title, the destination folder (name and link) and every blank with its
+value as a two-column table; Edit shows the title and one input per blank (an
+empty value clears that blank; the title cannot be empty) and needs a fresh
+approval. The model sees the granted templates and their blanks in the tool's
+description, and must give a value for every blank — a missing or unknown blank
+is refused for it to correct; a name two granted templates share is refused,
+and the model must use the template's ID. A value or title containing a
+template blank like `{{name}}` (spaced or not) or the fill sentinel's prefix
+`⟦agentos-fill:` is refused at the draft and at the edit — "A value can't
+contain a template blank like {{name}}; write it another way." — so the values
+that land are inserted literally (a value is never read as markup) and every
+form of a blank is filled, spaced (`{{ name }}`) or not. A template with no
+blanks creates one finished Doc with no fill step. The template itself is not
+knowledge: its boilerplate is not indexed or cited; nor is it a comment target
+— a template grant is copy-only. If the definition was republished with other
+blanks or another folder between the draft and the approval, the create is
+refused with "The template's blanks or folder changed since this agent was
+published; ask the creator to republish". Nothing is written when no copy
+exists yet; when an earlier attempt's copy may exist, the thread says "I
+couldn't create '<title>': <reason>", or "I couldn't confirm whether the Doc
+was created; please check <folder link>" when the write could not be confirmed.
+The new Doc is created as the workspace's Drive account and carries an
 invisible appProperty (key `agentos_write`, the write key's hash) set in the same
 `files.copy` request that makes it; the blanks are then filled with one two-pass
 Docs `batchUpdate` (every raw form to a sentinel, each sentinel to its value),

@@ -1213,3 +1213,105 @@ async def test_fill_sends_one_batchupdate_of_ordered_literal_replacements(deploy
             },
         ]
     }
+
+
+async def test_read_doc_returns_the_revision_title_and_paragraphs(deployment_key):
+    """Fails if documents.get does not return the revisionId, title and body paragraphs (each
+    with its text, named style and UTF-16 indices) with the tenant's token, asking for the
+    revisionId (D-50)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v1/documents/f1"):
+            return reply(
+                request,
+                200,
+                {
+                    "documentId": "f1",
+                    "title": "Guide",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 0,
+                                "endIndex": 7,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": "Status\n"}}],
+                                    "paragraphStyle": {"namedStyleType": "HEADING_1"},
+                                },
+                            },
+                            {
+                                "startIndex": 7,
+                                "endIndex": 16,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": "old line\n"}}],
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                },
+                            },
+                        ]
+                    },
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    doc = await client.read_doc(EMAIL, "f1")
+
+    assert (doc.revision_id, doc.title) == ("rev-1", "Guide")
+    assert [(p.text, p.style, p.start_index, p.end_index) for p in doc.paragraphs] == [
+        ("Status\n", "HEADING_1", 0, 7),
+        ("old line\n", "NORMAL_TEXT", 7, 16),
+    ]
+    [get] = [r for r in sent if r.method == "GET" and r.path_url.startswith("/v1/documents/f1")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    assert "revisionId" in get.path_url
+
+
+@pytest.mark.parametrize("case", ["writes", "revision mismatch"], ids=["writes", "mismatch"])
+async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deployment_key, case):
+    """Fails if the section replace is not one Docs batchUpdate carrying writeControl with the
+    read revision, a delete of the content range and an insert after the heading, with the
+    tenant's token, or a 400 FAILED_PRECONDITION (a moved Doc) is not a revision_mismatch
+    GoogleError (D-50)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v1/documents/f1:batchUpdate":
+            if case == "revision mismatch":
+                return reply(
+                    request,
+                    400,
+                    {
+                        "error": {
+                            "status": "FAILED_PRECONDITION",
+                            "errors": [{"reason": "failedPrecondition"}],
+                        }
+                    },
+                )
+            return reply(request, 200, {"documentId": "f1", "replies": [{}, {}]})
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    if case == "writes":
+        assert (
+            await client.replace_doc_section(EMAIL, "f1", "rev-1", 7, "new line\n", 7, 16) == "f1"
+        )
+    else:
+        with pytest.raises(GoogleError) as err:
+            await client.replace_doc_section(EMAIL, "f1", "rev-1", 7, "new line\n", 7, 16)
+        assert err.value.code == "revision_mismatch"
+
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v1/documents/f1:batchUpdate"
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    body = json.loads(post.body)
+    assert body["writeControl"] == {"requiredRevisionId": "rev-1"}
+    assert body["requests"] == [
+        {"deleteContentRange": {"range": {"startIndex": 7, "endIndex": 16}}},
+        {"insertText": {"location": {"index": 7}, "text": "new line\n"}},
+    ]

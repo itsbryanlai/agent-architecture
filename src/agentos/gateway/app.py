@@ -125,8 +125,8 @@ EDIT_ACTION = "task_edit"
 EDIT_CALLBACK = "task_edit"
 NUDGE_ACTION = "task_nudge"
 STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
-FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
-MULTILINE_FIELDS = {"details", "comment"}
+FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment", "text": "New text"}
+MULTILINE_FIELDS = {"details", "comment", "text"}
 # Slack wants an answer to a click within 3 seconds and does not repeat it. The click's work
 # gets this long, and the "try again" notice a little less than what is left.
 CLICK_TIMEOUT_SECONDS = 2.0

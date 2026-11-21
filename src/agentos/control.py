@@ -185,6 +185,9 @@ from agentos.config import (
 from agentos.connectors.drive import (
     SHARED_DRIVE_FOLDER_TEXT,
     DriveReader,
+    heading_duplicated_text,
+    heading_matches,
+    heading_missing_text,
     template_blank_names,
 )
 from agentos.connectors.google_iam import (
@@ -1085,6 +1088,7 @@ class ControlPlane:
         # together — the hash the admin reviews covers them.
         columns = await self._sheet_columns(tenant_id, agent_id, version)
         template_reads = await self._template_reads(tenant_id, agent_id, version)
+        await self._section_reads(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
             if columns is not None or template_reads is not None:
                 fresh = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
@@ -1218,6 +1222,41 @@ class ControlPlane:
                 ) from err
             reads[grant.id] = {"blanks": names, "drive_id": folder.drive_id}
         return reads
+
+    async def _section_reads(self, tenant_id: str, agent_id: str, version: int) -> None:
+        """Check each granted section's heading exists exactly once in its Doc (D-50), reading
+        the Doc once (``documents.get``). The creator names the heading; submit verifies it so the
+        admin reviews a section the agent can actually replace. Refuses when Drive is not set up
+        or connected, the Doc is not an untrashed Google Doc, or the heading is missing or appears
+        more than once. Nothing is merged: the heading is the creator's, frozen as typed."""
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None or record.status != "draft":
+            return
+        sections = [g for g in record.agent().grants.drive if g.kind == "section"]
+        if not sections:
+            return
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        reader = DriveReader(self._google, row.service_account_email)
+        for grant in sections:
+            try:
+                file = await reader.get_file(grant.doc_id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the Doc '{grant.name}': {err}") from err
+            if file.mime_type != MIME_DOC or file.trashed:
+                raise ConfigError(f"section '{grant.name}' must be a Google Doc")
+            try:
+                doc = await reader.read_doc(grant.doc_id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the Doc '{grant.name}': {err}") from err
+            matches = heading_matches(doc.paragraphs, grant.heading)
+            if not matches:
+                raise ConfigError(heading_missing_text(grant.heading, grant.name))
+            if len(matches) > 1:
+                raise ConfigError(heading_duplicated_text(grant.heading, grant.name))
 
     async def _check_template_folders(self, tenant_id: str, agent: AgentVersion) -> None:
         """Refuse a publish whose template destination folder is not in a shared drive (D-49).
@@ -1753,8 +1792,10 @@ class ControlPlane:
         if not target:
             raise TestSetError("choose the source, database, Drive file or agent this case expects")
         if expect == CITE:
-            # A template's boilerplate is not knowledge (D-49): it is never cited.
+            # A template's boilerplate is not knowledge (D-49): it is never cited. A section's
+            # Doc is granted as for reads (D-50), so it is cited by its Doc ID.
             drive_files = {g.id for g in agent.grants.drive if g.kind in ("file", "sheet")}
+            drive_files |= {g.doc_id for g in agent.grants.drive if g.kind == "section"}
             if target in drive_files:
                 return expect, target
             granted = {normalize_id(g.id) for g in agent.grants.notion_pages}
@@ -1763,6 +1804,8 @@ class ControlPlane:
             drive_files = {
                 g.id for g in agent.grants.drive if g.kind in ("file", "sheet", "template")
             }
+            # A section replace aims at the section's Doc ID (D-50).
+            drive_files |= {g.doc_id for g in agent.grants.drive if g.kind == "section"}
             if target in drive_files:
                 return expect, target
             granted = {normalize_id(g.id) for g in agent.grants.notion_databases}
@@ -2272,6 +2315,7 @@ class ControlPlane:
             "shared_drive": "shared_drives",
             "sheet": "sheets",
             "template": "templates",
+            "section": "sections",
         }
         for item in items:
             if item.id in existing:
@@ -2281,6 +2325,9 @@ class ControlPlane:
                 entry["tab"] = item.tab
             if item.kind == "template":
                 entry["folder_id"] = item.folder_id
+            if item.kind == "section":
+                entry["doc_id"] = item.id
+                entry["heading"] = item.heading
             drive_block.setdefault(keys[item.kind], []).append(entry)
             existing.add(item.id)
         async with self._uow.begin(tenant_id) as conn:
@@ -2309,7 +2356,7 @@ class ControlPlane:
         definition = agent_definition(record.agent())
         drive_block = definition.get("grants", {}).get("drive")
         if drive_block is not None:
-            for key in ("folders", "files", "shared_drives", "sheets", "templates"):
+            for key in ("folders", "files", "shared_drives", "sheets", "templates", "sections"):
                 drive_block[key] = [g for g in drive_block.get(key, []) if g["id"] != grant_id]
             if not any(drive_block.values()):
                 del definition["grants"]["drive"]

@@ -90,11 +90,11 @@
 <h2>Google Drive</h2>
 {% if drive_grants %}
 <table>
-  <tr><th>Creator's label</th><th>Kind</th><th>Drive ID</th><th>Tab / columns / blanks</th>{% if editor and is_draft %}<th></th>{% endif %}</tr>
+  <tr><th>Creator's label</th><th>Kind</th><th>Drive ID</th><th>Tab / columns / blanks / heading</th>{% if editor and is_draft %}<th></th>{% endif %}</tr>
   {% for g in drive_grants %}
   <tr>
     <td>{{ g.name }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
-    <td>{% if g.kind == "sheet" %}{{ g.tab }}{% if g.columns %}: {{ g.columns|join(", ") }}{% endif %}{% elif g.kind == "template" %}folder <code>{{ g.folder_id }}</code>{% if g.blanks %}: {{ g.blanks|join(", ") }}{% endif %}{% endif %}</td>
+    <td>{% if g.kind == "sheet" %}{{ g.tab }}{% if g.columns %}: {{ g.columns|join(", ") }}{% endif %}{% elif g.kind == "template" %}folder <code>{{ g.folder_id }}</code>{% if g.blanks %}: {{ g.blanks|join(", ") }}{% endif %}{% elif g.kind == "section" %}heading "{{ g.heading }}"{% endif %}</td>
     {% if editor and is_draft %}<td>{{ post_button(version_url ~ "/drive/remove", ctx.csrf, "Remove", {"grant_id": g.id, "request_id": new_token()}) }}</td>{% endif %}
   </tr>
   {% endfor %}

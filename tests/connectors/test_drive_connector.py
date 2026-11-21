@@ -111,6 +111,8 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
         ("sheet", "ID of one of two", "drive-sheet-0002", "drive-sheet-0002"),
         ("template", "unique name", "Offer template", "drive-template-0001"),
         ("template", "shared name", "Offer template", None),
+        ("section", "unique name", "VPN guide", "drive-section-0001"),
+        ("section", "shared name", "VPN guide", None),
     ],
     ids=[
         "sheet-unique-name",
@@ -118,18 +120,20 @@ async def test_find_write_counts_only_the_accounts_own_comment_with_the_full_ref
         "sheet-by-id",
         "template-unique-name",
         "template-shared-name",
+        "section-unique-name",
+        "section-shared-name",
     ],
 )
 def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case, ref, expected):
-    """Fails if sheet_for or template_for picks one of two granted Sheets or templates that
-    share a name instead of refusing so the model uses the ID, or a unique name or an ID
-    does not resolve."""
+    """Fails if sheet_for, template_for or section_for picks one of two granted Sheets,
+    templates or sections that share a name instead of refusing so the model uses the ID, or
+    a unique name or an ID does not resolve."""
     google = FakeGoogleAccounts()
     if kind == "sheet":
         grants = [DriveGrant("drive-sheet-0001", "Roster", "sheet", tab="Q1")]
         if case != "unique name":
             grants.append(DriveGrant("drive-sheet-0002", "Roster", "sheet", tab="Q1"))
-    else:
+    elif kind == "template":
         grants = [
             DriveGrant(
                 "drive-template-0001",
@@ -149,8 +153,30 @@ def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case,
                     blanks=("name",),
                 )
             )
+    else:
+        grants = [
+            DriveGrant(
+                "drive-section-0001",
+                "VPN guide",
+                "section",
+                doc_id="drive-section-0001",
+                heading="Status",
+            )
+        ]
+        if case != "unique name":
+            grants.append(
+                DriveGrant(
+                    "drive-section-0002",
+                    "VPN guide",
+                    "section",
+                    doc_id="drive-section-0002",
+                    heading="Status",
+                )
+            )
     conn = DriveConnector(DriveReader(google, EMAIL), grants)
-    lookup = conn.sheet_for if kind == "sheet" else conn.template_for
+    lookup = {"sheet": conn.sheet_for, "template": conn.template_for, "section": conn.section_for}[
+        kind
+    ]
 
     if expected is None:
         with pytest.raises(GrantDenied) as err:

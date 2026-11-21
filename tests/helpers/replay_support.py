@@ -123,14 +123,17 @@ from tests.helpers.agents import republish
 from tests.helpers.drive import (
     DRIVE_DOC,
     DRIVE_FOLDER,
+    DRIVE_SECTION,
     DRIVE_SHEET,
     DRIVE_TEMPLATE,
     SHEET_TAB,
     TEMPLATE_FOLDER,
     add_roster_sheet,
+    add_section_doc,
     add_template_tree,
     drive_account_email,
     make_drive_google,
+    section_grant_block,
     sheet_grant_block,
     template_grant_block,
 )
@@ -1416,6 +1419,50 @@ async def drive_create_doc(r: Rig) -> list[Recorded]:
     ]
 
 
+async def drive_replace_section(r: Rig) -> list[Recorded]:
+    """A Drive section-replace task (D-50): the model drafts replace_section on a granted Doc
+    section, the requester approves the card, and the section's content is replaced once at the
+    read revision, keeping the heading."""
+    thread = thread_ts(324)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 21, tzinfo=UTC)
+    )
+    add_section_doc(r.google)
+    r.llm.queue(
+        tool_turn(
+            ToolCall(
+                "tu_drs",
+                "replace_section",
+                {"section": DRIVE_SECTION, "text": "The VPN is back up."},
+            )
+        ),
+        answer("Sent you a card."),
+    )
+    await start_conversation(r, "it-helper", thread, "update the VPN status", stored=True)
+    cards = await eventually(lambda: [p for p in r.slack.posts() if p["blocks"]], timeout=30)
+    actions = next(b for b in cards[0]["blocks"] if b["type"] == "actions")
+    value = json.loads(actions["elements"][0]["value"])
+    handle = r.client.get_workflow_handle(value["task_id"])
+    await wait_state(handle, "awaiting_approval")
+    await approve(handle, value["nonce"])
+    assert await handle.result() == "done"
+    paras = r.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[0]["text"] == "Status\n"
+    assert paras[1]["text"] == "The VPN is back up.\n"
+    assert any(
+        p["thread_ts"] and "Replaced a section of VPN guide" in p["text"] for p in r.slack.posts()
+    )
+    return [
+        await current(r, "", handle.id),
+        await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
+    ]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -1977,6 +2024,8 @@ SCENARIOS["drive_comment"] = drive_comment
 SCENARIOS["drive_append"] = drive_append
 # A Drive create-from-template task is new: one shape (the stored draft), no legacy inline history.
 SCENARIOS["drive_create_doc"] = drive_create_doc
+# A Drive section-replace task is new: one shape (the stored draft), no legacy inline history.
+SCENARIOS["drive_replace_section"] = drive_replace_section
 
 
 # --- files --------------------------------------------------------------------------------

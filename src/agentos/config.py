@@ -410,7 +410,7 @@ class DriveGrant:
     A folder grants everything under it (recursively); a file grants just that file; a
     shared drive grants everything in it, walked from its root. Each grant is one scope
     that searches are filtered by. ``kind`` is ``folder``, ``file``, ``shared_drive``,
-    ``sheet`` or ``template``.
+    ``sheet``, ``template`` or ``section``.
 
     A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
     ``columns`` is its header row, read once when the version is submitted and frozen
@@ -424,6 +424,14 @@ class DriveGrant:
     grant's blanks or folder no longer match the draft's, or the folder's live shared
     drive is not the recorded one. A template grant is copy-only: it is not a read or
     comment target.
+
+    A ``section`` is a granted Doc the agent may replace one headed section of: ``id``
+    is the Doc's file ID (granted as for reads, indexed like any file), ``doc_id`` the
+    same Doc's file ID named for the write, and ``heading`` the heading the creator
+    names. The section is everything under that heading up to the next heading of the
+    same or higher level. Submit checks the heading exists exactly once. The write
+    refuses when the live grant's heading no longer matches the draft's, the heading is
+    gone or duplicated, or the Doc moved since the read revision.
     """
 
     id: str
@@ -434,6 +442,8 @@ class DriveGrant:
     folder_id: str = ""
     blanks: tuple[str, ...] = ()
     drive_id: str = ""
+    doc_id: str = ""
+    heading: str = ""
 
 
 @dataclass
@@ -617,11 +627,12 @@ _GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
-_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates"})
+_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates", "sections"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
 _DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
 _DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks", "drive_id"})
-DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template")
+_DRIVE_SECTION_KEYS = frozenset({"id", "name", "doc_id", "heading"})
+DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template", "section")
 # A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
 # The connector's link parser uses the same shape, so a grant and a resolved link agree.
 DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
@@ -635,6 +646,9 @@ MAX_COLUMN_NAME = 200
 # refuses a wider template rather than store a card Slack rejects.
 MAX_TEMPLATE_BLANKS = 50
 MAX_BLANK_NAME = 200
+# A section grant's heading name is bounded like a blank name so the approval card and the
+# Edit form always fit. The replacement text's own cap lives in ``agentos.models``.
+MAX_HEADING_NAME = 200
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -844,6 +858,31 @@ def _parse_drive_template(agent_id: str, raw: dict[str, Any], index: int = 0) ->
     )
 
 
+def _parse_drive_section(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.sections[{index}]"
+    _mapping(where, raw, _DRIVE_SECTION_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    doc_id = _text(where, "doc_id", _require(raw, "doc_id", where))
+    if not DRIVE_ID.fullmatch(doc_id):
+        raise ConfigError(
+            f"{where}: 'doc_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    heading = _text(where, "heading", _require(raw, "heading", where))
+    if len(heading) > MAX_HEADING_NAME:
+        raise ConfigError(f"{where}: a heading name may be at most {MAX_HEADING_NAME} characters")
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="section",
+        doc_id=doc_id,
+        heading=heading,
+    )
+
+
 def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
     where = f"agent '{agent_id}' grants.drive"
     drive = _mapping(where, raw, _DRIVE_KEYS)
@@ -855,6 +894,8 @@ def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
                 grants.append(_parse_drive_sheet(agent_id, item, i))
             elif kind == "template":
                 grants.append(_parse_drive_template(agent_id, item, i))
+            elif kind == "section":
+                grants.append(_parse_drive_section(agent_id, item, i))
             else:
                 grants.append(_parse_drive_grant(agent_id, item, kind, i))
     seen: set[str] = set()
@@ -1007,6 +1048,9 @@ def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
             entry["blanks"] = list(grant.blanks)
         if grant.drive_id:
             entry["drive_id"] = grant.drive_id
+    if grant.kind == "section":
+        entry["doc_id"] = grant.doc_id
+        entry["heading"] = grant.heading
     return entry
 
 

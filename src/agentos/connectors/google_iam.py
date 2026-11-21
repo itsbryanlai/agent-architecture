@@ -25,6 +25,12 @@ body's reason, so ``drive_errors`` can tell a quota wave from a disabled API fro
 sharing. The comment write surface (D-47) lists a file's comments (paged, each with
 whether the tenant's account wrote it) and posts a comment as that account.
 
+The section write surface (D-50) reads a Doc's structure (``documents.get``: its
+revisionId, title and body paragraphs with their named styles and UTF-16 indices) and
+replaces a section's content in one ``documents.batchUpdate`` carrying
+``writeControl.requiredRevisionId`` (a delete of the content range and an insert after the
+heading); a Doc that moved since the read answers 400 ``revision_mismatch``.
+
 The fake keeps the accounts and what is shared with each, and carries the failure
 injections in one place: ``fail_after_write`` (the response is lost after the effect),
 ``hang_after_write`` (a second attempt overlaps the first), ``delay_visibility`` (a
@@ -145,13 +151,15 @@ class GoogleError(Exception):
 class DriveItem:
     """One file or shared drive the tenant's account can see: its ID, name and link.
 
-    ``kind`` is ``folder``, ``file``, ``shared_drive`` or ``sheet``, so the grant picker
-    knows which grant to add. ``tab`` is empty on a listing; the picker's tab step fills
-    it for a Sheet before the grant is added. ``mime_type`` is the file's Drive mime type
-    (the template picker offers Docs only); ``folder_id`` is empty on a listing, the
-    template picker's folder step fills it before the grant is added. ``drive_id`` is the
-    shared drive the item sits in, empty for one in My Drive; the template picker offers
-    only folders with one as destinations (D-49).
+    ``kind`` is ``folder``, ``file``, ``shared_drive``, ``sheet``, ``template`` or
+    ``section``, so the grant picker knows which grant to add. ``tab`` is empty on a
+    listing; the picker's tab step fills it for a Sheet before the grant is added.
+    ``mime_type`` is the file's Drive mime type (the template picker offers Docs only);
+    ``folder_id`` is empty on a listing, the template picker's folder step fills it before
+    the grant is added. ``drive_id`` is the shared drive the item sits in, empty for one in
+    My Drive; the template picker offers only folders with one as destinations (D-49).
+    ``heading`` is empty on a listing; a section pick fills it with the heading the creator
+    names (D-50).
     """
 
     id: str
@@ -162,6 +170,7 @@ class DriveItem:
     mime_type: str = ""
     folder_id: str = ""
     drive_id: str = ""
+    heading: str = ""
 
 
 @dataclass(frozen=True)
@@ -245,6 +254,36 @@ class SheetMetadata:
     key: str
     value: str
     row_index: int
+
+
+@dataclass(frozen=True)
+class DocParagraph:
+    """One paragraph of a Doc as the section write needs it: its text (ending in a
+    newline), its named style (``HEADING_1``..``HEADING_6``, ``TITLE``, ``SUBTITLE`` or
+    ``NORMAL_TEXT``) and its ``startIndex``/``endIndex`` in the document body, as Google
+    reports them (UTF-16 code-unit offsets). The section write locates a heading and the
+    paragraphs under it by these (D-50)."""
+
+    text: str
+    style: str
+    start_index: int
+    end_index: int
+
+
+@dataclass(frozen=True)
+class DocRead:
+    """One ``documents.get`` of a Doc: its ``revisionId`` (the section write's lock), its
+    title and its body's paragraphs. References and small values plus the section text the
+    draft freezes; the revisionId is what the write's ``writeControl`` names (D-50)."""
+
+    revision_id: str
+    title: str
+    paragraphs: tuple[DocParagraph, ...]
+
+
+def utf16_len(text: str) -> int:
+    """A string's length in UTF-16 code units, the offset unit Google Docs indexes by."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 class GoogleAccounts(Protocol):
@@ -366,6 +405,31 @@ class GoogleAccounts(Protocol):
         sentinel to its value — so a value containing another blank's placeholder lands
         literally (D-49). A string no longer present is a no-op, so a retry fills only what
         is left."""
+        ...
+
+    async def read_doc(self, email: str, file_id: str) -> DocRead:
+        """One ``documents.get`` of a Doc: its revisionId, title and body paragraphs (each
+        with its text, named style and UTF-16 start/end index). The section write reads the
+        heading and the text under it from this, and locks the write to its revisionId
+        (D-50). A Doc that is gone or unreadable raises ``GoogleError`` with its status."""
+        ...
+
+    async def replace_doc_section(
+        self,
+        email: str,
+        file_id: str,
+        required_revision_id: str,
+        insert_index: int,
+        insert_text: str,
+        delete_start: int,
+        delete_end: int,
+    ) -> str:
+        """Replace a section's content in ONE Docs ``documents.batchUpdate`` carrying
+        ``writeControl.requiredRevisionId``: delete the content range ``[delete_start,
+        delete_end)`` and insert ``insert_text`` at ``insert_index`` (the heading's end, so
+        the heading is kept). The revision is the lock — a Doc that moved since the read
+        answers 400 (``revision_mismatch``) and nothing is written. Returns the Doc's ID
+        (D-50)."""
         ...
 
 
@@ -1252,6 +1316,136 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
+    async def read_doc(self, email: str, file_id: str) -> DocRead:
+        token = await self._drive_token(email)
+
+        def call() -> DocRead:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "GET",
+                    f"{DOCS}/documents/{file_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"fields": "documentId,title,revisionId,body.content"},
+                )
+                self._check_drive(response)
+                body = _json_object(response)
+                try:
+                    return DocRead(
+                        revision_id=str(body["revisionId"]),
+                        title=str(body.get("title", "")),
+                        paragraphs=_doc_paragraphs(body.get("body", {})),
+                    )
+                except (KeyError, TypeError) as err:
+                    raise GoogleError("unavailable") from err
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def replace_doc_section(
+        self,
+        email: str,
+        file_id: str,
+        required_revision_id: str,
+        insert_index: int,
+        insert_text: str,
+        delete_start: int,
+        delete_end: int,
+    ) -> str:
+        token = await self._drive_token(email)
+
+        def call() -> str:
+            session = self._drive_session_for_call()
+            try:
+                # Delete the section's content, then insert the new text at the heading's
+                # end (the same index the delete started at), so the heading is kept. The
+                # writeControl locks the batchUpdate to the read revision: a Doc that moved
+                # answers 400 FAILED_PRECONDITION and nothing is written.
+                requests: list[dict] = []
+                if delete_end > delete_start:
+                    requests.append(
+                        {
+                            "deleteContentRange": {
+                                "range": {"startIndex": delete_start, "endIndex": delete_end}
+                            }
+                        }
+                    )
+                requests.append(
+                    {"insertText": {"location": {"index": insert_index}, "text": insert_text}}
+                )
+                response = self._send(
+                    session,
+                    "POST",
+                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "requests": requests,
+                        "writeControl": {"requiredRevisionId": required_revision_id},
+                    },
+                )
+                if response.status_code == 400 and _is_revision_mismatch(response):
+                    raise GoogleError(
+                        "revision_mismatch",
+                        "The document changed since this write was drafted.",
+                        status=400,
+                    )
+                self._check_drive(response)
+                _json_object(response)
+                return file_id
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+
+def _is_revision_mismatch(response: requests.Response) -> bool:
+    """A Docs batchUpdate 400 whose body says the required revision no longer holds
+    (``FAILED_PRECONDITION`` / ``failedPrecondition``), as Google answers a moved Doc."""
+    try:
+        if response.json()["error"]["status"] == "FAILED_PRECONDITION":
+            return True
+    except (ValueError, KeyError, TypeError):
+        pass
+    return _drive_reason(response) == "failedPrecondition"
+
+
+def _doc_paragraphs(body: dict) -> tuple[DocParagraph, ...]:
+    """A Doc body's structural elements as paragraphs: each paragraph's text (its text
+    runs joined), its named style and its UTF-16 start/end index. Non-paragraph elements
+    (tables, sections breaks) are skipped; a non-text run contributes nothing."""
+    paragraphs: list[DocParagraph] = []
+    for element in body.get("content", []):
+        paragraph = element.get("paragraph")
+        if paragraph is None:
+            continue
+        text = "".join(
+            run.get("textRun", {}).get("content", "") for run in paragraph.get("elements", [])
+        )
+        style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+        paragraphs.append(
+            DocParagraph(
+                text=text,
+                style=style,
+                start_index=int(element["startIndex"]),
+                end_index=int(element["endIndex"]),
+            )
+        )
+    return tuple(paragraphs)
+
+
+def _split_doc_paragraphs(text: str) -> list[dict]:
+    """Inserted text as the paragraphs a Docs insertText makes: one per line, each ending
+    in a newline, normal text (the heading is kept separately). A trailing newline does not
+    make an empty paragraph; an interior blank line does."""
+    pieces = text.split("\n")
+    if pieces and pieces[-1] == "":
+        pieces.pop()
+    return [{"text": piece + "\n", "style": "NORMAL_TEXT"} for piece in pieces]
+
 
 def _trim_trailing_empty(values: list[str]) -> list[str]:
     end = len(values)
@@ -1313,6 +1507,7 @@ class FakeGoogleAccounts:
             "append": 0,
             "copy": 0,
             "fill": 0,
+            "replace": 0,
         }
         self._hang_after_write: dict[str, list[Hang]] = {
             "create": [],
@@ -1320,6 +1515,7 @@ class FakeGoogleAccounts:
             "comment": [],
             "append": [],
             "copy": [],
+            "replace": [],
         }
         self._visibility_delay = 0
         self._hidden_comments: dict[str, int] = {}
@@ -1364,6 +1560,13 @@ class FakeGoogleAccounts:
         self.copy_calls: list[tuple[str, str]] = []
         self.app_search_calls: list[tuple[str, str]] = []
         self.fill_calls: list[tuple[str, str]] = []
+        # The section-replace surface (D-50): each Doc's structural model — its revisionId
+        # and its paragraphs (text and named style) — and the (email, ID) of every documents.get
+        # and section batchUpdate, so a test sees whose account read and wrote. The replace
+        # failure injections live in ``_after_write``.
+        self.docs: dict[str, dict] = {}
+        self.doc_read_calls: list[tuple[str, str]] = []
+        self.doc_replace_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
@@ -1379,13 +1582,14 @@ class FakeGoogleAccounts:
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
         """The next ``times`` writes of ``kind`` ("create", "delete", "comment", "append",
-        "copy" or "fill") take effect and then raise, as when the response is lost."""
+        "copy", "fill" or "replace") take effect and then raise, as when the response is
+        lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
-        """The next write of ``kind`` ("create", "delete", "comment", "append" or "copy")
-        takes effect, then waits until the returned ``Hang`` is released. Another attempt
-        meanwhile runs normally: this is how two overlap."""
+        """The next write of ``kind`` ("create", "delete", "comment", "append", "copy" or
+        "replace") takes effect, then waits until the returned ``Hang`` is released. Another
+        attempt meanwhile runs normally: this is how two overlap."""
         hang = Hang()
         self._hang_after_write[kind].append(hang)
         return hang
@@ -1551,6 +1755,39 @@ class FakeGoogleAccounts:
     def set_sheet_header(self, file_id: str, tab: str, header: list[str]) -> None:
         """Replace a tab's header row, as a creator editing the Sheet's columns would."""
         self.sheets[file_id][tab]["rows"][0] = list(header)
+
+    def add_drive_doc(
+        self,
+        file_id: str,
+        name: str,
+        paragraphs: list[dict],
+        parent: str,
+        revision_id: str = "1",
+        drive_id: str = "",
+    ) -> None:
+        """A Google Doc as the section write reads it: a Drive file (indexed like any Doc)
+        plus its structural model — a revisionId and paragraphs of ``{text, style}``, each
+        text ending in a newline. The export text is the paragraphs joined."""
+        text = "".join(p["text"] for p in paragraphs)
+        self.add_drive_file(
+            file_id,
+            name,
+            MIME_DOC,
+            parent,
+            [DriveSection("", text)],
+            version=revision_id,
+            drive_id=drive_id,
+        )
+        self.docs[file_id] = {
+            "revision_id": revision_id,
+            "paragraphs": [dict(p) for p in paragraphs],
+        }
+
+    def set_doc_revision(self, file_id: str, revision_id: str) -> None:
+        """Move a Doc to another revision, as a collaborator's edit would (the write's
+        requiredRevisionId no longer holds)."""
+        self.docs[file_id]["revision_id"] = revision_id
+        self.set_drive_version(file_id, revision_id)
 
     def fail_next_export(self, error: Exception) -> None:
         self._export_error = error
@@ -1839,6 +2076,82 @@ class FakeGoogleAccounts:
             filled.append(DriveSection(section.heading, text))
         self.drive_content[file_id] = filled
         await self._after_write("fill")
+
+    async def read_doc(self, email: str, file_id: str) -> DocRead:
+        self.doc_read_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        doc = self.docs.get(file_id)
+        if doc is None:
+            # A Doc added without a structural model: its export text as normal paragraphs.
+            text = "\n".join(s.text for s in self.drive_content.get(file_id, []))
+            paragraphs = _split_doc_paragraphs(text + "\n")
+            revision_id = self.drive_files[file_id].version or "1"
+        else:
+            paragraphs = doc["paragraphs"]
+            revision_id = doc["revision_id"]
+        indexed: list[DocParagraph] = []
+        idx = 0
+        for p in paragraphs:
+            end = idx + utf16_len(p["text"])
+            indexed.append(DocParagraph(p["text"], p["style"], idx, end))
+            idx = end
+        return DocRead(revision_id, self.drive_files[file_id].name, tuple(indexed))
+
+    async def replace_doc_section(
+        self,
+        email: str,
+        file_id: str,
+        required_revision_id: str,
+        insert_index: int,
+        insert_text: str,
+        delete_start: int,
+        delete_end: int,
+    ) -> str:
+        self.doc_replace_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        doc = self.docs.get(file_id)
+        if doc is None:
+            raise GoogleError("refused", "The Doc has no readable body.", status=400)
+        # The revision is the lock: a Doc that moved since the read refuses, nothing written.
+        if required_revision_id != doc["revision_id"]:
+            raise GoogleError(
+                "revision_mismatch",
+                "The document changed since this write was drafted.",
+                status=400,
+            )
+        # Delete the content paragraphs (the range aligns with paragraph boundaries) and
+        # insert the new text's paragraphs at the heading's end, keeping the heading and
+        # everything from the next heading on, as Google's delete + insert does.
+        bounds: list[tuple[int, int]] = []
+        idx = 0
+        for p in doc["paragraphs"]:
+            end = idx + utf16_len(p["text"])
+            bounds.append((idx, end))
+            idx = end
+        pieces = _split_doc_paragraphs(insert_text)
+        result: list[dict] = []
+        inserted = False
+        for p, (start, end) in zip(doc["paragraphs"], bounds):
+            if not inserted and start >= delete_start:
+                result.extend(pieces)
+                inserted = True
+            if delete_end > delete_start and start >= delete_start and end <= delete_end:
+                continue
+            result.append(p)
+        if not inserted:
+            result.extend(pieces)
+        doc["paragraphs"] = result
+        doc["revision_id"] = str(int(doc["revision_id"]) + 1)
+        self.set_drive_version(file_id, doc["revision_id"])
+        self.drive_content[file_id] = [DriveSection("", "".join(p["text"] for p in result))]
+        await self._after_write("replace")
+        return file_id
 
 
 def accounts_from_settings(

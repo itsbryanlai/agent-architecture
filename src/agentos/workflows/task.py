@@ -438,6 +438,45 @@ class TaskWorkflow:
                 await self._record()
                 return self._state
             self._spec = dataclasses.replace(spec, revision=prepared.revision)
+        elif spec.tool_name == "replace_section":
+            # Check the section grant and read the heading's text and the Doc's revision before
+            # any card (D-50). A section replace is always a stored draft; no legacy inline shape.
+            try:
+                section: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_replace_section, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't replace that section: I couldn't find the Doc or the heading, "
+                    "or it isn't a section I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=section.revision)
         # The policy may let this comment run without a card (D-43): the activity reads
         # the tenant's setting and the platform's own record of who filed the item.
         # Histories recorded before the policy never ask and always show the card.
@@ -534,6 +573,8 @@ class TaskWorkflow:
             return await self._run_append(spec, task_id, card_ts, agent.name)
         if spec.tool_name == "create_doc":
             return await self._run_create_doc(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "replace_section":
+            return await self._run_replace_section(spec, task_id, card_ts, agent.name)
         if spec.tool_name == "nudge":
             return await self._run_nudge(spec, task_id, card_ts, agent.name)
 
@@ -1031,6 +1072,73 @@ class TaskWorkflow:
         await self._notice(
             task_notices.CREATED,
             f"{task_id}:created",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_replace_section(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """Replace the approved section of the granted Doc once (D-50). Nothing to watch after.
+
+        The revision is the lock: a Doc that moved since the read refuses with nothing written
+        (a permanent refusal, the thread carries the reason); a retry after a lost response finds
+        the section already holding the approved text. When the retries run out and the look
+        cannot confirm, the task says so and points to the Doc, never that nothing was written.
+        """
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.replace_doc_section, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_drive_section, spec, task_id
+                )
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_REPLACE_SECTION,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_REPLACE_SECTION,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Replaced")
+        await self._notice(
+            task_notices.REPLACED,
+            f"{task_id}:replaced",
             task_id,
             subject=title,
             url=item_url,

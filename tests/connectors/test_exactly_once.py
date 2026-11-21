@@ -34,14 +34,20 @@ from tests.conftest import (
 from tests.helpers.agents import republish
 from tests.helpers.drive import (
     DRIVE_DOC,
+    DRIVE_SECTION,
     DRIVE_SHEET,
     DRIVE_TEMPLATE,
+    SECTION_BEFORE,
+    SECTION_HEADING,
+    SECTION_PARAGRAPHS,
     SHEET_COLUMNS,
     SHEET_TAB,
     TEMPLATE_BLANKS,
     TEMPLATE_FOLDER,
     add_roster_sheet,
+    add_section_doc,
     add_template_tree,
+    section_grant_block,
     sheet_grant_block,
     template_grant_block,
 )
@@ -728,3 +734,86 @@ async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_th
     assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
     assert len(h.google.copy_calls) == 1
     assert len(h.google.fill_calls) == 1
+
+
+# --- a Drive section replace (D-50) ------------------------------------------------------
+
+
+async def grant_section_doc(h):
+    """Publish it-helper with the VPN guide's Status section grant and serve the Doc."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+    )
+    add_section_doc(h.google)
+
+
+def replace_spec() -> TaskSpec:
+    from agentos.connectors.drive import heading_matches, section_bounds
+    from agentos.connectors.google_iam import DocParagraph, utf16_len
+
+    paragraphs = []
+    idx = 0
+    for p in SECTION_PARAGRAPHS:
+        end = idx + utf16_len(p["text"])
+        paragraphs.append(DocParagraph(p["text"], p["style"], idx, end))
+        idx = end
+    start, end, _ = section_bounds(
+        tuple(paragraphs), heading_matches(tuple(paragraphs), SECTION_HEADING)[0]
+    )
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_SECTION,
+        "section_id": DRIVE_SECTION,
+        "doc_id": DRIVE_SECTION,
+        "heading": SECTION_HEADING,
+        "text": "The VPN is back up.",
+        "before": SECTION_BEFORE,
+        "revision_id": "1",
+        "content_start": start,
+        "content_end": end,
+        "item_title": "VPN guide",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_SECTION}",
+    }
+    return TaskSpec(ctx, "replace_section", payload, NONCE, tool="replace_section")
+
+
+async def test_a_drive_replace_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a section replace whose response was lost replaces the section a
+    second time, instead of finding the section already holding the approved text."""
+    h = dharness
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-replace-lost")
+    h.google.fail_after_write("replace")
+    with pytest.raises(GoogleError):
+        await run(h.acts.replace_doc_section, replace_spec(), task_id)
+
+    await run(h.acts.replace_doc_section, replace_spec(), task_id)
+
+    paras = h.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[1]["text"] == "The VPN is back up.\n"
+    assert paras[0]["text"] == "Status\n"
+    assert len(h.google.doc_replace_calls) == 1
+
+
+async def test_a_second_drive_replace_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a section replace attempt starting while another is mid-write replaces the
+    section a second time."""
+    h = dharness
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-replace-overlap")
+    hang = h.google.hang_after_write("replace")
+    first = asyncio.create_task(run(h.acts.replace_doc_section, replace_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.replace_doc_section, replace_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    ref = await first
+
+    assert await run(h.acts.replace_doc_section, replace_spec(), task_id) == ref
+    paras = h.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[1]["text"] == "The VPN is back up.\n"
+    assert len(h.google.doc_replace_calls) == 1

@@ -97,6 +97,7 @@ def drive_grants_dict() -> dict:
     ]
     raw["agents"]["it-helper"]["grants"]["drive"]["sheets"] = [sheet_grant_block()]
     raw["agents"]["it-helper"]["grants"]["drive"]["templates"] = [template_grant_block()]
+    raw["agents"]["it-helper"]["grants"]["drive"]["sections"] = [section_grant_block()]
     return raw
 
 
@@ -157,6 +158,43 @@ def add_template_tree(google: FakeGoogleAccounts) -> None:
         [DriveSection("", TEMPLATE_TEXT)],
     )
     google.add_drive_folder(TEMPLATE_PLAIN_FOLDER, "My folder")
+
+
+# The section-replace target (D-50): a granted Doc with a "Status" heading whose section
+# spans a nested heading up to the next same-level heading ("Other"), which is kept.
+DRIVE_SECTION = "drive-section-0001"
+SECTION_HEADING = "Status"
+SECTION_DOC_NAME = "VPN guide"
+SECTION_PARAGRAPHS = [
+    {"text": "Status\n", "style": "HEADING_1"},
+    {"text": "The VPN is down.\n", "style": "NORMAL_TEXT"},
+    {"text": "Steps\n", "style": "HEADING_2"},
+    {"text": "Restart the router.\n", "style": "NORMAL_TEXT"},
+    {"text": "Other\n", "style": "HEADING_1"},
+    {"text": "Keep this.\n", "style": "NORMAL_TEXT"},
+]
+# The section's current text, as the draft freezes it (the paragraphs under the heading,
+# trimmed): the card's "before".
+SECTION_BEFORE = "The VPN is down.\nSteps\nRestart the router."
+
+
+def section_grant_block() -> dict:
+    """A Drive section grant naming the VPN guide's Status heading. The grant's ID is the
+    Doc's file ID (granted as for reads); doc_id names the same Doc for the write."""
+    return {
+        "id": DRIVE_SECTION,
+        "name": SECTION_DOC_NAME,
+        "doc_id": DRIVE_SECTION,
+        "heading": SECTION_HEADING,
+    }
+
+
+def add_section_doc(google: FakeGoogleAccounts, parent: str = DRIVE_FOLDER) -> None:
+    """The VPN guide Doc as Google would serve it: a Drive file (indexed like any Doc) plus
+    its structural model, revision 1."""
+    google.add_drive_doc(
+        DRIVE_SECTION, SECTION_DOC_NAME, [dict(p) for p in SECTION_PARAGRAPHS], parent
+    )
 
 
 def add_shared_drive_tree(google: FakeGoogleAccounts) -> None:

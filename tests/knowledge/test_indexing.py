@@ -28,6 +28,7 @@ from tests.helpers.drive import (
     DRIVE_DOC,
     DRIVE_FOLDER,
     DRIVE_SCOPE,
+    DRIVE_SECTION,
     DRIVE_SHARED,
     DRIVE_SHEET,
     drive_agents_dict,
@@ -318,7 +319,8 @@ async def test_drive_schedules_are_planned_per_tenant(existing, create, update, 
 
 async def test_a_granted_template_is_not_knowledge():
     """Fails if a granted template's boilerplate gets a nightly indexing schedule, or the
-    folder, file, shared drive and sheet granted beside it lose theirs."""
+    folder, file, shared drive, sheet and section granted beside it lose theirs (a section's
+    Doc is granted as for reads, so it is indexed)."""
     cfg = parse_agents_config(drive_grants_dict())
     client = FakeScheduleClient([])
 
@@ -326,7 +328,7 @@ async def test_a_granted_template_is_not_knowledge():
 
     assert plan.create == [
         ids.drive_index_schedule_id(TENANT, ids.drive_scope(root))
-        for root in (DRIVE_FOLDER, DRIVE_DOC, DRIVE_SHARED, DRIVE_SHEET)
+        for root in (DRIVE_FOLDER, DRIVE_DOC, DRIVE_SHARED, DRIVE_SHEET, DRIVE_SECTION)
     ]
     assert (plan.update, plan.delete) == ([], [])
 

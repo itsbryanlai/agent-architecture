@@ -42,7 +42,7 @@ from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
-from agentos.connectors.google_iam import DriveItem, GoogleError
+from agentos.connectors.google_iam import MIME_DOC, DriveItem, GoogleError
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -328,6 +328,8 @@ class WebUI:
         self.route("POST", version + "/drive/pick/choose", self.drive_pick_choose)
         self.route("GET", version + "/drive/pick/tabs", self.drive_tab_page)
         self.route("POST", version + "/drive/pick/tabs", self.drive_tab_choose)
+        self.route("GET", version + "/drive/pick/template", self.drive_template_page)
+        self.route("POST", version + "/drive/pick/template", self.drive_template_choose)
         self.route("POST", version + "/drive/remove", self.drive_remove)
         self.route("POST", version + "/test-cases", self.add_test_case)
         self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
@@ -1311,6 +1313,71 @@ class WebUI:
             await ctx.plane.add_drive_grants(
                 ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
             )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_template_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The template step: pick a granted Doc as the template and a folder as the
+        destination of the new Docs (D-49). Only Docs and shared-drive folders the account
+        sees are offered: a destination outside a shared drive cannot hold a new Doc."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        templates = [item for item in listing.items if item.mime_type == MIME_DOC]
+        folders = [item for item in listing.items if item.kind == "folder" and item.drive_id]
+        return _page(
+            "drive_template.html",
+            ctx=ctx,
+            templates=templates,
+            folders=folders,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
+        )
+
+    async def drive_template_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        # Only a position in the listing the workspace's account produced can be chosen.
+        template = next(
+            (i for i in listing.items if i.id == ctx.get("template") and i.mime_type == MIME_DOC),
+            None,
+        )
+        folder = next(
+            (
+                i
+                for i in listing.items
+                if i.id == ctx.get("folder") and i.kind == "folder" and i.drive_id
+            ),
+            None,
+        )
+        if template is None or folder is None:
+            return _message(
+                "Choose again",
+                "Pick a template Doc and a destination folder from the Drive list.",
+                409,
+                ctx,
+                back=back,
+            )
+        chosen = [
+            DriveItem(
+                id=template.id,
+                name=template.name,
+                link=template.link,
+                kind="template",
+                folder_id=folder.id,
+            )
+        ]
+        await ctx.plane.add_drive_grants(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
         return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
 
     async def drive_remove(self, request: Request, ctx: Ctx, agent_id: str, version: int):

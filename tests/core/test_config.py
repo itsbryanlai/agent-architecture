@@ -143,6 +143,21 @@ def _drive_sheet(**overrides):
     return apply
 
 
+def _drive_template(**overrides):
+    """A definition whose one Drive template grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        template = {
+            "id": "drive-template-0001",
+            "name": "Offer template",
+            "folder_id": "drive-tmpl-folder-0001",
+        }
+        template.update(overrides)
+        definition["grants"]["drive"] = {"templates": [template]}
+
+    return apply
+
+
 DB = "grants.notion.databases.0"
 BAD_DEFINITIONS = [
     # An unknown key at the top, inside a grant, and three levels down.
@@ -186,6 +201,15 @@ BAD_DEFINITIONS = [
     (_drive_sheet(columns=["c"] * 51), "at most 50 columns"),
     (_drive_sheet(columns=["c" * 201]), "at most 200 characters"),
     (_drive_sheet(colours=["name"]), "unknown field 'colours'"),
+    # A template grant names a destination folder; its blanks are a bounded list of names.
+    (_drive_template(folder_id="short"), "'folder_id' must be a Drive ID"),
+    (_drive_template(folder_id=""), "missing required field 'folder_id'"),
+    (_drive_template(blanks="name,role"), "'blanks' must be a list"),
+    (_drive_template(blanks=["name", ""]), "'blanks' must be a list of non-empty"),
+    (_drive_template(blanks=["b"] * 51), "at most 50 blanks"),
+    (_drive_template(blanks=["b" * 201]), "at most 200 characters"),
+    (_drive_template(drive_id="short"), "'drive_id' must be a Drive ID"),
+    (_drive_template(colours=["name"]), "unknown field 'colours'"),
 ]
 
 

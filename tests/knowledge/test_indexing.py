@@ -28,7 +28,10 @@ from tests.helpers.drive import (
     DRIVE_DOC,
     DRIVE_FOLDER,
     DRIVE_SCOPE,
+    DRIVE_SHARED,
+    DRIVE_SHEET,
     drive_agents_dict,
+    drive_grants_dict,
     run_drive_index,
 )
 from tests.helpers.indexing_run import SCOPE_A, run_index
@@ -311,6 +314,21 @@ async def test_drive_schedules_are_planned_per_tenant(existing, create, update, 
         action = client.schedules[create[0]].action
         assert action.workflow == "DriveIndexingWorkflow"
         assert action.args == [TENANT, DRIVE_SCOPE, DRIVE_FOLDER]
+
+
+async def test_a_granted_template_is_not_knowledge():
+    """Fails if a granted template's boilerplate gets a nightly indexing schedule, or the
+    folder, file, shared drive and sheet granted beside it lose theirs."""
+    cfg = parse_agents_config(drive_grants_dict())
+    client = FakeScheduleClient([])
+
+    plan = await apply_drive_schedules(client, cfg)
+
+    assert plan.create == [
+        ids.drive_index_schedule_id(TENANT, ids.drive_scope(root))
+        for root in (DRIVE_FOLDER, DRIVE_DOC, DRIVE_SHARED, DRIVE_SHEET)
+    ]
+    assert (plan.update, plan.delete) == ([], [])
 
 
 @pytest.mark.parametrize("mode", ["start", "schedule", "confirm-gone"])

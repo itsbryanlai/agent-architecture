@@ -29,11 +29,13 @@ MANIFEST_DIR = Path(__file__).parent / "manifests"
 
 # The kind of task that carries out a write, by the idempotency method its manifest declares:
 # an item carrying a marker property is created, a comment ending in a marker is posted, a
-# sheet row carrying developer metadata is appended.
+# sheet row carrying developer metadata is appended, a Doc carrying a marker appProperty is
+# copied from a template.
 WRITE_KINDS = {
     "marker_property": "create_item",
     "marker_text": "add_comment",
     "developer_metadata": "append_row",
+    "app_properties": "create_doc",
 }
 
 

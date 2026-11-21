@@ -344,10 +344,14 @@ def granted_drive_roots(agents: AgentsConfig) -> dict[str, DriveGrant]:
 
     Pass a config whose ``agents`` are the tenant's published set
     (``agent_store.with_published_agents``). The grant carries its kind (folder or file),
-    which the walk uses to decide whether to list children or index the one file.
+    which the walk uses to decide whether to list children or index the one file. A
+    ``template`` grant is skipped: its boilerplate is not knowledge, never indexed or
+    cited (D-49).
     """
     roots: dict[str, DriveGrant] = {}
     for agent in agents.agents.values():
         for grant in agent.grants.drive:
+            if grant.kind == "template":
+                continue
             roots.setdefault(ids.drive_scope(grant.id), grant)
     return roots

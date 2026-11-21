@@ -351,17 +351,32 @@ EDITABLE_FIELDS = {
     # draft (they differ per grant), not a fixed set here. The empty map marks append_row
     # a write kind; ``row_limits`` builds the per-column limits from the draft's columns.
     "append_row": {},
+    # A create-from-template's editable fields are the title and the template's blanks,
+    # named by the stored draft, not a fixed set here. The empty map marks create_doc a
+    # write kind; ``blank_limits`` builds the limits from the draft's blanks.
+    "create_doc": {},
 }
 
 # One cell of an appended row: the raw character cap, and the room its escaped value has
 # on the approval card (a Slack section field holds 2000 characters).
 ROW_CELL_MAX = 1000
 _ROW_CELL_ROOM = 2000
+# One blank's fill value and the new Doc's title: the same card room as a row cell, and a
+# title cap like a created item's.
+BLANK_VALUE_MAX = 1000
+DOC_TITLE_MAX = 150
 
 
 def row_limits(columns: list[str]) -> dict[str, int]:
     """The editable limits of an append draft: one cell per column of the granted sheet."""
     return {column: ROW_CELL_MAX for column in columns}
+
+
+def blank_limits(blanks: list[str]) -> dict[str, int]:
+    """The editable limits of a create-from-template draft: the new Doc's title and one
+    value per template blank. A blank named ``title`` shares the title's input: the form
+    edits the Doc's name, and that blank keeps its draft value."""
+    return {**{blank: BLANK_VALUE_MAX for blank in blanks}, "title": DOC_TITLE_MAX}
 
 
 # Room on the card for the escaped value, after the bold label above it.
@@ -381,6 +396,13 @@ def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | N
     if tool_name == "append_row":
         # A row cell is keyed by its column name, which the draft names, not a fixed field.
         limit, room = ROW_CELL_MAX, _ROW_CELL_ROOM
+    elif tool_name == "create_doc":
+        # The title is a fixed field; a blank value is keyed by its blank name, which the
+        # draft names, not a fixed field.
+        if name == "title":
+            limit, room = DOC_TITLE_MAX, _CARD_ROOM["title"]
+        else:
+            limit, room = BLANK_VALUE_MAX, _ROW_CELL_ROOM
     else:
         limit = EDITABLE_FIELDS[tool_name][name]
         room = _NUDGE_COMMENT_ROOM if tool_name == "nudge" else _CARD_ROOM[name]

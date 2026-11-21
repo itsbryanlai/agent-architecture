@@ -1411,6 +1411,11 @@ def _drafted_text(kind: str, ctx: TurnContext) -> str:
             f"Drafted the row and sent <@{ctx.requester_user_id}> an approval card. "
             "Nothing is appended until they click Submit."
         )
+    if kind == "create_doc":
+        return (
+            f"Drafted the new Doc and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is created until they click Submit."
+        )
     return (
         f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "
         "Nothing is filed until they click Submit."

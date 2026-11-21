@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Choose a template and a destination folder{% endblock %}
+{% block body %}
+<p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
+<h1>Choose a template and a destination folder</h1>
+<p>Pick a Doc shared with this workspace's Drive address as the template, and a folder inside a shared drive where the new Docs will be created. The template's <code>{{ '{{field name}}' }}</code> blanks are read when the version is submitted, and an admin approves them before the agent writes. New Docs can only be created in a shared drive folder.</p>
+{% if templates and folders %}
+<form method="post" action="{{ version_url }}/drive/pick/template">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <p>
+    <label for="template">Template Doc</label>
+    <select name="template" id="template">
+      {% for t in templates %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}
+    </select>
+  </p>
+  <p>
+    <label for="folder">Destination folder (in a shared drive)</label>
+    <select name="folder" id="folder">
+      {% for f in folders %}<option value="{{ f.id }}">{{ f.name }}</option>{% endfor %}
+    </select>
+  </p>
+  <p><button type="submit">Add to this agent</button></p>
+</form>
+{% else %}
+<p class="muted">Share a Doc and a shared-drive folder with this workspace's Drive address, then choose again.</p>
+{% endif %}
+{% endblock %}

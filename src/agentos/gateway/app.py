@@ -67,6 +67,7 @@ from agentos import ids
 from agentos.agent_store import AgentStore, startup_agent_failure
 from agentos.audit import AuditStore
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
+from agentos.connectors.drive import fill_markup_error
 from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
@@ -91,6 +92,7 @@ from agentos.models import (
     EditRequest,
     ExternalUpdate,
     NudgeRequest,
+    blank_limits,
     field_error,
     row_limits,
 )
@@ -861,6 +863,20 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
         # cell the row left out — the same set apply_edit checks against.
         row = stored.get("row", {})
         return {column: str(row.get(column, "")) for column in stored.get("columns", [])}
+    if draft.tool_name == "create_doc":
+        # A create-from-template's editable fields are the title and its draft's blanks —
+        # one input each, empty for a blank the values left out — the same set apply_edit
+        # checks against. A blank named title shares the title's input (the Doc's name).
+        values = stored.get("values", {})
+        fields = {"title": str(stored.get("title", ""))}
+        fields.update(
+            {
+                blank: str(values.get(blank, ""))
+                for blank in stored.get("blanks", [])
+                if blank != "title"
+            }
+        )
+        return fields
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -879,6 +895,8 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     """The Edit form: one input per editable field, prefilled from the draft."""
     if draft.tool_name == "append_row":
         limits = row_limits(list(fields))
+    elif draft.tool_name == "create_doc":
+        limits = blank_limits(list(fields))
     else:
         limits = EDITABLE_FIELDS[draft.tool_name]
     blocks = []
@@ -893,7 +911,9 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
                     "action_id": "value",
                     "initial_value": current,
                     "max_length": limits[name],
-                    "multiline": name in MULTILINE_FIELDS or draft.tool_name == "append_row",
+                    "multiline": name in MULTILINE_FIELDS
+                    or draft.tool_name == "append_row"
+                    or (draft.tool_name == "create_doc" and name != "title"),
                 },
             }
         )
@@ -942,12 +962,21 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         errors = {next(iter(fields), ""): "This request can no longer be edited."}
     else:
         # The workflow checks every field again; this is the same check, shown here.
+        dynamic = draft.tool_name in ("append_row", "create_doc")
+        blanks: list[str] = []
+        if draft.tool_name == "create_doc" and draft.revision and d.content is not None:
+            stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
+            blanks = list(stored.get("blanks", []))
         for name, value in fields.items():
-            # An append's empty cell clears the column; every other field needs a value.
-            if not value and draft.tool_name != "append_row":
+            # An empty cell clears the column / blank; a create's title and every other
+            # field needs a value.
+            titled = draft.tool_name == "create_doc" and name == "title"
+            if not value and (not dynamic or titled):
                 errors[name] = "This can't be empty."
-            known = draft.tool_name == "append_row" or name in EDITABLE_FIELDS[draft.tool_name]
+            known = dynamic or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):
+                errors[name] = message
+            if draft.tool_name == "create_doc" and (message := fill_markup_error(value, blanks)):
                 errors[name] = message
     if errors:
         return _form_errors(errors)

@@ -96,6 +96,7 @@ def drive_grants_dict() -> dict:
         {"id": DRIVE_SHARED, "name": "Team drive"}
     ]
     raw["agents"]["it-helper"]["grants"]["drive"]["sheets"] = [sheet_grant_block()]
+    raw["agents"]["it-helper"]["grants"]["drive"]["templates"] = [template_grant_block()]
     return raw
 
 
@@ -118,6 +119,44 @@ def add_roster_sheet(google: FakeGoogleAccounts) -> int:
     """The Roster's Q1 tab as Google would serve it: a header row and one data row, so an
     append lands at row index 2. Returns the tab's numeric sheet ID."""
     return google.add_sheet_tab(DRIVE_SHEET, SHEET_TAB, SHEET_COLUMNS, [["alice", "engineer"]])
+
+
+# The create-from-template target (D-49): a template Doc with two blanks, and a destination
+# folder inside a shared drive. A plain folder outside any shared drive is the refusal case.
+DRIVE_TEMPLATE = "drive-template-0001"
+TEMPLATE_DRIVE = "drive-tmpl-shared-0001"
+TEMPLATE_FOLDER = "drive-tmpl-folder-0001"
+TEMPLATE_PLAIN_FOLDER = "drive-tmpl-plain-0001"
+TEMPLATE_BLANKS = ["name", "role"]
+TEMPLATE_TEXT = "Dear {{name}},\nYou are hired as {{role}}."
+
+
+def template_grant_block() -> dict:
+    """A Drive template grant naming the offer template, its folder, its published blanks
+    and the shared drive the submit read for the folder."""
+    return {
+        "id": DRIVE_TEMPLATE,
+        "name": "Offer template",
+        "folder_id": TEMPLATE_FOLDER,
+        "blanks": list(TEMPLATE_BLANKS),
+        "drive_id": TEMPLATE_DRIVE,
+    }
+
+
+def add_template_tree(google: FakeGoogleAccounts) -> None:
+    """A shared drive holding the destination folder and the template Doc with its blanks.
+    The folder inherits the drive's driveId, as Google reports it; the plain folder sits in
+    My Drive (no driveId) for the publish refusal."""
+    google.add_drive_folder(TEMPLATE_DRIVE, "HR shared drive", drive_id=TEMPLATE_DRIVE)
+    google.add_drive_folder(TEMPLATE_FOLDER, "Offer letters", parent=TEMPLATE_DRIVE)
+    google.add_drive_file(
+        DRIVE_TEMPLATE,
+        "Offer template",
+        MIME_DOC,
+        TEMPLATE_DRIVE,
+        [DriveSection("", TEMPLATE_TEXT)],
+    )
+    google.add_drive_folder(TEMPLATE_PLAIN_FOLDER, "My folder")
 
 
 def add_shared_drive_tree(google: FakeGoogleAccounts) -> None:

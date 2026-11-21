@@ -38,7 +38,13 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_api import JSON
-from tests.helpers.drive import DRIVE_FOLDER, DRIVE_SHEET
+from tests.helpers.drive import (
+    DRIVE_FOLDER,
+    DRIVE_SHEET,
+    DRIVE_TEMPLATE,
+    TEMPLATE_FOLDER,
+    TEMPLATE_PLAIN_FOLDER,
+)
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
@@ -151,6 +157,8 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
         ("add_drive_folder", BASE, True),
         ("add_drive_sheet", BASE, True),
         ("sheet_changed_tab", BASE, True),
+        ("add_drive_template", BASE, True),
+        ("template_changed_folder", BASE, True),
         ("other_properties", BASE, True),
         ("none", replace(BASE, channels=("C111", "C222")), True),
         ("none", replace(BASE, dm_everyone=True), True),
@@ -164,9 +172,9 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ],
 )
 def test_which_changes_widen_access(grant_change, audience, widens):
-    """Fails if a new grant (a Drive folder or sheet included), other properties (a sheet's
-    tab included), a new channel, wider direct messages or guests do not count as widening,
-    or if a removal, a relabel or no change does."""
+    """Fails if a new grant (a Drive folder, sheet or template included), other properties
+    (a sheet's tab or a template's folder included), a new channel, wider direct messages or
+    guests do not count as widening, or if a removal, a relabel or no change does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
@@ -183,6 +191,35 @@ def test_which_changes_widen_access(grant_change, audience, widens):
         )
         new.grants.drive.append(
             DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q2", columns=("name", "role"))
+        )
+    elif grant_change == "add_drive_template":
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_FOLDER,
+                blanks=("name", "role"),
+            )
+        )
+    elif grant_change == "template_changed_folder":
+        old.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_FOLDER,
+                blanks=("name", "role"),
+            )
+        )
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_PLAIN_FOLDER,
+                blanks=("name", "role"),
+            )
         )
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"

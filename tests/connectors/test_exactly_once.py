@@ -14,7 +14,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.config import TASK_QUEUE
-from agentos.connectors.google_iam import GoogleError
+from agentos.connectors.google_iam import DriveSection, GoogleError
 from agentos.connectors.notion import comment_ref
 from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
@@ -35,10 +35,15 @@ from tests.helpers.agents import republish
 from tests.helpers.drive import (
     DRIVE_DOC,
     DRIVE_SHEET,
+    DRIVE_TEMPLATE,
     SHEET_COLUMNS,
     SHEET_TAB,
+    TEMPLATE_BLANKS,
+    TEMPLATE_FOLDER,
     add_roster_sheet,
+    add_template_tree,
     sheet_grant_block,
+    template_grant_block,
 )
 from tests.helpers.slack import slack_error
 
@@ -610,3 +615,116 @@ async def test_a_drive_append_whose_marker_lags_is_found_by_the_retry_looking_ag
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
     assert len(rows) == 3 and rows[-1] == ["bob", "people"]
     assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+# --- a Drive create-from-template (D-49) -----------------------------------------------
+
+
+async def grant_create_template(h):
+    """Publish it-helper with the offer-template grant and serve the template tree."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(templates=[template_grant_block()]),
+    )
+    add_template_tree(h.google)
+
+
+def create_doc_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_TEMPLATE,
+        "template_id": DRIVE_TEMPLATE,
+        "folder_id": TEMPLATE_FOLDER,
+        "blanks": list(TEMPLATE_BLANKS),
+        "title": "Offer for Bob",
+        "values": {"name": "Bob", "role": "engineer"},
+        "item_title": "Offer for Bob",
+        "item_url": f"https://drive.google.com/drive/folders/{TEMPLATE_FOLDER}",
+    }
+    return TaskSpec(ctx, "create_doc", payload, NONCE, tool="create_doc_from_template")
+
+
+async def test_a_drive_create_whose_copy_response_was_lost_fills_the_found_copy(dharness):
+    """Fails if the retry of a create whose copy response was lost copies a second Doc, or
+    leaves the copy an earlier attempt made unfilled."""
+    h = dharness
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-lost")
+    h.google.fail_after_write("copy")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+
+
+async def test_a_second_drive_create_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a create attempt starting while another is mid-copy copies a second Doc."""
+    h = dharness
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-overlap")
+    hang = h.google.hang_after_write("copy")
+    first = asyncio.create_task(run(h.acts.create_drive_doc, create_doc_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    item = await first
+
+    assert (await run(h.acts.create_drive_doc, create_doc_spec(), task_id)).page_id == item.page_id
+    assert len(h.google.drive_children[TEMPLATE_FOLDER]) == 1
+
+
+async def test_a_drive_create_whose_marker_lags_is_found_by_the_retry_looking_again(dharness):
+    """Fails if a retry whose appProperty search lags the copy copies a second Doc, instead
+    of looking again until the marker is visible."""
+    h = dharness
+    h.acts.visibility_interval = 0
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-lag")
+    h.google.delay_visibility(2)
+    h.google.fail_after_write("copy")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "template_text",
+    [
+        "Dear {{name}},\nYou are hired as {{role}}.",
+        "Dear {{ name }},\nYou are hired as {{ role }}.",
+    ],
+    ids=["canonical", "spaced"],
+)
+async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_the_retry(
+    dharness, template_text
+):
+    """Fails if the retry of a create whose fill response was lost fills the copy a second
+    time or copies a second Doc, or a spaced blank is left unfilled so the filled copy
+    reads as not done."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_content(DRIVE_TEMPLATE, [DriveSection("", template_text)])
+    task_id = ids.task_id(TENANT, "drive-create-fill-lost")
+    h.google.fail_after_write("fill")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+    assert len(h.google.fill_calls) == 1

@@ -13,10 +13,21 @@ granted Sheet: the appended row carries developer metadata holding the key's has
 marker lookup searches for it before a retry appends again, and the row and its marker
 land in one atomic batchUpdate. The write refuses when the draft's columns no longer match
 the live grant's (a republish since the draft) or the tab's header no longer matches the
-columns the definition froze at publish. ``resolve_item`` walks a file's parents up to
+columns the definition froze at publish. The third is ``create_doc_from_template`` (D-49),
+a create task on a granted template: the copied Doc carries an appProperty holding the key's
+hash, the marker lookup searches the destination folder for it before a retry copies again,
+and the copy carries its marker in the same request while the fill replaces every raw blank
+form with a sentinel and each sentinel with its value in one batchUpdate, so values land
+literally and a retry fills only what is left; a template with no blanks needs no fill. A
+value or title carrying a blank's form or the sentinel prefix is refused at draft and edit,
+so the passes never splice a value. The write refuses when the draft's blanks or folder no
+longer match the live grant's, or the destination folder's live shared drive is not the one
+the definition recorded at submit.
+``resolve_item`` walks a file's parents up to
 a granted root — the same walk the search re-check makes — so a file inside a granted
 folder or shared drive resolves, and one moved out of it does not; the granted root is
-matched by ID and never fetched, as a shared drive's root is not a file. The connector
+matched by ID and never fetched, as a shared drive's root is not a file. A template grant
+is copy-only: the template itself does not resolve as a comment target through it. The connector
 brings the Drive error table so a failure is classified like every other connector's.
 """
 
@@ -24,12 +35,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 
 from agentos.config import DRIVE_ID, DriveGrant
 from agentos.connectors import drive_errors
 from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import (
+    MIME_DOC,
     MIME_FOLDER,
     DriveComment,
     DriveFile,
@@ -57,11 +70,88 @@ SHEET_METADATA_KEY = "agentos-write"
 HEADER_CHANGED_TEXT = (
     "The sheet's columns changed since this agent was published; ask the creator to republish"
 )
+# The appProperty key every Doc copied from a template carries (D-49). Its value is the
+# write's idempotency key hash, so a retry finds the copy an earlier attempt made.
+DOC_APP_PROPERTY_KEY = "agentos_write"
+# The refusal when the live grant's blanks or folder no longer match the draft's, or the
+# destination folder's live shared drive is not the one the definition recorded.
+DOC_SHAPE_CHANGED_TEXT = (
+    "The template's blanks or folder changed since this agent was published; "
+    "ask the creator to republish"
+)
+# The refusal when the destination folder sits in no shared drive: the same plain words
+# the publish refuses with, so a folder moved to My Drive reads the same everywhere.
+SHARED_DRIVE_FOLDER_TEXT = (
+    "New Docs can only be created in a shared drive folder; pick a folder inside a shared drive."
+)
+# The refusal for a value or title carrying the fill's markup (D-49): the sentinel prefix
+# or a raw form of one of the template's blanks. Such a value would be spliced by the
+# fill's passes or read as an unfilled blank, so the draft and the edit refuse it.
+FILL_MARKUP_TEXT = "A value can't contain a template blank like {{name}}; write it another way."
+# A template blank: ``{{field name}}``. The name is the inner text, trimmed; duplicate
+# names collapse to one. The fill replaces every raw form found for a name, spaced or not.
+_BLANK = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 
 def sheet_marker(idem_key: str) -> str:
     """The developer metadata value marking an appended row: the whole digest of its key."""
     return hashlib.sha256(idem_key.encode()).hexdigest()
+
+
+def doc_marker(idem_key: str) -> str:
+    """The appProperty value marking a copied Doc: the whole digest of its key."""
+    return hashlib.sha256(idem_key.encode()).hexdigest()
+
+
+def template_blank_names(text: str) -> tuple[str, ...]:
+    """The distinct ``{{field name}}`` blank names in a template's text, in first-seen order."""
+    names: list[str] = []
+    for match in _BLANK.finditer(text):
+        name = match.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def template_blank_forms(text: str) -> dict[str, tuple[str, ...]]:
+    """Every raw ``{{field name}}`` form per trimmed blank name, in first-seen order: the
+    fill replaces each form the text actually writes (``{{name}}``, ``{{ name }}``, ...),
+    so detection and fill agree (D-49)."""
+    forms: dict[str, list[str]] = {}
+    for match in _BLANK.finditer(text):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        found = forms.setdefault(name, [])
+        if match.group(0) not in found:
+            found.append(match.group(0))
+    return {name: tuple(raw) for name, raw in forms.items()}
+
+
+# The prefix every fill sentinel starts with. A value carrying it is refused, so the
+# value pass only ever touches what the form pass marked.
+FILL_SENTINEL_PREFIX = "⟦agentos-fill:"
+
+
+def fill_sentinel(name: str) -> str:
+    """The unique sentinel a blank's forms are replaced with before the value pass: a hash
+    of the blank's name in mathematical brackets, a string no template writes, so it does
+    not occur in the template's text and the value pass only touches what the form pass
+    marked (D-49)."""
+    return FILL_SENTINEL_PREFIX + hashlib.sha256(name.encode()).hexdigest() + "⟧"
+
+
+def fill_markup_error(text: str, blanks: Iterable[str]) -> str | None:
+    """The refusal for a value or title carrying the fill's markup, or None: the sentinel
+    prefix, or any raw form of one of the template's blanks (``{{name}}``, ``{{ name }}``,
+    ...). The draft and the edit check it so a value lands literally and a filled copy
+    never reads as unfilled (D-49)."""
+    if FILL_SENTINEL_PREFIX in text:
+        return FILL_MARKUP_TEXT
+    for blank in blanks:
+        if re.search(r"\{\{\s*" + re.escape(blank) + r"\s*\}\}", text):
+            return FILL_MARKUP_TEXT
+    return None
 
 
 def drive_file_id(ref: str) -> str | None:
@@ -127,6 +217,21 @@ class DriveReader:
             self._email, file_id, sheet_id, row, row_index, key, value
         )
 
+    async def copy_file(
+        self, template_id: str, folder_id: str, title: str, key: str, value: str
+    ) -> DriveFile:
+        return await self._google.copy_file(self._email, template_id, folder_id, title, key, value)
+
+    async def search_app_properties(
+        self, folder_id: str, drive_id: str, key: str, value: str
+    ) -> list[DriveFile]:
+        return await self._google.search_app_properties(
+            self._email, folder_id, drive_id, key, value
+        )
+
+    async def fill_doc(self, file_id: str, replacements: list[tuple[str, str]]) -> None:
+        return await self._google.fill_doc(self._email, file_id, replacements)
+
 
 class DriveConnector:
     """Drive limited to the grants of one agent version: the comment tool, and the
@@ -154,6 +259,7 @@ class DriveConnector:
 
     def tools_for_llm(self) -> list[dict]:
         sheets = [g for g in self._grants.values() if g.kind == "sheet"]
+        templates = [g for g in self._grants.values() if g.kind == "template"]
         tools = []
         for spec in self.manifest.tools.values():
             if not spec.offer_to_llm:
@@ -163,6 +269,11 @@ class DriveConnector:
                 # description names the granted sheets and their columns (D-48).
                 if sheets:
                     tools.append(self._append_row_definition(spec, sheets))
+            elif spec.name == "create_doc_from_template":
+                # The template tool is offered only to an agent granted a template, and its
+                # description names the granted templates and their blanks (D-49).
+                if templates:
+                    tools.append(self._create_doc_definition(spec, templates))
             else:
                 tools.append(spec.llm_definition())
         return tools
@@ -176,6 +287,17 @@ class DriveConnector:
         )
         definition = spec.llm_definition()
         definition["description"] = f"{spec.description}\nGranted sheets:\n{listing}"
+        return definition
+
+    @staticmethod
+    def _create_doc_definition(spec: ToolSpec, templates: list[DriveGrant]) -> dict:
+        listing = "\n".join(
+            f'- "{g.name}" (id {g.id}): blanks '
+            + (", ".join(g.blanks) if g.blanks else "(none recorded)")
+            for g in templates
+        )
+        definition = spec.llm_definition()
+        definition["description"] = f"{spec.description}\nGranted templates:\n{listing}"
         return definition
 
     def grant_for(self, target_id: str) -> DriveGrant:
@@ -199,6 +321,63 @@ class DriveConnector:
         raise GrantDenied(
             "This agent has not been granted a Sheet by that name or ID to append to."
         )
+
+    def template_for(self, ref: str) -> DriveGrant:
+        """The granted template a name or ID names, or ``GrantDenied``. Only a template grant
+        copies a Doc; a name two granted templates share is refused: the model must use the ID."""
+        ref = (ref or "").strip()
+        matches = [
+            g for g in self._grants.values() if g.kind == "template" and ref in (g.id, g.name)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise GrantDenied(
+                f"More than one granted template is named '{ref}'; use the template's ID."
+            )
+        raise GrantDenied("This agent has not been granted a template by that name or ID to copy.")
+
+    async def check_doc_shape(self, template_id: str, blanks: list[str], folder_id: str) -> None:
+        """The write's shape check without the write (D-49), run before reconcile looks for
+        the marker: the approved blanks and folder must still be the live grant's, and the
+        folder's live shared drive the recorded one. A republish between draft and approval,
+        or a folder moved out of its shared drive, refuses here."""
+        grant = self._grants.get(template_id)
+        if grant is None or grant.kind != "template":
+            raise GrantDenied("This agent has not been granted that template to copy.")
+        if tuple(blanks) != grant.blanks or folder_id != grant.folder_id:
+            raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
+        self._check_shared_drive(grant, await self._live_file(folder_id))
+
+    def _check_shared_drive(self, grant: DriveGrant, folder: DriveFile) -> None:
+        """The destination folder as it is live: it must sit in the shared drive the
+        definition recorded at submit. A folder moved to My Drive refuses with the
+        publish's plain words; one moved to another shared drive refuses as a changed
+        shape."""
+        if not folder.drive_id:
+            raise ConnectorError(SHARED_DRIVE_FOLDER_TEXT)
+        if folder.drive_id != grant.drive_id:
+            raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
+
+    async def resolve_doc_folder(self, template_id: str, folder_id: str) -> DriveFile:
+        """The destination folder of a granted template, for the card's name and link: the
+        template grant is checked first, the folder must be the grant's, and it is read live
+        (a folder gone, trashed or not a folder raises ``UnknownItem``). Its shared drive
+        must still be the recorded one, so a folder moved since the publish refuses before
+        any card."""
+        grant = self.template_for(template_id)
+        if grant.folder_id != folder_id:
+            raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
+        try:
+            folder = await self._reader.get_file(folder_id)
+        except Exception as err:
+            if drive_errors.is_gone(err):
+                raise UnknownItem(_UNKNOWN_FILE) from err
+            raise
+        if folder.mime_type != MIME_FOLDER or folder.trashed:
+            raise UnknownItem(_UNKNOWN_FILE)
+        self._check_shared_drive(grant, folder)
+        return folder
 
     async def read_checked_sheet(self, grant: DriveGrant, *, header_only: bool = False) -> SheetTab:
         """The tab as it is now, refusing when its header no longer matches the columns the
@@ -246,8 +425,9 @@ class DriveConnector:
         parent, bounded depth): a file moved out of the granted folder does not resolve.
         A granted root is matched by ID and never fetched — a shared drive's root is
         not a file, so ``files.get`` of it would answer 404. A folder or a shared
-        drive's root is not a file to comment on. A file that is not granted, not
-        found, not shared or trashed raises the same ``UnknownItem``, so the answer
+        drive's root is not a file to comment on. A template grant is copy-only: the
+        template itself is not a comment target through it. A file that is not granted,
+        not found, not shared or trashed raises the same ``UnknownItem``, so the answer
         never reveals whether an ungranted file exists.
         """
         file_id = drive_file_id(item_ref)
@@ -257,7 +437,8 @@ class DriveConnector:
         if file.mime_type == MIME_FOLDER:
             raise UnknownItem(_UNKNOWN_FILE)
         item = NotionItem(page_id=file.id, url=file.web_view_link, title=file.name, status=None)
-        if file_id in self._grants:
+        grant = self._grants.get(file_id)
+        if grant is not None and grant.kind != "template":
             return item
         node = file
         for _ in range(MAX_WALK_DEPTH):
@@ -324,11 +505,78 @@ class DriveConnector:
             sheet_marker(idem_key),
         )
 
+    async def _find_copy(self, grant: DriveGrant, idem_key: str) -> DriveFile | None:
+        """The Doc an earlier attempt copied under ``idem_key``, if visible: the appProperty
+        search in the destination folder is the create write's marker lookup (D-49). The
+        folder is read for its shared drive, which the drive-scoped search asks for."""
+        folder = await self._reader.get_file(grant.folder_id)
+        found = await self._reader.search_app_properties(
+            grant.folder_id, folder.drive_id, DOC_APP_PROPERTY_KEY, doc_marker(idem_key)
+        )
+        return found[0] if found else None
+
+    async def find_created_doc(self, template_id: str, idem_key: str) -> NotionItem | None:
+        """The copied Doc an earlier attempt made under ``idem_key``, if it is visible AND
+        filled. A copy still carrying a blank's form or fill sentinel reads as not done, so
+        the write runs and fills what is left (a lost response between the copy and the
+        fill, or between the fill's two passes)."""
+        grant = self._grants.get(template_id)
+        if grant is None or grant.kind != "template":
+            raise GrantDenied("This agent has not been granted that template to copy.")
+        copy = await self._find_copy(grant, idem_key)
+        if copy is None:
+            return None
+        sections = await self._reader.export_file(copy.id, MIME_DOC)
+        text = "\n".join(section.text for section in sections)
+        if any(fill_sentinel(blank) in text for blank in grant.blanks):
+            return None
+        if set(template_blank_names(text)) & set(grant.blanks):
+            return None
+        return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
+
+    async def create_doc(self, template_id: str, payload: dict, idem_key: str) -> NotionItem:
+        """Copy the granted template into its shared-drive folder as the approved title,
+        marking the copy with the key's hash, then fill every blank literally.
+
+        The approved shape is the written shape: the draft's blanks and folder must still be
+        the live grant's, and the folder's live shared drive the recorded one (a republish
+        or a moved folder since the draft refuses). The copy carries its marker in the same
+        request. The fill reads the copy's text for every raw form of each blank and replaces
+        them in two passes in one batchUpdate: each form to the blank's sentinel, then each
+        sentinel to its value. The draft and the edit refuse a value carrying a blank's form
+        or the sentinel prefix, so the passes never splice a value and a retry fills only
+        what is left. A template with no blanks needs no fill: the copy is the finished Doc.
+        """
+        await self.check_doc_shape(template_id, payload["blanks"], payload["folder_id"])
+        grant = self._grants[template_id]
+        copy = await self._find_copy(grant, idem_key)
+        if copy is None:
+            copy = await self._reader.copy_file(
+                template_id,
+                grant.folder_id,
+                payload["title"],
+                DOC_APP_PROPERTY_KEY,
+                doc_marker(idem_key),
+            )
+        sections = await self._reader.export_file(copy.id, MIME_DOC)
+        forms = template_blank_forms("\n".join(section.text for section in sections))
+        replacements: list[tuple[str, str]] = []
+        for blank in payload["blanks"]:
+            for form in forms.get(blank, ()):
+                replacements.append((form, fill_sentinel(blank)))
+        for blank in payload["blanks"]:
+            replacements.append((fill_sentinel(blank), payload["values"].get(blank, "")))
+        if replacements:
+            await self._reader.fill_doc(copy.id, replacements)
+        return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
+
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:
         if kind == "add_comment":
             return await self.find_comment(target, idem_key)
         if kind == "append_row":
             return await self.find_appended_row(target, idem_key)
+        if kind == "create_doc":
+            return await self.find_created_doc(target, idem_key)
         raise ConnectorError(f"Unknown write kind '{kind}'.")
 
     async def write(
@@ -345,6 +593,8 @@ class DriveConnector:
             return await self.create_comment(target, payload["comment"], idem_key, agent_name)
         if kind == "append_row":
             return await self.append_row(target, payload, idem_key)
+        if kind == "create_doc":
+            return await self.create_doc(target, payload, idem_key)
         raise ConnectorError(f"Unknown write kind '{kind}'.")
 
     def bulk_priority(self) -> AbstractContextManager[None]:

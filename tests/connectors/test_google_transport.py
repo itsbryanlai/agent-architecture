@@ -407,7 +407,8 @@ async def test_listing_stops_at_the_first_100_items_and_says_there_are_more(depl
 
 async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(deployment_key):
     """Fails if listing stops at the first page of files, misses the shared drives the
-    account is a member of, or returns anything but names, IDs and links."""
+    account is a member of, drops the shared drive a file sits in, or returns anything but
+    names, IDs, links and shared-drive IDs."""
 
     def handler(request):
         if request.path_url.startswith("/drive/v3/files"):
@@ -434,6 +435,7 @@ async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(de
                             "id": "f1",
                             "name": "Guide",
                             "webViewLink": "https://drive.google.com/file/d/f1",
+                            "driveId": "d1",
                         }
                     ],
                     "nextPageToken": "p2",
@@ -451,16 +453,17 @@ async def test_listing_pages_files_and_shared_drives_into_names_ids_and_links(de
 
     client, sent = client_with(handler, deployment_key)
     listing = await client.list_shared(EMAIL)
-    assert [(i.id, i.name, i.link, i.kind) for i in listing.items] == [
-        ("f1", "Guide", "https://drive.google.com/file/d/f1", "file"),
-        ("f2", "Roster", "https://drive.google.com/file/d/f2", "file"),
-        ("d1", "Team drive", "https://drive.google.com/drive/folders/d1", "shared_drive"),
+    assert [(i.id, i.name, i.link, i.kind, i.drive_id) for i in listing.items] == [
+        ("f1", "Guide", "https://drive.google.com/file/d/f1", "file", "d1"),
+        ("f2", "Roster", "https://drive.google.com/file/d/f2", "file", ""),
+        ("d1", "Team drive", "https://drive.google.com/drive/folders/d1", "shared_drive", ""),
     ]
     assert listing.more is False
     files = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
     assert len(files) == 2
     assert "sharedWithMe" in files[0].path_url
     assert "includeItemsFromAllDrives=true" in files[0].path_url
+    assert "driveId" in files[0].path_url
 
 
 # --- the Drive read surface (knowledge) ---------------------------------------------------
@@ -1059,3 +1062,154 @@ async def test_list_sheet_tabs_reads_only_the_titles_with_the_tenant_token(deplo
     query = parse_qs(urlsplit(get.path_url).query)
     assert query["fields"] == ["sheets.properties.title"]
     assert "rowData" not in get.path_url
+
+
+# --- the create-from-template write surface (D-49) ---------------------------------------
+
+
+async def test_copy_sends_the_title_folder_and_marker_appproperty_in_one_request(deployment_key):
+    """Fails if the copy does not POST the title, the destination folder and the marker
+    appProperty in one files.copy with supportsAllDrives and the tenant's token, or does not
+    return the new Doc's metadata."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files/tpl1/copy"):
+            return reply(
+                request,
+                200,
+                {
+                    "id": "new1",
+                    "name": "Offer for Bob",
+                    "mimeType": MIME_DOC,
+                    "webViewLink": "https://drive/new1",
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    made = await client.copy_file(
+        EMAIL, "tpl1", "folder1", "Offer for Bob", "agentos_write", "hash"
+    )
+
+    assert (made.id, made.name, made.web_view_link) == (
+        "new1",
+        "Offer for Bob",
+        "https://drive/new1",
+    )
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url.startswith("/drive/v3/files/tpl1/copy")
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    assert "supportsAllDrives=true" in post.path_url
+    assert json.loads(post.body) == {
+        "name": "Offer for Bob",
+        "parents": ["folder1"],
+        "appProperties": {"agentos_write": "hash"},
+    }
+
+
+@pytest.mark.parametrize("found", [True, False], ids=["found", "not-found"])
+async def test_app_property_search_lists_the_folder_drive_scoped(deployment_key, found):
+    """Fails if the marker lookup does not search the destination folder for the appProperty
+    key and value, drive-scoped with supportsAllDrives and includeItemsFromAllDrives and the
+    tenant's token, or returns anything but the matching files (none when absent)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/drive/v3/files"):
+            if not found:
+                return reply(request, 200, {"files": []})
+            return reply(
+                request,
+                200,
+                {
+                    "files": [
+                        {
+                            "id": "new1",
+                            "name": "Offer for Bob",
+                            "mimeType": MIME_DOC,
+                            "webViewLink": "https://drive/new1",
+                        }
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    matches = await client.search_app_properties(
+        EMAIL, "folder1", "drive1", "agentos_write", "hash"
+    )
+
+    assert [m.id for m in matches] == (["new1"] if found else [])
+    [get] = [r for r in sent if r.path_url.startswith("/drive/v3/files")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    query = parse_qs(urlsplit(get.path_url).query)
+    assert query["corpora"] == ["drive"]
+    assert query["driveId"] == ["drive1"]
+    assert query["supportsAllDrives"] == ["true"]
+    assert query["includeItemsFromAllDrives"] == ["true"]
+    assert "'folder1' in parents" in query["q"][0]
+    assert "appProperties has { key='agentos_write' and value='hash' }" in query["q"][0]
+
+
+async def test_fill_sends_one_batchupdate_of_ordered_literal_replacements(deployment_key):
+    """Fails if the fill is not one Docs batchUpdate applying the ordered replacement pairs
+    case-sensitively and literally, in order, with the tenant's token."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url == "/v1/documents/new1:batchUpdate":
+            return reply(request, 200, {"replies": [{}, {}, {}, {}]})
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    await client.fill_doc(
+        EMAIL,
+        "new1",
+        [
+            ("{{name}}", "sentinel-name"),
+            ("{{ role }}", "sentinel-role"),
+            ("sentinel-name", "Bob"),
+            ("sentinel-role", "engineer"),
+        ],
+    )
+
+    [post] = [
+        r for r in sent if r.method == "POST" and r.path_url == "/v1/documents/new1:batchUpdate"
+    ]
+    assert post.headers["Authorization"] == "Bearer tenant-token"
+    assert json.loads(post.body) == {
+        "requests": [
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "{{name}}", "matchCase": True},
+                    "replaceText": "sentinel-name",
+                }
+            },
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "{{ role }}", "matchCase": True},
+                    "replaceText": "sentinel-role",
+                }
+            },
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "sentinel-name", "matchCase": True},
+                    "replaceText": "Bob",
+                }
+            },
+            {
+                "replaceAllText": {
+                    "containsText": {"text": "sentinel-role", "matchCase": True},
+                    "replaceText": "engineer",
+                }
+            },
+        ]
+    }

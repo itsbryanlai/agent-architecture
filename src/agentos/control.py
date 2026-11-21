@@ -182,7 +182,11 @@ from agentos.config import (
     channel_audience_problems,
     read_secret,
 )
-from agentos.connectors.drive import DriveReader, template_blank_names
+from agentos.connectors.drive import (
+    SHARED_DRIVE_FOLDER_TEXT,
+    DriveReader,
+    template_blank_names,
+)
 from agentos.connectors.google_iam import (
     MIME_DOC,
     MIME_FOLDER,
@@ -1072,17 +1076,17 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         await self._require_picked(tenant_id, agent_id, version)
-        # A sheet grant's header row and a template grant's blanks are read once here, as the
-        # definition is frozen for the admin's review, and stored as its columns / blanks
-        # (D-48, D-49): the creator names neither, and the admin approves what the agent will
-        # write. The Google reads run outside the unit of work; inside it the draft is re-read
-        # and only the columns and blanks merged, so an edit made during the reads survives,
-        # and the merged definition and the submit commit together — the hash the admin
-        # reviews covers them.
+        # A sheet grant's header row and a template grant's blanks and destination drive are
+        # read once here, as the definition is frozen for the admin's review, and stored as
+        # its columns / blanks / drive_id (D-48, D-49): the creator names none of them, and
+        # the admin approves what the agent will write. The Google reads run outside the unit
+        # of work; inside it the draft is re-read and only those fields merged, so an edit
+        # made during the reads survives, and the merged definition and the submit commit
+        # together — the hash the admin reviews covers them.
         columns = await self._sheet_columns(tenant_id, agent_id, version)
-        blanks = await self._template_blanks(tenant_id, agent_id, version)
+        template_reads = await self._template_reads(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
-            if columns is not None or blanks is not None:
+            if columns is not None or template_reads is not None:
                 fresh = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
                 if fresh is not None and fresh.status == "draft":
                     definition = agent_definition(fresh.agent())
@@ -1091,8 +1095,8 @@ class ControlPlane:
                         if columns is not None and entry["id"] in columns:
                             entry["columns"] = columns[entry["id"]]
                     for entry in drive_block.get("templates", []):
-                        if blanks is not None and entry["id"] in blanks:
-                            entry["blanks"] = blanks[entry["id"]]
+                        if template_reads is not None and entry["id"] in template_reads:
+                            entry.update(template_reads[entry["id"]])
                     await self._agents.replace_draft(
                         tenant_id, agent_id, version, definition, conn=conn
                     )
@@ -1158,16 +1162,19 @@ class ControlPlane:
             columns[grant.id] = header
         return columns
 
-    async def _template_blanks(
+    async def _template_reads(
         self, tenant_id: str, agent_id: str, version: int
-    ) -> dict[str, list[str]] | None:
-        """Each granted template's ``{{field name}}`` blanks by template ID, or None when
-        there is nothing to read (no template grant, or not a draft).
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each granted template's ``{{field name}}`` blanks and destination folder's shared
+        drive by template ID, or None when there is nothing to read (no template grant, or
+        not a draft).
 
-        Refuses when Drive is not set up or connected, or a template's text cannot be read
-        or its blanks do not fit the card and the Edit form (D-49). The read is the template's
-        text only, never the whole Drive; duplicate blank names collapse to one. The write
-        fills the blanks the definition froze here.
+        Refuses when Drive is not set up or connected, a template is not an untrashed Google
+        Doc, its text cannot be read or its blanks do not fit the card and the Edit form
+        (D-49). The reads are the template's metadata and text and the folder's metadata
+        only, never the whole Drive; duplicate blank names collapse to one. The write fills
+        the blanks the definition froze here and refuses a folder whose live shared drive is
+        not the one recorded here.
         """
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None or record.status != "draft":
@@ -1181,8 +1188,14 @@ class ControlPlane:
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
         reader = DriveReader(self._google, row.service_account_email)
-        blanks: dict[str, list[str]] = {}
+        reads: dict[str, dict[str, Any]] = {}
         for grant in templates:
+            try:
+                file = await reader.get_file(grant.id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the template '{grant.name}': {err}") from err
+            if file.mime_type != MIME_DOC or file.trashed:
+                raise ConfigError(f"template '{grant.name}' must be a Google Doc")
             try:
                 sections = await reader.export_file(grant.id, MIME_DOC)
             except GoogleError as err:
@@ -1197,14 +1210,21 @@ class ControlPlane:
                     f"a blank name of template '{grant.name}' is longer than "
                     f"{MAX_BLANK_NAME} characters"
                 )
-            blanks[grant.id] = names
-        return blanks
+            try:
+                folder = await reader.get_file(grant.folder_id)
+            except GoogleError as err:
+                raise ConfigError(
+                    f"could not read the destination folder of template '{grant.name}': {err}"
+                ) from err
+            reads[grant.id] = {"blanks": names, "drive_id": folder.drive_id}
+        return reads
 
     async def _check_template_folders(self, tenant_id: str, agent: AgentVersion) -> None:
         """Refuse a publish whose template destination folder is not in a shared drive (D-49).
 
         The pilot's service account cannot own files, so a new Doc can only be created inside
-        a shared drive: the folder's ``driveId`` must be set. A folder outside a shared drive
+        a shared drive: the folder's ``driveId`` must be set, and the grant must record the
+        shared drive the submit read (the admin reviewed it). A folder outside a shared drive
         is refused with plain words; a folder that cannot be read refuses the publish too.
         """
         templates = [g for g in agent.grants.drive if g.kind == "template"]
@@ -1226,9 +1246,11 @@ class ControlPlane:
             if folder.mime_type != MIME_FOLDER or folder.trashed:
                 raise ConfigError(f"the destination of template '{grant.name}' is not a folder")
             if not folder.drive_id:
+                raise ConfigError(SHARED_DRIVE_FOLDER_TEXT)
+            if not grant.drive_id:
                 raise ConfigError(
-                    "New Docs can only be created in a shared drive folder; pick a folder "
-                    "inside a shared drive."
+                    f"the destination of template '{grant.name}' has no shared drive recorded; "
+                    "submit the version again so it is read"
                 )
 
     async def _require_picked(

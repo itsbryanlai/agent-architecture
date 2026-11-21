@@ -132,12 +132,14 @@ TEMPLATE_TEXT = "Dear {{name}},\nYou are hired as {{role}}."
 
 
 def template_grant_block() -> dict:
-    """A Drive template grant naming the offer template, its folder and its published blanks."""
+    """A Drive template grant naming the offer template, its folder, its published blanks
+    and the shared drive the submit read for the folder."""
     return {
         "id": DRIVE_TEMPLATE,
         "name": "Offer template",
         "folder_id": TEMPLATE_FOLDER,
         "blanks": list(TEMPLATE_BLANKS),
+        "drive_id": TEMPLATE_DRIVE,
     }
 
 

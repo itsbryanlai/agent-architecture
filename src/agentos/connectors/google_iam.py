@@ -181,8 +181,8 @@ class DriveFile:
     node is a folder (walked), an exportable Doc/Sheet/Slides, or a skipped type.
     ``parents`` are the folder IDs the file sits in (``files.get`` only); the search
     re-check walks them up to the granted root. ``drive_id`` is the shared drive the file
-    sits in (``files.get`` only), empty for a file in My Drive; the template write's publish
-    check refuses a destination folder whose ``drive_id`` is empty (D-49).
+    sits in (``files.get`` only), empty for a file in My Drive; the template write's checks
+    refuse a destination folder whose ``drive_id`` is empty or not the recorded one (D-49).
     """
 
     id: str
@@ -1520,11 +1520,15 @@ class FakeGoogleAccounts:
             )
 
     def move_drive_child(self, from_parent: str, to_parent: str, child_id: str) -> None:
-        """Move a child to another folder: sharing follows the file, its parents change."""
+        """Move a child to another folder: sharing follows the file, its parents change,
+        and its driveId becomes the new folder's, as Google reports it (empty in My Drive)."""
         self.remove_drive_child(from_parent, child_id)
         self.drive_children.setdefault(to_parent, []).append(child_id)
         child = self.drive_files[child_id]
-        self.drive_files[child_id] = replace(child, parents=(*child.parents, to_parent))
+        parent = self.drive_files.get(to_parent)
+        self.drive_files[child_id] = replace(
+            child, parents=(*child.parents, to_parent), drive_id=parent.drive_id if parent else ""
+        )
 
     def add_drive_comment(self, file_id: str, content: str, mine: bool = True) -> str:
         """A comment already on a file, as Google would return it; its ID comes back.
@@ -1774,11 +1778,19 @@ class FakeGoogleAccounts:
         if template_id not in self.drive_files or folder_id not in self.drive_files:
             raise GoogleError("not_found", status=404)
         folder = self.drive_files[folder_id]
+        # The pilot's service account cannot own files: a copy into My Drive is refused,
+        # as Google refuses it for an account that can only write inside shared drives.
+        if not folder.drive_id:
+            raise GoogleError(
+                "invalid_destination",
+                "New Docs can only be created in a shared drive folder",
+                status=400,
+            )
         new_id = f"new-doc-{uuid.uuid4().hex}"
         copied = DriveFile(
             new_id,
             title,
-            MIME_DOC,
+            self.drive_files[template_id].mime_type,
             version="1",
             web_view_link=f"https://drive.google.com/file/d/{new_id}",
             parents=(folder_id,),

@@ -23,7 +23,7 @@ from tests.conftest import ALICE, TENANT, eventually
 from tests.helpers.agents import republish
 from tests.helpers.budgets import NOV
 from tests.helpers.conversation import CHANNEL, THREAD, start_stored_conversation
-from tests.helpers.drive import DRIVE_DOC
+from tests.helpers.drive import DRIVE_DOC, DRIVE_TEMPLATE, add_template_tree, template_grant_block
 
 NONCE = "nonce-drive"
 OUTSIDE_FOLDER = "other-folder-0001"
@@ -117,6 +117,25 @@ async def test_a_drive_comment_needs_a_live_grant_before_the_card_and_before_the
         assert "couldn't find a Google Drive file" in told["text"]
     assert h.google.comment_calls == []
     assert not h.google.drive_comments.get(ref, [])
+
+
+async def test_a_template_grant_does_not_make_the_template_commentable(dharness):
+    """Fails if a granted template resolves as a comment target through its template grant,
+    so a card posts for a comment on the template itself."""
+    h = dharness
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(templates=[template_grant_block()]),
+    )
+    add_template_tree(h.google)
+    handle = await start_comment_task(h, DRIVE_TEMPLATE)
+
+    assert await handle.result() == "failed"
+    assert cards(h) == []
+    assert h.google.comment_calls == []
+    [told] = thread_posts(h, "I can't comment on that file")
+    assert "folder I have access to" in told["text"]
 
 
 @pytest.mark.parametrize(

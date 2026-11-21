@@ -102,7 +102,7 @@ from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
 from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
 from agentos.connectors.base import Connector, ConnectorError, Entry
-from agentos.connectors.drive import DriveReader
+from agentos.connectors.drive import DriveReader, fill_markup_error
 from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.manifest import (
     MANIFEST_DIR,
@@ -2466,9 +2466,12 @@ class AgentActivities:
                 grant = connector.template_for(template_ref.strip())
             except ConnectorError as err:
                 return DraftOutcome(error=str(err))
-            if error := check_field(kind, "title", title.strip()):
-                return DraftOutcome(error=error)
             blanks = list(grant.blanks)
+            title_text = title.strip()
+            if error := check_field(kind, "title", title_text) or fill_markup_error(
+                title_text, blanks
+            ):
+                return DraftOutcome(error=error)
             for name in values:
                 if name not in blanks:
                     return DraftOutcome(
@@ -2487,7 +2490,7 @@ class AgentActivities:
                 text = value.strip()
                 if not text:
                     return DraftOutcome(error=f"'{blank}' needs a non-empty value.")
-                if error := check_field(kind, blank, text):
+                if error := check_field(kind, blank, text) or fill_markup_error(text, blanks):
                     return DraftOutcome(error=error)
                 clean_values[blank] = text
             # Frozen here: the card shows this title and these values, and the task copies
@@ -2570,7 +2573,12 @@ class AgentActivities:
                 if not text and spec.tool_name == "create_doc" and key == "title":
                     log.warning("ignored edit: the title is empty tenant_id=%s", ctx.tenant_id)
                     return False
-                if text and check_field(spec.tool_name, key, text):
+                error = check_field(spec.tool_name, key, text) if text else None
+                if error is None and text and spec.tool_name == "create_doc":
+                    # A value carrying the fill's markup would be spliced by the fill or
+                    # read as an unfilled blank; the draft refuses it, so does the edit.
+                    error = fill_markup_error(text, current.get("blanks", []))
+                if error:
                     log.warning(
                         "ignored edit: invalid value for a field tenant_id=%s", ctx.tenant_id
                     )
@@ -2747,8 +2755,9 @@ class AgentActivities:
         The connector is the tool's manifest connector (Drive's ``create_doc_from_template``).
         The gate, the lease and the look-before-write are the other writes'; the marker is an
         appProperty on the copied Doc, and the write checks the draft's blanks and folder still
-        match the live grant's so a republish since the draft refuses with nothing written. A
-        task with a stored draft gets back the page ID only: the title and link are content.
+        match the live grant's and the folder still sits in its recorded shared drive, so a
+        republish or a moved folder since the draft refuses before this attempt copies. A task
+        with a stored draft gets back the page ID only: the title and link are content.
         """
         ctx = spec.ctx
         idem_key = f"{task_id}:create"
@@ -2946,7 +2955,8 @@ class AgentActivities:
         """The create-from-template counterpart of ``reconcile_sheet_append`` (D-49): the
         copied Doc, or None for "not seen". Reads only, one look, the tool's connector. The
         write's shape check runs first: a draft whose blanks or folder no longer match the
-        live grant refuses, and the task says it could not confirm."""
+        live grant, or whose folder left its recorded shared drive, refuses, and the task
+        says it could not confirm."""
         ctx = spec.ctx
         await self._gate(
             ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
@@ -2960,9 +2970,10 @@ class AgentActivities:
         ref = await self.writes.result(ctx.tenant_id, idem_key)
         item = _item_from_ref(ref) if ref is not None else None
         if item is None:
-            # The approved shape must still hold: a republish since the draft stops the
-            # look, which the task reads as "not confirmed", never as "nothing created".
-            connector.check_doc_shape(page_id, payload["blanks"], payload["folder_id"])
+            # The approved shape must still hold: a republish since the draft, or a folder
+            # moved out of its shared drive, stops the look, which the task reads as "not
+            # confirmed", never as "nothing created".
+            await connector.check_doc_shape(page_id, payload["blanks"], payload["folder_id"])
             item = cast(
                 NotionItem | None, await connector.find_write("create_doc", page_id, idem_key)
             )

@@ -409,18 +409,21 @@ class DriveGrant:
 
     A folder grants everything under it (recursively); a file grants just that file; a
     shared drive grants everything in it, walked from its root. Each grant is one scope
-    that searches are filtered by. ``kind`` is ``folder``, ``file``, ``shared_drive`` or
-    ``sheet``.
+    that searches are filtered by. ``kind`` is ``folder``, ``file``, ``shared_drive``,
+    ``sheet`` or ``template``.
 
     A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
     ``columns`` is its header row, read once when the version is submitted and frozen
     into the definition. The write refuses when the live header no longer matches.
 
     A ``template`` is a granted Doc the agent may copy into a new Doc: ``id`` is the
-    template's file ID, ``folder_id`` the shared-drive folder new Docs land in, and
-    ``blanks`` the template's ``{{field name}}`` placeholders, read once when the version
-    is submitted and frozen into the definition. The write refuses when the live grant's
-    blanks or folder no longer match the draft's.
+    template's file ID, ``folder_id`` the shared-drive folder new Docs land in,
+    ``drive_id`` the shared drive that folder sits in, and ``blanks`` the template's
+    ``{{field name}}`` placeholders. The blanks and the drive ID are read once when the
+    version is submitted and frozen into the definition. The write refuses when the live
+    grant's blanks or folder no longer match the draft's, or the folder's live shared
+    drive is not the recorded one. A template grant is copy-only: it is not a read or
+    comment target.
     """
 
     id: str
@@ -430,6 +433,7 @@ class DriveGrant:
     columns: tuple[str, ...] = ()
     folder_id: str = ""
     blanks: tuple[str, ...] = ()
+    drive_id: str = ""
 
 
 @dataclass
@@ -616,7 +620,7 @@ _PAGE_KEYS = frozenset({"id", "name"})
 _DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
 _DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
-_DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks"})
+_DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks", "drive_id"})
 DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template")
 # A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
 # The connector's link parser uses the same shape, so a grant and a resolved link agree.
@@ -821,12 +825,22 @@ def _parse_drive_template(agent_id: str, raw: dict[str, Any], index: int = 0) ->
         if any(len(b) > MAX_BLANK_NAME for b in blanks_raw):
             raise ConfigError(f"{where}: a blank name may be at most {MAX_BLANK_NAME} characters")
         blanks = tuple(blanks_raw)
+    # The shared drive the destination folder sits in, read at submit; empty until then
+    # (or for a folder outside any shared drive, which the publish refuses).
+    drive_id = raw.get("drive_id", "")
+    if not isinstance(drive_id, str):
+        raise ConfigError(f"{where}: 'drive_id' must be text")
+    if drive_id and not DRIVE_ID.fullmatch(drive_id):
+        raise ConfigError(
+            f"{where}: 'drive_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
     return DriveGrant(
         id=grant_id,
         name=_text(where, "name", _require(raw, "name", where)),
         kind="template",
         folder_id=folder_id,
         blanks=blanks,
+        drive_id=drive_id,
     )
 
 
@@ -991,6 +1005,8 @@ def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
         entry["folder_id"] = grant.folder_id
         if grant.blanks:
             entry["blanks"] = list(grant.blanks)
+        if grant.drive_id:
+            entry["drive_id"] = grant.drive_id
     return entry
 
 

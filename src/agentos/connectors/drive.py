@@ -18,12 +18,16 @@ a create task on a granted template: the copied Doc carries an appProperty holdi
 hash, the marker lookup searches the destination folder for it before a retry copies again,
 and the copy carries its marker in the same request while the fill replaces every raw blank
 form with a sentinel and each sentinel with its value in one batchUpdate, so values land
-literally and a retry fills only what is left. The write refuses when the draft's blanks or
-folder no longer match the live grant's.
+literally and a retry fills only what is left; a template with no blanks needs no fill. A
+value or title carrying a blank's form or the sentinel prefix is refused at draft and edit,
+so the passes never splice a value. The write refuses when the draft's blanks or folder no
+longer match the live grant's, or the destination folder's live shared drive is not the one
+the definition recorded at submit.
 ``resolve_item`` walks a file's parents up to
 a granted root — the same walk the search re-check makes — so a file inside a granted
 folder or shared drive resolves, and one moved out of it does not; the granted root is
-matched by ID and never fetched, as a shared drive's root is not a file. The connector
+matched by ID and never fetched, as a shared drive's root is not a file. A template grant
+is copy-only: the template itself does not resolve as a comment target through it. The connector
 brings the Drive error table so a failure is classified like every other connector's.
 """
 
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 
 from agentos.config import DRIVE_ID, DriveGrant
@@ -68,11 +73,21 @@ HEADER_CHANGED_TEXT = (
 # The appProperty key every Doc copied from a template carries (D-49). Its value is the
 # write's idempotency key hash, so a retry finds the copy an earlier attempt made.
 DOC_APP_PROPERTY_KEY = "agentos_write"
-# The refusal when the live grant's blanks or folder no longer match the draft's.
+# The refusal when the live grant's blanks or folder no longer match the draft's, or the
+# destination folder's live shared drive is not the one the definition recorded.
 DOC_SHAPE_CHANGED_TEXT = (
     "The template's blanks or folder changed since this agent was published; "
     "ask the creator to republish"
 )
+# The refusal when the destination folder sits in no shared drive: the same plain words
+# the publish refuses with, so a folder moved to My Drive reads the same everywhere.
+SHARED_DRIVE_FOLDER_TEXT = (
+    "New Docs can only be created in a shared drive folder; pick a folder inside a shared drive."
+)
+# The refusal for a value or title carrying the fill's markup (D-49): the sentinel prefix
+# or a raw form of one of the template's blanks. Such a value would be spliced by the
+# fill's passes or read as an unfilled blank, so the draft and the edit refuse it.
+FILL_MARKUP_TEXT = "A value can't contain a template blank like {{name}}; write it another way."
 # A template blank: ``{{field name}}``. The name is the inner text, trimmed; duplicate
 # names collapse to one. The fill replaces every raw form found for a name, spaced or not.
 _BLANK = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -113,12 +128,30 @@ def template_blank_forms(text: str) -> dict[str, tuple[str, ...]]:
     return {name: tuple(raw) for name, raw in forms.items()}
 
 
+# The prefix every fill sentinel starts with. A value carrying it is refused, so the
+# value pass only ever touches what the form pass marked.
+FILL_SENTINEL_PREFIX = "⟦agentos-fill:"
+
+
 def fill_sentinel(name: str) -> str:
     """The unique sentinel a blank's forms are replaced with before the value pass: a hash
     of the blank's name in mathematical brackets, a string no template writes, so it does
     not occur in the template's text and the value pass only touches what the form pass
     marked (D-49)."""
-    return "⟦agentos-fill:" + hashlib.sha256(name.encode()).hexdigest() + "⟧"
+    return FILL_SENTINEL_PREFIX + hashlib.sha256(name.encode()).hexdigest() + "⟧"
+
+
+def fill_markup_error(text: str, blanks: Iterable[str]) -> str | None:
+    """The refusal for a value or title carrying the fill's markup, or None: the sentinel
+    prefix, or any raw form of one of the template's blanks (``{{name}}``, ``{{ name }}``,
+    ...). The draft and the edit check it so a value lands literally and a filled copy
+    never reads as unfilled (D-49)."""
+    if FILL_SENTINEL_PREFIX in text:
+        return FILL_MARKUP_TEXT
+    for blank in blanks:
+        if re.search(r"\{\{\s*" + re.escape(blank) + r"\s*\}\}", text):
+            return FILL_MARKUP_TEXT
+    return None
 
 
 def drive_file_id(ref: str) -> str | None:
@@ -304,20 +337,34 @@ class DriveConnector:
             )
         raise GrantDenied("This agent has not been granted a template by that name or ID to copy.")
 
-    def check_doc_shape(self, template_id: str, blanks: list[str], folder_id: str) -> None:
+    async def check_doc_shape(self, template_id: str, blanks: list[str], folder_id: str) -> None:
         """The write's shape check without the write (D-49), run before reconcile looks for
-        the marker: the approved blanks and folder must still be the live grant's. A republish
-        between draft and approval refuses here."""
+        the marker: the approved blanks and folder must still be the live grant's, and the
+        folder's live shared drive the recorded one. A republish between draft and approval,
+        or a folder moved out of its shared drive, refuses here."""
         grant = self._grants.get(template_id)
         if grant is None or grant.kind != "template":
             raise GrantDenied("This agent has not been granted that template to copy.")
         if tuple(blanks) != grant.blanks or folder_id != grant.folder_id:
             raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
+        self._check_shared_drive(grant, await self._live_file(folder_id))
+
+    def _check_shared_drive(self, grant: DriveGrant, folder: DriveFile) -> None:
+        """The destination folder as it is live: it must sit in the shared drive the
+        definition recorded at submit. A folder moved to My Drive refuses with the
+        publish's plain words; one moved to another shared drive refuses as a changed
+        shape."""
+        if not folder.drive_id:
+            raise ConnectorError(SHARED_DRIVE_FOLDER_TEXT)
+        if folder.drive_id != grant.drive_id:
+            raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
 
     async def resolve_doc_folder(self, template_id: str, folder_id: str) -> DriveFile:
         """The destination folder of a granted template, for the card's name and link: the
         template grant is checked first, the folder must be the grant's, and it is read live
-        (a folder gone, trashed or not a folder raises ``UnknownItem``)."""
+        (a folder gone, trashed or not a folder raises ``UnknownItem``). Its shared drive
+        must still be the recorded one, so a folder moved since the publish refuses before
+        any card."""
         grant = self.template_for(template_id)
         if grant.folder_id != folder_id:
             raise ConnectorError(DOC_SHAPE_CHANGED_TEXT)
@@ -329,6 +376,7 @@ class DriveConnector:
             raise
         if folder.mime_type != MIME_FOLDER or folder.trashed:
             raise UnknownItem(_UNKNOWN_FILE)
+        self._check_shared_drive(grant, folder)
         return folder
 
     async def read_checked_sheet(self, grant: DriveGrant, *, header_only: bool = False) -> SheetTab:
@@ -377,8 +425,9 @@ class DriveConnector:
         parent, bounded depth): a file moved out of the granted folder does not resolve.
         A granted root is matched by ID and never fetched — a shared drive's root is
         not a file, so ``files.get`` of it would answer 404. A folder or a shared
-        drive's root is not a file to comment on. A file that is not granted, not
-        found, not shared or trashed raises the same ``UnknownItem``, so the answer
+        drive's root is not a file to comment on. A template grant is copy-only: the
+        template itself is not a comment target through it. A file that is not granted,
+        not found, not shared or trashed raises the same ``UnknownItem``, so the answer
         never reveals whether an ungranted file exists.
         """
         file_id = drive_file_id(item_ref)
@@ -388,7 +437,8 @@ class DriveConnector:
         if file.mime_type == MIME_FOLDER:
             raise UnknownItem(_UNKNOWN_FILE)
         item = NotionItem(page_id=file.id, url=file.web_view_link, title=file.name, status=None)
-        if file_id in self._grants:
+        grant = self._grants.get(file_id)
+        if grant is not None and grant.kind != "template":
             return item
         node = file
         for _ in range(MAX_WALK_DEPTH):
@@ -489,13 +539,15 @@ class DriveConnector:
         marking the copy with the key's hash, then fill every blank literally.
 
         The approved shape is the written shape: the draft's blanks and folder must still be
-        the live grant's (a republish since the draft refuses). The copy carries its marker in
-        the same request. The fill reads the copy's text for every raw form of each blank and
-        replaces them in two passes in one batchUpdate: each form to the blank's sentinel,
-        then each sentinel to its value — so a value containing another blank's placeholder
-        is kept exactly, and a retry fills only what is left.
+        the live grant's, and the folder's live shared drive the recorded one (a republish
+        or a moved folder since the draft refuses). The copy carries its marker in the same
+        request. The fill reads the copy's text for every raw form of each blank and replaces
+        them in two passes in one batchUpdate: each form to the blank's sentinel, then each
+        sentinel to its value. The draft and the edit refuse a value carrying a blank's form
+        or the sentinel prefix, so the passes never splice a value and a retry fills only
+        what is left. A template with no blanks needs no fill: the copy is the finished Doc.
         """
-        self.check_doc_shape(template_id, payload["blanks"], payload["folder_id"])
+        await self.check_doc_shape(template_id, payload["blanks"], payload["folder_id"])
         grant = self._grants[template_id]
         copy = await self._find_copy(grant, idem_key)
         if copy is None:
@@ -514,7 +566,8 @@ class DriveConnector:
                 replacements.append((form, fill_sentinel(blank)))
         for blank in payload["blanks"]:
             replacements.append((fill_sentinel(blank), payload["values"].get(blank, "")))
-        await self._reader.fill_doc(copy.id, replacements)
+        if replacements:
+            await self._reader.fill_doc(copy.id, replacements)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:

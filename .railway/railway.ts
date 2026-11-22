@@ -124,6 +124,9 @@ export default defineRailway(() => {
       QWEN_BASE_URL: "${{shared.QWEN_BASE_URL}}",
       SLACK_BOT_TOKEN: "${{shared.SLACK_BOT_TOKEN}}",
       NOTION_TOKEN: "${{shared.NOTION_TOKEN}}",
+      // Drive (D-45): the worker mints the tenant accounts' tokens with this.
+      GOOGLE_PROJECT_ID: "${{shared.GOOGLE_PROJECT_ID}}",
+      GOOGLE_SERVICE_ACCOUNT_KEY: "${{shared.GOOGLE_SERVICE_ACCOUNT_KEY}}",
     },
   });
 
@@ -156,6 +159,9 @@ export default defineRailway(() => {
       // Optional local override; leave unset so the token lives in the
       // database (docs/operations.md, Notion webhook).
       NOTION_WEBHOOK_VERIFICATION_TOKEN: preserve(),
+      // Drive (D-45): the gateway deletes the tenant's account on uninstall.
+      GOOGLE_PROJECT_ID: "${{shared.GOOGLE_PROJECT_ID}}",
+      GOOGLE_SERVICE_ACCOUNT_KEY: "${{shared.GOOGLE_SERVICE_ACCOUNT_KEY}}",
     },
   });
 
@@ -191,6 +197,9 @@ export default defineRailway(() => {
       // Optional: the "Choose from Notion" grant picker.
       NOTION_OAUTH_CLIENT_ID: "${{shared.NOTION_OAUTH_CLIENT_ID}}",
       NOTION_OAUTH_CLIENT_SECRET: "${{shared.NOTION_OAUTH_CLIENT_SECRET}}",
+      // Drive (D-45): Connect Google Drive creates the tenant's account with this.
+      GOOGLE_PROJECT_ID: "${{shared.GOOGLE_PROJECT_ID}}",
+      GOOGLE_SERVICE_ACCOUNT_KEY: "${{shared.GOOGLE_SERVICE_ACCOUNT_KEY}}",
     },
   });
 

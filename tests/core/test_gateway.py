@@ -1,19 +1,27 @@
 import json
 import secrets
 from dataclasses import replace
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import pytest
+import pytest_asyncio
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
 from agentos import ids
+from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
+from agentos.connectors.google_iam import FakeGoogleAccounts, GoogleError
+from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.slack_client import FakeSlack
 from agentos.slack_install import installed_tenant_secrets
 from agentos.stores import InMemoryTaskLinkStore
+from agentos.tenant_store import InMemoryTenantStore, TenantDirectory
+from agentos.unit_of_work import InMemoryUnitOfWork
 from tests.conftest import ALICE, TEAM, TENANT
 from tests.helpers.gateway import (
     FakeTemporalClient,
@@ -23,6 +31,7 @@ from tests.helpers.gateway import (
     signed_headers,
     stored_text,
 )
+from tests.helpers.keys import RefreshableKeyStore
 
 
 @pytest.fixture
@@ -220,3 +229,158 @@ async def test_a_tenant_with_no_agent_gets_one_fixed_not_set_up_reply(
     )
     assert (post["channel"], post["thread_ts"]) == ("D123", "1700000000.000200")
     assert [c["arg"].tenant_id for c in temporal.signal_with_starts] == [TENANT]
+
+
+# --- uninstall --------------------------------------------------------------------
+
+UNINSTALL_TOKEN = "xoxb-made-up-uninstall"
+REINSTALL_TOKEN = "xoxb-made-up-reinstall"
+NOTION_TOKEN = "ntn-made-up-kept"
+
+
+@pytest_asyncio.fixture
+async def uninstall_gateway(agents, temporal, secret):
+    """A gateway with the uninstall flow's stores, a tenant holding both credentials
+    and a connected Drive account."""
+    store = InMemoryTenantStore(agents)
+    credential_store = InMemoryCredentialStore()
+    key = secrets.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credentials = TenantCredentials(credential_store, keys)
+    await credentials.store_secret(TENANT, SLACK_BOT, UNINSTALL_TOKEN, 1, key)
+    await credentials.store_secret(TENANT, NOTION, NOTION_TOKEN, 1, key)
+    drive = InMemoryDriveConnectionStore()
+    google = FakeGoogleAccounts()
+    account_id = ids.drive_account_id(TENANT)
+    await google.ensure_account(account_id)
+    await drive.connect(TENANT, google.account_email(account_id), datetime(2026, 1, 1, tzinfo=UTC))
+    audit = InMemoryAuditStore()
+    app = create_app(
+        Settings(),
+        TenantDirectory(store),
+        temporal,
+        InMemoryTaskLinkStore(),
+        SignatureVerifier(secret),
+        tenant_store=store,
+        credentials=credentials,
+        audit=audit,
+        uow=InMemoryUnitOfWork(store, credential_store, audit, drive),
+        drive=drive,
+        google=google,
+    )
+    return TestClient(app), store, credential_store, audit, credentials, drive, google
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "app_uninstalled",
+        "tokens_revoked bot",
+        "repeat and out of order",
+        "late retry after reinstall",
+        "unknown team",
+        "oauth only",
+        "drive delete fails",
+        "no drive row",
+    ],
+    ids=[
+        "app-uninstalled",
+        "tokens-revoked",
+        "repeat",
+        "late-retry-after-reinstall",
+        "unknown-team",
+        "oauth-only",
+        "drive-delete-fails",
+        "no-drive-row",
+    ],
+)
+async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
+    """Fails if an uninstall event leaves the tenant enabled, its Slack token stored, its
+    Notion token deleted or its Drive account and row kept, a repeat or out-of-order event
+    audits again, a late retry of a processed event disables a reinstalled tenant or deletes
+    its fresh token, an unknown team or a user-token-only revocation is acted on, a
+    refused Google delete blocks the uninstall, or an account with no Drive row is kept."""
+    client, store, credential_store, audit, credentials, drive, google = uninstall_gateway
+    uninstall = {"type": "app_uninstalled"}
+    revoked_bot = {"type": "tokens_revoked", "tokens": {"oauth": [], "bot": [UNINSTALL_TOKEN]}}
+    revoked_oauth = {
+        "type": "tokens_revoked",
+        "tokens": {"oauth": ["xoxp-made-up-user"], "bot": []},
+    }
+    payloads = {
+        "app_uninstalled": [(TEAM, "EvU1", uninstall)],
+        "tokens_revoked bot": [(TEAM, "EvU1", revoked_bot)],
+        "repeat and out of order": [(TEAM, "EvU1", uninstall), (TEAM, "EvU2", revoked_bot)],
+        "late retry after reinstall": [(TEAM, "EvU1", uninstall)],
+        "unknown team": [("T_OTHER", "EvU1", uninstall)],
+        "oauth only": [(TEAM, "EvU1", revoked_oauth)],
+        "drive delete fails": [(TEAM, "EvU1", uninstall)],
+        "no drive row": [(TEAM, "EvU1", uninstall)],
+    }[case]
+    if case == "drive delete fails":
+        google.fail_next_delete(GoogleError("unavailable"))
+    if case == "no drive row":
+        # The account exists at Google with no row naming it: the uninstall still
+        # deletes it, by the derived ID.
+        await drive.delete(TENANT)
+    for team, event_id, event in payloads:
+        payload = {"type": "event_callback", "team_id": team, "event_id": event_id, "event": event}
+        assert post_event(client, secret, payload).status_code == 200
+    if case == "late retry after reinstall":
+        # A reinstall re-enables the tenant and stores a fresh token; then Slack delivers
+        # the same uninstall event again, late.
+        await store.set_enabled(TENANT, True)
+        await credentials.store_with_current_key(TENANT, SLACK_BOT, REINSTALL_TOKEN)
+        payload = {
+            "type": "event_callback",
+            "team_id": TEAM,
+            "event_id": "EvU1",
+            "event": uninstall,
+        }
+        assert post_event(client, secret, payload).status_code == 200
+    # The settle: a relay pass finds nothing to deliver, and no workflow was started.
+    assert await deliver_inbound(client.app) == 0
+    assert temporal.signal_with_starts == []
+
+    ref = await store.ref_for_slack_team(TEAM)
+    if case in ("unknown team", "oauth only"):
+        assert ref.enabled is True
+        assert await credential_store.get(TENANT, SLACK_BOT) is not None
+        assert audit.events == []
+        assert await drive.get(TENANT) is not None
+        assert google.accounts == {
+            ids.drive_account_id(TENANT): google.account_email(ids.drive_account_id(TENANT))
+        }
+        return
+    if case == "late retry after reinstall":
+        assert ref.enabled is True
+        row = await store.load(TENANT)
+        assert await credentials.slack_bot_token(row.config) == REINSTALL_TOKEN
+        assert await credential_store.get(TENANT, NOTION) is not None
+        assert [(e.kind, e.tool) for e in audit.events] == [("uninstall", "app_uninstalled")]
+        assert await drive.get(TENANT) is None
+        assert google.accounts == {}
+        return
+    assert ref.enabled is False
+    assert await credential_store.get(TENANT, SLACK_BOT) is None
+    assert await credential_store.get(TENANT, NOTION) is not None
+    assert await drive.get(TENANT) is None
+    if case == "drive delete fails":
+        # The uninstall stands; the account is left at Google, logged, and a reconnect
+        # finds it again by its deterministic ID.
+        assert google.accounts == {
+            ids.drive_account_id(TENANT): google.account_email(ids.drive_account_id(TENANT))
+        }
+    else:
+        assert google.accounts == {}
+    assert len(audit.events) == 1
+    recorded = audit.events[0]
+    assert (recorded.kind, recorded.tool, recorded.target, recorded.identity) == (
+        "uninstall",
+        "tokens_revoked" if case == "tokens_revoked bot" else "app_uninstalled",
+        TEAM,
+        "system:uninstall",
+    )
+    assert recorded.agent_id is None
+    assert UNINSTALL_TOKEN not in repr(recorded)

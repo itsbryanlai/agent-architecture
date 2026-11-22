@@ -10,11 +10,14 @@ from agentos.audience import AudienceCheckUnavailable, AudienceError
 from agentos.audience_pauses import NotPaused
 from agentos.budgets import BudgetError, BudgetNotFound, InvalidBudget
 from agentos.config import ConfigError
+from agentos.connectors.google_iam import GoogleError
 from agentos.control import Forbidden
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
 from agentos.members import InvalidMember, MemberError, MemberNotFound
+from agentos.notion_webhook import WebhookTokenError
 from agentos.switches import InvalidSwitch, SwitchError
+from agentos.test_sets import TestSetError
 
 STATUS_BY_ERROR: dict[type[Exception], int] = {
     Forbidden: 403,
@@ -31,11 +34,14 @@ STATUS_BY_ERROR: dict[type[Exception], int] = {
     ConfigError: 422,
     GrantProblems: 409,
     GrantCheckUnavailable: 502,
+    GoogleError: 502,
     AudienceError: 409,
     AudienceCheckUnavailable: 502,
     NotPaused: 409,
+    WebhookTokenError: 409,
     WideningNotAcknowledged: 409,
     GrantNotPicked: 409,
+    TestSetError: 409,
 }
 
 REFUSALS = tuple(STATUS_BY_ERROR)

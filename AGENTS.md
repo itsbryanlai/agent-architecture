@@ -25,8 +25,9 @@ An option that fails either criterion is named as such, with the cost of meeting
 - Identity comes from the runtime, never from the LLM.
 - Temporal history carries references and small values, never chat or document
   content.
-- Writes never run without approval from the requester; what was approved is
-  exactly what runs; every external write is idempotent.
+- Writes never run without approval from the requester, unless an admin turned
+  approval off for that low-risk action; what was approved, or what the policy
+  allowed, is exactly what runs; every external write is idempotent.
 - Every workflow ID, row and log line carries the tenant ID. IDs are built only in
   `src/agentos/ids.py`.
 - Temporal workflow code stays deterministic: `workflow.now()`,

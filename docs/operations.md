@@ -2,7 +2,7 @@
 
 How to set up, configure and run the system. What the system does is in [architecture.md](architecture.md); the first-run summary is in the [README](../README.md); what is built is in [status.md](status.md).
 
-Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Payload keys on a host without files](#payload-keys-on-a-host-without-files) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
+Contents: [Setup](#setup) · [Notion webhook](#notion-webhook-optional) · [Front door and channels](#front-door-and-channels) · [Several tenants](#several-tenants) · [Tenants in the database](#tenants-in-the-database) · [Encrypted workflow data](#encrypted-workflow-data) · [Payload keys on a host without files](#payload-keys-on-a-host-without-files) · [Model provider](#model-provider) · [Usage and cost](#usage-and-cost) · [Monthly budgets](#monthly-budgets) · [Kill switches](#kill-switches) · [Database and migrations](#database-and-migrations) · [Connections and concurrency](#connections-and-concurrency) · [Retention](#retention) · [Creator access](#creator-access) · [Run](#run) · [Tests](#tests) · [Knowledge](#knowledge-indexing-and-search) · [Agents in the database](#agents-in-the-database) · [Members and roles](#members-and-roles) · [Audit log](#audit-log) · [Control-plane API](#control-plane-api) · [Agent audiences](#agent-audiences) · [Web console](#web-console) · [Slack tunnel](#slack-tunnel-and-live-checks)
 
 Prerequisites: [uv](https://docs.astral.sh/uv/) (it installs Python 3.12 for you), Docker with Docker Compose, a tunnel tool (`cloudflared` or `ngrok`), a Slack workspace where you can create apps, a Notion workspace where you can create integrations, and an Anthropic API key (or Qwen, see Model provider).
 
@@ -103,8 +103,10 @@ signature it cannot check, so set it up in this order:
    token with the tenant's payload key and stores it in the database as
    **pending**, and logs that a token is pending (never the token). While a
    token is pending or active a second handshake gets 409 and changes nothing.
-3. Print the pending token once, paste it into the Notion integration to finish
-   subscribing, then confirm it:
+3. Show the pending token once, paste it into the Notion integration to finish
+   subscribing, then confirm it. In the console (an admin): **Settings → Notion
+   webhook verification → Reveal token**, Copy, paste into Notion's verify box,
+   then **Confirm**. The command line does the same:
 
    ```bash
    uv run python -m agentos.notion_webhook show --tenant <tenant_id>
@@ -112,13 +114,16 @@ signature it cannot check, so set it up in this order:
    ```
 
    Only a **confirmed** (active) token accepts events; a pending one never does.
-   Each command is audited as the operator (`operator:<OS login>`), and the
-   audit row never holds the token. `show` refuses once the token is confirmed.
-   The command reads the tenant's payload key from the same key source as the
-   gateway (`AGENTOS_KEY_SOURCE`), so run it where those keys are available.
+   Each step is audited — as the signed-in user (`user:<Slack ID>`) from the
+   console, as the operator (`operator:<OS login>`) from the command — and the
+   audit row never holds the token. `show` (Reveal) refuses once the token is
+   confirmed. The command reads the tenant's payload key from the same key
+   source as the gateway (`AGENTOS_KEY_SOURCE`), so run it where those keys are
+   available; the console uses its own.
 
 To re-subscribe (a new subscription sends a new token), clear the stored token
-first, then let the new handshake arrive:
+first (**Clear** on the settings page, or the command), then let the new
+handshake arrive:
 
 ```bash
 uv run python -m agentos.notion_webhook clear --tenant <tenant_id>
@@ -260,16 +265,27 @@ uv run python -m agentos.tenant_store import
   token and its Notion client when it has a Notion token (a tenant whose Slack
   token is unavailable or whose payload key is unusable is skipped and logged
   once, and tried again on the next pass; a tenant with no Notion token is
-  served Slack-only). An activity for a tenant the worker does not know yet is
+  served Slack-only). The new tenant's published agents' grants are checked by
+  the health refresh once it is served; a broken grant disables that agent, not
+  the tenant or the worker (see [Run](#what-stops-start-up-and-what-only-disables-an-agent)).
+  An activity for a tenant the worker does not know yet is
   retried, not failed: the shared retry policy (5 attempts, 1 s doubling to
   8 s, about 15 s) outlasts the 5 s refresh. A **disabled**
   tenant is dropped within that time: the gateway answers nothing for it, the
   worker no longer runs its activities, and the console refuses its sign-ins
   and sessions. Re-enabling it brings it back the same way.
-- A tenant's index schedules are still created by `index_knowledge --schedule`,
-  which you run after adding a tenant. The worker decides at start-up whether
-  it runs the indexing workflows (some published agent has a page grant), so
-  restart it once when a deployment's first page grant is published.
+- A tenant's nightly schedules are automatic (D-42): the worker ensures every
+  served tenant's index schedules (03:00 UTC, one per granted scope), retention
+  schedule (04:00 UTC) and creator-access schedule (05:00 UTC) at start-up, and
+  on its 5-second refresh for a tenant just admitted, a reinstall, or a changed
+  page grant. An unchanged tenant causes no schedule call. A failure is logged
+  with the tenant ID and retried on the next pass; it never stops the worker or
+  serving the tenant. A disabled tenant's schedules are left as they are (its
+  runs end cleanly); a reinstall re-ensures. The `--schedule` commands of
+  `index_knowledge`, `retention` and `creator_access` remain as a manual repair.
+  The worker decides at start-up whether it runs the indexing workflows (some
+  published agent has a page grant), so restart it once when a deployment's
+  first page grant is published.
 - Row-level security hides every tenant's row from the others. The two reads
   that cross tenants (a Slack workspace to its tenant, and the list of tenants)
   go through two `SECURITY DEFINER` functions that return the tenant ID, the
@@ -310,9 +326,10 @@ with another key source the console starts but does not offer the install.
 the installer becomes the tenant's first admin (the tenant row's `admins`
 list, like a YAML tenant's). The tenant ID is stable, built from the Slack
 team ID (`t-<team id lower-cased>`). A **reinstall** of a known workspace
-replaces the bot token (audited as a reinstall) and creates nothing else:
-settings, admins and key stay as they are, and every process rebuilds that
-tenant's Slack client from the new token on its next read.
+replaces the bot token (audited as a reinstall), re-enables the tenant if an
+uninstall disabled it, and creates nothing else: settings, admins, data and
+key stay as they are, and every process rebuilds that tenant's Slack client
+from the new token on its next read.
 
 **A tenant with no agents yet.** An installed tenant has no agents and no
 Notion. Its `default_agent` is NULL until an admin sets one; until then the
@@ -334,6 +351,291 @@ another tenant's row. The bot token is
 stored only as ciphertext in `tenant_credentials` (migration `032`), under
 the tenant's payload key with the tenant ID as associated data; the audit row
 holds IDs only.
+
+## Uninstall and reinstall
+
+When a workspace removes the app, Slack sends `app_uninstalled` (and
+`tokens_revoked` for its bot tokens). The gateway handles both for the
+workspace's tenant, taken from the signed event's `team_id`: in one unit of
+work it **disables the tenant**, **deletes its `slack_bot` credential** and
+its Drive connection row, and records one `uninstall` audit event (the event
+type in `tool`, the team ID in `target`, never a token). The tenant's Google
+service account is deleted at Google under the same tenant lock, best effort:
+a refusal is logged with the tenant ID and never blocks the uninstall, and the
+delete is tried even when no Drive row is stored (D-45). The
+**Notion credential is kept**, with the rest of
+the tenant's data, under normal retention. A retry of an event already
+handled changes nothing, even after a reinstall (its audit key is checked
+first), and an out-of-order event finds the tenant already disabled with no
+credential and changes nothing more; an event for an unknown workspace is ignored with a log line.
+`tokens_revoked` acts only when bot tokens were revoked — a user-token-only
+revocation changes nothing.
+
+**Pending work ends cleanly.** Within one directory refresh (about 15 s) and
+one worker sync (5 s), the worker stops serving the tenant. A task awaiting
+approval, executing or watching ends `cancelled` with no Slack post (the
+token is gone) and no retry storm; its final state is still recorded for
+`my_tasks`. A conversation turn in flight fails without a failure notice,
+leaving history valid. A tenant *not yet loaded* (installed seconds ago) is
+different: its activities stay retryable until a refresh picks it up.
+
+**A reinstall resumes the tenant.** "Add to Slack" again into the same
+workspace re-enables the row, stores the new bot token and audits a
+reinstall; agents, settings, admins, the payload key and the kept data are
+untouched, so the tenant works again with no manual step. Full deletion of a
+tenant's data is a later admin action, not part of uninstall.
+
+**Slack app setup (maintainer, once per deployment).** Add the bot events
+`app_uninstalled` and `tokens_revoked` to the app's Event Subscriptions
+(both are in `slack/app-manifest.yaml`), pointed at the same
+`<URL>/slack/events`. Event subscriptions are app-level: saving them takes
+effect without reinstalling the app into each workspace. The uninstall flow
+needs migration `037` (the `uninstall` audit kind); a new install gets it
+from `scripts/init_db.sql`.
+
+## Google Drive (one service account per tenant)
+
+Drive connects with one Google service account per tenant, created
+automatically in the deployment's Google Cloud project when an admin clicks
+**Connect Google Drive** on the settings page (D-45). Whatever that account
+can see is the tenant's: isolation is by identity, there is no sharer-matching
+rule. The customer's whole setup is that one click plus sharing folders and
+files with the account's address — no Google Cloud console steps, no keys to
+paste. A single **deployment** service account creates the tenant accounts
+and mints short-lived access tokens for them through the IAM Credentials API;
+no key is created or stored per tenant. The connection row
+(`drive_connections`, migration `042`) holds the account email and the
+connection's status and error code — not a credential. The settings page's
+list of what the account can see is a live read that writes nothing; the
+status changes on connect or disconnect.
+
+**Maintainer setup (once per deployment).**
+
+1. Create a Google Cloud project for the agents (or pick one). Note its
+   project ID.
+2. Enable the APIs: **IAM**, **IAM Credentials**, **Drive**, **Sheets** and
+   **Docs** (the last two are for the write tickets; enabling them now costs
+   nothing).
+3. Create a **deployment service account** in the project. Grant it, on the
+   project: **Service Account Admin** (`roles/iam.serviceAccountAdmin`, to
+   create and delete the tenant accounts) and **Service Account Token
+   Creator** (`roles/iam.serviceAccountTokenCreator`, to mint their tokens).
+4. Create a JSON key for the deployment account and put the whole JSON in the
+   shared variable `GOOGLE_SERVICE_ACCOUNT_KEY`; set `GOOGLE_PROJECT_ID` to
+   the project ID. On Railway both are shared variables, so the console and
+   the gateway read the same values. The key is a secret: it is never logged
+   and never appears in a repr.
+
+With either variable unset, Drive is simply not set up on that deployment:
+the settings page says so and offers no button. A malformed key stops the
+console or gateway at start-up with a plain message.
+
+**Limits.** A project holds about **100 service accounts by default** — one
+per connected tenant. Raise the quota on request to Google, or add projects,
+before the product outgrows it; the account ID is deterministic from the
+tenant, so a retried connect always finds the same account. The settings page
+lists at most the **first 100 items** shared with the address (files and
+shared drives together) and says so when more are shared. Service accounts
+created after 2025-04-15 cannot own Drive files: create-from-template (D-49)
+works only in Workspace shared drives. Disconnect deletes
+the account at Google and the row; files shared with the address keep their
+sharing until their owners remove it. A reconnect right after a disconnect
+can be refused with "Google is still removing this workspace's previous
+Drive account; try Connect again in a few minutes" — Google's IAM API is
+eventually consistent, so a delete takes a short while to finish. A second
+click a few minutes later connects, and the re-created account is a new
+identity: the old account's sharing and roles do not carry over.
+
+**Drive knowledge (read, D-46).** Anything shared with this address is
+available to every agent creator in this workspace; an admin approves each
+agent before it reads it. A creator grants a folder, file, shared drive or
+Sheet by picking it from what the account can see on the agent's version page —
+one click adds it (a Sheet asks for its tab next), one click removes it; there
+is no per-creator Google sign-in.
+For a shared drive, a Workspace customer adds this address as a member of the
+drive (Viewer is enough for reading) — that is the one share. What gets
+indexed: Google Docs and Slides as plain text, and Sheets as CSV with each
+tab's name kept as a heading; other file types are skipped and counted. A
+granted folder is walked recursively; a shared drive is walked from its root.
+Changes show up on the **next nightly run** (03:00 UTC, the same schedule as
+Notion): the walk compares each file's Drive version and re-exports only what
+changed, and removes files a complete walk no longer sees, trashed, or no
+longer readable (a 404, or a 403 whose reason is lost sharing). A walk that
+could not see everything — a folder whose listing kept failing, or the
+discovery cap — prunes nothing that run. A quota refusal is retried with the
+wait Google asked for; a disabled Drive or Sheets API counts the file failed
+and keeps what is stored. One bad file never fails the run. There is no Drive
+webhook in v1, so an edit is not reflected within seconds the way a Notion
+page event is. A scope whose root is gone or unreadable — any failure, not
+only a gone one — is kept for a few nightly runs before its index is deleted
+(the same guard as Notion), and the owner is told once, with the root's label
+and ID. The walk's outcome updates the connection's status on the settings
+page: an error with a code when any node failed. Before a Drive passage is
+cited it is re-checked live with the tenant's account, its parents walked up
+to the granted root; a file that is gone, no longer shared, or moved out of
+the granted folder is dropped, and the citation links to the file. The Drive
+connector switch (Console → Switches) stops Drive indexing and the Drive part
+of knowledge search while it is off.
+
+**Drive writes (comment, D-47).** An agent granted Drive folders or files is
+offered `comment_on_file`: it drafts a comment on a granted file (or a file
+under a granted folder or shared drive), and nothing is posted until the
+requester approves the card in Slack — a Drive comment always asks, whatever
+the tenant's approval policy for Notion comments says. The card shows the
+file's name with its link and the exact text; Edit changes the text and needs
+a fresh approval. The comment posts as the workspace's Drive account, ending
+with the agent's name and a reference; a retry looks the file's comments up
+for that reference before posting again, so an approved comment posts once.
+The file's grant is checked when the draft is made and again just before the
+write: a grant removed since approval stops it, and the thread says why.
+There is no follow-up watch on a Drive comment. **Commenting needs the share
+to allow comments**: Viewer access is enough for reading, but the write needs
+Commenter or above on the file (or its folder / shared drive); a view-only
+share is refused and the task reports it could not comment. The Drive
+connector switch and the writes switch (Console → Switches) stop the write
+while off. The minted token now carries the full `drive` scope (reads
+included); no re-consent is needed — the accounts are service accounts.
+
+**Drive writes (append a row, D-48).** An agent granted a Sheet is offered
+`append_row`: it drafts a row for one named tab of that Sheet, and nothing is
+appended until the requester approves the card in Slack — an append always
+asks, never low-risk. To grant a Sheet, the creator picks it from what the
+account can see on the version page (**Choose from Google Drive**); a Sheet
+asks for its tab next — the platform reads the Sheet's tab titles and the
+creator picks the one to append to. The definition editor can also add it
+directly as `grants.drive.sheets` with the file's ID, a label and the tab name
+(`{id, name, tab}`). The file must be shared with the workspace's Drive address
+**as Editor** (Viewer is enough for reading, but appending writes cells). The
+creator names no columns: when the version is submitted, the platform reads the
+tab's header row once (row 1 only) and stores it as the grant's `columns`, so
+the admin approves the columns the agent will write and the version page shows
+them; a header with a duplicate column name is refused, and an edit made while
+the header is read survives the submit. The card previews the row as a
+two-column table (column, value) with the Sheet's name, link and tab; Edit shows
+one input per column (empty for a cell the row left out), may clear a cell, and
+needs a fresh approval. Cells land exactly as approved: text stays text — a
+cell like `=1+1` is never turned into a formula — and a number the model gave
+stays a number. The model sees the granted sheets and their columns in the
+tool's description, and a row may only use those columns; a name two granted
+sheets share is refused, and the model must use the sheet's ID. Just before the
+write the header is read again (the granted tab alone): if it changed since
+publish, or the definition was republished with other columns between the draft
+and the approval, the append is refused with "The sheet's columns changed since
+this agent was published; ask the creator to republish" and nothing is written
+— the creator republishes (which re-reads the header) and the requester asks
+again. The row appends as the workspace's Drive account and carries invisible
+developer metadata (key `agentos-write`, the write key's hash) that moves with
+the row; the row and its metadata land in one atomic Sheets `batchUpdate`, and a
+retry searches that metadata before appending again, so an approved row appends
+once. There is no follow-up watch on an append. The Drive connector switch and
+the writes switch stop it while off.
+
+**Drive writes (create a Doc from a template, D-49).** An agent granted a
+template is offered `create_doc_from_template`: it drafts a new Doc copied from
+that template into the template's folder, and nothing is created until the
+requester approves the card in Slack — a create always asks, never low-risk.
+The creator writes `{{field name}}` blanks in a Google Doc (the template) and
+names a shared-drive folder where the new Docs will land. Keep the blanks in
+the Doc's body: the platform reads the exported body text, so blanks written
+only in a header or footer are not read. To grant it, the creator picks the
+template Doc and the destination folder from what the account can see on the
+version page (**Choose a template**) — only Google Docs are offered as
+templates and only folders inside a shared drive as destinations; the
+definition editor can also add it directly as `grants.drive.templates` with the
+template's file ID, a label and the folder's ID (`{id, name, folder_id}`). Two
+shares are needed: the template Doc shared with the workspace's Drive address
+(Viewer is enough to read and copy it), and the address added as **Content
+manager** of the shared drive that holds the destination folder (creating a Doc
+writes into the folder). New Docs can only be created in a shared drive folder
+— the pilot's service account cannot own files — so a destination folder
+outside a shared drive refuses the publish with "New Docs can only be created
+in a shared drive folder; pick a folder inside a shared drive." The creator
+names no blanks and no drive: when the version is submitted, the platform
+checks the template is an untrashed Google Doc (anything else refuses with
+"template '<name>' must be a Google Doc"), reads its text once and stores its
+`{{field name}}` names as the grant's `blanks` (duplicates collapse to one),
+and reads the destination folder's shared drive as the grant's `drive_id`, so
+the admin approves the blanks the agent will fill and the drive they land in,
+and the version page shows them. A folder that moved out of its recorded shared
+drive after the publish refuses the create before any card, and again at the
+write: one now in My Drive refuses with the publish's plain words, one in
+another shared drive refuses as a changed shape. The card previews the new
+Doc's title, the destination folder (name and link) and every blank with its
+value as a two-column table; Edit shows the title and one input per blank (an
+empty value clears that blank; the title cannot be empty) and needs a fresh
+approval. The model sees the granted templates and their blanks in the tool's
+description, and must give a value for every blank — a missing or unknown blank
+is refused for it to correct; a name two granted templates share is refused,
+and the model must use the template's ID. A value or title containing a
+template blank like `{{name}}` (spaced or not) or the fill sentinel's prefix
+`⟦agentos-fill:` is refused at the draft and at the edit — "A value can't
+contain a template blank like {{name}}; write it another way." — so the values
+that land are inserted literally (a value is never read as markup) and every
+form of a blank is filled, spaced (`{{ name }}`) or not. A template with no
+blanks creates one finished Doc with no fill step. The template itself is not
+knowledge: its boilerplate is not indexed or cited; nor is it a comment target
+— a template grant is copy-only. If the definition was republished with other
+blanks or another folder between the draft and the approval, the create is
+refused with "The template's blanks or folder changed since this agent was
+published; ask the creator to republish". Nothing is written when no copy
+exists yet; when an earlier attempt's copy may exist, the thread says "I
+couldn't create '<title>': <reason>", or "I couldn't confirm whether the Doc
+was created; please check <folder link>" when the write could not be confirmed.
+The new Doc is created as the workspace's Drive account and carries an
+invisible appProperty (key `agentos_write`, the write key's hash) set in the same
+`files.copy` request that makes it; the blanks are then filled with one two-pass
+Docs `batchUpdate` (every raw form to a sentinel, each sentinel to its value),
+and a retry searches that appProperty before copying again — a
+copy an earlier attempt left unfilled is found and filled, so an approved create
+makes one Doc. There is no follow-up watch on a create. The Drive connector
+switch and the writes switch stop it while off.
+
+**Drive writes (replace a section, D-50).** An agent granted a section is offered
+`replace_section`: it drafts a replacement for one headed section of a granted
+Google Doc, and nothing is written until the requester approves the card in Slack
+— a replace always asks, never low-risk. The section is a **heading** the creator
+names: everything under that heading up to the next heading of the same or higher
+level (a deeper heading is part of the section); the heading itself is kept. To
+grant it, the creator shares the Doc with the workspace's Drive address **as
+Editor** (Viewer is enough for reading, but replacing writes the body), picks the
+Doc and chooses its heading from a one-read list of the Doc's headings (or types
+it) — the definition editor can also add it directly as `grants.drive.sections`
+with the Doc's file ID, a label, the same Doc ID as `doc_id` (it must equal the ID)
+and the heading (`{id, name, doc_id, heading}`). A Doc already granted as a read
+file shows a plain message: a Doc is granted once across kinds. The Doc is granted
+as for reads: it is indexed and citable like any file. The section must be **plain
+paragraphs only** — a table, an inline image or any other non-paragraph element
+under the heading refuses it. When the version is submitted, the platform reads the
+Doc's metadata and body and checks the heading exists exactly once and the section
+is plain paragraphs: a missing heading refuses with "I can't find the heading
+'<name>' in <doc>; ask the creator to update the agent", a duplicated one with "The
+heading '<name>' appears more than once in <doc>; ask the creator to update the
+agent", and a table or image with "I can only replace a section made of plain
+paragraphs; '<doc>' has a table or image under '<heading>'". The version page shows
+the heading. The card previews the Doc (name and link), the section's heading, the
+whole current text (before, spread over section blocks, never cut) and the
+replacement (after); Edit changes the new text and needs a fresh approval, keeping
+the same read revision. The new text is inserted literally as plain text (bounded
+to 2000 characters); a character Google Docs strips (a control character other than
+newline and tab, or a private-use code point) is refused at draft and edit. The
+section's current text is bounded too: over 5,000 characters refuses the draft in
+plain words. The model sees the granted sections and their headings in the tool's
+description; a name two granted sections share is refused, and the model must use
+the section's ID. The write is one Docs `batchUpdate` locked to the revision read at
+the draft (`writeControl.requiredRevisionId`): it inserts the new text first at the
+section's first content paragraph (so the new paragraphs keep its NORMAL style),
+then deletes the shifted old range; an empty section normalises the inserted range
+to NORMAL_TEXT, and a section ending at the body end keeps the body's final
+newline. If the Doc moved since the read — a collaborator
+edited it, or a retry follows a lost response — the revision no longer holds and
+nothing is written; the platform reads the section and compares it with the
+approved text: equal means the earlier attempt landed (done), different refuses
+with "The document changed since you approved; I'll draft it again". If the
+definition was republished with another heading between the draft and the
+approval, or the heading was renamed, removed or duplicated, the replace is
+refused with nothing written. The replacement lands as the workspace's Drive
+account. There is no follow-up watch on a replace. The Drive connector switch and
+the writes switch stop it while off.
 
 ## Encrypted workflow data
 
@@ -721,10 +1023,11 @@ retries the activity.
 ## Retention
 
 A nightly Temporal schedule (04:00 UTC) purges each tenant's expired rows in batches and logs
-counts only. Create or update the schedules once, after the worker is running:
+counts only. The worker creates or updates each served tenant's schedule automatically, at
+start-up and when a tenant is admitted or reinstalled (D-42); the command is a manual repair:
 
 ```bash
-uv run python -m agentos.retention --schedule            # every tenant
+uv run python -m agentos.retention --schedule            # repair: every tenant
 uv run python -m agentos.retention --tenant acme          # purge one tenant now, without Temporal
 ```
 
@@ -739,7 +1042,7 @@ uv run python -m agentos.retention set --tenant acme --messages-days 180 --tool-
 | Setting | Default | What goes |
 |---|---|---|
 | `messages_days` | 365 | A conversation's messages, once its newest message is older than this (a thread is never cut in the middle), and a thread's stored specialist idle for longer than this |
-| `tool_outputs_days` | 90 | Tool output text, tool inputs and stored model replies older than this, in a conversation with no newer message; and the drafts of a task whose newest revision is older than this |
+| `tool_outputs_days` | 90 | Tool output text, tool inputs and stored model replies older than this, in a conversation with no newer message; the drafts of a task whose newest revision is older than this; and answer feedback (votes and their reasons) older than this |
 | `idempotency_days` | 90 | Idempotency records older than this, and inbound Slack events (and saved Edit forms) delivered longer ago than this |
 | `sessions_days` | 1 | Console sessions, this many days after they expired (they are also purged at sign-in) |
 
@@ -750,6 +1053,47 @@ follow-up still needs is deleted. The record of when an agent's owner was last m
 refusal (`owner_pings`) is purged after two days. Audit and usage rows are kept (append-only by
 design), as are `external_writes`, `task_links` and agent definitions. An inbound event the relay
 has not yet delivered is never purged.
+
+## Creator access
+
+A nightly Temporal schedule (05:00 UTC, after indexing and retention) checks that each
+published agent's creator can still read every Notion object they picked for it. The worker
+creates or updates each served tenant's schedule automatically, at start-up and when a tenant
+is admitted or reinstalled (D-42); `--schedule` is a manual repair. Without `--schedule` the
+command starts one pass per tenant on the worker and prints its counts:
+
+```bash
+uv run python -m agentos.creator_access --schedule       # repair: every stored tenant
+uv run python -m agentos.creator_access --tenant acme    # one pass now, through the worker
+```
+
+The check reads with the creator's own Notion sign-in, which exists only if they ticked
+"Keep my Notion sign-in" before a Choose-from-Notion sign-in. The token is stored encrypted
+per tenant and creator (`tenant_credentials`, kind `notion_creator:<Slack user ID>`); a
+consented pick replaces it, and "Stop keeping it" on the version page deletes it (audited
+`connector`, as `creator_consent` / `creator_consent_revoked`). The box is a per-pick
+choice: completing a re-pick with it unticked revokes the sign-in a former pick kept.
+Dropping a creator from the tenant deletes
+their sign-in in the same unit of work as the member change (audited as the same revoke,
+with the member as target). Without consent the picker works unchanged and the grant shows
+"cannot verify (no consent)" — never a suspension.
+
+The workflow lists the tenant's published agents and runs one activity per agent — one
+cheap read per picked object, through the tenant's Notion rate limiter, heartbeating
+between reads — then the combined health check. A disabled (uninstalled) or unknown
+tenant's pass ends cleanly with zero counts, before any read. The verdict per object lives
+in `creator_access`: `verified`, `lost` (Notion refused the creator: gone or unshared) or
+`cannot_verify` (no consent, or a dead token — a 401). A transient failure (network, rate
+limit, server error) changes nothing; the next pass tries again. A `lost` verdict is
+sticky: only a successful read replaces it, and a `cannot_verify` never lifts it. The
+health check combines both sources: an agent is available only when its grants pass and no
+granted object is lost. A lost object suspends the agent with the reason "its creator can
+no longer see '<grant>'" — the same fixed reply, refused Submit, audit and
+once-per-transition DMs as a grant problem (D-35); the creator and admins are told. A later
+pass where both sources pass recovers it; neither source can flap the other. Recovery from
+a lost verdict waits for the next nightly pass — the worker's five-minute re-check
+re-evaluates health from the stored verdicts but does not re-read the creator's access. The
+version page shows each grant's last verdict and when it was checked.
 
 ## Run
 
@@ -764,6 +1108,47 @@ uv run uvicorn agentos.gateway.app:app --port 8000     # terminal 2
 Keep your tunnel pointed at port 8000. The Temporal web UI is at
 <http://localhost:8233>. DM the bot, or @mention it in a channel it has been
 invited to.
+
+### What stops start-up, and what only disables an agent
+
+Platform-wide problems stop the worker: no usable master key or tenant key, a
+database behind the code's migrations, a chat or embedding model with no price
+in effect today, an inconsistent tenants table, or routing that names an
+unpublished agent or a channel its audience leaves out. The message names what
+to fix; nothing is served until it is.
+
+Ensuring the tenants' nightly schedules (D-42) is start-up work that never
+stops start-up: one tenant's schedule failure is logged with its ID and retried
+on the refresh, and every other tenant is ensured and served regardless.
+
+A broken Notion grant disables **only its agent** (D-35). At start-up and on
+the directory refresh the worker checks each published agent's grants with the
+same read-only check a publish runs. An agent whose database or page is missing
+or not shared, whose property mapping no longer matches, whose property IDs are
+missing, or whose tenant has no Notion token is marked unavailable in
+`agent_health` with the reason. A message to it gets one fixed reply —
+"<name> is unavailable right now: an admin needs to fix its access. Nothing was
+changed." — with no model call and no Notion call, and a write waiting for
+approval is refused at Submit with the same reason. Every other agent and
+tenant keeps running. The agent's creator and the tenant's admins get one Slack
+DM per transition, and each transition is audited as `agent_health`. The DM is
+best-effort: a crash or a Slack failure at the transition loses that one notice;
+the health state and the audit row are unaffected. A watch on an unavailable
+agent keeps polling and reports the status change once the agent recovers; a
+write whose agent becomes unavailable between the pre-write check and the write
+stops with the same fixed reply on the card — nothing changed, no failure line.
+
+Recovery needs no restart: an unavailable agent is re-checked at most once
+every five minutes, a newly published version is checked at once, and a passing
+check marks the agent available again (audited, and the creator is told). Fix
+the grant in Notion, or publish a corrected version. A transient Notion failure
+(a network error, rate limit or server error) changes no health; the next check
+tries again. A check that cannot run never stops the worker: a permanent
+connector problem (a granted database with no data source) marks its agent
+unavailable; any other unexpected error is logged and changes no health; one
+agent's or tenant's failed check never skips the rest. An admin's kill switch
+is separate: it is checked first, and turning an agent off is not a health
+transition.
 
 ## Railway (hosted)
 
@@ -1039,29 +1424,51 @@ uv run pytest tests/pg -v -m pg
 ## Knowledge: indexing and search
 
 An agent with a Notion page grant (`grants.notion.pages`) can answer from every
-page under that page. Index the pages first, with the worker running (the
-worker does the reading and embedding; the command only asks Temporal to start
-it):
+page under that page; an agent with a Drive grant (`grants.drive`) can answer
+from every file under the granted folder or shared drive, or from the one
+granted file. Index them first, with the worker running (the worker does the
+reading and embedding; the command only asks Temporal to start it):
 
 ```bash
-uv run python -m agentos.index_knowledge             # one run per granted page, now
+uv run python -m agentos.index_knowledge             # one run per granted scope, now
 uv run python -m agentos.index_knowledge --wait      # ... and print a summary per run
 uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
 uv run python -m agentos.index_knowledge --confirm-gone  # see "A page that cannot be read"
 ```
 
 Indexing calls the embeddings endpoint, so it **spends embedding credit**;
-pages whose content has not changed since the last run are not embedded again.
-Two agents granted the same page share one run. `--schedule` creates or updates
-one schedule per granted page and deletes the schedules of pages that are no
-longer granted. Pages removed from the tree or trashed are removed from the
-index on the next run.
+pages and files whose content has not changed since the last run are not
+embedded again. Two agents granted the same page or Drive folder share one run.
+The worker ensures one nightly schedule (03:00 UTC) per granted scope
+automatically, at start-up and on its refresh when a tenant's grants change
+(D-42); `--schedule` is a manual repair that creates or updates one schedule per
+granted scope, Notion and Drive alike, and deletes the schedules of scopes that
+are no longer granted. Pages removed from the tree or trashed are removed from
+the index on the next run; the Drive walk's rules are in "Drive knowledge"
+above.
 
 What is indexed, how pages that cannot be read are treated, how a webhook refreshes a single page
 and how a search is checked and cited are in [architecture.md §6](architecture.md#6-knowledge-retrieval).
 A scope whose granted page is gone is reported to the agent's creator; to delete its index sooner
 than three nightly runs, run `uv run python -m agentos.index_knowledge --confirm-gone` (add
 `--tenant` for one tenant).
+
+### Search log and the Searched line
+
+Every completed `search_knowledge` call logs one line, `search_knowledge returned`, with the tenant
+and agent IDs, the number of granted scopes (`scopes`), the candidate hits (`hits`), how
+many the distance cut-off dropped (`dropped`), how many passages were kept (`kept`), and
+each kept page's ID and best distance (`pages=<page id>:<distance>,…`). It carries no
+titles or passage text. It tells a search that found nothing from one whose passages the
+answer did not cite. `hits` can exceed `dropped + kept`: hits whose page fails the live
+re-check, or beyond the per-page and per-search passage caps, are not counted in either.
+
+An answer that cites its passages gets the Sources line. When a turn's searches returned
+passages but the answer cites none of them, the reply instead shows a Searched line naming
+up to three of those pages, nearest first, built from the same stored page metadata and
+only scopes still granted to the agent. A turn whose searches returned nothing shows no
+footer. The Searched line is behind the `searched-footer` patch marker, so histories
+recorded before it replay unchanged.
 
 ### Upgrading an existing index
 
@@ -1078,7 +1485,8 @@ docker compose exec -T postgres psql -U agentos -d agentos < scripts/migrations/
 ### Keeping the index fresh
 
 Set up the Notion webhook (above) to refresh a page within about 30 seconds of an edit. The
-nightly run (`--schedule`) remains the backstop for anything the webhook misses.
+nightly run (its schedule is ensured automatically, D-42) remains the backstop for anything
+the webhook misses.
 
 ### Local embeddings with Ollama
 
@@ -1121,11 +1529,12 @@ section of the YAML file changes nothing**: the database is the source.
 `--agent` on a draft to get a grant's property IDs before publishing (`--version`
 picks another version).
 
-Known gap: a version published after the worker started that adds a Notion page
-grant gets no index schedule and no startup grant check until the worker
-restarts, and a worker started with no page grants has no embedder until it
-restarts. Run `uv run python -m agentos.index_knowledge --schedule` after such a
-publish.
+A version published after the worker started that adds a Notion page grant
+needs no restart for its schedule or its grant check: the worker's refresh
+applies the index schedule on its next pass (about 5 seconds), and the health
+refresh checks the new version at once. Known gap: a worker started with no
+page grants has no embedder and does not run the indexing workflows until it
+restarts, so restart it once when a deployment's first page grant is published.
 
 ## Members and roles
 
@@ -1174,10 +1583,12 @@ any write that is not `application/json`.
 it to `docker-compose.yml` (a container binds `0.0.0.0`). The process then exits
 unless the host is `127.0.0.1`, `::1` or `localhost`; no flag overrides that. It
 also exits without `AGENTOS_CONTROL_ACTOR`, your Slack user ID: every request acts
-as that user, and nothing in a request (header, query or body) can change it. It also
-needs each tenant's Notion key exported (`NOTION_TOKEN`, or the variable the tenant's
-`secrets.notion_token_env` names), because the grant check and publish read Notion
-with it; the process exits naming an unset variable. With
+as that user, and nothing in a request (header, query or body) can change it. The
+grant check and publish read Notion with each tenant's own token: the encrypted
+credential row once an admin has connected Notion in the console, else the variable
+the tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default). A tenant
+with neither fails its own check or publish with a message naming the variable; the
+process starts and serves the tenant Slack-only. With
 [sign-in configured](#web-console) the process may bind more widely and every
 request acts as the signed-in user instead. What the user may do comes from their role in the
 tenant named in the path (`/tenants/<tenant id>/...`), decided by
@@ -1209,8 +1620,8 @@ publish without it is refused with 422. It runs the grant check next (with the t
 Notion token) and is refused with 409 and the problems while any database or page grant has one (a
 page must be readable and not in the trash). If Notion cannot be read right now
 (a network error, a rate limit, a server error) the answer is 502 and nothing is
-published. A new page grant still gets no index schedule until
-the worker restarts. The audit log is paged by `seq`: pass the previous page's
+published. A new page grant gets its index schedule on the worker's next refresh
+pass (about 5 seconds), with no restart (D-42). The audit log is paged by `seq`: pass the previous page's
 `next_before` as `before`; `limit` is capped at 200. A write may carry an
 `Idempotency-Key` header: a retry with the same key, path and body records one
 audit event (the change itself is refused the second time, with 409).
@@ -1281,14 +1692,177 @@ and logs `possible duplicate Slack post` with the tenant ID and key, and the log
 missing scope once per tenant. A public channel the bot has not joined refuses the lookup the
 same way. `slack/app-manifest.yaml` lists the same scopes.
 
+## Where is my request? (my_tasks)
+
+`my_tasks` answers "where is my request?" from the platform's own `tasks` table
+(migration 035), with no Notion search. The task workflow records each state change
+through an idempotent upsert by task ID, behind the `task-record` patch marker: a task
+that was already running when the change deployed keeps its old shape and simply has
+no row, so it is invisible to `my_tasks` until it ends and a new task records itself.
+The row holds the item's title and link, its last known status, the listed state
+(awaiting approval, filed, watching, done, failed, cancelled), when the task last
+reported, and the thread it lives in — short metadata, never conversation text.
+
+The tool is offered only to an agent with a write grant (a Notion database), and the
+grant is checked again when the call runs: a call the model invents for an agent
+without one is a tool error and lists nothing. It takes no input and lists the asker's
+own tasks made through any agent in the workspace: the requester comes from the
+runtime, open tasks first, then newest, at most 10. A connector switch stops only that
+connector's tools, so turning Notion off does not refuse `my_tasks` (the platform's
+own read); an agent switch and agent health still stop it. A question asked in the
+task's own thread refreshes the task at most once per turn: the first `my_tasks` call
+pokes the watch through the webhook's `external_update` signal and waits for the fresh
+report, and a second call in the same turn lists the store as it is. A task that
+reported within 60 seconds (`POKE_GAP`) of the question is fresh already, so the poke
+and wait are skipped; otherwise the watch answers the poke at most once per `POKE_GAP`,
+so the question never forces a sooner poll, and the wait is bounded — a task that does
+not report in time is listed as it was last recorded. A task that closed between the
+lookup and the poke already recorded its final state, so the turn still answers from
+the store. These two refresh rules sit behind the `my-tasks-once-per-turn` patch
+marker; conversations recorded before it keep the original poke and wait on every
+call. The thread link in the listing opens the channel the task's thread lives in
+(Slack's universal link); a thread permalink would need the workspace's domain, which
+the runtime does not store (D-37).
+
+Nothing deletes a task row yet: retention does not cover `tasks`. The worker's start-up
+wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level security and
+grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
+app role).
+
+## Approval policy (low-risk comments)
+
+Every write asks the requester to approve before it runs, unless an admin turned
+approval off for that low-risk action (D-43). The manifest's `low_risk` flag marks
+which actions may be relaxed — today only Notion's `add_comment`; loading refuses
+the flag on any create, append or replace. The policy is one row per tenant and
+action in `approval_policies` (migration 040): `requester_approval` (the default,
+also for an action with no row) or `none`. An admin changes it in the **Approvals**
+section of the settings page, audited as `policy_change`; the worker reads it on
+the next comment task, with no restart.
+
+With the policy `none`, a comment runs without a card only when the item was filed
+by the requester: the task reads the platform's own records — the created page's
+link to the task that created it (`task_links`) and that task's requester — never
+the model's word for it. The comment then runs as soon as its draft is resolved,
+through the same agent-effect gate and the same exactly-once lease as an approved
+comment, audited as `write` with outcome `policy`, no approver and no `approval`
+row. The thread line reads "Commented on '<item>' (<link>) (no approval needed:
+your admin's setting)." A switch that covers the write still stops it (the thread
+says why, audited `write` with `error`). In every other case — the default policy, an
+item the requester did not file, an item with no creating task, any create, the
+nudge's comment — the card shows as before. The new workflow commands sit behind
+the `approval-policy` patch marker; tasks recorded before it keep showing the card.
+
+## Nudge the assignee
+
+A watched item that has not moved for `stale_after_days` posts its "No movement" line with a
+**Nudge the assignee** button (D-41). One click by the requester — the button carries a nonce
+only the watch accepts, from the requester alone — drafts a nudge and sends one approval card
+previewing both effects exactly: the comment on the item, and a DM to the assignee
+("<requester> asked me to check on '<item>'", the item link, the approved text; nothing else
+from the conversation). Submit / Edit / Cancel work as on other cards; an edit changes the text
+both effects carry. The nudge is never low-risk: it always shows a card. Nothing runs without
+approval, and what was approved is what runs.
+
+On approval the comment posts first, then the DM, each exactly once (the comment through the
+reference-marker-and-lease path, the DM through the Slack post path with its metadata marker and
+history lookup in the DM channel). A DM that fails after the comment is reported in the thread
+("Commented on '<item>', but I couldn't DM the assignee."); the comment is never retried. Both
+effects pass the agent-effect gate: an agent turned off, unavailable, a paused channel or a lost
+audience before the write cancels both, as for other writes. A nudge that ran restarts the stale
+clock from the nudge, so a later stale period can offer again. One offer per stale period; a
+declined, expired or failed nudge spends it, and a spent offer (clicked, prepare failed, nudge
+done) drops its button from the stale notice, best-effort. The watch keeps polling while the card
+waits (the nudge is a child task), and the nudge records its own row in `tasks`.
+
+**In the agent definition**, the assignee is an optional people property per database grant,
+mapped like the other roles (first person only):
+
+```yaml
+grants:
+  notion:
+    databases:
+      - id: <database id>
+        name: IT requests
+        properties:
+          # ...title, status, done_values, requested_by, request_id...
+          assignee: Assignee
+        property_ids:
+          # ...the other four IDs...
+          assignee: <property id>   # agentos.check_grants prints it
+follow_up:
+  nudge: true        # default; false offers no nudge
+  max_nudges: 2      # default; 0 to 10, nudges one task may run
+```
+
+The fallbacks are decided in the card text, never by the model: no assignee property or an empty
+one → a comment without a mention; an assignee with no Slack match → a comment with a plain-name
+mention and no DM; the assignee is the requester → no button at all. A configured assignee
+mapping is checked like the other roles (a people property, an ID configured), but a broken one
+disables only the nudge, never the agent: it is reported in the console's grant check and the
+health log, and the nudge then treats the mapping as absent (a comment without a mention).
+Adding the mapping is a widening the publish approver acknowledges.
+
+**Maintainer steps:**
+
+1. **Notion integration capability:** the DM match reads the assignee's email, which needs
+   "Read user information including email addresses" on the integration (Notion → Settings →
+   Connections → the integration → Capabilities). Without it the nudge still works as a
+   plain-name comment with no DM — the fallback, not an error.
+2. **Slack scopes:** `users:read.email` (the email lookup) and `im:history` (the DM's
+   exactly-once lookup) are already in `slack/app-manifest.yaml`; an app installed from the
+   current manifest needs no change. An older app missing them: add the scopes and reinstall.
+
+Audited as one `approval` (tool `nudge`) plus one `write` per effect (`nudge_comment`,
+`nudge_dm`); a decline or expiry as `approval_closed`. A DM Slack refuses for good (a gone
+channel or user, an inactive account) records its `write` as `error` and is not retried. All new
+workflow commands sit behind the `nudge` patch marker: a task already watching when this deployed
+keeps its old shape (one plain stale line, no offer) until it ends.
+
+## Answer feedback
+
+Every final answer carries two small buttons, 👍 and 👎, under the text. Notices, approval
+cards, the not-set-up reply and the fixed off / unavailable / budget replies carry none.
+
+- One vote per person per answer, changeable: a second click replaces the voter's earlier vote
+  and clears any reason it carried. Another person's vote is separate.
+- The voter is the Slack user of the signed click, never a field of the button or the model.
+  The button names the answer (its conversation ID and message ts) and the agent and version
+  that answered; a click naming another tenant's conversation is refused.
+- A 👎 opens a small modal for an optional one-line reason (at most 300 characters). Submitting
+  or dismissing keeps the vote; a reason attaches only while the vote is still a 👎.
+- The vote is acknowledged to the voter alone ("Thanks — noted.", an ephemeral message);
+  nothing is posted in the thread. Every click is audited as its own `feedback` event — the vote
+  and the agent, never the reason text — and the vote and its event commit in one transaction, so
+  a failed audit write leaves no vote behind and the clicker is told to try again.
+- No model call and no connector call: the gateway records the vote in `answer_feedback`
+  (migration 036) directly, without a workflow. Feedback is the user's action, not the agent's,
+  so the kill-switch gate does not apply (D-38).
+- An answer posted as a new message (after a dropped progress edit) is posted first and edited
+  once more to add its buttons. That edit is best effort: if it fails, the answer stays as posted,
+  without buttons, and is still recorded.
+
+Votes follow the tenant's `tool_outputs_days` retention: the nightly purge deletes votes older
+than the limit, the reason text with them. The reason is the only free text the feature stores.
+
 ## Web console
 
-The same process serves web pages for agents, versions, members, usage and the audit log,
-behind Sign in with Slack. The pages call the same `ControlPlane` methods as the
-JSON API, so a user's role in the tenant decides what they can do in both. The
-console is off unless sign-in is configured.
+The same process serves web pages for agents, versions, members, usage, the audit log
+and each agent's feedback, behind Sign in with Slack. The pages call the same
+`ControlPlane` methods as the JSON API, so a user's role in the tenant decides what they
+can do in both. The console is off unless sign-in is configured.
 
 The pages call the same `ControlPlane` methods as the JSON API. Who sees what, the browser guard, the session cookie and the error pages are in [architecture.md §5](architecture.md#control-plane-and-console).
+
+A publish or a resume refused for a missing audience confirmation shows a sentence a
+person acts on — "Tick 'I confirm these people may see what this agent can access'
+(4 people: 1 guests, 1 from other workspaces) and publish again" — rendered from the
+refusal's counts, not the API's `confirm_audience` JSON wording. The JSON API keeps its
+machine-readable message.
+
+An `audience` block that omits `dm` closes direct messages to nobody. The version page
+and the diff say so plainly — "Direct messages: nobody (add `dm: everyone` to keep them
+open)" — and the publish confirmation lists it under what changes.
 
 **In the Slack app** (api.slack.com/apps, the app the gateway uses):
 
@@ -1312,13 +1886,14 @@ uv run python -m agentos.control_api --host 0.0.0.0 --port 8100
 ```
 
 The grant check ("Check Notion grants", and inside every publish) reads Notion with
-the tenant's own Notion key, so the process needs it too. The variable is the one the
-tenant's `secrets.notion_token_env` names (`NOTION_TOKEN` by default,
-`NOTION_TOKEN_GLOBEX` in the example above); export one per tenant. A tenant whose
-variable is unset is served Slack-only: the console starts, and that tenant's grant
-check fails at publish time with a message naming the variable, until Notion is
-connected. The console also serves the public "Add to Slack" page when the install is
-configured — see [Slack OAuth install](#slack-oauth-install-pilot).
+the tenant's own Notion token: the encrypted credential row once an admin has connected
+Notion on the settings page (below), else the variable the tenant's
+`secrets.notion_token_env` names (`NOTION_TOKEN` by default, `NOTION_TOKEN_GLOBEX` in the
+example above); export one per tenant as the fallback. A tenant with neither is served
+Slack-only: the console starts, and that tenant's grant check fails at publish time with
+a message naming the variable, until Notion is connected. The console also serves the
+public "Add to Slack" page when the install is configured — see
+[Slack OAuth install](#slack-oauth-install-pilot).
 
 **Choose from Notion (optional).** A creator may grant only what their own Notion account
 can see. With the picker on, "Choose from Notion" on a draft signs the creator in to
@@ -1343,7 +1918,118 @@ both, stops the process at start. Without them, behaviour is as before: the admi
 sees each grant's live title and parent, a warning when the creator's label and the live
 title don't contain one another as whole words once normalised, and a diff against the published version,
 and must tick a box to publish a version that widens
-access. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
+access. For a database with a single data source (Notion's 2025 model), the live title is
+the data source's title — the name people see as the database name — not the container's
+title, which can differ ("New database"); one extra Notion read, rate-limited like the
+rest. Run `uv run python scripts/migrate.py` for migration `020` on an existing database.
+
+**Tenant settings (admins).** `/ui/<tenant>/settings` (the **Settings** nav link) gathers
+the organisation's setup on one page. Every change is audited and picked up by every
+process on its next directory refresh, with no restart.
+
+- **Default agent and channel routing.** Choose the default agent among the published
+  agents, and map channels — picked from the channels the app is in — to agents. The same
+  rules as the tenant file apply: the default and every mapped agent need a published
+  version, and a mapped channel must be in its agent's audience. Audited as
+  `tenant_settings`. A tenant with no default agent sees a "not set up" banner with the
+  steps left (create an agent, publish it, choose it here).
+- **Approvals.** Each low-risk action the manifests declare (today `add_comment`, a
+  comment on an item the requester filed) with a switch: requester approval (the
+  default) or no approval. With no approval, the comment runs without a card on the
+  requester's own item; every other write still shows its card. Audited as
+  `policy_change`; see [Approval policy](#approval-policy-low-risk-comments).
+- **Agent health.** Each published agent's status (available / unavailable), the reason
+  and when the worker last checked it, read from `agent_health`; an agent no check has
+  recorded shows "never checked". Read-only: fix the grant in Notion or the agent's
+  definition, and the next check marks it available again (see
+  [What stops start-up](#what-stops-start-up-and-what-only-disables-an-agent)). The
+  agents list badges an unavailable agent.
+- **Connect Notion.** With the public integration configured (the same
+  `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET` as the picker), a Notion
+  workspace admin signs in and authorizes the integration for the workspace. The callback
+  validates the returned workspace bot token with one cheap API call and stores it
+  encrypted as the tenant's `notion` credential (migration `034`), with the workspace ID
+  and name on the tenant row. The page shows the workspace, who connected it and when.
+  **Reconnect** replaces the token; **Disconnect** removes it and the workspace. Both are
+  audited as `connector`; the token is never in the audit row. Processes resolve the
+  Notion token from the credential row first, the tenant's `notion_token_env` variable as
+  fallback — the same resolver shape as the Slack bot token. No new redirect URI: the flow
+  reuses `<AGENTOS_CONSOLE_URL>/auth/notion/callback`. A workspace another tenant already
+  uses is refused.
+- **Notion webhook verification.** Reveal the pending token once (with a Copy button),
+  paste it into the Notion integration, then **Confirm** or **Clear** — the same steps and
+  audit kind (`webhook_token`) as the command line, as the signed-in user. See
+  [Notion webhook](#notion-webhook-optional).
+
+**Creator feedback page.** `/ui/<tenant>/agents/<agent>/feedback` (the **Feedback** link
+on the agent page) shows what went wrong with one agent's answers, for the agent's
+creator and admins; another creator's agent is refused the same as one that does not
+exist. Sections, newest first, each with the count of every matching row in the window:
+questions the agent could not answer (a knowledge search that found nothing within the
+cut-off, or the fixed no-answer text — both detected from the hashes the audit row
+holds, no model call), turns that failed or hit the step limit, refused tools and grants
+(a tool call that errored, or a turn refused because the agent's grant check failed),
+declined or expired approvals, writes that failed, and 👎 votes with their reasons beside
+the 👍/👎 totals. The window is the last 30 days by default, with 90 and 365 offered.
+
+The page never shows who asked or who voted: no user IDs, no names, no thread links.
+A question's text is shown only while retention keeps the stored message, and only for
+a row whose turn stored one; otherwise the row keeps its count, date and agent version.
+Each stored question row carries the question's reference (conversation and message)
+beside the version, and a **Make a test case** button: one click adds the question to
+the agent's next draft — its newest draft, or one made from the published version when
+none exists — with the expected behaviour left for the creator to choose on the version
+page. Only this agent's own stored user question qualifies: a question retention has
+purged, another agent's conversation, or an assistant message cannot become a case.
+The reads are one indexed
+query per section over the rows the worker and the gateway already write
+(`audit_events`, `answer_feedback`, `conversation_messages`; migration `039` adds the
+per-agent indexes): no new data collection.
+
+**Creator test sets.** On a draft's version page, the agent's creator and admins write
+test cases: a question and an expected behaviour — answers citing a granted page, drafts
+a write to a granted database, refuses, or hands off to a listed specialist (the target
+must be one the draft grants or lists). Cases are stored per version and copied forward
+when a new draft is made. **Run tests** runs them against the **draft** definition, not
+the published one: a dedicated workflow on its own task queue (`agentos-tests`) runs each
+case as a turn through the same model and read path as a real turn, with the draft's
+grants and the runner as the requester in a direct message. Writes never run: when the
+model drafts a write, the run records the drafted action (tool and target database) and
+stops that case — no approval card, no task, nothing written, and nothing at all posts to
+Slack. A hand-off is recorded and stops the case too. Every case needs an expectation
+chosen before a run starts, and with the picker required every grant new since the
+published version must have been chosen from the creator's Notion, the same rule as at
+submit. One run of a version goes at a time — a second start while one is running is
+refused — and a retried start with the same request ID returns the first run. A run's
+workflow has a one-hour execution timeout; a running row older than that plus ten minutes
+is shown as failed on the version page and closed as failed by the next run start, so a run whose workflow died
+or whose final write could not land never blocks the version.
+
+A run spends at most **$0.20**, counted in the tenant's usage like any model call; a
+check after every model step stops the run at the cap (unknown spend stops it too), and
+the cases not run are reported. One call may take the run past the cap by its own cost,
+the same bound the monthly budgets keep; the aggregate bound is the monthly budgets plus
+one run at a time per version. Each case comes back pass/fail with a reason
+(expected source not cited, wrong action, did not refuse, wrong hand-off), shown on the
+version page with the run's time and spend; a refusal is the provider's `refusal` stop
+reason only — a model's plain-text refusal is not detected. A platform stop is an error,
+not a refusal: a case whose turn ended at the agent's monthly budget comes back
+`stopped_by_budget`, one the admin switched off `agent_off`, and one whose access needs
+fixing `agent_unavailable`, so a "refuses" case never passes on a reply the agent never
+chose. The run's row always closes: an uninstall mid-run or a failure that ends the run
+closes it as failed. The run's question and answer text stays in Postgres (its
+conversations are purged by the normal retention); the results are references and fixed
+codes.
+
+The approving admin's view of a **pending** version shows the latest run (pass/fail
+counts, failures expanded) and warns when there is no run or the draft or its test cases
+changed after it ran — the run records the definition and case-set hashes it ran against
+(a withdraw and resubmit alone changes neither). Cases and runs are audited
+(`test_case`, `test_run`) with references and hashes only; a run's reads write no
+`tool_call` rows, so a creator's tests stay out of the feedback page. Run
+`uv run python scripts/migrate.py` for migration `041` on an existing database. The
+console connects to Temporal on the first run; with Temporal down a run cannot start and
+its row is closed as failed, while every other page keeps working.
 
 Sign-in counts as configured only when all three variables are set and the URL is
 `https://`. The one exception is a local trial at `http://127.0.0.1:<port>` or

@@ -123,6 +123,57 @@ def _drop(path: str):
     return apply
 
 
+def _drive_grant_id(value):
+    """A definition whose one Drive folder grant carries ``value`` as its ID."""
+
+    def apply(definition: dict) -> None:
+        definition["grants"]["drive"] = {"folders": [{"id": value, "name": "Team folder"}]}
+
+    return apply
+
+
+def _drive_sheet(**overrides):
+    """A definition whose one Drive sheet grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        sheet = {"id": "drive-sheet-0001", "name": "Roster", "tab": "Q1"}
+        sheet.update(overrides)
+        definition["grants"]["drive"] = {"sheets": [sheet]}
+
+    return apply
+
+
+def _drive_template(**overrides):
+    """A definition whose one Drive template grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        template = {
+            "id": "drive-template-0001",
+            "name": "Offer template",
+            "folder_id": "drive-tmpl-folder-0001",
+        }
+        template.update(overrides)
+        definition["grants"]["drive"] = {"templates": [template]}
+
+    return apply
+
+
+def _drive_section(**overrides):
+    """A definition whose one Drive section grant carries the given fields."""
+
+    def apply(definition: dict) -> None:
+        section = {
+            "id": "drive-section-0001",
+            "name": "VPN guide",
+            "doc_id": "drive-section-0001",
+            "heading": "Status",
+        }
+        section.update(overrides)
+        definition["grants"]["drive"] = {"sections": [section]}
+
+    return apply
+
+
 DB = "grants.notion.databases.0"
 BAD_DEFINITIONS = [
     # An unknown key at the top, inside a grant, and three levels down.
@@ -149,7 +200,34 @@ BAD_DEFINITIONS = [
     (_set("follow_up.poll_interval_minutes", 0), "'poll_interval_minutes' must be"),
     (_set("follow_up.stale_after_days", 100000), "'stale_after_days' must be"),
     (_set("approval.expires_after_hours", -1), "'expires_after_hours' must be"),
+    (_set("follow_up.nudge", "yes"), "'nudge' must be true or false"),
+    (_set("follow_up.max_nudges", True), "'max_nudges' must be a whole number"),
+    (_set("follow_up.max_nudges", 11), "'max_nudges' must be"),
+    (_set(f"{DB}.properties.assignee", 7), "'assignee' must be non-empty text"),
     (_drop("max_steps"), "missing required field 'max_steps'"),
+    # A Drive grant ID is the connector's bare-ID shape: no query injection, no short ID.
+    (_drive_grant_id("x' or '1'='1"), "'id' must be a Drive ID"),
+    (_drive_grant_id("folder 1"), "'id' must be a Drive ID"),
+    (_drive_grant_id("short"), "'id' must be a Drive ID"),
+    # A sheet grant names a tab; its columns are a bounded list of non-empty names.
+    (_drive_sheet(tab=""), "missing required field 'tab'"),
+    (_drive_sheet(id="short"), "'id' must be a Drive ID"),
+    (_drive_sheet(columns="name,role"), "'columns' must be a list"),
+    (_drive_sheet(columns=["name", ""]), "'columns' must be a list of non-empty"),
+    (_drive_sheet(columns=["c"] * 51), "at most 50 columns"),
+    (_drive_sheet(columns=["c" * 201]), "at most 200 characters"),
+    (_drive_sheet(colours=["name"]), "unknown field 'colours'"),
+    # A template grant names a destination folder; its blanks are a bounded list of names.
+    (_drive_template(folder_id="short"), "'folder_id' must be a Drive ID"),
+    (_drive_template(folder_id=""), "missing required field 'folder_id'"),
+    (_drive_template(blanks="name,role"), "'blanks' must be a list"),
+    (_drive_template(blanks=["name", ""]), "'blanks' must be a list of non-empty"),
+    (_drive_template(blanks=["b"] * 51), "at most 50 blanks"),
+    (_drive_template(blanks=["b" * 201]), "at most 200 characters"),
+    (_drive_template(drive_id="short"), "'drive_id' must be a Drive ID"),
+    (_drive_template(colours=["name"]), "unknown field 'colours'"),
+    # A section grant's doc_id is the same Doc as its id: the write names the granted Doc.
+    (_drive_section(doc_id="drive-other-0001"), "'doc_id' must be the same Doc as 'id'"),
 ]
 
 
@@ -194,3 +272,19 @@ def test_max_writes_per_turn_outside_one_to_ten_is_refused(bad):
     """Fails if a limit that is no whole number from 1 to 10 is accepted."""
     with pytest.raises(ConfigError, match="max_writes_per_turn"):
         parse_agent("it-helper", _helper(max_writes_per_turn=bad), 1)
+
+
+def test_the_assignee_and_nudge_fields_round_trip():
+    """Fails if the assignee mapping or the nudge policy is lost between the definition and the agent."""
+    definition = block()
+    db = definition["grants"]["notion"]["databases"][0]
+    db["properties"]["assignee"] = "Assignee"
+    db["property_ids"]["assignee"] = "asg1"
+    definition["follow_up"] = {**definition["follow_up"], "nudge": False, "max_nudges": 5}
+
+    agent = parse_agent("it-helper", definition, 1)
+
+    grant = agent.grants.notion_databases[0]
+    assert (grant.assignee_prop, grant.assignee_prop_id) == ("Assignee", "asg1")
+    assert (agent.follow_up.nudge, agent.follow_up.max_nudges) == (False, 5)
+    assert parse_agent("it-helper", agent_definition(agent), 1) == agent

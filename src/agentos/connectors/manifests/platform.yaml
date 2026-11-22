@@ -1,0 +1,21 @@
+# Platform connector manifest: reads of the platform's own state, not a connector's.
+# The runtime reads it like every manifest (see agentos.connectors.manifest).
+#
+# my_tasks lists the asker's tasks from the tasks table. The requester comes from the
+# runtime (TurnContext), never from the model, so the tool takes no input fields. It is
+# offered only to an agent that has a write grant (a Notion database), because only such
+# an agent starts tasks; the grant is checked again when the call runs.
+connector: platform
+tools:
+  my_tasks:
+    risk: read
+    description: >-
+      List the requests the person asking has made through any agent in this
+      workspace, from the platform's own task records: title, link, state (awaiting
+      approval, filed, watching, done, failed, cancelled), last known status, when
+      it last changed and the thread it lives in. Open requests first, newest first,
+      at most 10. Use this for questions like "where is my request?" or "my open
+      requests" before searching Notion.
+    input_schema:
+      type: object
+      properties: {}

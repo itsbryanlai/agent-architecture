@@ -5,15 +5,18 @@ The single reference for every kind of event in the audit log (`audit_events`). 
 table by `scripts/init_db.sql` and the migrations. A kind that is not in both cannot be written.
 
 Contents: [Columns](#columns) · [Conversation and tools](#conversation-and-tools) ·
-[Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Members](#members) ·
+[Feedback](#feedback) ·
+[Writes](#writes) · [Agent lifecycle](#agent-lifecycle) · [Test sets](#test-sets) · [Members](#members) ·
 [Audiences](#audiences) · [Budgets and usage](#budgets-and-usage) · [Switches](#switches) ·
-[Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
+[Retention](#retention) · [Webhook token](#webhook-token) · [Install](#install) ·
+[Uninstall](#uninstall) · [Connector](#connector) · [Tenant settings](#tenant-settings) · [Access review](#access-review) · [What the log never holds](#what-the-log-never-holds) ·
 [How to read it](#how-to-read-it) · [What you see in a live run](#what-you-see-in-a-live-run)
 
 ## Columns
 
 Every row has `tenant_id`, `seq` (insertion order, may have gaps), `at`, `kind`, `event_key`
-(unique per tenant) and `outcome` (`ok` or `error`). The tables below say what the other
+(unique per tenant) and `outcome` (`ok`, `error`, or `policy` — a write that ran under an
+admin's no-approval policy, D-43). The tables below say what the other
 columns hold for each kind:
 
 - **requester**: `requester_user_id`. **identity**: whose access was used.
@@ -42,19 +45,45 @@ is the Slack user who asked, agent and version are the ones the turn is pinned t
 | `tool_call` | A read tool ran (`search_knowledge`, a Notion read) and its output was stored. | tool name | - | - | in: hash of the tool input; out: hash of the output text | Written with `error` when the tool failed, or when the agent or the connector was switched off (the model got the off message); nothing is read then | `<conversation>:audit:tool:<tool use id>` |
 | `hand_off` | A front door hands the thread to a specialist, before the announcement is shown. Agent and version are the front door's. | - | specialist's agent ID | - | - | A hand-off the specialist's audience refuses is `audience_refused`, not this | `<tenant>:audit:hand-off:<event id>` |
 
+## Feedback
+
+Written by the gateway when a person clicks 👍 or 👎 on an answer — the user's action, not the
+agent's (D-38). The voter is the Slack user of the signed request; the agent and version are the
+ones the answer's button names. The optional reason a 👎 may carry lives in `answer_feedback`
+only, never here, and is purged with that row by retention. Every click records its own event,
+because the key carries the vote's time: up → down → up records three events and an identical
+double click records twice (Slack does not retry clicks). The vote and its event commit in one
+transaction, so a failed audit insert leaves no vote behind. Submitting or dismissing the reason
+form records nothing new.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `feedback` | A person's click on an answer is recorded: 👍 or 👎, a second click by the same person replacing it. Every click is its own event | the voter / `user:<voter>` | The agent and version that answered | `feedback` | the vote: `up` or `down` | `ok` | `<conversation>:audit:feedback:<answer ts>:<voter>:<vote>:<vote time>` |
+
 ## Writes
 
 Written when an approved write is carried out, as the agent. Requester is the person who asked;
 the approver is the same person (only the requester can approve). Tool is the write tool's name
-(`add_comment` for a comment, otherwise the create tool the agent's connector declares). Target is the Notion database ID
-for a create or the page ID for a comment (after a create, the new page ID on success).
+(`add_comment` for a Notion comment, `comment_on_file` for a Drive comment (D-47), otherwise the
+create tool the agent's connector declares). Target is the Notion database ID for a create, the
+page ID for a Notion comment or the Drive file ID for a Drive comment (after a create, the new
+page ID on success).
+A comment that ran under the tenant's approval policy (D-43) is written here too: its `write`
+row has outcome `policy` and an empty approver, and no `approval` row precedes it — the log
+alone shows it ran without approval.
+A nudge (D-41) records one `approval` with tool `nudge` and one `write` per effect: tool
+`nudge_comment` (target the page ID) and, when the assignee matched a Slack user, `nudge_dm`
+(target the assignee's Slack user ID, out the hash of `{ts}`). A nudge with no DM records no
+`nudge_dm` row. A DM Slack refuses for good (a gone channel or user, an inactive account) records
+`write` with `error` and is not retried; a DM that failed after the comment with a transient error
+records no row (the thread line says so).
 `approval_closed` is the exception: it is written when no approved write is carried out (a decline
 or an expiry), with its own tool, target and approver as its row states.
 
 | Kind | Written when | in / out | Refused or failed | Event key |
 |---|---|---|---|---|
 | `approval` | The approved write starts, before anything is sent. Records the exact payload that was approved. | in: hash of the approved payload; out: - | Also written for a write refused later (switch, audience, idempotency method), because the approval did happen | `<task>:audit:approval:<approval nonce>` |
-| `write` | The write finished (or a reconciliation found it done): `ok`. Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}` or `{comment_id}` on `ok`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, or no connector manifest declares the idempotency method. Nothing was changed. | `<task>:<create or comment>:audit:write:<outcome>` |
+| `write` | The write finished (or a reconciliation found it done): `ok`, or `policy` when it ran under the admin's no-approval policy (D-43). Or it was refused or failed for good: `error`. | in: hash of the payload; out: hash of `{page_id}`, `{comment_id}` or `{ts}` (a nudge DM) on `ok` or `policy`, - on `error` | Written with `error` when a kill switch covers writes or the connector, the agent was turned off, the requester left the audience, the agent no longer has the grant, the connector rejected it, Slack refused the nudge DM for good, or no connector manifest declares the idempotency method. Nothing was changed. A refused policy write has no `approval` row either. | `<task>:<create, comment or dm>:audit:write:<outcome>` |
 | `approval_closed` | The approval closed without a write: the requester declined it, or it expired. Recorded before the card is updated. Tool is `declined` or `expired` (not the write tool's name); target is empty; the approver is the requester on a decline, empty on an expiry. | in: hash of the proposed payload (the revision the card named); out: - | Not written if the audit store stayed down through the activity's retries, or if the named draft revision is missing (non-retryable); either way the card still closes | `<task>:audit:approval-closed:<approval nonce>` |
 
 A write that is never approved (declined, expired) records one `approval_closed` event and no `approval` or `write`: nothing ran.
@@ -79,6 +108,19 @@ random and a retry records again. A refused action (wrong role, bad state) write
 | `agent_publish` | An admin publishes a pending version | the submitter / the admin (may be the same person) | Admin only. Written first; `widening_confirm` and `audience_confirm` follow it in the same transaction when they apply |
 | `agent_import` | The one-time YAML import inserts an agent as published version 1 | `import:yaml` / `import:yaml` | Identity `user:import:yaml`. Key `<tenant>:audit:import:<agent id>`: once per agent, ever |
 
+## Test sets
+
+Written by the control plane in the same transaction as the change (D-44). Requester and identity:
+the person acting, as `user:<Slack ID>`. Each row names the agent and the draft version it concerns.
+A refused action (wrong role, bad case, no expectations chosen) writes nothing.
+
+| Kind | Written when | tool | target | in | Notes |
+|---|---|---|---|---|---|
+| `test_case` | A case is added to a draft, its expectation chosen, or it is removed | `add`, `expect` or `remove` | the case ID | hash of the case's question and expectation (`add`), of the expectation (`expect`), of the case ID (`remove`) — never the text | The feedback page's "Make a test case" records `add` on the draft the question landed on; a draft made for it records `agent_draft` first |
+| `test_run` | A run of a draft's cases starts | - | the run ID | hash of the draft definition the run runs against | The run's results, spend and finish are the run row's, not the log's; a start that fails closes the row as failed. The run's own reads and drafted writes write no `tool_call` rows: a creator's tests stay out of the feedback page's reads |
+
+Event key: the control key, `<tenant>:audit:control:<kind>:<request ID>`.
+
 ## Members
 
 Written by the control plane in the same transaction. Admin only. Agent and version are empty (a
@@ -95,7 +137,7 @@ member's Slack user ID. Key as for the agent lifecycle.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | approver | outcome | Event key |
 |---|---|---|---|---|---|---|---|---|
-| `audience_refused` | A turn is refused because the asker is not in the agent's audience, or a hand-off to a specialist is refused for the same reason. | Slack user who asked / `agent:<agent id>` | The agent that was asked (for a refused hand-off, the specialist, at its published version) | reason code: `channel`, `dm`, `guest`, `external`, `deactivated`, `unavailable`, `off`, `paused` | the front door's ID for a refused hand-off, else - | - | `error` when the lookup failed (`unavailable`), else `ok` | `<tenant>:audit:audience-refused:<event id>:<agent id>:<front door or empty>` |
+| `audience_refused` | A turn is refused because the asker is not in the agent's audience, or a hand-off to a specialist is refused for the same reason. | Slack user who asked / `agent:<agent id>` | The agent that was asked (for a refused hand-off, the specialist, at its published version) | reason code: `channel`, `dm`, `guest`, `external`, `deactivated`, `unavailable`, `off`, `paused`, `health` | the front door's ID for a refused hand-off, else - | - | `error` when the lookup failed (`unavailable`), else `ok` | `<tenant>:audit:audience-refused:<event id>:<agent id>:<front door or empty>` |
 | `audience_confirm` | An admin publishes a version after confirming the counted audience (total, guests, other workspaces). Written only when the plane counts audiences. | submitter / `user:<admin>` | Published version | - | `total=N guests=N external=N` | the admin | `ok` | Control key |
 | `audience_pause` | The watch finds a channel an agent answers in has been shared with another organisation, and pauses the agent there. One row per agent paused. | `system:audience-watch` for both | The agent's published version | why: `channel_shared` | the channel ID | - | `ok` | `<tenant>:audit:audience-pause:<agent id>:<channel>:<paused at>` (once per pause) |
 | `audience_resume` | An editor or admin ends a pause after confirming the channel's people. | actor / `user:<actor>` | The published version; the agent with an empty version when it has no published version | the pause's reason | `<channel> total=N guests=N external=N` | the actor | `ok` | Control key |
@@ -118,6 +160,20 @@ changed: turning off what is off, or on what is on, records nothing.
 | `switch_off` | A switch is turned off | admin's Slack ID / `user:<admin>`, or `operator:<login>` for both | The agent for an `agent` switch, else empty; never a version | scope: `agent`, `all_agents`, `connector`, `writes` | the agent ID or connector name; empty for `all_agents` and `writes` | `ok` | Control key |
 | `switch_on` | A switch is turned back on | as above | as above | scope | as above | `ok` | Control key |
 
+## Agent health
+
+Written by the worker's health check, only on a transition: an agent becoming unavailable,
+or available again. The check combines two sources — the grants themselves, and the nightly
+creator-access pass (`creator_access`) — and an agent is available only when both pass. A
+repeated check that finds the same status records nothing. The reason itself (the grant and
+the problem, or the grant the creator can no longer see) lives in `agent_health`, never in
+the audit row; the row carries its hash. A switch an admin turns off or on is not a health
+transition (see Switches).
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `agent_health` | The worker's health check flips an agent's health: unavailable (a grant problem, or a granted object its creator can no longer see) or available again (both sources pass). | `system:agent-health` for both | The agent and the version checked | the new status: `unavailable` or `available` | - | `ok` | `<tenant>:audit:agent-health:<agent id>:<checked at>` (once per transition); `output_sha256` is the hash of the reason when unavailable |
+
 ## Retention
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
@@ -129,13 +185,15 @@ Rows in `audit_events` are not subject to retention themselves.
 ## Webhook token
 
 Written by the host command that manages a tenant's Notion webhook verification token
-(`python -m agentos.notion_webhook`), as `operator:<OS login>` (which names the requester too).
-Written only when the command did something: a show of an already-confirmed token, or a confirm
-or clear with nothing to change, records nothing. The token itself is never in the row.
+(`python -m agentos.notion_webhook`), as `operator:<OS login>` (which names the requester too),
+or by the console's settings page (an admin), as `user:<Slack ID>`. The two surfaces share one
+state machine and audit kind. Written only when the step did something: a show of an
+already-confirmed token, or a confirm or clear with nothing to change, records nothing. The
+token itself is never in the row.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `webhook_token` | The operator shows the pending token, confirms it, or clears it | `operator:<OS login>` for both | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<random>`: a repeat run records again |
+| `webhook_token` | The pending token is shown (revealed), confirmed, or cleared | `operator:<OS login>` for both from the command; the admin / `user:<admin>` from the console | none | `show`, `confirm` or `clear` | - | `ok` | `<tenant>:audit:control:webhook_token:<command>:<request ID or random>`: a retry with the same request ID records once |
 
 ## Payload key
 
@@ -156,7 +214,68 @@ allowlist, a failed code exchange) writes nothing. The bot token is never in the
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
-| `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
+| `install` | "Add to Slack" creates a tenant, or a reinstall replaces its bot token (and re-enables it after an uninstall) | the installer / `user:<installer>` | none | `install` or `reinstall` | the Slack team ID | `ok` | `<tenant>:audit:control:install:<random>`: each install attempt records again |
+
+## Uninstall
+
+Written by the gateway's Slack event handler (`app_uninstalled`, or `tokens_revoked`
+naming bot tokens), in the same transaction as the tenant disable and the deletion of
+its `slack_bot` credential. The Notion credential is kept. A retry of an event already
+handled records and changes nothing, even after a reinstall (its audit key is checked
+first); an out-of-order event records nothing: the tenant is already disabled with no
+credential. An event for
+an unknown workspace, or a `tokens_revoked` naming no bot token, records nothing. No
+user acts: the event comes from Slack, so the requester and identity are the system
+marker. The row never holds a token.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `uninstall` | The workspace uninstalls the app or its bot tokens are revoked: the tenant is disabled and its Slack credential deleted | `system:uninstall` for both | none | `app_uninstalled` or `tokens_revoked` | the Slack team ID | `ok` | `<tenant>:audit:control:uninstall:<Slack event ID>`: a Slack retry records nothing |
+
+## Connector
+
+Written by the console's Connect Notion and Disconnect (the control plane), in the same
+transaction as the encrypted credential and the tenant's workspace. Admin only. A refused
+connect (a state this session never began or already spent, a failed code exchange or
+validation call, a workspace another tenant uses) writes nothing. The token is never in the row.
+
+The same kind records a creator's consent to keep their own Notion sign-in for the nightly
+access check (`creator_consent`, written with the encrypted per-creator credential when a
+consented picker flow completes) and its revocation (`creator_consent_revoked`, written with
+the credential's deletion). Any member with a role may consent or revoke for themselves; a
+re-pick completed with the consent box unticked revokes the sign-in a former pick kept. An
+admin dropping a member deletes the
+sign-in in the same transaction as the member change and records the revoke with the member
+as target. A revoke with nothing stored writes nothing. The token is never in these rows
+either.
+
+The same kind records the tenant's Google Drive connection (D-45): `drive_connect` when the
+deployment's Google service account creates (or finds) the tenant's own service account,
+`drive_disconnect` when the account is deleted at Google. Written in the same transaction as
+the connection row, after the Google call succeeds. A second click on an already-connected
+tenant, a disconnect with nothing connected, or a refused connect (a non-admin, a deployment
+without the Google settings, a failed Google call) writes nothing. No key is created or
+stored per tenant; the account email in `target` is not a secret. An uninstall deletes the
+connection row with the disable and the account best effort; it records `uninstall`, not a
+connector event.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `connector` | Notion is connected (or reconnected), or disconnected | the admin / `user:<admin>` | none | `connect` or `disconnect` | the Notion workspace ID on connect; empty on disconnect | `ok` | Control key |
+| `connector` | A creator consents to keep their Notion sign-in (a consented pick replaces it), or the consent is revoked: by the creator, by an unticked re-pick, or by an admin's member change | the creator / `user:<creator>`, or the admin / `user:<admin>` for a member change | none | `creator_consent` or `creator_consent_revoked` | the creator's Slack ID on consent; the member's Slack ID when a member change deletes it; empty on a self-revoke | `ok` | Control key |
+| `connector` | Google Drive is connected (or reconnected after an error), or disconnected (D-45) | the admin / `user:<admin>` | none | `drive_connect` or `drive_disconnect` | the tenant's service-account email | `ok` | Control key |
+
+## Tenant settings
+
+Written by the console's settings page (the control plane), in the same transaction as the
+change. Admin only. Setting what is already in force changes nothing and records
+nothing; a refused change (an unpublished agent, a channel outside its agent's audience,
+an action that is not low-risk, an unknown policy) records nothing.
+
+| Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
+|---|---|---|---|---|---|---|---|
+| `tenant_settings` | The default agent or the channel routing changes | the admin / `user:<admin>` | none | `routing` | `default=<agent or ->; <channel>-><agent>,...`, cut at 300 characters | `ok` | Control key |
+| `policy_change` | The tenant's approval policy for a low-risk action changes (D-43) | the admin / `user:<admin>` | none | the action's name (`add_comment`) | the new policy: `none` or `requester_approval` | `ok` | Control key |
 
 ## Access review
 
@@ -176,7 +295,8 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 - Rows are exempt from retention and kept until someone removes them outside the app.
 - A refused control-plane action (wrong role, last admin, stale review) is not audited. The refusals that
   are audited are the ones above: `audience_refused`, a refused write as `approval` + `write` with
-  `error`, and a requester's decline as `approval_closed` with tool `declined`.
+  `error` (a refused policy write as `write` with `error` alone), and a requester's decline as
+  `approval_closed` with tool `declined`.
 
 ## How to read it
 
@@ -188,8 +308,12 @@ Written with the publish or the pick, by the control plane. Identity `user:<Slac
 ## What you see in a live run
 
 - A DM question that searches the knowledge: `tool_call` (`search_knowledge`, `ok`), then `answer`.
+- Someone clicks 👎 on an answer and types a reason: `feedback` (target `down`, the voter as
+  requester); the reason stays in `answer_feedback`, not in the log.
 - A request that files a Notion item: `approval`, then `write` (`ok`, target the new page ID). If the
   agent was switched off between approval and write: `approval`, then `write` with `error`.
+- A comment on the requester's own item with the admin's approval policy off: `write` with `policy`
+  and no `approval` row; an admin's switch change earlier: `policy_change` (target `none`).
 - A front door that hands off: `hand_off` (front door as the agent, specialist as target), a `notice` (`hand_off`) for the announcement, then the specialist's own `tool_call` and `answer` rows.
 - Someone outside an agent's audience asks it: `audience_refused` (the reason in `tool`).
 - Publishing a version: `agent_publish`, then `widening_confirm` when it widens, then `audience_confirm`

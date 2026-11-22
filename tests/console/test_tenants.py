@@ -368,10 +368,18 @@ async def test_turn_uses_its_tenants_clients_only(two_tenants):
     assert h.notions[TENANT].calls == []
 
 
-async def test_unknown_tenant_activity_is_retryable():
-    """Fails if an activity for a tenant the worker does not know yet fails for good."""
+@pytest.mark.parametrize("state", ["not loaded", "disabled"], ids=["not-loaded", "disabled"])
+async def test_unknown_tenant_activity_is_retryable(state):
+    """Fails if an activity for a tenant not loaded yet fails for good, or one for a
+    disabled tenant retries instead of refusing non-retryably as TenantDisabled."""
     config = parse_agents_config(agents_dict())
     registry = TenantRegistry({TENANT: runtime_for(config, FakeSlack(), FakeNotionAPI())})
+    if state == "disabled":
+        registry.remove(TENANT)
+        registry.set_disabled({TENANT})
+        tenant = TENANT
+    else:
+        tenant = "initech"
     acts = AgentActivities(
         settings=Settings(),
         registry=registry,
@@ -384,7 +392,7 @@ async def test_unknown_tenant_activity_is_retryable():
         agents=seeded_agent_store(config),
     )
     ctx = TurnContext(
-        tenant_id="initech",
+        tenant_id=tenant,
         agent_id="it-helper",
         agent_version=1,
         requester_user_id=ALICE,
@@ -395,10 +403,14 @@ async def test_unknown_tenant_activity_is_retryable():
 
     with pytest.raises(ApplicationError) as caught:
         await acts.post_placeholder(ctx, "key")
-    assert caught.value.non_retryable is False
+    assert caught.value.non_retryable is (state == "disabled")
+    if state == "disabled":
+        assert caught.value.type == "TenantDisabled"
     with pytest.raises(ApplicationError) as caught:
-        await acts.load_agent("initech", "it-helper")
-    assert caught.value.non_retryable is False
+        await acts.load_agent(tenant, "it-helper")
+    assert caught.value.non_retryable is (state == "disabled")
+    if state == "disabled":
+        assert caught.value.type == "TenantDisabled"
 
 
 def make_acts(*configs):

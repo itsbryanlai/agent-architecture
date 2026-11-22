@@ -5,11 +5,18 @@ Everything is in memory: the stores, a fake Notion and a fake Slack sign-in.
 
 import html
 import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from agentos.agent_feedback import FEEDBACK_DAYS
+from agentos.agent_health import AVAILABLE, UNAVAILABLE, AgentHealth
+from agentos.audit import canonical_sha256
 from agentos.config import parse_agent
+from agentos.feedback import AnswerFeedback
+from agentos.knowledge.search import NO_MATCH
+from agentos.models import NO_ANSWER, AuditEvent
 from agentos.web_ui import SKELETON, definition_text, parse_definition
 from tests.conftest import DB_ID, GLOBEX, TENANT, default_schema
 from tests.helpers.agents import helper_block
@@ -86,6 +93,17 @@ async def test_the_agents_page_links_the_admin_pages_and_offers_a_new_agent(h):
     assert 'name="request_id"' in page.text
 
 
+@pytest.mark.parametrize("status", [UNAVAILABLE, AVAILABLE], ids=["unavailable", "available"])
+async def test_the_agents_list_badges_an_unavailable_agent(h, status):
+    """Fails if the agents list does not badge an unavailable agent, or badges an available one."""
+    await make_pending(h)
+    await h.health.record(AgentHealth(TENANT, "it-helper", 1, status, None, h.clock()))
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(f"{UI}/agents")).text
+    assert ('<span class="status">unavailable</span>' in page) is (status == UNAVAILABLE)
+
+
 async def test_the_agent_page_lists_its_pending_version_and_its_creator(h):
     """Fails if the agent page does not list version 1 as pending with its creator."""
     page = await admin_page(h, f"{UI}/agents/it-helper")
@@ -160,7 +178,12 @@ async def test_a_creator_cannot_open_an_agent_another_creator_made_and_it_is_not
     async with using(c):
         listing = await c.get(f"{UI}/agents")
         assert listing.status_code == 200 and "it-helper" not in listing.text
-        for path in (VERSION, f"{UI}/agents/it-helper", f"{UI}/agents/nobody"):
+        for path in (
+            VERSION,
+            f"{UI}/agents/it-helper",
+            f"{UI}/agents/it-helper/feedback",
+            f"{UI}/agents/nobody",
+        ):
             page = await c.get(path)
             assert page.status_code == 404, path
             assert "system_prompt" not in page.text
@@ -190,7 +213,7 @@ async def test_before_sign_in_an_unknown_tenant_and_a_real_one_answer_alike(h):
 async def test_the_admin_pages_are_refused_to_a_creator_by_the_control_plane(h):
     c = await h.signed_in(OWNER)
     async with using(c):
-        for path in ("/members", "/audit"):
+        for path in ("/members", "/audit", "/settings"):
             response = await c.get(UI + path)
             assert response.status_code == 403
             assert "may not do this" in response.text
@@ -203,14 +226,21 @@ async def test_pages_need_a_session(h):
         for path in (
             f"{UI}/agents",
             f"{UI}/agents/it-helper",
+            f"{UI}/agents/it-helper/feedback",
             VERSION,
             f"{UI}/members",
             f"{UI}/audit",
+            f"{UI}/settings",
         ):
             response = await c.get(path)
             assert response.status_code == 303 and response.headers["location"] == "/login", path
-        posted = await post(c, f"{VERSION}/publish", "anything")
-        assert posted.status_code == 303 and posted.headers["location"] == "/login"
+        for path in (
+            f"{VERSION}/publish",
+            f"{UI}/settings/routing",
+            f"{UI}/settings/approvals",
+        ):
+            posted = await post(c, path, "anything")
+            assert posted.status_code == 303 and posted.headers["location"] == "/login", path
     assert await status_of_version(h) == "pending"
 
 
@@ -219,9 +249,10 @@ async def test_a_user_who_lost_their_role_sees_no_access_with_no_data(h):
     c = await h.signed_in(OWNER)
     async with using(c):
         await h.members.remove_member(TENANT, OWNER)
-        response = await c.get(f"{UI}/agents")
-        assert response.status_code == 403
-        assert "no role" in response.text and "it-helper" not in response.text
+        for path in (f"{UI}/agents", f"{UI}/agents/it-helper/feedback"):
+            response = await c.get(path)
+            assert response.status_code == 403, path
+            assert "no role" in response.text and "it-helper" not in response.text
 
 
 async def test_an_unknown_agent_or_version_is_a_404_page(h):
@@ -625,6 +656,12 @@ async def test_a_creator_cannot_drive_the_admin_forms(h):
             (f"{UI}/members", {"user_id": "U_NEW", "role": "admin"}),
             (f"{UI}/members/{OTHER}/role", {"role": "admin"}),
             (f"{UI}/members/{OTHER}/remove", {}),
+            (f"{UI}/settings/routing", {"default_agent": "it-helper"}),
+            (f"{UI}/settings/approvals", {"action": "add_comment", "policy": "none"}),
+            (f"{UI}/settings/notion/disconnect", {}),
+            (f"{UI}/settings/webhook/reveal", {}),
+            (f"{UI}/settings/webhook/confirm", {}),
+            (f"{UI}/settings/webhook/clear", {}),
         ]:
             response = await post(c, path, token, **fields)
             assert response.status_code == 403, path
@@ -642,7 +679,13 @@ async def test_another_creator_cannot_submit_or_edit_an_agent_they_do_not_own(h)
         token = await csrf_token(c)
         edit = await post(c, f"{VERSION}/edit", token, definition=definition_text(helper_block()))
         submit = await post(c, f"{VERSION}/submit", token)
+        case = await post(c, f"{VERSION}/test-cases", token, question="q", expect="refuse")
+        run = await post(c, f"{VERSION}/test-run", token)
+        from_feedback = await post(
+            c, f"{UI}/agents/it-helper/test-cases", token, conversation_id="c1", question_seq="1"
+        )
     assert edit.status_code == 403 and submit.status_code == 403
+    assert case.status_code == 403 and run.status_code == 403 and from_feedback.status_code == 403
     assert await status_of_version(h) == "draft"
 
 
@@ -683,6 +726,20 @@ FORM_ROUTES = [
     ("members", {"user_id": "U_NEW", "role": "creator"}),
     ("switches/off", {"scope": "writes", "target": ""}),
     ("budgets", {"agent_id": "mine", "amount": "5"}),
+    ("settings/routing", {"default_agent": "it-helper"}),
+    ("settings/approvals", {"action": "add_comment", "policy": "none"}),
+    ("settings/notion/start", {}),
+    ("settings/notion/disconnect", {}),
+    ("settings/drive/connect", {}),
+    ("settings/drive/disconnect", {}),
+    ("settings/webhook/reveal", {}),
+    ("settings/webhook/confirm", {}),
+    ("settings/webhook/clear", {}),
+    ("agents/it-helper/versions/1/test-cases", {"question": "q"}),
+    ("agents/it-helper/versions/1/test-run", {}),
+    ("agents/it-helper/versions/1/drive/pick/choose", {"pick_0": "yes"}),
+    ("agents/it-helper/versions/1/drive/remove", {"grant_id": "drive-folder-0001"}),
+    ("agents/it-helper/test-cases", {"conversation_id": "c1", "question_seq": "1"}),
 ]
 
 
@@ -910,12 +967,288 @@ async def test_only_pages_are_open_to_a_cross_site_navigation(h):
 
 async def test_other_tenants_data_is_not_reachable_through_a_session(h):
     await h.plane.add_agent(GLOBEX, ROOT, "globex-secret", helper_block())
+    globex_events = len([e for e in h.audit.events if e.tenant_id == GLOBEX])
     c = await h.signed_in(OWNER)
     async with using(c):
-        for path in (f"/ui/{GLOBEX}/agents", f"/ui/{GLOBEX}/agents/globex-secret"):
+        for path in (
+            f"/ui/{GLOBEX}/agents",
+            f"/ui/{GLOBEX}/agents/globex-secret",
+            f"/ui/{GLOBEX}/agents/globex-secret/feedback",
+            f"/ui/{GLOBEX}/settings",
+        ):
             response = await c.get(path)
             assert response.status_code == 403 and "globex-secret" not in response.text
         token = await csrf_token(c)
-        posted = await post(c, f"/ui/{GLOBEX}/members", token, user_id="U_NEW", role="admin")
-        assert posted.status_code == 403
+        for path, fields in (
+            (f"/ui/{GLOBEX}/members", {"user_id": "U_NEW", "role": "admin"}),
+            (f"/ui/{GLOBEX}/settings/routing", {"default_agent": "it-helper"}),
+        ):
+            posted = await post(c, path, token, **fields)
+            assert posted.status_code == 403, path
     assert await h.members.get_member(GLOBEX, "U_NEW") is None
+    assert len([e for e in h.audit.events if e.tenant_id == GLOBEX]) == globex_events
+
+
+# --- the creator feedback page --------------------------------------------------------
+
+FEEDBACK = f"{UI}/agents/it-helper/feedback"
+ASKER = "U_ASKER"
+VOTER = "U_VOTER"
+APPROVER = "U_APPROVER"
+
+
+def seed_event(
+    h,
+    kind,
+    *,
+    tool=None,
+    outcome="ok",
+    output=None,
+    conversation=None,
+    version=1,
+    at=None,
+    approver=None,
+):
+    """One audit row for it-helper, as the worker records it: IDs and hashes only."""
+    h.audit.events.append(
+        AuditEvent(
+            tenant_id=TENANT,
+            event_key=f"{TENANT}:seed:{len(h.audit.events)}",
+            kind=kind,
+            agent_id="it-helper",
+            agent_version=version,
+            requester_user_id=ASKER,
+            identity="agent:it-helper",
+            outcome=outcome,
+            conversation_id=conversation,
+            tool=tool,
+            output_sha256=None if output is None else canonical_sha256(output),
+            approver_user_id=approver,
+            at=at if at is not None else datetime.now(UTC),
+            seq=len(h.audit.events) + 1,
+        )
+    )
+
+
+async def seed_turn(h, conversation, question, kind, **fields):
+    """A stored question, then the audit row of the turn that answered it."""
+    await h.history.append(
+        TENANT, conversation, f"{conversation}:user", "user", [{"type": "text", "text": question}]
+    )
+    seed_event(h, kind, conversation=conversation, **fields)
+
+
+async def seed_vote(h, vote, *, reason=None, voter=VOTER, answer_ts="1.1", age=None):
+    await h.feedback.record_vote(
+        AnswerFeedback(
+            tenant_id=TENANT,
+            conversation_id="c-vote",
+            answer_ts=answer_ts,
+            voter=voter,
+            agent_id="it-helper",
+            agent_version=1,
+            vote=vote,
+            reason=reason,
+            at=h.clock() - age if age is not None else datetime.now(UTC),
+        )
+    )
+
+
+@pytest.mark.parametrize("user", [OWNER, ADMIN2], ids=["the creator", "an admin"])
+async def test_the_feedback_page_is_shown_to_the_agents_creator_and_admins(h, user):
+    """Fails if the agent's creator or an admin cannot open the agent's feedback page."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    c = await h.signed_in(user)
+    async with using(c):
+        page = await c.get(FEEDBACK)
+    assert page.status_code == 200
+    assert "Questions the agent could not answer" in page.text
+    assert f'href="{UI}/agents/it-helper"' in page.text
+
+
+async def test_the_feedback_page_never_shows_who_asked_or_who_voted(h):
+    """Fails if an asker's, voter's or approver's ID, or the agent identity, appears on the page."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await seed_turn(
+        h, "c1", "how do I reset my password", "tool_call", tool="search_knowledge", output=NO_MATCH
+    )
+    await seed_turn(h, "c2", "what is the refund policy", "answer", output=NO_ANSWER)
+    await seed_turn(h, "c3", "why did this fail", "notice", tool="failure")
+    await seed_turn(
+        h, "c4", "which items are mine", "tool_call", tool="search_items", outcome="error"
+    )
+    seed_event(h, "audience_refused", tool="health", conversation="c5")
+    seed_event(h, "approval_closed", tool="declined", approver=APPROVER)
+    seed_event(h, "write", tool="add_comment", outcome="error", approver=APPROVER)
+    await seed_vote(h, "down", reason="cited the wrong page", voter=VOTER, answer_ts="1.1")
+    await seed_vote(h, "up", voter="U_VOTER2", answer_ts="2.2")
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        page = (await c.get(FEEDBACK)).text
+    assert "how do I reset my password" in page  # the rows themselves rendered
+    assert "cited the wrong page" in page
+    for person in (ASKER, VOTER, "U_VOTER2", APPROVER, "agent:it-helper"):
+        assert person not in page, person
+
+
+async def test_a_question_older_than_retention_shows_the_count_not_the_text(h):
+    """Fails if a question retention purged is shown as text, or a stored question is hidden."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    await h.history.append(
+        TENANT, "c-old", "c-old:user", "user", [{"type": "text", "text": "the purged question"}]
+    )
+    # Retention purged the old conversation's messages; the audit row is kept.
+    del h.history.messages[(TENANT, "c-old")]
+    del h.history.times[(TENANT, "c-old")]
+    seed_event(
+        h, "answer", output=NO_ANSWER, conversation="c-old", at=h.clock() - timedelta(days=100)
+    )
+    await seed_turn(h, "c-new", "the stored question", "answer", output=NO_ANSWER)
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        page = (await c.get(FEEDBACK, params={"days": "365"})).text
+    assert "the purged question" not in page
+    assert "the stored question" in page
+    assert '<span class="muted">(2)</span>' in page
+    assert "not stored" in page
+
+
+@pytest.mark.parametrize(
+    ("turns", "events", "votes", "expected", "absent"),
+    [
+        pytest.param(
+            [
+                ("c1", "q one", "tool_call", {"tool": "search_knowledge", "output": NO_MATCH}),
+                ("c2", "q two", "answer", {"output": NO_ANSWER}),
+            ],
+            [("answer", {"output": "a real answer", "conversation": "c3"})],
+            [],
+            [
+                '<span class="muted">(2)</span>',
+                "no matching documents",
+                "no answer",
+                "q one",
+                "q two",
+                'data-conversation="c1"',
+                'data-question-seq="1"',
+                'data-agent-version="1"',
+            ],
+            ["a real answer"],
+            id="unanswered",
+        ),
+        pytest.param(
+            [
+                ("c1", "q steps", "notice", {"tool": "step_limit"}),
+                ("c2", "q failed", "notice", {"tool": "failure"}),
+            ],
+            [("notice", {"tool": "hand_off", "conversation": "c3"})],
+            [],
+            ['<span class="muted">(2)</span>', "step_limit", "failure", "q steps", "q failed"],
+            ["hand_off"],
+            id="failed_turns",
+        ),
+        pytest.param(
+            [("c1", "q refused", "tool_call", {"tool": "search_items", "outcome": "error"})],
+            [
+                ("audience_refused", {"tool": "health", "conversation": "c2"}),
+                ("tool_call", {"tool": "search_items", "conversation": "c3"}),
+            ],
+            [],
+            [
+                '<span class="muted">(2)</span>',
+                "search_items",
+                "grant check failed",
+                "q refused",
+                "not stored",
+            ],
+            [],
+            id="refused",
+        ),
+        pytest.param(
+            [],
+            [
+                ("approval_closed", {"tool": "declined", "approver": APPROVER}),
+                ("approval_closed", {"tool": "expired"}),
+                ("approval", {"tool": "add_comment"}),
+            ],
+            [],
+            ['<span class="muted">(2)</span>', "declined", "expired"],
+            ["add_comment"],
+            id="approvals_closed",
+        ),
+        pytest.param(
+            [],
+            [
+                ("write", {"tool": "add_comment", "outcome": "error"}),
+                ("write", {"tool": "create_item", "outcome": "error"}),
+                ("write", {"tool": "create_item", "outcome": "ok"}),
+            ],
+            [],
+            ['<span class="muted">(2)</span>', "add_comment", "create_item"],
+            [],
+            id="writes_failed",
+        ),
+        pytest.param(
+            [],
+            [],
+            [
+                ("down", "wrong source", "1.1", None),
+                ("down", None, "2.2", None),
+                ("up", None, "3.3", None),
+                ("down", "old reason", "4.4", timedelta(days=40)),
+            ],
+            ['<span class="muted">(2)</span>', "wrong source", "no reason given", "👍 1 · 👎 2"],
+            ["old reason"],
+            id="votes",
+        ),
+    ],
+)
+async def test_each_feedback_section_shows_its_rows_and_count(
+    h, turns, events, votes, expected, absent
+):
+    """Fails if a section hides a seeded row, counts one it should not, or loses its count."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    for conversation, question, kind, fields in turns:
+        await seed_turn(h, conversation, question, kind, **fields)
+    for kind, fields in events:
+        seed_event(h, kind, **fields)
+    for vote, reason, answer_ts, age in votes:
+        await seed_vote(h, vote, reason=reason, answer_ts=answer_ts, age=age)
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        response = await c.get(FEEDBACK)
+    assert response.status_code == 200
+    for text in expected:
+        assert text in response.text, text
+    for text in absent:
+        assert text not in response.text, text
+
+
+@pytest.mark.parametrize(
+    ("raw", "days"),
+    [
+        ("30", 30),
+        ("90", 90),
+        ("365", 365),
+        ("", 30),
+        ("7", 30),
+        ("x", 30),
+        ("0", 30),
+        ("-30", 30),
+        ("90.0", 30),
+    ],
+)
+async def test_the_feedback_window_is_one_of_the_fixed_choices(h, raw, days):
+    """Fails if the days parameter selects a window outside the fixed choices, or the selection does not take effect."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    seed_event(
+        h, "answer", output=NO_ANSWER, conversation="c-old", at=h.clock() - timedelta(days=40)
+    )
+    await seed_turn(h, "c-new", "the recent question", "answer", output=NO_ANSWER)
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        page = (await c.get(FEEDBACK, params={"days": raw})).text
+    assert days in FEEDBACK_DAYS
+    assert f'<option value="{days}" selected>' in page
+    total = 2 if days >= 90 else 1
+    assert f'<span class="muted">({total})</span>' in page

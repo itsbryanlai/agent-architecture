@@ -2,9 +2,11 @@
 
 Rules this workflow keeps:
 
-* Writes never run without approval. Only the requester can approve, and the
-  approval nonce on the click must match the one on the card. Anything else is
-  ignored and the workflow keeps waiting.
+* Writes never run without approval, unless an admin turned approval off for that
+  low-risk action (D-43): a comment on an item the requester filed then runs without
+  a card, behind the ``approval-policy`` marker, and the thread line says so. Only the
+  requester can approve, and the approval nonce on the click must match the one on the
+  card. Anything else is ignored and the workflow keeps waiting.
 * What was approved is exactly what runs: the payload is frozen before the card is posted,
   as revision 1 of the task's draft in Postgres (``task_drafts``); the spec carries the
   reference (``draft_ref``, ``revision``) and the nonce, never the text. The only thing that
@@ -27,6 +29,10 @@ Rules this workflow keeps:
   the tracker. It never says nothing was filed after retries ran out.
 * A long watch continues as new, carrying a ``WatchState`` of IDs, times and flags, and a burst
   of pokes is answered at most once per ``POKE_GAP``.
+* An uninstalled tenant ends the task cleanly: the runtime reports it disabled (a
+  non-retryable refusal), and the task stops with no Slack post — the token is deleted —
+  recording its final state for ``my_tasks``. A tenant not loaded yet stays retryable.
+  Behind the ``tenant-disabled`` marker; older histories replay without it.
 * Logs carry IDs only, never the comment, the title or the details.
 * History stays small and free of content: after creation the workflow keeps only the item's
   page ID and last status. The lines posted in the thread that name the title, the comment
@@ -42,11 +48,14 @@ from datetime import timedelta
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from agentos import task_notices
+    from agentos import ids, task_notices
     from agentos.activities import AgentActivities
+    from agentos.agent_health import agent_unavailable_text
     from agentos.config import AgentVersion
+    from agentos.connectors.manifest import TOOLS
     from agentos.connectors.notion import normalize_id
     from agentos.models import (
         EDITABLE_FIELDS,
@@ -56,21 +65,25 @@ with workflow.unsafe.imports_passed_through():
         EditRequest,
         ExternalUpdate,
         NotionItem,
+        NudgeDone,
+        NudgePrepared,
+        NudgeRequest,
         TaskSpec,
         WatchState,
         check_field,
     )
-    from agentos.slack_format import escape_slack
-    from agentos.switches import agent_off_card_text, agent_off_text
+    from agentos.switches import DRIVE, agent_off_card_text, agent_off_text
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         POKE_GAP,
         RECONCILE_INTERVAL,
         RECONCILE_TRIES,
         RETRY,
+        TENANT_DISABLED_PATCH,
         WATCH_HISTORY_BOUND,
         WRITE_HEARTBEAT_TIMEOUT,
         WRITE_TIMEOUT,
+        is_tenant_disabled,
     )
 
 MAX_EDITS = 5
@@ -86,6 +99,19 @@ DRAFT_REFS_PATCH = "draft-refs"
 CONTINUE_AS_NEW_PATCH = "task-continue-as-new"
 # Histories recorded before a closed approval was audited close it with no audit row.
 PATCH_APPROVAL_CLOSED = "approval-closed-audit"
+# Histories recorded before agent health existed never see an unavailable agent; they
+# replay without its clean stop. A watch is not covered: an unavailable agent's poll
+# fails retryably, so the watch keeps polling with no workflow change.
+AGENT_UNAVAILABLE_PATCH = "agent-unavailable"
+# Histories recorded before the task store existed never record their state; they
+# replay without the record activity, and those tasks simply have no row.
+TASK_RECORD_PATCH = "task-record"
+# Histories recorded before the nudge existed never offer one: their stale notice is
+# the plain line, their watch never wakes for a nudge, and they carry no nudge state.
+NUDGE_PATCH = "nudge"
+# Histories recorded before the approval policy existed never ask it: every comment
+# shows its card, as it did then.
+APPROVAL_POLICY_PATCH = "approval-policy"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -108,6 +134,14 @@ class TaskWorkflow:
         self._poked = False
         self._edits = 0
         self._refresh_due = False
+        # The nudge offer's nonce, the nudge task in flight and a click or report the
+        # watch loop has not applied yet survive a hop in the WatchState; the loop
+        # applies them, never here.
+        resume = spec.resume
+        self._nudge_nonce = resume.nudge_nonce if resume is not None else ""
+        self._nudge_child = resume.nudge_child if resume is not None else ""
+        self._nudge_requested = resume.nudge_requested if resume is not None else False
+        self._nudge_done = resume.nudge_done if resume is not None else False
         if spec.resume is not None:
             self._state = "watching"
 
@@ -199,21 +233,62 @@ class TaskWorkflow:
         if self._page_key is not None and normalize_id(u.page_id) == self._page_key:
             self._poked = True
 
+    @workflow.signal(name="nudge")
+    def nudge(self, r: NudgeRequest) -> None:
+        """A click on the stale notice's nudge button: only the requester, only the
+        live offer's nonce, only while watching with no nudge already in flight.
+
+        An accepted click spends the offer at once: the nonce is cleared here, so a
+        second click on the same button is ignored even while the nudge is drafted.
+        """
+        if self._state != "watching":
+            workflow.logger.warning("ignored nudge click: the task is not watching")
+            return
+        if not self._nudge_nonce or r.nonce != self._nudge_nonce:
+            workflow.logger.warning("ignored nudge click: nonce does not match the offer")
+            return
+        if r.user_id != self._spec.ctx.requester_user_id:
+            workflow.logger.warning("ignored nudge click: clicker is not the requester")
+            return
+        if self._nudge_child:
+            workflow.logger.warning("ignored nudge click: a nudge is already in flight")
+            return
+        self._nudge_requested = True
+        self._nudge_nonce = ""
+
+    @workflow.signal(name="nudge_done")
+    def nudge_done(self, d: NudgeDone) -> None:
+        """The nudge task reports its comment landed; the watch restarts the stale clock."""
+        if self._nudge_child and d.child_id == self._nudge_child:
+            self._nudge_done = True
+
     @workflow.run
     async def run(self, spec: TaskSpec) -> str:
         if self._refs:
             workflow.patched(DRAFT_REFS_PATCH)
         try:
             return await self._run(spec)
-        except ActivityError:
+        except ActivityError as err:
             # Before approval nothing has been written, so a terminal failure
             # ends the task with one line. After it, the failure paths below
             # decide what to say, and anything else is raised.
             if self._state not in ("drafted", "awaiting_approval"):
                 raise
             task_id = workflow.info().workflow_id
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                # The activity's message is the fixed unavailable reply, built from the
+                # agent's name: a clean stop, not a failure. Nothing was written.
+                await self._act(
+                    AgentActivities.post_in_thread, spec.ctx, _reason(err), f"{task_id}:failed"
+                )
+                self._state = "cancelled"
+                await self._record()
+                return self._state
             await self._notice(task_notices.CARRY_ON_FAILED, f"{task_id}:failed", task_id)
             self._state = "failed"
+            await self._record()
             return self._state
 
     async def _run(self, spec: TaskSpec) -> str:
@@ -243,19 +318,41 @@ class TaskWorkflow:
                     await self._act(
                         AgentActivities.post_in_thread,
                         ctx,
-                        agent_off_text(escape_slack(agent.name)),
+                        agent_off_text(agent.name),
                         f"{task_id}:failed",
                     )
                     self._state = "cancelled"
+                    await self._record()
                     return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                tool = TOOLS.get(spec.tool)
+                if tool is not None and tool.connector == DRIVE:
+                    refusal = (
+                        "I can't comment on that file: I couldn't find it, or it isn't in a "
+                        "folder I have access to."
+                    )
+                else:
+                    refusal = (
+                        "I can't comment on that item: I couldn't find it, or it isn't in a "
+                        "database I have access to."
+                    )
                 await self._act(
                     AgentActivities.post_in_thread,
                     ctx,
-                    "I can't comment on that item: I couldn't find it, or it isn't in a "
-                    "database I have access to.",
+                    refusal,
                     f"{task_id}:failed",
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
             if self._refs:
                 self._spec = dataclasses.replace(
@@ -263,8 +360,136 @@ class TaskWorkflow:
                 )
             else:
                 self._spec = dataclasses.replace(spec, payload=payload)
+        elif spec.tool_name == "append_row":
+            # Resolve the granted sheet before any card (D-48). An append is always a stored
+            # draft, as a Drive comment is; there is no legacy inline shape to carry.
+            try:
+                appended: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_append, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't append to that sheet: I couldn't find it, or it isn't a sheet "
+                    "I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=appended.revision)
+        elif spec.tool_name == "create_doc":
+            # Check the template grant and resolve its folder before any card (D-49). A
+            # create-from-template is always a stored draft; there is no legacy inline shape.
+            try:
+                prepared: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_create_doc, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't create a Doc from that template: I couldn't find it, or it "
+                    "isn't a template I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=prepared.revision)
+        elif spec.tool_name == "replace_section":
+            # Check the section grant and read the heading's text and the Doc's revision before
+            # any card (D-50). A section replace is always a stored draft; no legacy inline shape.
+            try:
+                section: DraftOutcome = await self._act(
+                    AgentActivities.prepare_stored_replace_section, spec
+                )
+            except ActivityError as err:
+                if _is_agent_off(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_off_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                    await self._act(
+                        AgentActivities.post_in_thread,
+                        ctx,
+                        agent_unavailable_text(agent.name),
+                        f"{task_id}:failed",
+                    )
+                    self._state = "cancelled"
+                    await self._record()
+                    return self._state
+                await self._act(
+                    AgentActivities.post_in_thread,
+                    ctx,
+                    "I can't replace that section: I couldn't find the Doc or the heading, "
+                    "or it isn't a section I have access to.",
+                    f"{task_id}:failed",
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+            self._spec = dataclasses.replace(spec, revision=section.revision)
+        # The policy may let this comment run without a card (D-43): the activity reads
+        # the tenant's setting and the platform's own record of who filed the item.
+        # Histories recorded before the policy never ask and always show the card.
+        if (
+            workflow.patched(APPROVAL_POLICY_PATCH)
+            and spec.tool_name == "add_comment"
+            and await self._act(AgentActivities.comment_approval_policy, self._spec)
+        ):
+            self._spec = dataclasses.replace(self._spec, under_policy=True)
+            return await self._run_comment_under_policy(self._spec, task_id, agent.name)
         card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
+        await self._record()
 
         # --- wait for a valid decision, with one reminder, until expiry ---------
         expires = timedelta(hours=agent.approval.expires_after_hours)
@@ -315,6 +540,7 @@ class TaskWorkflow:
                 f"{task_id}:expired",
             )
             self._state = "expired"
+            await self._record()
             return self._state
 
         if not self._decision.approved:
@@ -322,6 +548,7 @@ class TaskWorkflow:
                 await self._try(AgentActivities.record_approval_closed, spec, task_id, "declined")
             await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Cancelled")
             self._state = "cancelled"
+            await self._record()
             return self._state
 
         if workflow.patched(PRE_WRITE_PATCH):
@@ -329,29 +556,45 @@ class TaskWorkflow:
             # paused or an audience changed since the card was shown stops the write here.
             try:
                 stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
-            except ActivityError:
+            except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    return await self._stop_for_tenant_disabled(spec, task_id)
                 # The check could not be completed: fail closed, take the buttons off.
                 stopped = UNCHECKED_CARD_TEXT
             if stopped is not None:
                 await self._try(AgentActivities.update_card_line, spec, task_id, card_ts, stopped)
                 self._state = "cancelled"
+                await self._record()
                 return self._state
 
         if spec.tool_name == "add_comment":
             return await self._run_comment(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "append_row":
+            return await self._run_append(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "create_doc":
+            return await self._run_create_doc(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "replace_section":
+            return await self._run_replace_section(spec, task_id, card_ts, agent.name)
+        if spec.tool_name == "nudge":
+            return await self._run_nudge(spec, task_id, card_ts, agent.name)
 
         title = "" if self._refs else spec.payload["title"]
         database_id = spec.database_id if self._refs else spec.payload["database_id"]
 
         # --- execute exactly once ------------------------------------------------
         self._state = "executing"
+        await self._record()
         try:
             item: NotionItem = await self._act_write(
                 AgentActivities.create_notion_item, spec, task_id
             )
         except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent.name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent.name)
             found = None
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(AgentActivities.reconcile_notion_item, spec, task_id)
@@ -367,6 +610,7 @@ class TaskWorkflow:
                         f"{task_id}:failed",
                     )
                     self._state = "failed"
+                    await self._record()
                     return self._state
             if found is None:
                 reason = _reason(err)
@@ -381,6 +625,7 @@ class TaskWorkflow:
                     reason=reason,
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
             item = found
 
@@ -415,6 +660,7 @@ class TaskWorkflow:
         """
         ctx = self._spec.ctx
         self._state = "watching"
+        await self._record(state.last_status or "")
         self._page_key = normalize_id(item.page_id)
         self._poked = state.poked
         done_values = _done_values(agent, database_id)
@@ -424,8 +670,11 @@ class TaskWorkflow:
         last_status = state.last_status
         last_change = state.last_change
         stale_sent = state.stale_sent
+        nudges_used = state.nudges_used
         # Histories recorded before this patch neither hop nor space out pokes.
         hop = workflow.patched(CONTINUE_AS_NEW_PATCH)
+        # Histories recorded before the nudge never offer one and never wake for one.
+        nudge_on = workflow.patched(NUDGE_PATCH)
         last_poll = None
 
         while True:
@@ -435,6 +684,7 @@ class TaskWorkflow:
                     task_notices.STOPPED_WATCH, f"{task_id}:stopped", task_id, subject=item.title
                 )
                 self._state = "done"
+                await self._record(last_status or "")
                 return self._state
             if hop and _hop_due():
                 # Signals that arrive after this point make Temporal refuse the hop and run
@@ -447,11 +697,25 @@ class TaskWorkflow:
                     stale_sent=stale_sent,
                     deadline=deadline,
                     poked=self._poked,
+                    nudges_used=nudges_used,
+                    nudge_nonce=self._nudge_nonce,
+                    nudge_child=self._nudge_child,
+                    nudge_requested=self._nudge_requested,
+                    nudge_done=self._nudge_done,
                 )
                 workflow.continue_as_new(dataclasses.replace(self._spec, resume=resume))
             woken_by_poke = True
             try:
-                await workflow.wait_condition(lambda: self._poked, timeout=min(poll, remaining))
+                await workflow.wait_condition(
+                    lambda: (
+                        self._poked or (nudge_on and (self._nudge_requested or self._nudge_done))
+                    ),
+                    timeout=min(poll, remaining),
+                )
+                if nudge_on:
+                    # A nudge click or report is not a poke: it neither spaces out the
+                    # next poll nor asks for a fresh-status report.
+                    woken_by_poke = self._poked
             except TimeoutError:
                 woken_by_poke = False
             if hop and woken_by_poke and last_poll is not None:
@@ -460,6 +724,37 @@ class TaskWorkflow:
                     await workflow.sleep(wait)
             self._poked = False
             last_poll = workflow.now()
+
+            if nudge_on:
+                if self._nudge_done:
+                    # The nudge ran: the stale clock restarts from now, and a later
+                    # stale period may offer another, up to max_nudges. The spent
+                    # offer's button goes first, under the key its notice was posted.
+                    self._nudge_done = False
+                    self._nudge_child = ""
+                    self._nudge_nonce = ""
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
+                    nudges_used += 1
+                    last_change = workflow.now()
+                    stale_sent = False
+                if self._nudge_requested:
+                    self._nudge_requested = False
+                    await self._try(
+                        AgentActivities.clear_stale_offer,
+                        self._spec,
+                        task_id,
+                        f"{task_id}:stale:{nudges_used}",
+                        agent.follow_up.stale_after_days,
+                    )
+                    await self._start_nudge(
+                        task_id, item, database_id, nudges_used, agent.follow_up.stale_after_days
+                    )
 
             try:
                 current: NotionItem = await self._act(
@@ -471,9 +766,15 @@ class TaskWorkflow:
                     item.page_id,
                 )
             except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    # The app was uninstalled: the watch ends here, with no post.
+                    return await self._stop_for_tenant_disabled(
+                        self._spec, task_id, last_status or ""
+                    )
                 if _is_agent_off(err):
                     # An admin turned the agent off: the watch ends here, with no post.
                     self._state = "cancelled"
+                    await self._record(last_status or "")
                     return self._state
                 if _is_permanent(err):
                     await self._notice(
@@ -483,6 +784,7 @@ class TaskWorkflow:
                         subject=item.title,
                     )
                     self._state = "done"
+                    await self._record(last_status or "")
                     return self._state
                 workflow.logger.warning("watch poll failed after retries; still watching")
                 continue
@@ -495,23 +797,81 @@ class TaskWorkflow:
                     status=current.status or "",
                 )
                 self._state = "done"
+                await self._record(current.status or "")
                 return self._state
             now = workflow.now()
             if current.status != last_status:
                 last_status = current.status
                 last_change = now
-            elif not stale_sent and now - last_change >= stale_after:
-                stale_sent = True
-                await self._notice(
-                    task_notices.STALE,
-                    f"{task_id}:stale",
-                    task_id,
-                    subject=current.title,
-                    days=agent.follow_up.stale_after_days,
-                )
+                await self._record(current.status or "")
+            else:
+                if woken_by_poke:
+                    # A poke asked for a fresh look: report the check even when nothing
+                    # moved, so a my_tasks wait in the thread sees the refresh land.
+                    await self._record(current.status or "")
+                if not stale_sent and now - last_change >= stale_after:
+                    stale_sent = True
+                    if nudge_on:
+                        # One offer per stale period: the button lives on this notice
+                        # alone, and only a nudge that runs starts the next period.
+                        nonce = ""
+                        if agent.follow_up.nudge and nudges_used < agent.follow_up.max_nudges:
+                            offer = False
+                            try:
+                                offer = await self._act(
+                                    AgentActivities.nudge_offer, self._spec, task_id, item.page_id
+                                )
+                            except ActivityError as err:
+                                error_type, slack_code = _failure_cause(err)
+                                workflow.logger.warning(
+                                    "activity nudge_offer failed after retries; continuing "
+                                    "tenant_id=%s task_id=%s error=%s slack_code=%s",
+                                    ctx.tenant_id,
+                                    task_id,
+                                    error_type,
+                                    slack_code,
+                                )
+                            if offer:
+                                nonce = str(workflow.uuid4())
+                                self._nudge_nonce = nonce
+                        await self._try(
+                            AgentActivities.post_stale_notice,
+                            self._spec,
+                            task_id,
+                            f"{task_id}:stale:{nudges_used}",
+                            agent.follow_up.stale_after_days,
+                            nonce,
+                        )
+                    else:
+                        await self._notice(
+                            task_notices.STALE,
+                            f"{task_id}:stale",
+                            task_id,
+                            subject=current.title,
+                            days=agent.follow_up.stale_after_days,
+                        )
             item = NotionItem(
                 page_id=item.page_id, url=item.url, title=current.title, status=current.status
             )
+
+    async def _stop_for_tenant_disabled(
+        self, spec: TaskSpec, task_id: str, status: str = ""
+    ) -> str:
+        """The tenant's app was uninstalled: end cleanly with no Slack post.
+
+        The token is deleted, so no card redraw or thread line can land; the task's
+        final state is still recorded for ``my_tasks``. A write in flight when the
+        uninstall landed cannot be confirmed either way (the runtime is gone); the
+        task says nothing rather than claim it was not filed.
+        """
+        workflow.logger.info(
+            "task ended: tenant uninstalled tenant_id=%s task_id=%s",
+            spec.ctx.tenant_id,
+            task_id,
+        )
+        self._state = "cancelled"
+        await self._record(status)
+        return self._state
 
     async def _stop_for_agent_off(
         self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
@@ -525,6 +885,22 @@ class TaskWorkflow:
             agent_off_card_text(agent_name),
         )
         self._state = "cancelled"
+        await self._record()
+        return self._state
+
+    async def _stop_for_agent_unavailable(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """The agent's grants broke after the approval and before the write: nothing was written."""
+        await self._try(
+            AgentActivities.update_card_line,
+            spec,
+            task_id,
+            card_ts,
+            agent_unavailable_text(agent_name),
+        )
+        self._state = "cancelled"
+        await self._record()
         return self._state
 
     async def _run_comment(
@@ -532,13 +908,18 @@ class TaskWorkflow:
     ) -> str:
         """Post the approved comment once. There is nothing to watch afterwards."""
         self._state = "executing"
+        await self._record()
         payload = {} if self._refs else spec.payload
         title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
         try:
             await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
         except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
             if _is_agent_off(err):
                 return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
             if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
                 found = await self._reconcile(
                     AgentActivities.reconcile_notion_comment, spec, task_id
@@ -554,6 +935,7 @@ class TaskWorkflow:
                         url=item_url,
                     )
                     self._state = "failed"
+                    await self._record()
                     return self._state
             else:
                 reason = _reason(err)
@@ -568,6 +950,7 @@ class TaskWorkflow:
                     reason=reason,
                 )
                 self._state = "failed"
+                await self._record()
                 return self._state
         await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Commented")
         await self._notice(
@@ -578,7 +961,447 @@ class TaskWorkflow:
             url=item_url,
         )
         self._state = "done"
+        await self._record()
         return self._state
+
+    async def _run_append(self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str) -> str:
+        """Append the approved row to the granted Sheet once (D-48). Nothing to watch after."""
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.append_sheet_row, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(AgentActivities.reconcile_sheet_append, spec, task_id)
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_APPEND,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_APPEND,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Appended")
+        await self._notice(
+            task_notices.APPENDED,
+            f"{task_id}:appended",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_create_doc(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """Copy the approved template into its folder once (D-49). Nothing to watch after."""
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.create_drive_doc, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(AgentActivities.reconcile_drive_doc, spec, task_id)
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_CREATE_DOC,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_CREATE_DOC,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Created")
+        await self._notice(
+            task_notices.CREATED,
+            f"{task_id}:created",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_replace_section(
+        self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str
+    ) -> str:
+        """Replace the approved section of the granted Doc once (D-50). Nothing to watch after.
+
+        The revision is the lock: a Doc that moved since the read refuses with nothing written
+        (a permanent refusal, the thread carries the reason); a retry after a lost response finds
+        the section already holding the approved text. When the retries run out and the look
+        cannot confirm, the task says so and points to the Doc, never that nothing was written.
+        """
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.replace_doc_section, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_drive_section, spec, task_id
+                )
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_REPLACE_SECTION,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_REPLACE_SECTION,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Replaced")
+        await self._notice(
+            task_notices.REPLACED,
+            f"{task_id}:replaced",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_comment_under_policy(self, spec: TaskSpec, task_id: str, agent_name: str) -> str:
+        """Post the comment the tenant's policy allows, without a card (D-43).
+
+        The write is the same exactly-once comment write, with no approval row and
+        outcome 'policy'. The same pre-write re-check a carded write gets runs first,
+        without the approval row: a channel paused or an audience lost since the turn's
+        check stops the comment, and the thread carries the line the card would show.
+        There is no card to update, so a refusal or a failure says so in the thread.
+        There is nothing to watch afterwards.
+        """
+        try:
+            stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            # The check could not be completed: fail closed, nothing is written.
+            stopped = UNCHECKED_CARD_TEXT
+        if stopped is not None:
+            await self._notice(
+                task_notices.STOPPED_COMMENT, f"{task_id}:failed", task_id, reason=stopped
+            )
+            self._state = "cancelled"
+            await self._record()
+            return self._state
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.add_notion_comment, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            stopped_text = None
+            if _is_agent_off(err):
+                stopped_text = agent_off_text(agent_name)
+            elif workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                stopped_text = agent_unavailable_text(agent_name)
+            if stopped_text is not None:
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=stopped_text,
+                )
+                self._state = "cancelled"
+                await self._record()
+                return self._state
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_notion_comment, spec, task_id
+                )
+                if found is None:
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_COMMENT,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._notice(
+            task_notices.COMMENTED_NO_APPROVAL,
+            f"{task_id}:commented",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _start_nudge(
+        self, task_id: str, item: NotionItem, database_id: str, nudges_used: int, stale_days: int
+    ) -> None:
+        """Draft the nudge and start its task: one approval card for both effects.
+
+        The watch keeps watching while the card waits. The nudge task reports back
+        when its comment lands; only then does the stale clock restart. A nudge that
+        is declined, expires or fails reports nothing: the period's offer is spent.
+        """
+        ctx = self._spec.ctx
+        child_id = ids.task_id(ctx.tenant_id, str(workflow.uuid4()))
+        try:
+            prepared: NudgePrepared = await self._act(
+                AgentActivities.prepare_nudge, self._spec, task_id, item.page_id, child_id
+            )
+        except ActivityError as err:
+            error_type, slack_code = _failure_cause(err)
+            workflow.logger.warning(
+                "activity prepare_nudge failed after retries; continuing "
+                "tenant_id=%s task_id=%s error=%s slack_code=%s",
+                ctx.tenant_id,
+                task_id,
+                error_type,
+                slack_code,
+            )
+            self._nudge_nonce = ""
+            await self._try(
+                AgentActivities.clear_stale_offer,
+                self._spec,
+                task_id,
+                f"{task_id}:stale:{nudges_used}",
+                stale_days,
+            )
+            await self._notice(
+                task_notices.NUDGE_PREPARE_FAILED,
+                f"{task_id}:nudge-failed:{nudges_used}",
+                task_id,
+                subject=item.title,
+            )
+            return
+        self._nudge_nonce = ""
+        if prepared.refused:
+            await self._notice(
+                task_notices.NUDGE_SELF,
+                f"{task_id}:nudge-self:{nudges_used}",
+                task_id,
+                subject=item.title,
+            )
+            return
+        spec = TaskSpec(
+            ctx=ctx,
+            tool_name="nudge",
+            payload={},
+            approval_nonce=str(workflow.uuid4()),
+            draft_ref=child_id,
+            revision=1,
+            database_id=database_id,
+            parent_id=task_id,
+            nudge_dm=prepared.dm,
+        )
+        await workflow.start_child_workflow(
+            TaskWorkflow.run, spec, id=child_id, parent_close_policy=ParentClosePolicy.ABANDON
+        )
+        self._nudge_child = child_id
+
+    async def _run_nudge(self, spec: TaskSpec, task_id: str, card_ts: str, agent_name: str) -> str:
+        """Run the approved nudge: the comment first, then the DM, each exactly once.
+
+        A DM failure after the comment reports "commented, couldn't DM" and never
+        retries the comment. The watch that started this task is told the comment
+        landed, so its stale clock restarts from the nudge.
+        """
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        try:
+            await self._act_write(AgentActivities.nudge_comment, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            if _is_agent_off(err):
+                return await self._stop_for_agent_off(spec, task_id, card_ts, agent_name)
+            if workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                return await self._stop_for_agent_unavailable(spec, task_id, card_ts, agent_name)
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                found = await self._reconcile(
+                    AgentActivities.reconcile_notion_comment, spec, task_id
+                )
+                if found is None:
+                    await self._try(
+                        AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
+                    )
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_COMMENT,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
+                )
+                await self._notice(
+                    task_notices.FAILED_COMMENT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        # The comment landed. The DM runs once; whatever happens to it, the comment
+        # is never attempted again. A nudge with no Slack match has no DM to run.
+        dm_ts = ""
+        if spec.nudge_dm:
+            try:
+                dm_ts = await self._act_write(AgentActivities.nudge_dm, spec, task_id)
+            except ActivityError as err:
+                if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                    return await self._stop_for_tenant_disabled(spec, task_id)
+                await self._try(
+                    AgentActivities.update_card, spec, task_id, card_ts, "Commented, DM failed"
+                )
+                await self._notice(
+                    task_notices.NUDGE_NO_DM, f"{task_id}:nudge-no-dm", task_id, subject=title
+                )
+                await self._report_nudge_done(spec, task_id)
+                self._state = "done"
+                await self._record()
+                return self._state
+        await self._try(
+            AgentActivities.update_card, spec, task_id, card_ts, "Nudged" if dm_ts else "Commented"
+        )
+        await self._notice(
+            task_notices.NUDGED if dm_ts else task_notices.NUDGE_COMMENTED,
+            f"{task_id}:nudged",
+            task_id,
+            subject=title,
+        )
+        await self._report_nudge_done(spec, task_id)
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _report_nudge_done(self, spec: TaskSpec, task_id: str) -> None:
+        """Tell the watch the nudge's comment landed, so it restarts the stale clock.
+
+        Best-effort: the watch may have ended while the card waited (the item is done
+        or the watch ran out); the nudge still ran, and the report is then dropped.
+        """
+        if not spec.parent_id:
+            return
+        try:
+            await workflow.get_external_workflow_handle(spec.parent_id).signal(
+                "nudge_done", NudgeDone(task_id)
+            )
+        except Exception:  # noqa: BLE001 - the report is best-effort; the nudge already ran
+            workflow.logger.warning(
+                "nudge report not delivered tenant_id=%s task_id=%s parent_id=%s",
+                spec.ctx.tenant_id,
+                task_id,
+                spec.parent_id,
+            )
 
     async def _store_edit(self, e: EditRequest) -> None:
         """Store the saved edit as the next revision of the draft, then redraw the card.
@@ -643,6 +1466,25 @@ class TaskWorkflow:
             days=days,
         )
         await self._try(AgentActivities.post_in_thread, ctx, text, idem_key)
+
+    async def _record(self, status: str = "") -> None:
+        """Record the task's state in the platform's store, for the asker's ``my_tasks``.
+
+        Best-effort: a failed record never ends the task. The activity reads the item's
+        title and link from the stored draft or the write's result; the workflow carries
+        only its state, the status and the time. Histories recorded before the store
+        existed never record (the patch marker is absent).
+        """
+        if not workflow.patched(TASK_RECORD_PATCH):
+            return
+        await self._try(
+            AgentActivities.record_task_state,
+            self._spec,
+            workflow.info().workflow_id,
+            self._state,
+            status,
+            workflow.now(),
+        )
 
     async def _try(self, method, *args) -> None:
         """Run an activity whose failure must not end the task (a card redraw, a notice)."""
@@ -725,6 +1567,16 @@ def _is_agent_off(err: ActivityError) -> bool:
     """True when the activity refused because an admin turned the agent off."""
     cause = err.cause
     return isinstance(cause, ApplicationError) and cause.type == "AgentOff"
+
+
+def _is_agent_unavailable(err: ActivityError) -> bool:
+    """True when the activity refused because the agent's grant check failed.
+
+    A watch never matches this: its poll fails retryably, so the watch keeps polling
+    and resumes when a check passes. The draft, card and write paths stop clean.
+    """
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == "AgentUnavailable"
 
 
 def _reason(err: ActivityError) -> str:

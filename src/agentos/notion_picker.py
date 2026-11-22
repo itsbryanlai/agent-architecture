@@ -9,14 +9,27 @@ The flow:
    browser to Notion.
 2. Notion sends the browser back to ``/auth/notion/callback``. The callback needs the same
    console session and a ``state`` it issued (single use, ten minutes), exchanges the code for
-   the creator's token, searches with that token, and drops the token. The token lives for
-   the length of that request: it is a local variable, never stored, logged or put in a table.
+   the creator's token and searches with that token. Without consent the token is dropped: it
+   lives for the length of that request, a local variable, never stored, logged or put in a
+   table. With the consent the creator ticked before signing in ("keep my Notion sign-in"),
+   the control plane stores it encrypted per tenant and creator, and the nightly check
+   (``creator_access``) reads with it; a consented pick replaces it, revoking deletes it.
+   The box is a per-pick choice: completing a re-pick with it unticked revokes the sign-in
+   a former pick kept.
 3. What the search listed (IDs, kinds, titles) is kept in memory for the session so the
    creator can tick objects. Only an ID in that list can be picked, and a pick is recorded
    for the agent (``grant_picks``).
 
 The listing is per process: with several console processes behind one address the callback
 must reach the process that began the flow. The console runs as one process today.
+
+Connect Notion (the admin settings page) reuses the same integration, state mechanism and
+callback path with a ``purpose`` in the flow: the authorize URL asks for ``owner=workspace``
+(a workspace admin authorizes the whole workspace, not picked pages), the callback exchanges
+the code for the workspace bot token, validates it with one cheap call (``users/me``) and
+hands it to ``ControlPlane.connect_notion``, which stores it encrypted as the tenant's
+``notion`` credential. The token lives only in that request and the encrypted row; it is
+never logged. Reconnecting replaces the row; Disconnect removes it.
 """
 
 from __future__ import annotations
@@ -39,6 +52,7 @@ log = logging.getLogger("agentos.notion_picker")
 AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize"
 TOKEN_URL = "https://api.notion.com/v1/oauth/token"
 SEARCH_URL = "https://api.notion.com/v1/search"
+USERS_ME_URL = "https://api.notion.com/v1/users/me"
 # Search results are databases and pages directly in this version; a later one returns data
 # sources, whose IDs are not what a grant names.
 NOTION_VERSION = "2022-06-28"
@@ -62,9 +76,33 @@ class PickerConfig:
         return f"{sign_in.console_url}{NOTION_CALLBACK_PATH}"
 
 
+@dataclass(frozen=True)
+class WorkspaceGrant:
+    """What Connect Notion's OAuth returned: the workspace bot token and its workspace.
+
+    The token stays out of ``repr``; it is stored encrypted and never logged.
+    """
+
+    token: str = field(repr=False)
+    workspace_id: str
+    workspace_name: str
+
+
 class NotionOAuth(Protocol):
     async def list_visible(self, code: str, redirect_uri: str) -> list[PickedObject]:
         """Trade the code for the creator's token, list what it can search, discard it."""
+        ...
+
+    async def list_and_keep(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
+        """Trade the code for the creator's token, list what it can search, return both.
+
+        The caller stores the token only with the creator's consent; the token is never
+        logged. Without consent the caller uses ``list_visible``, which discards it.
+        """
+        ...
+
+    async def connect_workspace(self, code: str, redirect_uri: str) -> WorkspaceGrant:
+        """Trade the code for the workspace bot token, validate it with one cheap call."""
         ...
 
 
@@ -77,26 +115,62 @@ class HttpNotionOAuth:
         self._config = config
         self._transport = transport
 
-    async def list_visible(self, code: str, redirect_uri: str) -> list[PickedObject]:
+    async def _exchange(self, http: httpx.AsyncClient, code: str, redirect_uri: str) -> dict:
         basic = base64.b64encode(
             f"{self._config.client_id}:{self._config.client_secret}".encode()
         ).decode()
+        token_response = await http.post(
+            TOKEN_URL,
+            headers={"Authorization": f"Basic {basic}", "Notion-Version": NOTION_VERSION},
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        body = token_response.json()
+        if token_response.status_code != 200 or not isinstance(body, dict):
+            raise NotionPickerError(f"token endpoint refused: {token_response.status_code}")
+        return body
+
+    async def list_visible(self, code: str, redirect_uri: str) -> list[PickedObject]:
+        objects, _token = await self._list(code, redirect_uri)
+        return objects
+
+    async def list_and_keep(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
+        return await self._list(code, redirect_uri)
+
+    async def _list(self, code: str, redirect_uri: str) -> tuple[list[PickedObject], str]:
         try:
             async with httpx.AsyncClient(timeout=15.0, transport=self._transport) as http:
-                token_response = await http.post(
-                    TOKEN_URL,
-                    headers={"Authorization": f"Basic {basic}", "Notion-Version": NOTION_VERSION},
-                    json={
-                        "grant_type": "authorization_code",
-                        "code": code,
-                        "redirect_uri": redirect_uri,
-                    },
+                body = await self._exchange(http, code, redirect_uri)
+                token = body.get("access_token")
+                if not isinstance(token, str) or not token:
+                    raise NotionPickerError("token endpoint refused: no token")
+                return await self._search(http, token), token
+        except (httpx.HTTPError, ValueError) as err:
+            raise NotionPickerError(f"Notion request failed: {type(err).__name__}") from err
+
+    async def connect_workspace(self, code: str, redirect_uri: str) -> WorkspaceGrant:
+        try:
+            async with httpx.AsyncClient(timeout=15.0, transport=self._transport) as http:
+                body = await self._exchange(http, code, redirect_uri)
+                token = body.get("access_token")
+                workspace_id = body.get("workspace_id")
+                workspace_name = body.get("workspace_name")
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (token, workspace_id, workspace_name)
+                ):
+                    raise NotionPickerError("token response names no workspace bot token")
+                # One cheap call proves the token works before anything is stored.
+                response = await http.get(
+                    USERS_ME_URL,
+                    headers={"Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION},
                 )
-                body = token_response.json()
-                token = body.get("access_token") if isinstance(body, dict) else None
-                if token_response.status_code != 200 or not isinstance(token, str) or not token:
-                    raise NotionPickerError(f"token endpoint refused: {token_response.status_code}")
-                return await self._search(http, token)
+                if response.status_code != 200:
+                    raise NotionPickerError(f"validation refused: {response.status_code}")
+                return WorkspaceGrant(token, workspace_id, workspace_name)
         except (httpx.HTTPError, ValueError) as err:
             raise NotionPickerError(f"Notion request failed: {type(err).__name__}") from err
 
@@ -142,11 +216,13 @@ def _title_of(item: dict) -> str:
     return "".join(r.get("plain_text", "") for r in rich)[:200]
 
 
-def authorize_url(config: PickerConfig, sign_in: SignInConfig, state: str) -> str:
+def authorize_url(
+    config: PickerConfig, sign_in: SignInConfig, state: str, owner: str = "user"
+) -> str:
     query = {
         "client_id": config.client_id,
         "response_type": "code",
-        "owner": "user",
+        "owner": owner,
         "redirect_uri": config.redirect_uri(sign_in),
         "state": state,
     }
@@ -160,6 +236,11 @@ class Flow:
     session_hash: str
     agent_id: str
     version: int
+    # "pick" lists what the creator can see; "connect" authorizes the tenant's workspace.
+    purpose: str = "pick"
+    # The creator ticked "keep my Notion sign-in" before signing in. Not part of the
+    # flow's identity: the listing is found again on the pick page either way.
+    consent: bool = field(default=False, compare=False)
 
 
 @dataclass

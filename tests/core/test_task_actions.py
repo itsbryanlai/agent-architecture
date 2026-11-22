@@ -289,6 +289,35 @@ def test_edit_click_opens_prefilled_modal(agents):
     assert inputs["details"]["max_length"] == 1900
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "fields", "multiline"),
+    [
+        ("append_row", {"name": "alice", "title": "engineer"}, {"name": True, "title": True}),
+        ("create_doc", {"title": "Offer for Bob", "name": "Bob"}, {"title": False, "name": True}),
+    ],
+    ids=["append-columns", "create-title-and-blanks"],
+)
+def test_the_edit_form_inputs_are_multiline_except_a_create_title(
+    agents, tool_name, fields, multiline
+):
+    """Fails if an append column's input is single-line (even one named title), or a
+    create-from-template input other than the title is single-line."""
+    draft = DraftView(
+        tool_name=tool_name,
+        fields=fields,
+        nonce="n-current",
+        requester_user_id=ALICE,
+        editable=True,
+    )
+    client, sec, _, slack = gateway(agents, draft)
+
+    assert post_interaction(client, sec, edit_click(ALICE)).status_code == 200
+
+    [opened] = slack.views()
+    inputs = {b["block_id"]: b["element"] for b in opened["view"]["blocks"]}
+    assert {name: element["multiline"] for name, element in inputs.items()} == multiline
+
+
 def test_edit_click_by_someone_else_is_ignored(agents):
     client, sec, _, slack = gateway(agents, an_edit_draft())
 

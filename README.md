@@ -1,6 +1,6 @@
 # agentos
 
-A platform for Slack agents that *do work*: they answer from the sources their creator granted, take actions only after the requester approves, and follow up for days until the work is done. It is built on Temporal (Python SDK), Postgres, Slack and Notion.
+A platform for Slack agents that *do work*: they answer from the sources their creator granted, take actions only after the requester approves by default (an admin's policy may let a low-risk comment on the requester's own item run without it), and follow up for days until the work is done. It is built on Temporal (Python SDK), Postgres, Slack and Notion.
 
 The product is in [`docs/product.md`](docs/product.md), the design in [`docs/architecture.md`](docs/architecture.md), the reasons in [`docs/decisions.md`](docs/decisions.md). What is built and what is not is in [`docs/status.md`](docs/status.md). Setup, configuration and every command are in [`docs/operations.md`](docs/operations.md), and a map of the code is in [`docs/modules.md`](docs/modules.md).
 
@@ -8,7 +8,7 @@ The product is in [`docs/product.md`](docs/product.md), the design in [`docs/arc
 
 1. A Slack DM, or an @mention in a channel, reaches the gateway, which stores the event and answers Slack at once. A relay then starts or signals a `ConversationWorkflow` for that thread.
 2. The agent answers with its Notion read tools and indexed knowledge (with citations), or asks to create an item or comment on one.
-3. A write starts a `TaskWorkflow`, which DMs the requester an approval card. Nothing is written until they click **Submit**; **Edit** asks again.
+3. A write starts a `TaskWorkflow`, which DMs the requester an approval card. By default nothing is written until they click **Submit**; **Edit** asks again. An admin's policy may let a low-risk comment on the requester's own item run without the card.
 4. Submit writes to Notion exactly once, even if the worker crashes and retries.
 5. The task watches the item and posts in the original thread when its status reaches "done".
 

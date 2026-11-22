@@ -4,6 +4,7 @@ a tenant added, changed or disabled without a restart (gateway, worker, console)
 import logging
 import secrets as token_source
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 from temporalio.exceptions import ApplicationError
 
+from agentos import ids
 from agentos.activities import AgentActivities
 from agentos.agent_store import InMemoryAgentStore
 from agentos.audit import InMemoryAuditStore
@@ -22,10 +24,13 @@ from agentos.config import (
     load_tenants_config,
     parse_agents_config,
 )
+from agentos.connectors.drive import DriveReader
+from agentos.connectors.google_iam import MIME_DOC, DriveSection, FakeGoogleAccounts
 from agentos.connectors.notion import FakeNotionAPI
 from agentos.control import ControlPlane
 from agentos.control_api import create_app as create_control_app
-from agentos.credentials import SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
+from agentos.drive_connections import InMemoryDriveConnectionStore
 from agentos.gateway.app import create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.grant_checker import NotionGrantChecker
@@ -48,7 +53,15 @@ from agentos.tenant_store import (
     import_tenant,
     startup_tenants,
 )
-from agentos.tenants import RegistrySync, TenantRegistry, UnknownTenant, build_registry, runtime_for
+from agentos.tenants import (
+    RegistrySync,
+    TenantDisabled,
+    TenantRegistry,
+    UnknownTenant,
+    build_registry,
+    runtime_for,
+)
+from agentos.worker import build_tenant_clients
 from tests.conftest import (
     ALICE,
     GLOBEX,
@@ -60,7 +73,7 @@ from tests.conftest import (
 from tests.helpers.console_harness import ROOT, ConsoleHarness, using
 from tests.helpers.control_api import BASE, JSON, StandIn
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event
-from tests.helpers.keys import CountingKeyStore
+from tests.helpers.keys import CountingKeyStore, RefreshableKeyStore
 
 
 @pytest.fixture
@@ -396,6 +409,53 @@ async def test_the_worker_serves_a_tenant_added_later_with_its_own_clients(monke
     assert await sync.sync() == []
 
 
+@pytest.mark.parametrize("connected", [True, False])
+async def test_a_tenant_admitted_later_gets_its_drive_reader(monkeypatch, connected):
+    """Fails if a tenant admitted after start-up carries no Drive reader while its
+    connection row exists, carries one with no row, or a rebuilt runtime keeps a reader
+    the row no longer backs."""
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    set_secrets(monkeypatch, "ACME")
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    _built, slack, notion = fake_factories()
+    google = FakeGoogleAccounts()
+    connections = InMemoryDriveConnectionStore()
+    email = google.account_email(ids.drive_account_id(GLOBEX))
+    if connected:
+        await connections.connect(GLOBEX, email, datetime(2026, 11, 20, tzinfo=UTC))
+    file_id = "drive-file-0001"
+    google.add_drive_file(file_id, "Guide", MIME_DOC, "folder-1", [DriveSection("", "text")])
+
+    async def drive(config):
+        row = await connections.get(config.tenant_id)
+        return DriveReader(google, row.service_account_email) if row is not None else None
+
+    registry = await build_registry(
+        await startup_tenants(directory), Settings(), slack, notion, drive=drive
+    )
+    sync = RegistrySync(directory, registry, slack, notion, drive=drive)
+    set_secrets(monkeypatch, "GLOBEX")
+    await import_tenant(store, globex())
+    clock.advance(6)
+
+    assert await sync.sync() == [GLOBEX]
+    reader = registry.get(GLOBEX).drive
+    if connected:
+        assert reader is not None
+        await reader.get_file(file_id)
+        assert google.get_calls == [(email, file_id)]
+    else:
+        assert reader is None
+
+    # A rebuilt runtime resolves the row again: a disconnect while the worker runs
+    # leaves the next rebuild without a reader.
+    await connections.delete(GLOBEX)
+    store.replace_config(replace(globex(), channels={"C9": "it-helper"}))
+    clock.advance(6)
+    await sync.sync()
+    assert registry.get(GLOBEX).drive is None
+
+
 async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):
     store, clock = InMemoryTenantStore(acme(), globex()), Clock()
     set_secrets(monkeypatch, "GLOBEX")
@@ -409,6 +469,57 @@ async def test_the_worker_drops_a_tenant_that_is_disabled(monkeypatch):
     with pytest.raises(UnknownTenant):
         registry.get(GLOBEX)
     assert registry.tenants() == [TENANT]
+
+
+async def test_the_disabled_mark_follows_the_directory(monkeypatch):
+    """Fails if a disabled tenant is reported as merely unknown, or a re-enabled one stays refused."""
+    store, clock = InMemoryTenantStore(acme(), globex()), Clock()
+    set_secrets(monkeypatch, "GLOBEX")
+    registry, sync, _ = await start_worker_registry(monkeypatch, store, clock)
+
+    await store.set_enabled(GLOBEX, False)
+    clock.advance(6)
+    await sync.sync()
+
+    with pytest.raises(TenantDisabled):
+        registry.get(GLOBEX)
+    with pytest.raises(UnknownTenant) as caught:
+        registry.get("never-stored")
+    assert not isinstance(caught.value, TenantDisabled)
+
+    await store.set_enabled(GLOBEX, True)
+    clock.advance(6)
+    await sync.sync()
+
+    assert registry.get(GLOBEX).config.slack_team_id == GLOBEX_TEAM
+
+
+async def test_the_start_up_registry_marks_stored_but_disabled_tenants(monkeypatch):
+    """Fails if a restarted worker reports a stored-but-disabled tenant as not-yet-loaded
+    until its first sync, so the tenant's pending work retries instead of ending cleanly."""
+    store, clock = InMemoryTenantStore(acme(), globex()), Clock()
+    set_secrets(monkeypatch, "ACME", "GLOBEX")
+    await store.set_enabled(GLOBEX, False)
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credentials = TenantCredentials(InMemoryCredentialStore(), keys)
+    _built, slack, notion = fake_factories()
+
+    registry, _sync = await build_tenant_clients(
+        await startup_tenants(directory),
+        directory,
+        Settings(),
+        credentials,
+        keys,
+        logging.getLogger("test"),
+        slack_factory=slack,
+        notion_factory=notion,
+    )
+
+    with pytest.raises(TenantDisabled):
+        registry.get(GLOBEX)
 
 
 async def test_a_sync_that_drops_a_tenant_forgets_its_cached_token():
@@ -458,6 +569,104 @@ async def test_changed_settings_reach_the_worker_without_new_clients(monkeypatch
 
     assert registry.get(TENANT).config.channels == {"C9": "it-helper"}
     assert built["slack"] == ["slack-ACME"]
+
+
+async def test_the_notion_client_follows_the_resolved_credential(monkeypatch):
+    """Fails if the worker keeps the env Notion token when a credential row exists, keeps a
+    stale client when Connect Notion replaces the row, or does not fall back to the env
+    variable once Disconnect removes it."""
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    credentials = TenantCredentials(credential_store, keys)
+    set_secrets(monkeypatch, "ACME")
+    built, slack, notion = fake_factories()
+    registry = await build_registry(
+        await startup_tenants(directory),
+        Settings(),
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+    )
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack,
+        notion,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+    )
+    # No row yet: the env variable builds the client.
+    assert built["notion"] == ["notion-ACME"]
+
+    row_token = "ntn-workspace-row-token"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, row_token.encode()), 1
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token]
+
+    # An unchanged row builds nothing new.
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token]
+
+    await credential_store.delete(TENANT, NOTION)
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == ["notion-ACME", row_token, "notion-ACME"]
+
+
+async def test_a_tenant_connected_only_in_the_console_is_served_without_a_variable(monkeypatch):
+    """Fails if the worker needs the Notion variable exported for a tenant whose token is a
+    credential row, or keeps a stale Notion client when the row is replaced or removed."""
+    set_secrets(monkeypatch, "ACME")
+    monkeypatch.delenv("NOTION_TOKEN_ACME")
+    store, clock = InMemoryTenantStore(acme()), Clock()
+    directory = TenantDirectory(store, ttl_seconds=5, clock=clock)
+    key = token_source.token_bytes(32)
+    keys = RefreshableKeyStore({(TENANT, 1): key})
+    await keys.refresh()
+    credential_store = InMemoryCredentialStore()
+    row_token = "ntn-connected-in-the-console"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, row_token.encode()), 1
+    )
+    credentials = TenantCredentials(credential_store, keys)
+    built, slack, notion = fake_factories()
+
+    registry, sync = await build_tenant_clients(
+        await startup_tenants(directory),
+        directory,
+        Settings(),
+        credentials,
+        keys,
+        logging.getLogger("test"),
+        slack_factory=slack,
+        notion_factory=notion,
+    )
+
+    assert built["notion"] == [row_token]
+    assert registry.get(TENANT).notion_api is not None
+
+    replaced = "ntn-reconnected"
+    await credential_store.put(
+        TENANT, NOTION, encrypt_with_tenant_key(TENANT, key, replaced.encode()), 1
+    )
+    clock.advance(6)
+    await sync.sync()
+    assert built["notion"] == [row_token, replaced]
+
+    await credential_store.delete(TENANT, NOTION)
+    clock.advance(6)
+    await sync.sync()
+    assert registry.get(TENANT).notion_api is None
+    assert built["notion"] == [row_token, replaced]
 
 
 async def test_a_new_tenant_with_an_unset_variable_waits_and_is_reported_once(monkeypatch, caplog):

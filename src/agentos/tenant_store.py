@@ -17,7 +17,9 @@ Rules kept here:
 * A ``TenantDirectory`` serves the enabled tenants from a short cache, so a tenant
   added, changed or disabled in the database reaches the gateway, the worker and the
   console within ``DEFAULT_TTL_SECONDS`` without a restart. A disabled tenant is not
-  in what it returns, so every caller treats it as unknown.
+  in what it serves, but ``disabled_tenants`` names it: the worker ends a disabled
+  tenant's pending work cleanly, while a tenant not stored at all stays retryable
+  (it may be installed seconds later).
 * A tenant's settings are never copied back from the YAML file once imported.
 """
 
@@ -105,7 +107,38 @@ class TenantStore(Protocol):
         """
         ...
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None: ...
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
+        """Enable or disable the tenant. ``conn`` joins the change to a unit of work,
+        as ``insert`` does, so a disable commits with its credential deletion and audit."""
+        ...
+
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        """Store the default agent and the channel map an admin set in the console.
+
+        ``conn`` joins the change to a unit of work, as ``insert`` does. The directory
+        notices the moved change time on its next refresh, with no restart.
+        """
+        ...
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        """Store the connected Notion workspace (or clear it with None).
+
+        A workspace another tenant already uses raises ``ConfigError``: one Notion
+        workspace belongs to one tenant, as the import and the install require.
+        """
+        ...
 
 
 def _secret_env(config: AgentsConfig) -> dict[str, str]:
@@ -117,6 +150,7 @@ def _config_from_row(
     slack_team_id: str,
     default_agent: str,
     notion_workspace_id: str | None,
+    notion_workspace_name: str | None,
     channels: dict,
     admins: list,
     secret_env: dict,
@@ -133,6 +167,7 @@ def _config_from_row(
         agents={},
         default_agent=default_agent,
         notion_workspace_id=notion_workspace_id,
+        notion_workspace_name=notion_workspace_name,
         secrets=TenantSecrets(**secret_env),
         channels={str(k): str(v) for k, v in channels.items()},
         admins=tuple(str(a) for a in admins),
@@ -165,7 +200,7 @@ class PostgresTenantStore:
             cur = await conn.execute(
                 """
                 SELECT tenant_id, slack_team_id, default_agent, notion_workspace_id,
-                       channels, admins, secret_env, enabled, updated_at
+                       notion_workspace_name, channels, admins, secret_env, enabled, updated_at
                 FROM tenants WHERE tenant_id = %s
                 """,
                 (tenant_id,),
@@ -173,7 +208,7 @@ class PostgresTenantStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return TenantRow(_config_from_row(*row[:7]), row[7], row[8])
+        return TenantRow(_config_from_row(*row[:8]), row[8], row[9])
 
     async def insert(self, config: AgentsConfig, conn: Any = None) -> bool:
         try:
@@ -181,8 +216,9 @@ class PostgresTenantStore:
                 cur = await db.execute(
                     """
                     INSERT INTO tenants (tenant_id, slack_team_id, default_agent,
-                                         notion_workspace_id, channels, admins, secret_env)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                         notion_workspace_id, notion_workspace_name,
+                                         channels, admins, secret_env)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (tenant_id) DO NOTHING
                     RETURNING tenant_id
                     """,
@@ -191,6 +227,7 @@ class PostgresTenantStore:
                         config.slack_team_id,
                         config.default_agent,
                         config.notion_workspace_id,
+                        config.notion_workspace_name,
                         Jsonb(config.channels),
                         Jsonb(list(config.admins)),
                         Jsonb(_secret_env(config)),
@@ -203,12 +240,45 @@ class PostgresTenantStore:
                 "or Notion workspace"
             ) from err
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None:
-        async with tenant_transaction(self._pool, tenant_id) as conn:
-            await conn.execute(
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await db.execute(
                 "UPDATE tenants SET enabled = %s, updated_at = now() WHERE tenant_id = %s",
                 (enabled, tenant_id),
             )
+
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await db.execute(
+                "UPDATE tenants SET default_agent = %s, channels = %s WHERE tenant_id = %s",
+                (default_agent, Jsonb(channels), tenant_id),
+            )
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        try:
+            async with joined_transaction(self._pool, tenant_id, conn) as db:
+                await db.execute(
+                    "UPDATE tenants SET notion_workspace_id = %s, notion_workspace_name = %s "
+                    "WHERE tenant_id = %s",
+                    (workspace_id, workspace_name, tenant_id),
+                )
+        except UniqueViolation as err:
+            raise ConfigError(
+                f"tenant '{tenant_id}': another tenant already uses Notion workspace "
+                f"'{workspace_id}'"
+            ) from err
 
 
 # --- In memory (tests) --------------------------------------------------------
@@ -265,8 +335,44 @@ class InMemoryTenantStore:
         self._put(config, True)
         return True
 
-    async def set_enabled(self, tenant_id: str, enabled: bool) -> None:
+    async def set_enabled(self, tenant_id: str, enabled: bool, conn: Any = None) -> None:
         self._put(self._rows[tenant_id].config, enabled)
+
+    async def set_routing(
+        self,
+        tenant_id: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        conn: Any = None,
+    ) -> None:
+        row = self._rows[tenant_id]
+        self._put(
+            replace(row.config, default_agent=default_agent, channels=dict(channels)), row.enabled
+        )
+
+    async def set_notion_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        workspace_name: str | None,
+        conn: Any = None,
+    ) -> None:
+        if workspace_id:
+            for other_id, row in self._rows.items():
+                if other_id != tenant_id and row.config.notion_workspace_id == workspace_id:
+                    raise ConfigError(
+                        f"tenant '{tenant_id}': another tenant already uses Notion workspace "
+                        f"'{workspace_id}'"
+                    )
+        row = self._rows[tenant_id]
+        self._put(
+            replace(
+                row.config,
+                notion_workspace_id=workspace_id,
+                notion_workspace_name=workspace_name,
+            ),
+            row.enabled,
+        )
 
     def replace_config(self, config: AgentsConfig) -> None:
         """Test hook: change a stored tenant's settings, as an admin tool will."""
@@ -279,7 +385,9 @@ class InMemoryTenantStore:
 class TenantSource(Protocol):
     """What the gateway, worker and console ask for the tenants they serve.
 
-    Only enabled tenants are visible: a disabled tenant is answered as unknown.
+    Only enabled tenants are served: a disabled tenant is answered as unknown.
+    ``disabled_tenants`` still names the stored-but-disabled ones, so the worker can
+    end their pending work cleanly instead of retrying it as not-yet-loaded.
     """
 
     async def snapshot(self) -> TenantsConfig: ...
@@ -289,6 +397,11 @@ class TenantSource(Protocol):
     async def get(self, tenant_id: str) -> AgentsConfig | None: ...
 
     async def only_tenant(self) -> str | None: ...
+
+    async def disabled_tenants(self) -> list[str]:
+        """The stored tenants that are disabled, as after an uninstall. A tenant not
+        stored at all is not named: it may still be installed, so its work retries."""
+        ...
 
     def latest(self) -> TenantsConfig:
         """The tenants as last read, with no read of its own. For sync code that runs
@@ -313,6 +426,9 @@ class StaticTenants:
 
     async def only_tenant(self) -> str | None:
         return self._tenants.only_tenant()
+
+    async def disabled_tenants(self) -> list[str]:
+        return []
 
     def latest(self) -> TenantsConfig:
         return self._tenants
@@ -431,6 +547,12 @@ class TenantDirectory:
             self._unknown = {t: until for t, until in self._unknown.items() if until > now}
         if len(self._unknown) < MAX_UNKNOWN_TENANTS:
             self._unknown[tenant_id] = now + UNKNOWN_TENANT_TTL_SECONDS
+
+    async def disabled_tenants(self) -> list[str]:
+        # The refresh keeps every stored row, enabled or not; the snapshot serves only
+        # the enabled ones. Reading it here brings the rows up to date first.
+        await self.snapshot()
+        return sorted(t for t, row in self._rows.items() if not row.enabled)
 
     async def only_tenant(self) -> str | None:
         return (await self.snapshot()).only_tenant()

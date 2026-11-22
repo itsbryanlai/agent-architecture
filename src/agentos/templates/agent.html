@@ -4,6 +4,7 @@
 {% block body %}
 <p><a href="{{ base }}/agents">Agents</a></p>
 <h1>{{ agent_id }}</h1>
+<p class="muted"><a href="{{ agent_url }}/feedback">Feedback</a> — what went wrong with this agent's answers.</p>
 {% if stopped_by == "agent" %}<p class="error">This agent is turned off by an admin and is not answering.</p>
 {% elif stopped_by == "all_agents" %}<p class="error">All agents are turned off by an admin, so this agent is not answering.</p>{% endif %}
 {% if writes_off %}<p class="warn">Writes are turned off by an admin: this agent can draft, but nothing it drafts can be submitted.</p>{% endif %}

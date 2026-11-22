@@ -5,6 +5,7 @@ never collide and every ID says whose data it belongs to.
 """
 
 import hashlib
+from datetime import datetime
 
 from agentos.connectors.notion import normalize_id
 
@@ -36,12 +37,31 @@ def knowledge_scope(page_id: str) -> str:
     return f"notion:page:{normalize_id(page_id)}"
 
 
+def drive_scope(granted_id: str) -> str:
+    """The scope name for a granted Drive folder, file or shared drive: everything under
+    it shares it."""
+    return f"drive:{granted_id}"
+
+
+def is_drive_scope(scope: str) -> bool:
+    """True for a scope ``drive_scope`` built: a Drive folder, file or shared drive."""
+    return scope.startswith("drive:")
+
+
 def index_workflow_id(tenant: str, scope: str) -> str:
     return f"{tenant}:index:{scope}"
 
 
 def index_schedule_id(tenant: str, scope: str) -> str:
     return f"{tenant}:index-schedule:{scope}"
+
+
+def drive_index_workflow_id(tenant: str, scope: str) -> str:
+    return f"{tenant}:drive-index:{scope}"
+
+
+def drive_index_schedule_id(tenant: str, scope: str) -> str:
+    return f"{tenant}:drive-index-schedule:{scope}"
 
 
 def retention_workflow_id(tenant: str) -> str:
@@ -52,9 +72,46 @@ def retention_schedule_id(tenant: str) -> str:
     return f"{tenant}:retention-schedule"
 
 
+def creator_access_workflow_id(tenant: str) -> str:
+    return f"{tenant}:creator-access"
+
+
+def creator_access_schedule_id(tenant: str) -> str:
+    return f"{tenant}:creator-access-schedule"
+
+
+def notion_creator_kind(user_id: str) -> str:
+    """The credential kind of one creator's kept Notion sign-in; the row carries the tenant."""
+    return f"notion_creator:{user_id}"
+
+
+def drive_account_id(tenant_id: str) -> str:
+    """The tenant's Google service-account ID, deterministic from the tenant ID so a
+    retried connect finds the same account. Google's class is 6-30 characters, a letter
+    then lowercase letters, digits and hyphens; a tenant ID does not fit it, so this
+    carries the tenant's hash instead of the tenant ID itself.
+    """
+    return f"ag-{hashlib.sha256(tenant_id.encode()).hexdigest()[:24]}"
+
+
 def page_refresh_id(tenant: str, page_id: str) -> str:
     """One refresh workflow per page, so a burst of events lands in one run."""
     return f"{tenant}:page-refresh:{normalize_id(page_id)}"
+
+
+def test_case_id(tenant: str, uuid: str) -> str:
+    """One test case of one agent version."""
+    return f"{tenant}:test-case:{uuid}"
+
+
+def test_run_id(tenant: str, uuid: str) -> str:
+    """One test run of one agent version; also its workflow ID."""
+    return f"{tenant}:test-run:{uuid}"
+
+
+def test_conversation_id(run_id: str, case_id: str) -> str:
+    """The conversation one test case runs in. ``run_id`` carries the tenant."""
+    return f"{run_id}:conv:{case_id}"
 
 
 # Audit event keys. Each names one thing that happened, so an activity that
@@ -72,6 +129,15 @@ def audit_answer_key(conversation_id: str, placeholder_ts: str) -> str:
 def audit_notice_key(conversation_id: str, tool: str, marker: str) -> str:
     """A non-answer final text: ``marker`` is the placeholder ts or the reply's idempotency key."""
     return f"{conversation_id}:audit:notice:{tool}:{marker}"
+
+
+def audit_feedback_key(
+    conversation_id: str, answer_ts: str, voter: str, vote: str, at: datetime
+) -> str:
+    """One click on one answer. Every click is audited, so the key carries the vote's time:
+    up → down → up records three events and an identical double click records twice (Slack
+    does not retry clicks). The reason text is never part of the event."""
+    return f"{conversation_id}:audit:feedback:{answer_ts}:{voter}:{vote}:{at.isoformat()}"
 
 
 def audit_hand_off_key(tenant: str, event_id: str) -> str:
@@ -168,6 +234,20 @@ def audience_pause_notice_key(
 def scope_gone_notice_key(tenant: str, scope: str, recipient: str, first_seen: str) -> str:
     """The idempotency key of the direct message that tells one person a scope's root page is gone."""
     return f"{tenant}:scope-gone-notice:{scope}:{first_seen}:{recipient}"
+
+
+# Agent health. One check that flips an agent's status is one transition, named by when it
+# ran: its audit event and the notice to each person happen once, however often the check runs.
+
+
+def audit_agent_health_key(tenant: str, agent_id: str, checked_at: str) -> str:
+    """The audit event of one health transition, named by the check that made it."""
+    return f"{tenant}:audit:agent-health:{agent_id}:{checked_at}"
+
+
+def agent_health_notice_key(tenant: str, agent_id: str, checked_at: str, recipient: str) -> str:
+    """The idempotency key of the direct message that tells one person about one transition."""
+    return f"{tenant}:agent-health-notice:{agent_id}:{checked_at}:{recipient}"
 
 
 def edit_event_id(unique: str) -> str:

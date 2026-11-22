@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 032 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 042 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -152,7 +152,9 @@ INSERT INTO audit_kinds (kind) VALUES
   ('audience_refused'), ('audience_confirm'), ('budget_set'),
   ('audience_pause'), ('audience_resume'),
   ('switch_off'), ('switch_on'), ('usage_repriced'), ('retention_set'),
-  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install')
+  ('grant_pick'), ('widening_confirm'), ('webhook_token'), ('payload_key'), ('install'),
+  ('uninstall'), ('agent_health'), ('connector'), ('tenant_settings'), ('feedback'),
+  ('policy_change')
 ON CONFLICT DO NOTHING;
 
 -- Audit log: append-only, one row per thing an agent did. Holds IDs and hashes,
@@ -175,18 +177,24 @@ CREATE TABLE IF NOT EXISTS audit_events (
   input_sha256       text        CHECK (input_sha256 ~ '^[0-9a-f]{64}$'),
   output_sha256      text        CHECK (output_sha256 ~ '^[0-9a-f]{64}$'),
   approver_user_id   text,
-  outcome            text        NOT NULL CHECK (outcome IN ('ok', 'error')),
+  outcome            text        NOT NULL CONSTRAINT audit_events_outcome_check
+    CHECK (outcome IN ('ok', 'error', 'policy')),
   PRIMARY KEY (tenant_id, event_key),
   UNIQUE (seq),
   CONSTRAINT audit_events_agent_required CHECK (
     kind IN ('member_add', 'member_remove', 'member_role', 'budget_set',
              'switch_off', 'switch_on', 'usage_repriced', 'retention_set', 'webhook_token',
-             'payload_key', 'install')
+             'payload_key', 'install', 'uninstall', 'connector', 'tenant_settings',
+             'policy_change')
     OR (kind = 'audience_resume' AND agent_id IS NOT NULL)
     OR (agent_id IS NOT NULL AND agent_version IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS audit_events_by_time ON audit_events (tenant_id, at DESC, seq DESC);
+
+-- The feedback page reads one agent's rows in a time window. Same as migration 039.
+CREATE INDEX IF NOT EXISTS audit_events_by_agent
+  ON audit_events (tenant_id, agent_id, at DESC, seq DESC);
 
 CREATE OR REPLACE FUNCTION audit_events_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -659,6 +667,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   -- NULL for a tenant installed from Slack with no agent yet (migration 032).
   default_agent       text,
   notion_workspace_id text        UNIQUE,
+  -- The connected Notion workspace's name, for display (migration 034).
+  notion_workspace_name text,
   channels            jsonb       NOT NULL DEFAULT '{}'::jsonb,   -- channel ID -> agent ID
   admins              jsonb       NOT NULL DEFAULT '[]'::jsonb,   -- Slack user IDs
   secret_env          jsonb       NOT NULL DEFAULT '{}'::jsonb,   -- field -> env var NAME
@@ -999,10 +1009,14 @@ DROP POLICY IF EXISTS key_insert ON tenant_payload_keys;
 CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
--- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as migration 032.
+-- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as
+-- migrations 032, 034 and 038: the kinds are 'slack_bot', 'notion' and a creator's kept
+-- Notion sign-in ('notion_creator:<Slack user ID>'), and Disconnect or a consent revoke
+-- removes a row, so the app role may DELETE too.
 CREATE TABLE IF NOT EXISTS tenant_credentials (
   tenant_id   text        NOT NULL,
-  kind        text        NOT NULL CHECK (kind IN ('slack_bot')),
+  kind        text        NOT NULL CHECK (
+    kind IN ('slack_bot', 'notion') OR kind ~ '^notion_creator:[A-Z0-9_]{1,64}$'),
   ciphertext  bytea       NOT NULL,
   key_version integer     NOT NULL CHECK (key_version >= 1),
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -1010,7 +1024,7 @@ CREATE TABLE IF NOT EXISTS tenant_credentials (
 );
 
 REVOKE ALL ON tenant_credentials FROM agentos_app;
-GRANT SELECT, INSERT, UPDATE ON tenant_credentials TO agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_credentials TO agentos_app;
 
 ALTER TABLE tenant_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_credentials FORCE ROW LEVEL SECURITY;
@@ -1020,6 +1034,223 @@ CREATE POLICY tenant_isolation ON tenant_credentials
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 ALTER TABLE tenants ALTER COLUMN default_agent DROP NOT NULL;
+
+-- Agent health: the worker's grant check, one row per tenant and agent. Same as migration 033.
+CREATE TABLE IF NOT EXISTS agent_health (
+  tenant_id     text        NOT NULL,
+  agent_id      text        NOT NULL,
+  agent_version integer     NOT NULL CHECK (agent_version >= 1),
+  status        text        NOT NULL CHECK (status IN ('available', 'unavailable')),
+  reason        text,
+  checked_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, agent_id),
+  CONSTRAINT agent_health_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$'),
+  CONSTRAINT agent_health_reason_matches_status CHECK (
+    (status = 'unavailable') = (reason IS NOT NULL))
+);
+
+REVOKE ALL ON agent_health FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON agent_health TO agentos_app;
+
+ALTER TABLE agent_health ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_health FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON agent_health;
+CREATE POLICY tenant_isolation ON agent_health
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- The nightly verdict on a creator's access to one granted object, written by the
+-- creator-access pass and read by the health check and the console. Same as migration 038.
+CREATE TABLE IF NOT EXISTS creator_access (
+  tenant_id  text        NOT NULL,
+  agent_id   text        NOT NULL,
+  notion_id  text        NOT NULL,
+  status     text        NOT NULL CHECK (status IN ('verified', 'lost', 'cannot_verify')),
+  checked_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, agent_id, notion_id),
+  CONSTRAINT creator_access_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+REVOKE ALL ON creator_access FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON creator_access TO agentos_app;
+
+ALTER TABLE creator_access ENABLE ROW LEVEL SECURITY;
+ALTER TABLE creator_access FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON creator_access;
+CREATE POLICY tenant_isolation ON creator_access
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- The platform's record of each task, written by the task workflow and read by the
+-- my_tasks tool for the requester named on the row. Same as migration 035.
+CREATE TABLE IF NOT EXISTS tasks (
+  tenant_id         text        NOT NULL,
+  task_id           text        NOT NULL,
+  requester_user_id text        NOT NULL,
+  agent_id          text        NOT NULL,
+  title             text        NOT NULL DEFAULT '',
+  url               text        NOT NULL DEFAULT '',
+  page_id           text        NOT NULL DEFAULT '',
+  state             text        NOT NULL CHECK (
+    state IN ('awaiting_approval', 'filed', 'watching', 'done', 'failed', 'cancelled')),
+  last_status       text        NOT NULL DEFAULT '',
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  channel           text        NOT NULL,
+  thread_ts         text        NOT NULL,
+  PRIMARY KEY (tenant_id, task_id),
+  CONSTRAINT tasks_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+CREATE INDEX IF NOT EXISTS tasks_requester
+  ON tasks (tenant_id, requester_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS tasks_thread
+  ON tasks (tenant_id, channel, thread_ts);
+
+REVOKE ALL ON tasks FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON tasks TO agentos_app;
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tasks;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Answer feedback: one 👍/👎 per person per answer, changeable; the optional reason is the
+-- only free text and is purged with the row by retention. Same as migration 036.
+CREATE TABLE IF NOT EXISTS answer_feedback (
+  tenant_id       text        NOT NULL,
+  conversation_id text        NOT NULL,
+  answer_ts       text        NOT NULL,
+  voter           text        NOT NULL,
+  agent_id        text        NOT NULL,
+  agent_version   integer     NOT NULL CHECK (agent_version >= 1),
+  vote            text        NOT NULL CHECK (vote IN ('up', 'down')),
+  reason          text        CHECK (reason IS NULL OR char_length(reason) <= 300),
+  at              timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, conversation_id, answer_ts, voter),
+  CONSTRAINT answer_feedback_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+-- The feedback page reads one agent's votes in a time window. Same as migration 039.
+CREATE INDEX IF NOT EXISTS answer_feedback_by_agent
+  ON answer_feedback (tenant_id, agent_id, at DESC);
+
+REVOKE ALL ON answer_feedback FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON answer_feedback TO agentos_app;
+
+ALTER TABLE answer_feedback ENABLE ROW LEVEL SECURITY;
+ALTER TABLE answer_feedback FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON answer_feedback;
+CREATE POLICY tenant_isolation ON answer_feedback
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Approval policy per low-risk action (D-43): requester_approval (the default, also
+-- for an action with no row) or none, one row per tenant and action. Same as
+-- migration 040.
+CREATE TABLE IF NOT EXISTS approval_policies (
+  tenant_id  text        NOT NULL,
+  action     text        NOT NULL,
+  policy     text        NOT NULL CHECK (policy IN ('requester_approval', 'none')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, action)
+);
+
+REVOKE ALL ON approval_policies FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE ON approval_policies TO agentos_app;
+
+ALTER TABLE approval_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approval_policies FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON approval_policies;
+CREATE POLICY tenant_isolation ON approval_policies
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Creator test sets: cases on an agent version, and runs of them against a draft.
+-- The question is the only free text; a run's results are references and fixed reason
+-- codes. Same as migration 041.
+CREATE TABLE IF NOT EXISTS test_cases (
+  tenant_id   text        NOT NULL,
+  agent_id    text        NOT NULL,
+  version     integer     NOT NULL CHECK (version >= 1),
+  case_id     text        NOT NULL,
+  question    text        NOT NULL CHECK (char_length(question) BETWEEN 1 AND 2000),
+  expect      text        NOT NULL DEFAULT ''
+    CHECK (expect IN ('', 'cite', 'write', 'refuse', 'hand_off')),
+  target      text        NOT NULL DEFAULT '',
+  seq         integer     NOT NULL CHECK (seq >= 1),
+  created_by  text        NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, agent_id, version, case_id),
+  FOREIGN KEY (tenant_id, agent_id, version)
+    REFERENCES agent_versions (tenant_id, agent_id, version) ON DELETE CASCADE,
+  CONSTRAINT test_cases_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$'),
+  CONSTRAINT test_cases_target_set CHECK (expect IN ('', 'refuse') OR target <> '')
+);
+
+CREATE TABLE IF NOT EXISTS test_runs (
+  tenant_id         text        NOT NULL,
+  run_id            text        NOT NULL,
+  agent_id          text        NOT NULL,
+  version           integer     NOT NULL CHECK (version >= 1),
+  status            text        NOT NULL CHECK (status IN ('running', 'done', 'failed')),
+  started_by        text        NOT NULL,
+  definition_sha256 text        NOT NULL CHECK (definition_sha256 ~ '^[0-9a-f]{64}$'),
+  cases_sha256      text        NOT NULL CHECK (cases_sha256 ~ '^[0-9a-f]{64}$'),
+  started_at        timestamptz NOT NULL DEFAULT now(),
+  finished_at       timestamptz,
+  spend_usd         numeric(20, 8) NOT NULL DEFAULT 0 CHECK (spend_usd >= 0),
+  results           jsonb       NOT NULL DEFAULT '[]',
+  PRIMARY KEY (tenant_id, run_id),
+  CONSTRAINT test_runs_agent_id_pattern CHECK (agent_id ~ '^[a-z][a-z0-9-]{1,39}$')
+);
+
+CREATE INDEX IF NOT EXISTS test_runs_by_version
+  ON test_runs (tenant_id, agent_id, version, started_at DESC);
+
+REVOKE ALL ON test_cases, test_runs FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test_cases TO agentos_app;
+GRANT SELECT, INSERT, UPDATE ON test_runs TO agentos_app;
+
+ALTER TABLE test_cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_cases FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON test_cases;
+CREATE POLICY tenant_isolation ON test_cases
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE test_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_runs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON test_runs;
+CREATE POLICY tenant_isolation ON test_runs
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+INSERT INTO audit_kinds (kind) VALUES ('test_case'), ('test_run') ON CONFLICT DO NOTHING;
+
+-- Google Drive connections (D-45): one service account per tenant; the row is the
+-- connection's identity and last check, not a credential. Same as migration 042.
+CREATE TABLE IF NOT EXISTS drive_connections (
+  tenant_id             text        NOT NULL PRIMARY KEY,
+  service_account_email text        NOT NULL,
+  status                text        NOT NULL CHECK (status IN ('connected', 'error')),
+  last_error            text,
+  connected_at          timestamptz NOT NULL DEFAULT now(),
+  checked_at            timestamptz,
+  CONSTRAINT drive_connections_error_matches_status CHECK (
+    (status = 'error') = (last_error IS NOT NULL))
+);
+
+REVOKE ALL ON drive_connections FROM agentos_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON drive_connections TO agentos_app;
+
+ALTER TABLE drive_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE drive_connections FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON drive_connections;
+CREATE POLICY tenant_isolation ON drive_connections
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1032,5 +1263,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040'), ('041'), ('042')
 ON CONFLICT DO NOTHING;

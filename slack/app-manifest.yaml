@@ -30,8 +30,10 @@ settings:
     request_url: https://REPLACE_ME/slack/events
     bot_events:
       - app_mention
+      - app_uninstalled
       - channel_shared
       - message.im
+      - tokens_revoked
   interactivity:
     is_enabled: true
     request_url: https://REPLACE_ME/slack/interactivity

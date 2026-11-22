@@ -19,6 +19,7 @@ from agentos.knowledge.store import InMemoryKnowledgeStore
 from agentos.tenants import TenantRegistry, runtime_for
 from agentos.workflows.indexing import IndexingWorkflow
 from tests.conftest import ROOT_A, ROOT_B, TENANT, knowledge_agents_dict, make_fake_notion
+from tests.helpers.drive import DRIVE_SCOPE, drive_agents_dict
 from tests.helpers.knowledge import FakeScheduleClient
 
 SCOPE_A = ids.knowledge_scope(ROOT_A)
@@ -91,18 +92,29 @@ async def test_leftover_schedule_run_reads_and_stores_nothing(kharness):
     assert h.knowledge.pages == {}
 
 
-async def test_apply_schedules_deletes_rows_of_ungranted_scopes():
+@pytest.mark.parametrize("kind", ["notion", "drive"])
+async def test_apply_schedules_deletes_rows_of_ungranted_scopes(kind):
+    """Fails if a revoked scope's rows survive the schedule pass, or a scope still granted
+    by either connector (a Drive folder included) is purged with it."""
     store = InMemoryKnowledgeStore()
     await seed(store, SCOPE_A)
-    await seed(store, SCOPE_B)
+    if kind == "notion":
+        cfg = config_with_only_b()
+        granted = SCOPE_B
+        await seed(store, granted)
+        keep = ids.index_schedule_id(TENANT, granted)
+    else:
+        cfg = parse_agents_config(drive_agents_dict())
+        granted = DRIVE_SCOPE
+        await seed(store, granted, page_id="drive-doc-0001")
+        keep = ids.drive_index_schedule_id(TENANT, granted)
     stale = ids.index_schedule_id(TENANT, SCOPE_A)
-    keep = ids.index_schedule_id(TENANT, SCOPE_B)
     client = FakeScheduleClient([stale, keep])
 
-    plan = await apply_schedules(client, config_with_only_b(), store)
+    plan = await apply_schedules(client, cfg, store)
 
     assert plan.delete == [stale]
-    assert await store.scopes(TENANT) == [SCOPE_B]
+    assert await store.scopes(TENANT) == [granted]
 
 
 async def test_schedule_command_with_no_grants_left_deletes_schedules_and_rows(monkeypatch):

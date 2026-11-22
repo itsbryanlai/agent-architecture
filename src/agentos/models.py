@@ -61,7 +61,7 @@ class ApprovalDecision:
 @dataclass
 class ExternalUpdate:
     page_id: str
-    source: str  # "notion_webhook"
+    source: str  # "notion_webhook" (the gateway) or "my_tasks" (the in-thread poke)
 
 
 @dataclass
@@ -124,6 +124,9 @@ class Citation:
     marker: int  # the number the model writes
     scope: str  # e.g. "notion:page:<32-hex root id>"
     page_id: str  # normalized 32-hex Notion page id
+    # The passage's distance from the question, so the reply can name the nearest pages it
+    # searched. None on a citation recorded before distances were carried.
+    distance: float | None = None
 
 
 @dataclass
@@ -231,16 +234,66 @@ class WatchState:
     deadline: datetime
     # A poke arrived and has not been answered by a poll yet.
     poked: bool = False
+    # Nudges this task has run; the live stale offer's nonce (empty when none); and the
+    # nudge task in flight (empty when none). A watch recorded before nudges carries none.
+    nudges_used: int = 0
+    nudge_nonce: str = ""
+    nudge_child: str = ""
+    # A click or a report the watch loop has not applied yet; a hop must not drop it.
+    nudge_requested: bool = False
+    nudge_done: bool = False
+
+
+@dataclass
+class NudgeRequest:
+    """A click on a stale notice's "Nudge the assignee" button.
+
+    The nonce is the offer's, issued when the stale notice was posted; the user is the
+    signed clicker. The workflow accepts it only from the requester, on the live offer.
+    """
+
+    nonce: str
+    user_id: str
+
+
+@dataclass
+class NudgeDone:
+    """A nudge task tells the watch it came from: the comment landed, the clock restarts.
+
+    Sent only when the nudge ran; a declined, expired or failed nudge sends nothing.
+    """
+
+    child_id: str
+
+
+@dataclass
+class NudgePrepared:
+    """What preparing a nudge found: the draft is stored, or there is nobody to nudge.
+
+    ``refused`` is True when the assignee resolved to the requester themselves.
+    ``dm`` says the assignee matched a Slack user, so the nudge includes a DM.
+    """
+
+    refused: bool = False
+    dm: bool = False
 
 
 @dataclass
 class TaskSpec:
     ctx: TurnContext
+    # The kind of task: "create_item", "add_comment", "append_row", "create_doc",
+    # "replace_section" or "nudge" — what the workflow routes on and the editable fields
+    # are keyed by. A Drive comment is an "add_comment" task too; a Drive sheet append is
+    # an "append_row" task; a Drive section replace is a "replace_section" task.
     tool_name: str
     # Empty on a task made now: the payload is a revision of ``task_drafts`` (``draft_ref``,
     # ``revision``). A task recorded before that carries its frozen payload here.
     payload: dict
     approval_nonce: str
+    # The manifest tool the model called ("comment_on_file" for a Drive comment), which
+    # names the connector the write goes through. Empty on a task recorded before it: the
+    # kind named a Notion tool then, as it still does for Notion's own.
+    tool: str = ""
     # The task ID the draft revisions are stored under; empty on a task that carries its payload.
     draft_ref: str = ""
     # The revision the card shows and the approval names. An edit stores the next revision and
@@ -250,6 +303,15 @@ class TaskSpec:
     database_id: str = ""
     # Set on a continue-as-new: the task is already past approval and only watches.
     resume: WatchState | None = None
+    # The watch that started this nudge task; it is told when the nudge ran. Empty otherwise.
+    parent_id: str = ""
+    # Whether the approved nudge includes a DM (the assignee matched a Slack user).
+    # Set by the watch from the prepared draft; edits change only the text, not this.
+    nudge_dm: bool = False
+    # Set by the workflow when the tenant's policy lets this comment run without the
+    # requester's approval (D-43): the write then records no approval row, no approver,
+    # and outcome 'policy'. Never set from the model's input.
+    under_policy: bool = False
 
 
 @dataclass
@@ -270,6 +332,15 @@ NOTION_TEXT_MAX = 2000
 COMMENT_SIGNATURE_MAX = 100
 SIGNATURE_NAME_MAX = 26
 
+# The assignee name a nudge's plain-name mention may carry, capped when the draft is
+# frozen. A Notion name can be all "&", which escape to five characters each on the card.
+NUDGE_NAME_MAX = 80
+
+# The new text a section replace inserts: bounded so the approval card (a Slack section
+# text field holds 3000 characters) and the Edit form always fit. The before text the card
+# shows is read from the Doc and truncated for display, not capped here.
+SECTION_TEXT_MAX = 2000
+
 # The fields a requester may edit on an approval card, per tool, with the
 # longest value each may hold. Every path that accepts a value (the model's
 # first draft, an edit) checks ``check_field``, so an accepted value always fits
@@ -277,28 +348,83 @@ SIGNATURE_NAME_MAX = 26
 EDITABLE_FIELDS = {
     "create_item": {"title": 150, "details": NOTION_TEXT_MAX - 100},
     "add_comment": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX},
+    # A nudge's editable text goes into both the comment and the DM; the mention and the
+    # DM's frame are the runtime's, rebuilt from the approved revision. The comment also
+    # carries a mention: worst case a plain-name one ("@<name> ", the name capped) or a
+    # real one's leading space, so the cap leaves its room under Notion's 2000 as well.
+    "nudge": {"comment": NOTION_TEXT_MAX - COMMENT_SIGNATURE_MAX - (NUDGE_NAME_MAX + len("@ "))},
+    # An append's editable fields are the granted sheet's columns, named by the stored
+    # draft (they differ per grant), not a fixed set here. The empty map marks append_row
+    # a write kind; ``row_limits`` builds the per-column limits from the draft's columns.
+    "append_row": {},
+    # A create-from-template's editable fields are the title and the template's blanks,
+    # named by the stored draft, not a fixed set here. The empty map marks create_doc a
+    # write kind; ``blank_limits`` builds the limits from the draft's blanks.
+    "create_doc": {},
+    # A section replace edits only the new text; the heading, the before text and the read
+    # revision are the draft's, fixed (an edit keeps the same read revision).
+    "replace_section": {"text": SECTION_TEXT_MAX},
 }
+
+# One cell of an appended row: the raw character cap, and the room its escaped value has
+# on the approval card (a Slack section field holds 2000 characters).
+ROW_CELL_MAX = 1000
+_ROW_CELL_ROOM = 2000
+# One blank's fill value and the new Doc's title: the same card room as a row cell, and a
+# title cap like a created item's.
+BLANK_VALUE_MAX = 1000
+DOC_TITLE_MAX = 150
+
+
+def row_limits(columns: list[str]) -> dict[str, int]:
+    """The editable limits of an append draft: one cell per column of the granted sheet."""
+    return {column: ROW_CELL_MAX for column in columns}
+
+
+def blank_limits(blanks: list[str]) -> dict[str, int]:
+    """The editable limits of a create-from-template draft: the new Doc's title and one
+    value per template blank. A blank named ``title`` shares the title's input: the form
+    edits the Doc's name, and that blank keeps its draft value."""
+    return {**{blank: BLANK_VALUE_MAX for blank in blanks}, "title": DOC_TITLE_MAX}
+
 
 # Room on the card for the escaped value, after the bold label above it.
 _CARD_ROOM = {
     "title": 2000 - len("*Title*\n"),
     "details": 2000 - len("*Details*\n"),
     "comment": 3000 - len("*Comment*\n"),
+    "text": 3000 - len("*New text*\n"),
 }
+# A nudge's comment preview shares its section with the mention ("@<name> ") behind a
+# longer label. The name is Notion-written, so its worst escaped size (five characters
+# per "&") is reserved too, and the section fits Slack's 3000 even for a hostile name.
+_NUDGE_COMMENT_ROOM = 3000 - len("*Comment on the item*\n") - (len("@ ") + 5 * NUDGE_NAME_MAX)
 
 
 def _field_problem(tool_name: str, name: str, value: str) -> tuple[str, str] | None:
     """Why ``value`` does not fit, and what the model should do about it."""
-    limit = EDITABLE_FIELDS[tool_name][name]
+    if tool_name == "append_row":
+        # A row cell is keyed by its column name, which the draft names, not a fixed field.
+        limit, room = ROW_CELL_MAX, _ROW_CELL_ROOM
+    elif tool_name == "create_doc":
+        # The title is a fixed field; a blank value is keyed by its blank name, which the
+        # draft names, not a fixed field.
+        if name == "title":
+            limit, room = DOC_TITLE_MAX, _CARD_ROOM["title"]
+        else:
+            limit, room = BLANK_VALUE_MAX, _ROW_CELL_ROOM
+    else:
+        limit = EDITABLE_FIELDS[tool_name][name]
+        room = _NUDGE_COMMENT_ROOM if tool_name == "nudge" else _CARD_ROOM[name]
     if len(value) > limit:
         return (
             f"'{name}' is {len(value)} characters; the limit is {limit}.",
             "Shorten it and call the tool again.",
         )
-    if len(escape_slack(value)) > _CARD_ROOM[name]:
+    if len(escape_slack(value)) > room:
         what = (
             f"'{name}' has too many '&', '<' or '>' characters: they are encoded on the "
-            f"approval card and the result is over its {_CARD_ROOM[name]}-character room."
+            f"approval card and the result is over its {room}-character room."
         )
         return what, "Shorten it or use fewer of them, and call the tool again."
     return None
@@ -379,8 +505,22 @@ ACCESS_AUDIT_KINDS = ("grant_pick", "widening_confirm")
 WEBHOOK_AUDIT_KINDS = ("webhook_token",)
 # A tenant's payload key, created or rotated in the database by a host command.
 PAYLOAD_KEY_AUDIT_KINDS = ("payload_key",)
-# A tenant created by the Slack OAuth install, or its bot token replaced by a reinstall.
-INSTALL_AUDIT_KINDS = ("install",)
+# A tenant created by the Slack OAuth install, its bot token replaced by a reinstall,
+# or its app uninstalled (the tenant disabled and its Slack credential deleted).
+INSTALL_AUDIT_KINDS = ("install", "uninstall")
+# An agent's grant check flipping its health: the agent and the version checked.
+HEALTH_AUDIT_KINDS = ("agent_health",)
+# A tenant's Notion workspace connected or disconnected in the console; never the token.
+CONNECTOR_AUDIT_KINDS = ("connector",)
+# A tenant's default agent and channel routing, set by an admin in the console.
+TENANT_SETTINGS_AUDIT_KINDS = ("tenant_settings",)
+# A tenant's approval policy for a low-risk action, changed by an admin in the console.
+POLICY_AUDIT_KINDS = ("policy_change",)
+# A person's 👍/👎 on an answer: the agent and version that answered, never the reason text.
+FEEDBACK_AUDIT_KINDS = ("feedback",)
+# A creator's test cases on a version, and a test run of them: references and hashes only,
+# never a question's text or a case's result detail.
+TEST_AUDIT_KINDS = ("test_case", "test_run")
 AUDIT_KINDS = (
     ("answer", "notice", "tool_call", "hand_off", "approval", "approval_closed", "write")
     + AGENT_AUDIT_KINDS
@@ -394,8 +534,16 @@ AUDIT_KINDS = (
     + WEBHOOK_AUDIT_KINDS
     + PAYLOAD_KEY_AUDIT_KINDS
     + INSTALL_AUDIT_KINDS
+    + HEALTH_AUDIT_KINDS
+    + CONNECTOR_AUDIT_KINDS
+    + TENANT_SETTINGS_AUDIT_KINDS
+    + POLICY_AUDIT_KINDS
+    + FEEDBACK_AUDIT_KINDS
+    + TEST_AUDIT_KINDS
 )
-AUDIT_OUTCOMES = ("ok", "error")
+# 'policy' marks a write that ran under an admin's no-approval policy (D-43): it
+# succeeded, and no approval row precedes it.
+AUDIT_OUTCOMES = ("ok", "error", "policy")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -413,7 +561,7 @@ class AuditEvent:
     kind: str
     agent_id: (
         str | None
-    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install
+    )  # None only for a tenant-wide event: membership, budget, switch, usage, retention, webhook token, payload key, install, uninstall, connector, tenant settings, approval policy
     agent_version: int | None
     requester_user_id: str
     identity: str  # whose access was used, e.g. "agent:it-helper"
@@ -421,7 +569,7 @@ class AuditEvent:
     conversation_id: str | None = None
     task_id: str | None = None
     tool: str | None = None
-    target: str | None = None  # a Notion page or database ID, or a specialist ID
+    target: str | None = None  # a Notion page or database ID, a specialist ID, or a feedback vote
     input_sha256: str | None = None
     output_sha256: str | None = None
     approver_user_id: str | None = None
@@ -444,6 +592,9 @@ class AuditEvent:
             + WEBHOOK_AUDIT_KINDS
             + PAYLOAD_KEY_AUDIT_KINDS
             + INSTALL_AUDIT_KINDS
+            + CONNECTOR_AUDIT_KINDS
+            + TENANT_SETTINGS_AUDIT_KINDS
+            + POLICY_AUDIT_KINDS
         )
         if self.kind in AGENT_NO_VERSION_AUDIT_KINDS:
             if not self.agent_id:

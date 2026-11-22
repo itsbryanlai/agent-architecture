@@ -77,6 +77,9 @@ def embed_max_distance(model: str, override: float | None = None) -> float | Non
 
 
 TASK_QUEUE = "agentos-main"
+# Test runs poll their own queue, so a burst of them never parks the turns and tasks
+# of the main queue; the worker registers the test-run workflow on it.
+TEST_TASK_QUEUE = "agentos-tests"
 
 # Which model provider the worker uses. Anthropic is the default; Qwen is a
 # second provider selectable for testing.
@@ -160,6 +163,12 @@ class Settings:
     notion_oauth_client_id: str | None = None
     notion_oauth_client_secret: str | None = field(default=None, repr=False)
     require_grant_picker: bool = False
+    # The deployment's Google service account (D-45): it creates one service account per
+    # tenant in the project and mints short-lived tokens for them. The JSON key is a
+    # deployment secret: never logged, never in a repr. Drive is unavailable on a console
+    # where either setting is unset.
+    google_project_id: str | None = None
+    google_service_account_key: str | None = field(default=None, repr=False)
     # The pilot allowlist for the Slack OAuth install: the Slack team IDs that may
     # install. Empty (the default) refuses every install.
     install_allowed_teams: tuple[str, ...] = ()
@@ -290,6 +299,8 @@ def load_settings() -> Settings:
         notion_oauth_client_id=env.get("NOTION_OAUTH_CLIENT_ID") or None,
         notion_oauth_client_secret=env.get("NOTION_OAUTH_CLIENT_SECRET") or None,
         require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
+        google_project_id=env.get("GOOGLE_PROJECT_ID") or None,
+        google_service_account_key=env.get("GOOGLE_SERVICE_ACCOUNT_KEY") or None,
         install_allowed_teams=_parse_install_teams(env.get("AGENTOS_INSTALL_ALLOWED_TEAMS")),
         db_pool_min=_parse_positive_int(env, "AGENTOS_DB_POOL_MIN", DEFAULT_DB_POOL_MIN),
         db_pool_max=_parse_positive_int(env, "AGENTOS_DB_POOL_MAX", DEFAULT_DB_POOL_MAX),
@@ -345,8 +356,13 @@ class NotionDatabaseGrant:
     The ``*_prop`` fields are names, kept as labels for people. The runtime
     addresses Notion properties only by the ``*_prop_id`` fields, which are
     stable across renames. They may be missing in a names-only config so the
-    check command can read it and print the IDs; the worker refuses to start
-    until all four are set.
+    check command can read it and print the IDs; a published agent whose grant
+    lacks them is unavailable until all four are set.
+
+    ``assignee_prop`` is optional: the people property the nudge reads the
+    assignee from. Empty means the database has no assignee mapping and a nudge
+    is a comment without a mention. When set, it is checked like the other
+    roles (a people property, addressed by its ID).
     """
 
     id: str
@@ -360,6 +376,8 @@ class NotionDatabaseGrant:
     status_prop_id: str | None = None
     requested_by_prop_id: str | None = None
     request_id_prop_id: str | None = None
+    assignee_prop: str = ""
+    assignee_prop_id: str | None = None
 
     def missing_property_ids(self) -> list[str]:
         """Roles that have no property ID configured."""
@@ -385,9 +403,56 @@ class NotionPageGrant:
 
 
 @dataclass
+class DriveGrant:
+    """A Google Drive folder, file or shared drive the agent may read, shared with the
+    tenant's account.
+
+    A folder grants everything under it (recursively); a file grants just that file; a
+    shared drive grants everything in it, walked from its root. Each grant is one scope
+    that searches are filtered by. ``kind`` is ``folder``, ``file``, ``shared_drive``,
+    ``sheet``, ``template`` or ``section``.
+
+    A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
+    ``columns`` is its header row, read once when the version is submitted and frozen
+    into the definition. The write refuses when the live header no longer matches.
+
+    A ``template`` is a granted Doc the agent may copy into a new Doc: ``id`` is the
+    template's file ID, ``folder_id`` the shared-drive folder new Docs land in,
+    ``drive_id`` the shared drive that folder sits in, and ``blanks`` the template's
+    ``{{field name}}`` placeholders. The blanks and the drive ID are read once when the
+    version is submitted and frozen into the definition. The write refuses when the live
+    grant's blanks or folder no longer match the draft's, or the folder's live shared
+    drive is not the recorded one. A template grant is copy-only: it is not a read or
+    comment target.
+
+    A ``section`` is a granted Doc the agent may replace one headed section of: ``id``
+    is the Doc's file ID (granted as for reads, indexed like any file), ``doc_id`` the
+    same Doc's file ID named for the write (it must equal ``id``), and ``heading`` the
+    heading the creator names, stripped of surrounding whitespace. The section is
+    everything under that heading up to the next heading of the same or higher level
+    (``TITLE`` and ``SUBTITLE`` are the highest level). Submit checks the heading exists
+    exactly once and the section is plain paragraphs only. The write refuses when the
+    live grant's heading no longer matches the draft's, the heading is gone or duplicated,
+    the section holds a table or image, or the Doc moved since the read revision.
+    """
+
+    id: str
+    name: str
+    kind: str = "folder"
+    tab: str = ""
+    columns: tuple[str, ...] = ()
+    folder_id: str = ""
+    blanks: tuple[str, ...] = ()
+    drive_id: str = ""
+    doc_id: str = ""
+    heading: str = ""
+
+
+@dataclass
 class Grants:
     notion_databases: list[NotionDatabaseGrant] = field(default_factory=list)
     notion_pages: list[NotionPageGrant] = field(default_factory=list)
+    drive: list[DriveGrant] = field(default_factory=list)
 
 
 # The most an agent definition may ask for. A task lives at most one approval window plus one
@@ -401,6 +466,10 @@ class FollowUpPolicy:
     poll_interval_minutes: int = 15
     stale_after_days: int = 3
     max_watch_days: int = 30
+    # Whether a stale item offers a nudge of its assignee, and how many nudges
+    # one task may run. The offer also needs the watch to be stale again.
+    nudge: bool = True
+    max_nudges: int = 2
 
 
 @dataclass
@@ -413,7 +482,7 @@ DEFAULT_MAX_WRITES_PER_TURN = 2
 MAX_WRITES_PER_TURN_RANGE = (1, 10)
 
 # Slack IDs: C for a public channel, G for a private one, S for a user group.
-_CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
+CHANNEL_ID = re.compile(r"[CG][A-Z0-9_]{2,}")
 _USER_GROUP_ID = re.compile(r"S[A-Z0-9_]{2,}")
 
 
@@ -492,6 +561,8 @@ class AgentsConfig:
     default_agent: str | None
     # The Notion workspace this tenant's webhook events must come from.
     notion_workspace_id: str | None = None
+    # The connected workspace's name, for display; set by Connect Notion, not the YAML file.
+    notion_workspace_name: str | None = None
     secrets: TenantSecrets = field(default_factory=TenantSecrets)
     # Slack channel ID to the agent that answers mentions there.
     channels: dict[str, str] = field(default_factory=dict)
@@ -514,6 +585,7 @@ _PROPERTY_ID_FIELDS = {
     "status": "status_prop_id",
     "requested_by": "requested_by_prop_id",
     "request_id": "request_id_prop_id",
+    "assignee": "assignee_prop_id",
 }
 
 
@@ -553,10 +625,32 @@ _AGENT_KEYS = frozenset(
         "team",
     }
 )
-_GRANT_KEYS = frozenset({"notion"})
+_GRANT_KEYS = frozenset({"notion", "drive"})
 _NOTION_KEYS = frozenset({"databases", "pages"})
 _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
+_DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates", "sections"})
+_DRIVE_ITEM_KEYS = frozenset({"id", "name"})
+_DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
+_DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks", "drive_id"})
+_DRIVE_SECTION_KEYS = frozenset({"id", "name", "doc_id", "heading"})
+DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template", "section")
+# A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
+# The connector's link parser uses the same shape, so a grant and a resolved link agree.
+DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,}")
+# A sheet grant's header row is bounded so the approval card (Slack section fields) and
+# the Edit form (Slack modal blocks) always fit: at most 50 columns, each name at most 200
+# characters. The submit step refuses a wider header rather than store a card Slack rejects.
+MAX_SHEET_COLUMNS = 50
+MAX_COLUMN_NAME = 200
+# A template grant's blanks are bounded like a sheet's columns so the approval card and the
+# Edit form always fit: at most 50 blanks, each name at most 200 characters. The submit step
+# refuses a wider template rather than store a card Slack rejects.
+MAX_TEMPLATE_BLANKS = 50
+MAX_BLANK_NAME = 200
+# A section grant's heading name is bounded like a blank name so the approval card and the
+# Edit form always fit. The replacement text's own cap lives in ``agentos.models``.
+MAX_HEADING_NAME = 200
 
 # Inclusive bounds on the numbers a definition sets.
 MAX_STEPS_RANGE = (1, 50)
@@ -564,7 +658,9 @@ _FOLLOW_UP_RANGES = {
     "poll_interval_minutes": (1, 1440),
     "stale_after_days": (1, 365),
     "max_watch_days": (1, MAX_WATCH_DAYS),
+    "max_nudges": (0, 10),
 }
+_FOLLOW_UP_BOOLS = frozenset({"nudge"})
 _APPROVAL_RANGES = {
     "expires_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
     "reminder_after_hours": (1, MAX_APPROVAL_EXPIRES_HOURS),
@@ -621,7 +717,7 @@ def _parse_database_grant(
     if not isinstance(props, dict):
         raise ConfigError(f"agent '{agent_id}' grant '{name}': missing required field 'properties'")
     pwhere = f"agent '{agent_id}' grant '{name}' properties"
-    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS))
+    _mapping(pwhere, props, frozenset(_PROPERTY_FIELDS) | {"assignee"})
     values: dict[str, Any] = {}
     for key, attr in _PROPERTY_FIELDS.items():
         if key not in props or props[key] in (None, "", []):
@@ -635,6 +731,8 @@ def _parse_database_grant(
             values[attr] = done
         else:
             values[attr] = _text(pwhere, key, props[key])
+    assignee = props.get("assignee")
+    assignee_prop = "" if assignee in (None, "") else _text(pwhere, "assignee", assignee)
     ids_raw = raw.get("property_ids")
     if ids_raw is None:
         ids_raw = {}
@@ -660,6 +758,7 @@ def _parse_database_grant(
         done_values=list(values["done_values"]),
         requested_by_prop=values["requested_by_prop"],
         request_id_prop=values["request_id_prop"],
+        assignee_prop=assignee_prop,
         **id_values,
     )
 
@@ -673,9 +772,161 @@ def _parse_page_grant(agent_id: str, raw: dict[str, Any], index: int = 0) -> Not
     )
 
 
-def _parse_policy(where: str, raw: Any, ranges: dict[str, tuple[int, int]], cls: type) -> Any:
-    block = _mapping(where, raw, frozenset(ranges))
-    return cls(**{k: _whole(where, k, v, *ranges[k]) for k, v in block.items()})
+def _parse_drive_grant(agent_id: str, raw: dict[str, Any], kind: str, index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.{kind}s[{index}]"
+    _mapping(where, raw, _DRIVE_ITEM_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind=kind,
+    )
+
+
+def _parse_drive_sheet(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.sheets[{index}]"
+    _mapping(where, raw, _DRIVE_SHEET_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    columns_raw = raw.get("columns")
+    columns: tuple[str, ...] = ()
+    if columns_raw is not None:
+        if not isinstance(columns_raw, list) or not all(
+            isinstance(c, str) and c.strip() for c in columns_raw
+        ):
+            raise ConfigError(f"{where}: 'columns' must be a list of non-empty column names")
+        if len(columns_raw) > MAX_SHEET_COLUMNS:
+            raise ConfigError(f"{where}: a sheet may name at most {MAX_SHEET_COLUMNS} columns")
+        if any(len(c) > MAX_COLUMN_NAME for c in columns_raw):
+            raise ConfigError(f"{where}: a column name may be at most {MAX_COLUMN_NAME} characters")
+        columns = tuple(columns_raw)
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="sheet",
+        tab=_text(where, "tab", _require(raw, "tab", where)),
+        columns=columns,
+    )
+
+
+def _parse_drive_template(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.templates[{index}]"
+    _mapping(where, raw, _DRIVE_TEMPLATE_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    folder_id = _text(where, "folder_id", _require(raw, "folder_id", where))
+    if not DRIVE_ID.fullmatch(folder_id):
+        raise ConfigError(
+            f"{where}: 'folder_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    blanks_raw = raw.get("blanks")
+    blanks: tuple[str, ...] = ()
+    if blanks_raw is not None:
+        if not isinstance(blanks_raw, list) or not all(
+            isinstance(b, str) and b.strip() for b in blanks_raw
+        ):
+            raise ConfigError(f"{where}: 'blanks' must be a list of non-empty blank names")
+        if len(blanks_raw) > MAX_TEMPLATE_BLANKS:
+            raise ConfigError(f"{where}: a template may name at most {MAX_TEMPLATE_BLANKS} blanks")
+        if any(len(b) > MAX_BLANK_NAME for b in blanks_raw):
+            raise ConfigError(f"{where}: a blank name may be at most {MAX_BLANK_NAME} characters")
+        blanks = tuple(blanks_raw)
+    # The shared drive the destination folder sits in, read at submit; empty until then
+    # (or for a folder outside any shared drive, which the publish refuses).
+    drive_id = raw.get("drive_id", "")
+    if not isinstance(drive_id, str):
+        raise ConfigError(f"{where}: 'drive_id' must be text")
+    if drive_id and not DRIVE_ID.fullmatch(drive_id):
+        raise ConfigError(
+            f"{where}: 'drive_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="template",
+        folder_id=folder_id,
+        blanks=blanks,
+        drive_id=drive_id,
+    )
+
+
+def _parse_drive_section(agent_id: str, raw: dict[str, Any], index: int = 0) -> DriveGrant:
+    where = f"agent '{agent_id}' grants.drive.sections[{index}]"
+    _mapping(where, raw, _DRIVE_SECTION_KEYS)
+    grant_id = _text(where, "id", _require(raw, "id", where))
+    if not DRIVE_ID.fullmatch(grant_id):
+        raise ConfigError(
+            f"{where}: 'id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    doc_id = _text(where, "doc_id", _require(raw, "doc_id", where))
+    if not DRIVE_ID.fullmatch(doc_id):
+        raise ConfigError(
+            f"{where}: 'doc_id' must be a Drive ID (letters, digits, - and _, 10 or more)"
+        )
+    if doc_id != grant_id:
+        raise ConfigError(f"{where}: 'doc_id' must be the same Doc as 'id'")
+    heading = _text(where, "heading", _require(raw, "heading", where)).strip()
+    if len(heading) > MAX_HEADING_NAME:
+        raise ConfigError(f"{where}: a heading name may be at most {MAX_HEADING_NAME} characters")
+    return DriveGrant(
+        id=grant_id,
+        name=_text(where, "name", _require(raw, "name", where)),
+        kind="section",
+        doc_id=doc_id,
+        heading=heading,
+    )
+
+
+def _parse_drive_grants(agent_id: str, raw: Any) -> list[DriveGrant]:
+    where = f"agent '{agent_id}' grants.drive"
+    drive = _mapping(where, raw, _DRIVE_KEYS)
+    grants: list[DriveGrant] = []
+    for kind in DRIVE_GRANT_KINDS:
+        key = f"{kind}s"
+        for i, item in enumerate(_list_of(f"{where}.{key}", drive.get(key))):
+            if kind == "sheet":
+                grants.append(_parse_drive_sheet(agent_id, item, i))
+            elif kind == "template":
+                grants.append(_parse_drive_template(agent_id, item, i))
+            elif kind == "section":
+                grants.append(_parse_drive_section(agent_id, item, i))
+            else:
+                grants.append(_parse_drive_grant(agent_id, item, kind, i))
+    seen: set[str] = set()
+    for grant in grants:
+        if grant.id in seen:
+            raise ConfigError(f"{where}: '{grant.id}' is granted more than once")
+        seen.add(grant.id)
+    return grants
+
+
+def _parse_policy(
+    where: str,
+    raw: Any,
+    ranges: dict[str, tuple[int, int]],
+    cls: type,
+    bool_keys: frozenset[str] = frozenset(),
+) -> Any:
+    block = _mapping(where, raw, frozenset(ranges) | bool_keys)
+    values: dict[str, Any] = {}
+    for key, value in block.items():
+        if key in bool_keys:
+            if type(value) is not bool:
+                raise ConfigError(f"{where}: '{key}' must be true or false")
+            values[key] = value
+        else:
+            values[key] = _whole(where, key, value, *ranges[key])
+    return cls(**values)
 
 
 def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
@@ -702,6 +953,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         _parse_page_grant(agent_id, pg, i)
         for i, pg in enumerate(_list_of(f"{where} grants.notion.pages", notion.get("pages")))
     ]
+    drive = _parse_drive_grants(agent_id, grants_raw.get("drive"))
     description = raw.get("description")
     if description is not None and not isinstance(description, str):
         raise ConfigError(f"{where}: 'description' must be text")
@@ -712,9 +964,13 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         name=_text(where, "name", _require(raw, "name", where)),
         system_prompt=_text(where, "system_prompt", _require(raw, "system_prompt", where)),
         max_steps=_whole(where, "max_steps", _require(raw, "max_steps", where), *MAX_STEPS_RANGE),
-        grants=Grants(notion_databases=databases, notion_pages=pages),
+        grants=Grants(notion_databases=databases, notion_pages=pages, drive=drive),
         follow_up=_parse_policy(
-            f"{where} follow_up", raw.get("follow_up"), _FOLLOW_UP_RANGES, FollowUpPolicy
+            f"{where} follow_up",
+            raw.get("follow_up"),
+            _FOLLOW_UP_RANGES,
+            FollowUpPolicy,
+            bool_keys=_FOLLOW_UP_BOOLS,
         ),
         approval=_parse_policy(
             f"{where} approval", raw.get("approval"), _APPROVAL_RANGES, ApprovalPolicy
@@ -744,6 +1000,7 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
                 "done_values": list(db.done_values),
                 "requested_by": db.requested_by_prop,
                 "request_id": db.request_id_prop,
+                **({"assignee": db.assignee_prop} if db.assignee_prop else {}),
             },
         }
         property_ids = {
@@ -775,7 +1032,30 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
     }
     if agent.audience is not None:
         definition["audience"] = _audience_definition(agent.audience)
+    if agent.grants.drive:
+        definition["grants"]["drive"] = {
+            f"{kind}s": [_drive_grant_entry(g) for g in agent.grants.drive if g.kind == kind]
+            for kind in DRIVE_GRANT_KINDS
+        }
     return definition
+
+
+def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
+    entry: dict[str, Any] = {"id": grant.id, "name": grant.name}
+    if grant.kind == "sheet":
+        entry["tab"] = grant.tab
+        if grant.columns:
+            entry["columns"] = list(grant.columns)
+    if grant.kind == "template":
+        entry["folder_id"] = grant.folder_id
+        if grant.blanks:
+            entry["blanks"] = list(grant.blanks)
+        if grant.drive_id:
+            entry["drive_id"] = grant.drive_id
+    if grant.kind == "section":
+        entry["doc_id"] = grant.doc_id
+        entry["heading"] = grant.heading
+    return entry
 
 
 def _audience_definition(audience: Audience) -> dict[str, Any]:
@@ -810,7 +1090,7 @@ def _parse_audience(agent_where: str, raw: Any) -> Audience | None:
     if unknown:
         raise ConfigError(f"{where}: unknown field '{min(unknown)}'")
     channels = _id_list(
-        f"{where}", "channels", raw.get("channels", []), _CHANNEL_ID, "Slack channel ID"
+        f"{where}", "channels", raw.get("channels", []), CHANNEL_ID, "Slack channel ID"
     )
     dm = raw.get("dm")
     dm_everyone = False

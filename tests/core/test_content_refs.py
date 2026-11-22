@@ -27,7 +27,7 @@ from agentos import ids
 from agentos.audit import canonical_sha256
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.gateway import app as gateway_app
-from agentos.gateway.app import TRY_AGAIN, create_app
+from agentos.gateway.app import APPROVAL_ACTIONS, EDIT_ACTION, TRY_AGAIN, create_app
 from agentos.gateway.relay import InboundRelay
 from agentos.models import (
     CUT_SHORT,
@@ -48,6 +48,7 @@ from tests.conftest import ALICE, DB_ID, OTHER_DB_ID, TEAM, TENANT, eventually, 
 from tests.helpers.agents import helper_block, make_published
 from tests.helpers.conversation import stored_history
 from tests.helpers.gateway import FakeTemporalClient, im_event, post_event, signed_headers
+from tests.helpers.tasks import wait_state
 
 CHANNEL = "C_GENERAL"
 THREAD = "1700000000.000100"
@@ -135,11 +136,23 @@ class Gateway:
 
 
 def card_value(h, which: int = -1) -> dict:
-    """The task ID and nonce on the newest approval card (or an update that redrew it)."""
+    """The task ID and nonce on the newest approval card (or an update that redrew it).
+
+    An answer's feedback buttons are actions too, so only a message with task buttons counts.
+    """
     shown = [p["blocks"] for p in h.slack.posts() if p["blocks"]] + [
         u["blocks"] for u in h.slack.updates() if u["blocks"]
     ]
-    actions = next(b for b in shown[which] if b["type"] == "actions")
+    task_actions = set(APPROVAL_ACTIONS) | {EDIT_ACTION}
+    cards = [
+        blocks
+        for blocks in shown
+        if any(
+            b["type"] == "actions" and {e["action_id"] for e in b["elements"]} & task_actions
+            for b in blocks
+        )
+    ]
+    actions = next(b for b in cards[which] if b["type"] == "actions")
     return json.loads(actions["elements"][0]["value"])
 
 
@@ -257,6 +270,8 @@ async def test_a_task_and_its_edit_leave_no_payload_in_history_and_the_edit_is_w
     assert S_TASK in json.dumps(cards[0]["blocks"])
     value = card_value(h)
     task = h.client.get_workflow_handle(value["task_id"])
+    # The card is posted by an activity; the task accepts edits only once it is awaiting approval.
+    await wait_state(task, "awaiting_approval")
 
     await gateway.click("task_edit", value)
     assert (
@@ -284,7 +299,7 @@ async def test_a_task_and_its_edit_leave_no_payload_in_history_and_the_edit_is_w
         await replayer.replay_workflow(
             await h.client.get_workflow_handle(workflow_id).fetch_history()
         )
-    assert await task.query("state") == "watching"
+    await wait_state(task, "watching")
 
 
 # --- acknowledging Slack first ----------------------------------------------------------------
@@ -409,6 +424,8 @@ async def test_saving_an_edit_with_temporal_unavailable_keeps_the_form_open_with
     await gateway.say("order a monitor")
     await eventually(lambda: [p for p in h.slack.posts() if p["blocks"]])
     value = card_value(h)
+    task = h.client.get_workflow_handle(value["task_id"])
+    await wait_state(task, "awaiting_approval")
     await gateway.click("task_edit", value)
 
     down = DownTemporal()
@@ -430,6 +447,7 @@ async def test_the_write_reads_the_revision_that_was_approved_not_a_newer_one(ha
     await eventually(lambda: [p for p in h.slack.posts() if p["blocks"]])
     first = card_value(h)
     task = h.client.get_workflow_handle(first["task_id"])
+    await wait_state(task, "awaiting_approval")
 
     await h.acts.content.put_inbound(
         TENANT,

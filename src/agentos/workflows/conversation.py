@@ -20,7 +20,10 @@ Rules this workflow keeps:
   reply activity builds the Sources line from stored page metadata.
   Citation numbers are unique for the life of the thread (they carry over
   turns and continue-as-new), so a number cited from an earlier turn still
-  means the same page.
+  means the same page. An answer that cites none of the passages its turn's
+  searches returned still shows where it searched: the workflow passes the
+  turn's own citations to the reply activity (behind the ``searched-footer``
+  marker), which names those pages in a Searched line instead.
 * Identity comes from the runtime. The requester is the Slack user who sent the
   message, put into ``TurnContext`` here, never anything the LLM said.
 * Writes never run here. A call to a write tool (the connector manifest's ``risk`` says
@@ -48,7 +51,9 @@ Rules this workflow keeps:
   thread is switched, and a refused one leaves the thread with the front door.
 * A failed turn is reported in the thread and never ends the conversation: the
   placeholder is replaced with a short error, history is left valid, and the
-  workflow goes on to wait for the next message.
+  workflow goes on to wait for the next message. A turn failed because the tenant's
+  app was uninstalled posts nothing (the token is deleted); history is still left
+  valid, so a reinstall resumes the thread. Behind the ``tenant-disabled`` marker.
 * While a tool step runs long, the placeholder shows that step's label, fixed
   runtime text built from the agent's grants and config, never the model's words
   or a tool's input. Labels are throttled in workflow time and awaited inside the
@@ -66,13 +71,14 @@ from datetime import datetime, timedelta
 from typing import TypeVar
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.converter import value_to_type
 from temporalio.exceptions import ActivityError, ChildWorkflowError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from agentos import ids
-    from agentos.activities import HAND_OFF_TOOL, AgentActivities
+    from agentos.activities import HAND_OFF_TOOL, MY_TASKS_TOOL, AgentActivities
     from agentos.audience import (
         UNAVAILABLE,
         AudienceDecision,
@@ -91,6 +97,7 @@ with workflow.unsafe.imports_passed_through():
         Citation,
         ConversationRef,
         DraftOutcome,
+        ExternalUpdate,
         InboundMessage,
         LLMResponse,
         StepResult,
@@ -102,12 +109,16 @@ with workflow.unsafe.imports_passed_through():
         check_field,
     )
     from agentos.slack_format import escape_slack
+    from agentos.tasks import REFRESH_WAIT, TaskRecord
     from agentos.workflows import (
         ACTIVITY_TIMEOUT,
         LLM_TIMEOUT,
+        POKE_GAP,
         PROGRESS_RETRY,
         PROGRESS_TIMEOUT,
         RETRY,
+        TENANT_DISABLED_PATCH,
+        is_tenant_disabled,
     )
     from agentos.workflows.task import TaskWorkflow
 
@@ -155,6 +166,12 @@ PATCH_NOTICE_AUDIT = "notice-audit"
 PATCH_HANDOFF_REFUSAL_AGENT = "handoff-refusal-specialist"
 PATCH_PROGRESS = "progress"
 PATCH_PROGRESS_DROPPED = "progress-dropped"
+PATCH_SEARCHED_FOOTER = "searched-footer"
+# The my_tasks tool and its in-thread poke: a call no older history ever made.
+PATCH_MY_TASKS = "my-tasks"
+# One refresh per turn, and no poke for a task that just reported: a my-tasks history
+# recorded before this patch pokes and waits on every call, even a second in the turn.
+PATCH_MY_TASKS_ONCE = "my-tasks-once-per-turn"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -170,6 +187,7 @@ SEARCHING_SOURCES = "Searching the knowledge sources…"
 READING_NOTION = "Reading Notion…"
 DRAFTING_REQUEST = "Drafting the request…"
 HANDING_OVER = "Handing over to {agent}…"
+CHECKING_REQUESTS = "Checking your requests…"
 
 
 def progress_label(
@@ -193,6 +211,8 @@ def progress_label(
         return SEARCHING_SOURCES
     if name == HAND_OFF_TOOL:
         return HANDING_OVER.format(agent=escape_slack(agent_name))
+    if name == MY_TASKS_TOOL:
+        return CHECKING_REQUESTS
     if kind == READ_KIND:
         return READING_NOTION
     if kind in EDITABLE_FIELDS:
@@ -222,6 +242,12 @@ class _TurnState:
         # True once a progress edit on this placeholder was dropped: a late attempt may still
         # land on it after the reply, so the final text is posted as a new message instead.
         self.progress_dropped = False
+        # The citations this turn's searches kept, so the reply can name the pages it
+        # searched even when the answer cites none of them. References only, like citations.
+        self.searched: list[Citation] = []
+        # True once this turn refreshed the thread's task, or found it fresh enough: a
+        # second my_tasks call lists the store without another poke and wait.
+        self.task_refreshed = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -343,6 +369,16 @@ class ConversationWorkflow:
         # A hand-off during the turn changes the thread's agent, so log
         # and recover as whichever agent was running.
         self._log_failure(self._ref(), err)
+        if (
+            isinstance(err, ActivityError)
+            and workflow.patched(TENANT_DISABLED_PATCH)
+            and is_tenant_disabled(err)
+        ):
+            # The app was uninstalled: no token to post a failure notice with. Leave
+            # history valid so a reinstall resumes the thread, and post nothing.
+            if state.ctx is not None and state.placeholder_ts is not None:
+                await self._recover(conv_id, state, post=False)
+            return
         if state.ctx is None or state.placeholder_ts is None:
             # No placeholder to replace, so the user would get no reply at
             # all: post the failure notice as a new message instead.
@@ -410,8 +446,12 @@ class ConversationWorkflow:
             err.activity_type if isinstance(err, ActivityError) else type(err).__name__,
         )
 
-    async def _recover(self, conv_id: str, state: "_TurnState") -> None:
-        """Leave valid history and tell the user. Each step is best effort."""
+    async def _recover(self, conv_id: str, state: "_TurnState", post: bool = True) -> None:
+        """Leave valid history and tell the user. Each step is best effort.
+
+        ``post=False`` leaves the history valid but posts nothing: the tenant's app
+        was uninstalled, so there is no token to post with.
+        """
         ref = self._ref()
         ctx = state.ctx
         placeholder_ts = state.placeholder_ts
@@ -448,6 +488,8 @@ class ConversationWorkflow:
                 )
             except ActivityError as err:
                 self._log_failure(ref, err, "recovery")
+        if not post:
+            return
         try:
             if workflow.patched(PATCH_NOTICE_AUDIT):
                 await self._finalize(
@@ -685,6 +727,7 @@ class ConversationWorkflow:
             results: list[ToolResult] = list(outcomes)  # type: ignore[arg-type]
             for result in results:
                 self.citations.extend(result.citations)
+                state.searched.extend(result.citations)
             del self.citations[:-MAX_CITATIONS]
             await workflow.execute_activity_method(
                 AgentActivities.append_tool_results,
@@ -751,6 +794,20 @@ class ConversationWorkflow:
                 AgentActivities.post_final_notice,
                 [ctx, placeholder_ts, shown, "step_limit"],
             )
+        elif workflow.patched(PATCH_SEARCHED_FOOTER):
+            await self._finalize(
+                state,
+                AgentActivities.finalize_searched_reply,
+                AgentActivities.post_final_searched_reply,
+                [
+                    ctx,
+                    placeholder_ts,
+                    shown,
+                    citations,
+                    model_answer,
+                    state.searched if model_answer else [],
+                ],
+            )
         else:
             await self._finalize(
                 state,
@@ -793,12 +850,20 @@ class ConversationWorkflow:
         The activity posts it and then keeps it in history, so a reply that was not shown is
         not stored; recovery stores the failure notice in its place.
         """
-        await self._finalize(
-            state,
-            AgentActivities.finalize_model_reply,
-            AgentActivities.post_final_model_reply,
-            [ctx, placeholder_ts, key, list(self.citations), cut_short],
-        )
+        if workflow.patched(PATCH_SEARCHED_FOOTER):
+            await self._finalize(
+                state,
+                AgentActivities.finalize_searched_model_reply,
+                AgentActivities.post_final_searched_model_reply,
+                [ctx, placeholder_ts, key, list(self.citations), cut_short, state.searched],
+            )
+        else:
+            await self._finalize(
+                state,
+                AgentActivities.finalize_model_reply,
+                AgentActivities.post_final_model_reply,
+                [ctx, placeholder_ts, key, list(self.citations), cut_short],
+            )
         state.reply_stored = True
 
     def _kind(self, call: ToolCall | ToolCallRef) -> str:
@@ -1018,6 +1083,7 @@ class ConversationWorkflow:
         # The specialist's placeholder is new: no progress edit was dropped on it, so its
         # final text may edit it even if the front door's placeholder was left unsafe.
         state.progress_dropped = False
+        state.searched = []
         state.handed_off = True
         return specialist, ctx, placeholder_ts
 
@@ -1101,12 +1167,13 @@ class ConversationWorkflow:
             call.name, kind, source_titles=[g.name for g in agent.grants.notion_pages]
         )
         return await self._with_progress(
-            ctx, state, label, self._run_call(ctx, agent, conv_id, call, kind, first_marker)
+            ctx, state, label, self._run_call(ctx, state, agent, conv_id, call, kind, first_marker)
         )
 
     async def _run_call(
         self,
         ctx: TurnContext,
+        state: "_TurnState",
         agent: AgentVersion,
         conv_id: str,
         call: ToolCall | ToolCallRef,
@@ -1114,6 +1181,8 @@ class ConversationWorkflow:
         first_marker: int,
     ) -> ToolResult:
         if kind == READ_KIND:
+            if call.name == MY_TASKS_TOOL and workflow.patched(PATCH_MY_TASKS):
+                await self._refresh_thread_task(ctx, state)
             return await workflow.execute_activity_method(
                 AgentActivities.run_stored_read_tool
                 if isinstance(call, ToolCallRef)
@@ -1129,6 +1198,52 @@ class ConversationWorkflow:
             return await self._start_task(ctx, agent, call, kind)
         # Never raise on a tool the LLM invented; tell it instead.
         return ToolResult(call.id, f"Unknown tool '{call.name}'.", is_error=True)
+
+    async def _refresh_thread_task(self, ctx: TurnContext, state: "_TurnState") -> None:
+        """Poke the watch of the asker's task in this thread, then wait for its report.
+
+        The poke is the webhook's own ``external_update`` signal, so the watch answers
+        it at most once per ``POKE_GAP``: a question never forces a sooner poll. The
+        wait is bounded and best-effort; a task that does not report in time is listed
+        as it was last recorded. A task that closed between the lookup and the poke
+        already recorded its final state, so a failed signal changes nothing.
+
+        A turn refreshes at most once: a second my_tasks call lists the store as it is.
+        A task that reported within ``POKE_GAP`` is fresh already, so its poke and wait
+        are skipped. Histories recorded before the once-per-turn patch keep the original
+        poke and wait on every call.
+        """
+        once = workflow.patched(PATCH_MY_TASKS_ONCE)
+        if once and state.task_refreshed:
+            return
+        record: TaskRecord | None = await workflow.execute_activity_method(
+            AgentActivities.task_in_thread,
+            args=[ctx.tenant_id, ctx.channel, ctx.thread_ts, ctx.requester_user_id],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
+        if record is None or not record.page_id:
+            return
+        if once:
+            state.task_refreshed = True
+            if workflow.now() - record.updated_at < POKE_GAP:
+                return
+        try:
+            await workflow.get_external_workflow_handle(record.task_id).signal(
+                "external_update", ExternalUpdate(page_id=record.page_id, source="my_tasks")
+            )
+        except Exception as err:  # noqa: BLE001 - a closed task refuses the signal; its final state is recorded
+            self._log_failure(self._ref(), err, "task poke")
+            return
+        try:
+            await workflow.execute_activity_method(
+                AgentActivities.wait_task_refresh,
+                args=[ctx.tenant_id, record.task_id, record.updated_at],
+                start_to_close_timeout=REFRESH_WAIT + timedelta(seconds=15),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError as err:
+            self._log_failure(self._ref(), err, "task refresh wait")
 
     async def _with_progress(
         self,
@@ -1238,6 +1353,7 @@ class ConversationWorkflow:
             tool_name=kind,
             payload=payload,
             approval_nonce=str(workflow.uuid4()),
+            tool=call.name,
         )
         await workflow.start_child_workflow(
             TaskWorkflow.run,
@@ -1269,6 +1385,7 @@ class ConversationWorkflow:
             tool_name=kind,
             payload={},
             approval_nonce=str(workflow.uuid4()),
+            tool=call.name,
             draft_ref=task_id,
             revision=outcome.revision,
             database_id=outcome.database_id,
@@ -1288,6 +1405,21 @@ def _drafted_text(kind: str, ctx: TurnContext) -> str:
         return (
             f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
             "Nothing is posted until they click Submit."
+        )
+    if kind == "append_row":
+        return (
+            f"Drafted the row and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is appended until they click Submit."
+        )
+    if kind == "create_doc":
+        return (
+            f"Drafted the new Doc and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is created until they click Submit."
+        )
+    if kind == "replace_section":
+        return (
+            f"Drafted the section replacement and sent <@{ctx.requester_user_id}> an approval "
+            "card. Nothing is written until they click Submit."
         )
     return (
         f"Drafted the request and sent <@{ctx.requester_user_id}> an approval card. "

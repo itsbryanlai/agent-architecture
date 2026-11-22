@@ -18,6 +18,11 @@
   {% if editor and is_pending %}{{ post_button(version_url ~ "/withdraw", ctx.csrf, "Withdraw", {"request_id": new_token()}) }}{% endif %}
   {% if ctx.is_admin and is_pending %}
     {{ post_button(version_url ~ "/reject", ctx.csrf, "Reject", {"request_id": new_token()}) }}
+    {% if not run_review.run %}
+    <p class="warn">This version has no test run yet. Its creator can run the draft's test cases before you publish.</p>
+    {% elif run_review.stale %}
+    <p class="warn">The draft or its test cases changed after its last test run; the results below are older than what runs now.</p>
+    {% endif %}
     <form method="post" action="{{ version_url }}/publish">
       <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
       <input type="hidden" name="request_id" value="{{ new_token() }}">
@@ -39,17 +44,34 @@
     </form>
   {% endif %}
   {% if editor %}{{ post_button(version_url ~ "/check-grants", ctx.csrf, "Check Notion grants") }}{% endif %}
-  {% if editor and is_draft and picker_enabled %}{{ post_button(version_url ~ "/pick/start", ctx.csrf, "Choose from Notion") }}{% endif %}
+  {% if editor and is_draft and picker_enabled %}
+    <form method="post" action="{{ version_url }}/pick/start">
+      <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+      <label><input type="checkbox" name="consent" value="yes"{% if creator_consented %} checked{% endif %}> Keep my Notion sign-in so the platform can check each night that I can still see what I gave this agent.</label>
+      <button type="submit">Choose from Notion</button>
+    </form>
+  {% endif %}
   {% if editor and not is_draft %}
     {{ post_button(agent_url ~ "/drafts", ctx.csrf, "Copy into a new draft", {"from_version": record.version, "request_id": new_token()}) }}
   {% endif %}
 </div>
 
+{% if editor and picker_enabled and creator_consented %}
+<div class="actions">
+  <span>Your Notion sign-in is kept for the nightly access check.</span>
+  <form method="post" action="{{ version_url }}/pick/revoke">
+    <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+    <input type="hidden" name="request_id" value="{{ new_token() }}">
+    <button type="submit">Stop keeping it</button>
+  </form>
+</div>
+{% endif %}
+
 
 {% if grant_rows %}
 <h2>Grants</h2>
 <table>
-  <tr><th>Creator's label</th><th>Kind</th><th>Notion ID</th>{% if review and review.reports %}<th>Live title in Notion</th><th>Parent</th>{% endif %}{% if picker_enabled %}<th>Chosen from Notion</th>{% endif %}</tr>
+  <tr><th>Creator's label</th><th>Kind</th><th>Notion ID</th>{% if review and review.reports %}<th>Live title in Notion</th><th>Parent</th>{% endif %}{% if picker_enabled %}<th>Chosen from Notion</th><th>Creator access</th>{% endif %}</tr>
   {% for g in grant_rows %}
   <tr>
     <td>{{ g.label }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
@@ -57,11 +79,40 @@
     <td>{% if g.live and g.live.live_title is not none %}{{ g.live.live_title }}{% if g.live.label_differs %} <span class="error">The label does not match the live title: check this is the object you mean to give the agent.</span>{% endif %}{% else %}<span class="muted">not readable</span>{% endif %}</td>
     <td>{% if g.live and g.live.parent %}{{ g.live.parent }}{% endif %}</td>
     {% endif %}
-    {% if picker_enabled %}<td>{% if g.pick %}{{ g.pick.picked_by }}, {{ g.pick.picked_at | stamp }}{% else %}<span class="muted">no</span>{% endif %}</td>{% endif %}
+    {% if picker_enabled %}<td>{% if g.pick %}{{ g.pick.picked_by }}, {{ g.pick.picked_at | stamp }}{% else %}<span class="muted">no</span>{% endif %}</td>
+    <td>{% if g.access %}{% if g.access.status == "lost" %}<span class="error">lost</span>{% elif g.access.status == "cannot_verify" %}cannot verify (no consent){% else %}verified {{ g.access.checked_at | stamp }}{% endif %}{% else %}<span class="muted">not checked yet</span>{% endif %}</td>{% endif %}
   </tr>
   {% endfor %}
 </table>
 {% if review and review.live_problem %}<p class="error">{{ review.live_problem }}; the live titles are missing.</p>{% endif %}
+{% endif %}
+
+<h2>Google Drive</h2>
+{% if drive_grants %}
+<table>
+  <tr><th>Creator's label</th><th>Kind</th><th>Drive ID</th><th>Tab / columns / blanks / heading</th>{% if editor and is_draft %}<th></th>{% endif %}</tr>
+  {% for g in drive_grants %}
+  <tr>
+    <td>{{ g.name }}</td><td>{{ g.kind }}</td><td><code>{{ g.id }}</code></td>
+    <td>{% if g.kind == "sheet" %}{{ g.tab }}{% if g.columns %}: {{ g.columns|join(", ") }}{% endif %}{% elif g.kind == "template" %}folder <code>{{ g.folder_id }}</code>{% if g.blanks %}: {{ g.blanks|join(", ") }}{% endif %}{% elif g.kind == "section" %}heading "{{ g.heading }}"{% endif %}</td>
+    {% if editor and is_draft %}<td>{{ post_button(version_url ~ "/drive/remove", ctx.csrf, "Remove", {"grant_id": g.id, "request_id": new_token()}) }}</td>{% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">This version has no Google Drive grants.</p>
+{% endif %}
+{% if editor %}
+  {% if not drive_configured %}
+<p class="muted">Google Drive is not set up on this deployment.</p>
+  {% elif not drive_connected %}
+<p class="muted">Google Drive is not connected. <a href="{{ base }}/settings">Connect it in Settings</a>, then share folders and files with the workspace's Drive address.</p>
+  {% else %}
+<p class="muted">Anything shared with this workspace's Drive address is available to every agent creator in this workspace; an admin approves each agent before it reads it.</p>
+    {% if is_draft %}
+<div class="actions"><a href="{{ version_url }}/drive/pick"><button type="button">Choose from Google Drive</button></a> <a href="{{ version_url }}/drive/pick/template"><button type="button">Choose a template</button></a> <a href="{{ version_url }}/drive/pick/section"><button type="button">Choose a section</button></a></div>
+    {% endif %}
+  {% endif %}
 {% endif %}
 
 {% if review and review.diff and review.diff.changes %}
@@ -88,6 +139,95 @@
 {% endif %}
 {% endif %}
 
+<h2>Test cases</h2>
+{% if editor and is_draft %}
+<p class="muted">Questions this draft should handle the right way. A run uses this draft, not the published version; it never writes anything and posts nothing to Slack. Every case needs an expected behaviour before a run.</p>
+<table>
+  <tr><th>Question</th><th>Expected behaviour</th><th></th></tr>
+  {% for c in cases %}
+  <tr>
+    <td>{{ c.question | truncate(200, True) }}</td>
+    <td>
+      {% if c.expect %}{{ expect_labels[c.expect] }}{% if c.target %} <code>{{ c.target }}</code>{% endif %}
+      {% else %}
+      <form method="post" action="{{ version_url }}/test-cases/{{ c.case_id }}/expect">
+        <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+        <input type="hidden" name="request_id" value="{{ new_token() }}">
+        <select name="expect">
+          <option value="">choose…</option>
+          {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
+        </select>
+        <input type="text" name="target" placeholder="page, database or Drive file ID, or agent ID">
+        <button type="submit">Save</button>
+      </form>
+      {% endif %}
+    </td>
+    <td>{{ post_button(version_url ~ "/test-cases/" ~ c.case_id ~ "/remove", ctx.csrf, "Remove", {"request_id": new_token()}) }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="muted">No test cases yet.</td></tr>
+  {% endfor %}
+</table>
+<form method="post" action="{{ version_url }}/test-cases">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <p><label for="case-question">Question</label><br>
+  <textarea id="case-question" name="question" rows="2"></textarea></p>
+  <p><label for="case-expect">Expected behaviour</label>
+  <select id="case-expect" name="expect">
+    <option value="">choose later</option>
+    {% for k in expect_kinds %}<option value="{{ k }}">{{ expect_labels[k] }}</option>{% endfor %}
+  </select>
+  <input type="text" name="target" placeholder="page, database or Drive file ID, or agent ID">
+  <button type="submit">Add case</button></p>
+</form>
+{{ post_button(version_url ~ "/test-run", ctx.csrf, "Run tests", {"request_id": new_token()}) }}
+<span class="muted">One run spends at most $0.20, counted in this organisation's usage.</span>
+{% else %}
+<table>
+  <tr><th>Question</th><th>Expected behaviour</th></tr>
+  {% for c in cases %}
+  <tr>
+    <td>{{ c.question | truncate(200, True) }}</td>
+    <td>{% if c.expect %}{{ expect_labels[c.expect] }}{% if c.target %} <code>{{ c.target }}</code>{% endif %}{% else %}<span class="muted">not chosen</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="2" class="muted">No test cases.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if run_review.run %}
+{% set run = run_review.run %}
+<h2>Test run</h2>
+<p>
+  {{ run.count("pass") }} passed · {{ run.count("fail") }} failed
+  {%- if run.count("not_run") %} · {{ run.count("not_run") }} not run{% endif %}
+  {%- if run.count("error") %} · {{ run.count("error") }} errored{% endif %}
+  — {{ run.started_at | stamp }}, spend {{ run.spend_usd | usd }}
+  <span class="muted">run by {{ run.started_by }}</span>
+</p>
+{% if run.status == "running" %}<p class="muted">The run is still going; reload this page to see its results.</p>{% endif %}
+{% if run.status == "failed" %}<p class="error">This run could not start.</p>{% endif %}
+{% if run_review.stale %}<p class="warn">The draft or its test cases changed after this run; run the tests again.</p>{% endif %}
+{% set questions = {} %}
+{% for c in cases %}{% set _ = questions.update({c.case_id: c.question}) %}{% endfor %}
+<details{% if run.count("fail") or run.count("error") or run.count("not_run") %} open{% endif %}>
+  <summary>Per-case results</summary>
+  <table>
+    <tr><th>Question</th><th>Result</th><th>Reason</th><th>What the draft did</th></tr>
+    {% for r in run.results %}
+    <tr>
+      <td>{{ questions.get(r.case_id, r.case_id) | truncate(120, True) }}</td>
+      <td>{% if r.outcome == "fail" %}<span class="error">{{ r.outcome }}</span>{% else %}{{ r.outcome }}{% endif %}</td>
+      <td>{{ case_reason.get(r.reason, "") }}</td>
+      <td>{% if r.tool %}{{ r.tool }}{% endif %}{% if r.target %} <code>{{ r.target }}</code>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+
 <h2>Audience</h2>
 {% set eff = audience.effective %}
 {% if not eff.explicit %}<p class="muted">default (no audience set): every full member by direct message, the channels the tenant file maps to this agent, no guests.</p>{% endif %}
@@ -104,6 +244,9 @@
   </td></tr>
   <tr><th>Guests</th><td>{% if eff.guests %}allowed{% else %}not allowed{% endif %}. People from other Slack workspaces are never let in.</td></tr>
 </table>
+{% if eff.explicit and not eff.dm_everyone and not eff.dm_user_groups %}
+<p class="warn">Direct messages: nobody (add <code>dm: everyone</code> to keep them open).</p>
+{% endif %}
 {% if audience.summary %}
 {% set sm = audience.summary %}
 <p><strong>{{ sm.total }} people</strong> can reach this agent: {{ sm.guests }} guest{{ "" if sm.guests == 1 else "s" }}, {{ sm.external }} from another workspace. Counted from Slack just now.</p>

@@ -108,6 +108,8 @@ class FakeEmbedder:
     Texts that share words end up close together. ``texts_embedded`` counts how many
     texts were embedded, so tests can see whether anything was re-embedded.
     ``usage_per_text`` is the billed count it reports per text; None reports no usage.
+    ``fail_embed_for`` makes the endpoint refuse one exact text (a lasting refusal), the
+    injection point for the one-bad-file path; it lives here, not monkeypatched per test.
     """
 
     def __init__(self, dimensions: int = 1024, model: str = "fake-embed"):
@@ -115,8 +117,16 @@ class FakeEmbedder:
         self.dimensions = dimensions
         self.texts_embedded = 0
         self.usage_per_text: int | None = 1
+        self.embed_errors: dict[str, Exception] = {}
+
+    def fail_embed_for(self, text: str, error: Exception) -> None:
+        """Make every embed of a batch containing ``text`` raise ``error``."""
+        self.embed_errors[text] = error
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        for text in texts:
+            if text in self.embed_errors:
+                raise self.embed_errors[text]
         self.texts_embedded += len(texts)
         vectors = Embeddings(self._one(t) for t in texts)
         if self.usage_per_text is not None:

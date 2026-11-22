@@ -24,14 +24,37 @@ STALE = "stale"
 FAILED_COMMENT = "failed_comment"
 NOT_CONFIRMED_COMMENT = "not_confirmed_comment"
 COMMENTED = "commented"
+COMMENTED_NO_APPROVAL = "commented_no_approval"
+# The append write's lines (D-48): a row appended to a granted Sheet, no watch afterwards.
+APPENDED = "appended"
+FAILED_APPEND = "failed_append"
+NOT_CONFIRMED_APPEND = "not_confirmed_append"
+# The create-from-template write's lines (D-49): a Doc copied into a shared-drive folder,
+# no watch afterwards.
+CREATED = "created"
+FAILED_CREATE_DOC = "failed_create_doc"
+NOT_CONFIRMED_CREATE_DOC = "not_confirmed_create_doc"
+# The section-replace write's lines (D-50): a headed section of a granted Doc replaced,
+# no watch afterwards.
+REPLACED = "replaced"
+FAILED_REPLACE_SECTION = "failed_replace_section"
+NOT_CONFIRMED_REPLACE_SECTION = "not_confirmed_replace_section"
+# The fixed line a card shows when a write is stopped before it runs; a policy write
+# has no card, so the line goes to the thread as it is.
+STOPPED_COMMENT = "stopped_comment"
+NUDGED = "nudged"
+NUDGE_COMMENTED = "nudge_commented"
+NUDGE_NO_DM = "nudge_no_dm"
+NUDGE_SELF = "nudge_self"
+NUDGE_PREPARE_FAILED = "nudge_prepare_failed"
 
 # Kinds about the item a create made, not about the draft.
-ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE)
+ITEM_NOTICES = (FILED, STOPPED_WATCH, STOPPED_UNREADABLE, DONE, STALE, CREATED)
 
 
 def subject(tool_name: str, payload: dict) -> str:
     """The short name of what a task is about, for card and thread lines."""
-    if tool_name == "add_comment":
+    if tool_name in ("add_comment", "append_row", "nudge", "replace_section"):
         return payload.get("item_title") or payload.get("item") or ""
     return payload.get("title", "")
 
@@ -81,4 +104,36 @@ def notice_text(
         return f"I couldn't confirm whether the comment was posted; please check {url}"
     if kind == COMMENTED:
         return f"Commented on {name} ({url})."
+    if kind == COMMENTED_NO_APPROVAL:
+        return f"Commented on '{name}' ({url}) (no approval needed: your admin's setting)."
+    if kind == APPENDED:
+        return f"Appended a row to {name} ({url})."
+    if kind == FAILED_APPEND:
+        return f"I couldn't append a row to '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_APPEND:
+        return f"I couldn't confirm whether the row was appended; please check {url}"
+    if kind == CREATED:
+        return f"Created {name} ({url})."
+    if kind == FAILED_CREATE_DOC:
+        return f"I couldn't create '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_CREATE_DOC:
+        return f"I couldn't confirm whether the Doc was created; please check {url}"
+    if kind == REPLACED:
+        return f"Replaced a section of {name} ({url})."
+    if kind == FAILED_REPLACE_SECTION:
+        return f"I couldn't replace the section in '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_REPLACE_SECTION:
+        return f"I couldn't confirm whether the section was replaced; please check {url}"
+    if kind == STOPPED_COMMENT:
+        return reason
+    if kind == NUDGED:
+        return f"Nudged the assignee about '{name}': commented on the item and sent a DM."
+    if kind == NUDGE_COMMENTED:
+        return f"Commented on '{name}' as a nudge."
+    if kind == NUDGE_NO_DM:
+        return f"Commented on '{name}', but I couldn't DM the assignee."
+    if kind == NUDGE_SELF:
+        return f"The assignee of '{name}' is you, so there's nobody to nudge."
+    if kind == NUDGE_PREPARE_FAILED:
+        return f"I couldn't prepare the nudge for '{name}'."
     raise ValueError(f"unknown notice kind {kind!r}")

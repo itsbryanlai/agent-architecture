@@ -995,6 +995,47 @@ async def test_the_console_shows_a_publish_refused_for_a_mapped_channel():
     assert refused.status_code == 409 and OTHER_CHAN in refused.text
 
 
+@pytest.mark.parametrize("surface", ["console publish", "console resume", "api publish"])
+async def test_a_missing_confirmation_reads_plainly_in_the_console_and_as_json_in_the_api(surface):
+    """Fails if the console shows the API's confirm_audience wording instead of a sentence a
+    person acts on, or the API answer loses its machine-readable form."""
+    if surface == "api publish":
+        plane, agents, _audit, _, client = api_world()
+        await pending(plane, channels=[CHAN])
+        async with client as c:
+            refused = await c.post(
+                f"{API}/agents/it-helper/versions/1/publish",
+                json={**ACK, "definition_sha256": await sha_of(agents)},
+            )
+        assert refused.status_code == 409
+        assert "confirm_audience" in refused.json()["error"]
+        return
+    h, _ = console_world()
+    await console_pending(h, channels=[CHAN])
+    if surface == "console resume":
+        await h.pauses.open_pause(TENANT, "it-helper", CHAN, "channel_shared", h.clock())
+        path = f"/ui/{TENANT}/agents/it-helper/channels/{CHAN}/resume"
+        box = "I confirm these people may see what this agent says here"
+    else:
+        path = f"{VERSION_URL}/publish"
+        box = "I confirm these people may see what this agent can access"
+    c = await h.signed_in(CONSOLE_ADMIN)
+    async with using(c):
+        fields = (
+            {}
+            if surface == "console resume"
+            else {
+                **ACK_FORM,
+                "definition_sha256": await sha_of(h.agents),
+            }
+        )
+        refused = await post(c, path, await csrf_token(c), **fields)
+    assert refused.status_code == 409
+    text = refused.text.replace("&#39;", "'")
+    assert f"Tick '{box}' (4 people: 1 guests, 1 from other workspaces)" in text
+    assert "confirm_audience" not in text
+
+
 # --- startup ----------------------------------------------------------------------------
 
 

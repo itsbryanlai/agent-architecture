@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import uuid
 
+import httpx
 import pytest
+from slack_sdk.signature import SignatureVerifier
 
 from agentos import ids
 from agentos.audit import PostgresAuditStore, event_json
-from agentos.credentials import PostgresCredentialStore, TenantCredentials
+from agentos.config import Settings
+from agentos.credentials import NOTION, SLACK_BOT, PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import DatabaseKeyStore, MasterKeys, tenant_key_material
+from agentos.gateway.app import create_app
 from agentos.slack_install import InstallConfig, Installer
-from agentos.stores import tenant_transaction
-from agentos.tenant_store import PostgresTenantStore
+from agentos.stores import InMemoryTaskLinkStore, tenant_transaction
+from agentos.tenant_store import PostgresTenantStore, TenantDirectory
 from agentos.unit_of_work import PostgresUnitOfWork
+from tests.helpers.gateway import FakeTemporalClient, signed_headers
 
 BOT_TOKEN = "xoxb-made-up-pg-install"
 INSTALLER = "U_INSTALLER"
@@ -93,3 +99,62 @@ async def test_the_install_commits_the_tenant_key_token_and_audit_together(pool,
         ("install", "install", INSTALLER, team)
     ]
     assert BOT_TOKEN not in event_json(events[0])
+
+
+async def test_the_uninstall_event_disables_and_deletes_as_the_app_role(pool):
+    """Fails if the gateway's uninstall unit of work cannot disable the tenant, delete its
+    Slack credential and audit once as the app role, or a repeat event changes anything."""
+    team = f"T{uuid.uuid4().hex[:8].upper()}"
+    tenant_id = ids.tenant_for_slack_team(team)
+    masters = MasterKeys({1: secrets.token_bytes(32)})
+    await installer_for(pool, team, masters, PostgresAuditStore(pool)).install(
+        team, BOT_TOKEN, INSTALLER
+    )
+    keys = DatabaseKeyStore(pool, masters)
+    await keys.refresh()
+    credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
+    await credentials.store_with_current_key(tenant_id, NOTION, "ntn-made-up-kept")
+
+    secret = "made-up-signing-secret"
+    app = create_app(
+        Settings(),
+        TenantDirectory(PostgresTenantStore(pool)),
+        FakeTemporalClient(),
+        InMemoryTaskLinkStore(),
+        SignatureVerifier(secret),
+        tenant_store=PostgresTenantStore(pool),
+        credentials=credentials,
+        audit=PostgresAuditStore(pool),
+        uow=PostgresUnitOfWork(pool),
+    )
+    body = json.dumps(
+        {
+            "type": "event_callback",
+            "team_id": team,
+            "event_id": "EvU1",
+            "event": {"type": "app_uninstalled"},
+        }
+    ).encode()
+    headers = signed_headers(secret, body, "application/json")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://gateway.example.com"
+    ) as client:
+        assert (
+            await client.post("/slack/events", content=body, headers=headers)
+        ).status_code == 200
+        # A Slack retry of the same event changes nothing more.
+        assert (
+            await client.post("/slack/events", content=body, headers=headers)
+        ).status_code == 200
+
+    ref = await PostgresTenantStore(pool).ref_for_slack_team(team)
+    assert ref.enabled is False
+    assert await PostgresCredentialStore(pool).get(tenant_id, SLACK_BOT) is None
+    assert await PostgresCredentialStore(pool).get(tenant_id, NOTION) is not None
+    events = await PostgresAuditStore(pool).list(tenant_id)
+    uninstalls = [e for e in events if e.kind == "uninstall"]
+    assert [(e.tool, e.target, e.identity) for e in uninstalls] == [
+        ("app_uninstalled", team, "system:uninstall")
+    ]
+    assert BOT_TOKEN not in event_json(uninstalls[0])
+    assert {e.kind for e in events} == {"install", "uninstall"}

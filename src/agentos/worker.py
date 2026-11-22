@@ -1,16 +1,18 @@
 """The Temporal worker: runs both workflows and every activity.
 
 Real clients are built here, at startup, one Slack client and one Notion
-client for each tenant. The Slack token is resolved from the tenant's encrypted
+client for each tenant. Both tokens are resolved from the tenant's encrypted
 credential row first, else the environment variable its config names; a missing
-one fails with a message naming the tenant and the variable (never its value).
-A tenant with no Notion token is served Slack-only.
+Slack token fails with a message naming the tenant and the variable (never its
+value). A tenant with no Notion token is served Slack-only. A token connected
+in the console while the worker runs reaches it on the next directory refresh.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -18,12 +20,17 @@ from psycopg_pool import AsyncConnectionPool
 from temporalio.worker import Worker
 
 from agentos.activities import AgentActivities
+from agentos.agent_health import (
+    AgentHealthChecker,
+    PostgresAgentHealthStore,
+    run_health_refresh,
+)
 from agentos.agent_store import (
     PostgresAgentStore,
     published_tenants,
     startup_agent_failure,
-    with_published_agents,
 )
+from agentos.approval_policy import PostgresApprovalPolicyStore
 from agentos.audience_pauses import PostgresPauseStore
 from agentos.audience_watch import AudienceWatchActivities
 from agentos.audit import PostgresAuditStore
@@ -32,6 +39,7 @@ from agentos.config import (
     EMBED_DIMENSIONS,
     PROVIDER_QWEN,
     TASK_QUEUE,
+    TEST_TASK_QUEUE,
     AgentsConfig,
     ConfigError,
     Settings,
@@ -39,8 +47,11 @@ from agentos.config import (
     load_settings,
     validate_worker_capacity,
 )
-from agentos.connectors.notion import NotionAPI, RealNotionAPI, check_grant, check_page_grant
+from agentos.connectors.drive import DriveReader
+from agentos.connectors.google_iam import GoogleError, accounts_from_settings
+from agentos.connectors.notion import NotionAPI, RealNotionAPI
 from agentos.content_store import PostgresContentStore
+from agentos.creator_access import CreatorAccessActivities, PostgresCreatorAccessStore
 from agentos.credentials import PostgresCredentialStore, TenantCredentials
 from agentos.crypto_keys import (
     KeyStore,
@@ -50,14 +61,18 @@ from agentos.crypto_keys import (
     start_key_refresh,
     startup_key_failure,
 )
+from agentos.drive_connections import PostgresDriveConnectionStore
+from agentos.grant_picks import PostgresGrantPickStore
+from agentos.knowledge.drive_indexing import DriveIndexActivities
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
 from agentos.knowledge.indexing import IndexActivities
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.llm import AnthropicLLMClient, LLMClient, QwenLLMClient
 from agentos.members import PostgresMemberStore
 from agentos.retention import PostgresRetentionStore, RetentionActivities
+from agentos.schedules import refresh_schedules_once, run_schedule_refresh
 from agentos.schema_version import require_current_schema
-from agentos.slack_client import RealSlackPoster
+from agentos.slack_client import RealSlackPoster, SlackPoster
 from agentos.stores import (
     PostgresExternalWriteStore,
     PostgresHistoryStore,
@@ -66,17 +81,23 @@ from agentos.stores import (
     PostgresToolOutputStore,
 )
 from agentos.switches import PostgresSwitchStore
+from agentos.tasks import PostgresTaskStore
 from agentos.temporal_client import build_temporal_client
-from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
-from agentos.tenants import RegistrySync, build_registry, require_tenant_secret
+from agentos.tenant_store import PostgresTenantStore, TenantDirectory, TenantSource, startup_tenants
+from agentos.tenants import RegistrySync, TenantRegistry, build_registry
+from agentos.test_sets import PostgresTestSetStore
 from agentos.threads import PostgresOwnerPingStore, PostgresThreadStore
+from agentos.unit_of_work import PostgresUnitOfWork
 from agentos.usage import PostgresUsageStore, Prices, UsageRecorder, load_prices, utcnow
 from agentos.workflows.audience_watch import AudienceWatchWorkflow
 from agentos.workflows.conversation import ConversationWorkflow
+from agentos.workflows.creator_access import CreatorAccessWorkflow
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 from agentos.workflows.page_refresh import PageRefreshWorkflow
 from agentos.workflows.retention import RetentionWorkflow
 from agentos.workflows.task import TaskWorkflow
+from agentos.workflows.test_run import TestRunWorkflow
 
 
 def build_llm(settings: Settings) -> LLMClient:
@@ -96,18 +117,20 @@ def build_llm(settings: Settings) -> LLMClient:
 
 
 def build_embedder(settings: Settings, tenants: TenantsConfig, http_client=None) -> Embedder | None:
-    """Build the embedder, only when some published agent of any tenant has a Notion page grant.
+    """Build the embedder, only when some published agent of any tenant has a knowledge grant
+    (a Notion page or a Drive folder/file).
 
     ``tenants`` carries each tenant's published agents (``published_tenants``).
 
     The embedder is the platform's own, shared by every tenant. Agents without
     knowledge need no embedding settings, so the Anthropic provider keeps
-    working without them. Returns None when no agent has a page grant. When ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no
-    Qwen setting is needed (a local server needs no key, but the SDK requires a
-    non-empty string). Otherwise the Qwen settings are used.
+    working without them. Returns None when no agent has a knowledge grant. When
+    ``AGENTOS_EMBED_BASE_URL`` is set, that endpoint is used and no Qwen setting is needed
+    (a local server needs no key, but the SDK requires a non-empty string). Otherwise the
+    Qwen settings are used.
     """
     if not any(
-        agent.grants.notion_pages
+        agent.grants.notion_pages or agent.grants.drive
         for config in tenants.tenants.values()
         for agent in config.agents.values()
     ):
@@ -149,76 +172,6 @@ async def warn_pages_without_model(store, tenant_ids, logger) -> int:
     return total
 
 
-async def check_grants_at_startup(
-    api: NotionAPI | None, agents: AgentsConfig, log: logging.Logger
-) -> str | None:
-    """Check every published agent's Notion grants against the live schemas.
-
-    ``agents`` carries the tenant's published agents (``with_published_agents``).
-
-    Returns None when all is well, or a one-line failure summary when any grant
-    has a problem (including a missing property ID); the caller must then exit
-    rather than run a half-working agent. Notes, such as a property renamed in
-    Notion but still found by its ID, are logged as warnings. Only the
-    granted databases' schemas are read, with the agent's own token, and the
-    agent never changes a schema. Logs name the tenant, agent and grant, and
-    never a token or page content. A Slack-only tenant (``api`` None) passes
-    while none of its agents grants Notion objects.
-    """
-    if api is None and any(
-        agent.grants.notion_databases or agent.grants.notion_pages
-        for agent in agents.agents.values()
-    ):
-        return (
-            f"tenant '{agents.tenant_id}': published agents grant Notion objects but the "
-            "tenant has no Notion token; connect Notion or remove the grants"
-        )
-    failed = 0
-    missing_ids = False
-    for agent in agents.agents.values():
-        for grant in agent.grants.notion_databases:
-            check = await check_grant(api, grant, require_ids=True)
-            for note in check.notes:
-                log.warning(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    grant.name,
-                    note,
-                )
-            for problem in check.problems:
-                log.error(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    grant.name,
-                    problem,
-                )
-            failed += bool(check.problems)
-            missing_ids = missing_ids or bool(grant.missing_property_ids())
-        for page_grant in agent.grants.notion_pages:
-            problems = await check_page_grant(api, page_grant)
-            for problem in problems:
-                log.error(
-                    "tenant_id=%s agent=%s grant=%s: %s",
-                    agents.tenant_id,
-                    agent.agent_id,
-                    page_grant.name,
-                    problem,
-                )
-            failed += bool(problems)
-    if not failed:
-        return None
-    summary = f"{failed} Notion grant(s) have problems; the worker will not start."
-    if missing_ids:
-        summary += (
-            " Property IDs are missing: run `uv run python -m agentos.check_grants"
-            " --tenant <tenant> --agent <agent>` on a draft and paste its property_ids"
-            " block into the definition."
-        )
-    return summary
-
-
 def startup_price_failure(
     prices: Prices, prices_path: str, models: list[str], at: datetime | None = None
 ) -> str | None:
@@ -246,29 +199,68 @@ TENANT_SYNC_SECONDS = 5.0
 async def admit_new_tenant(
     config: AgentsConfig,
     keys: KeyStore,
-    agent_store: PostgresAgentStore,
     log: logging.Logger,
 ) -> str | None:
     """The start-up work for a tenant that appears while the worker runs.
 
     Its encryption key must be usable, or it is not served until it is. Its published
-    agents' Notion grants are checked once and any problem is logged; a tenant that
-    has just been added normally has none yet, and every publish checks its grants.
+    agents' grants are checked by the health refresh once the tenant is served; a
+    broken grant disables that agent, never the tenant or the worker.
     """
     problems = check_keys(keys, [config.tenant_id])
     if problems:
         return "; ".join(problems)
-    published = await with_published_agents(agent_store, config)
-    if any(
-        agent.grants.notion_databases or agent.grants.notion_pages
-        for agent in published.agents.values()
-    ):
-        api = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
-        log.info("tenant_id=%s checking grants", config.tenant_id)
-        failure = await check_grants_at_startup(api, published, log)
-        if failure:
-            log.error("tenant_id=%s %s", config.tenant_id, failure)
     return None
+
+
+async def build_tenant_clients(
+    tenants: TenantsConfig,
+    directory: TenantSource,
+    settings: Settings,
+    credentials: TenantCredentials,
+    keys: KeyStore,
+    log: logging.Logger,
+    slack_factory: Callable[[str], SlackPoster] = RealSlackPoster,
+    notion_factory: Callable[[str], NotionAPI] = RealNotionAPI,
+    drive: Callable[[AgentsConfig], Awaitable[DriveReader | None]] | None = None,
+) -> tuple[TenantRegistry, RegistrySync]:
+    """The worker's tenant clients at start-up, and the sync that keeps them current.
+
+    The registry carries the directory's stored-but-disabled marks from the start, so a
+    restart ends a disabled tenant's pending work cleanly before the first sync pass.
+    Both resolve each tenant's tokens through ``TenantCredentials``: the encrypted
+    credential row first, else the environment variable the tenant's settings name.
+    A tenant connected only in the console is served with no variable exported, and
+    a token connected or replaced while the worker runs rebuilds that tenant's
+    client on the next sync, as a Slack reinstall does. The health check reads its
+    Notion client from this registry, so it checks with the connected token too.
+    ``drive`` resolves each tenant's Drive reader from its connection row, so a tenant
+    admitted after start-up and a rebuilt runtime both carry it.
+    """
+    registry = await build_registry(
+        tenants,
+        settings,
+        slack_factory,
+        notion_factory,
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+        drive=drive,
+    )
+    # The first sync pass is an interval away; until it lands, a stored-but-disabled
+    # tenant would look not-yet-loaded and its pending work would retry, not end cleanly.
+    registry.set_disabled(set(await directory.disabled_tenants()))
+    sync = RegistrySync(
+        directory,
+        registry,
+        slack_factory,
+        notion_factory,
+        admit=lambda config: admit_new_tenant(config, keys, log),
+        slack_token=credentials.slack_bot_token,
+        notion_token=credentials.notion_token,
+        on_drop=credentials.forget,
+        drive=drive,
+    )
+    return registry, sync
 
 
 async def main() -> None:
@@ -301,6 +293,15 @@ async def main() -> None:
             raise SystemExit(agent_failure)
         published = await published_tenants(agent_store, tenants)
         embedder = build_embedder(settings, published)
+        # The deployment's Google client (None when Drive is not set up). A malformed key
+        # fails at start-up, never at the first read, like the console's connect.
+        try:
+            google = accounts_from_settings(
+                settings.google_project_id, settings.google_service_account_key
+            )
+        except GoogleError as err:
+            raise SystemExit(str(err)) from err
+        drive_connections = PostgresDriveConnectionStore(pool)
         price_failure = startup_price_failure(
             prices,
             settings.prices_path,
@@ -308,20 +309,47 @@ async def main() -> None:
         )
         if price_failure:
             raise SystemExit(price_failure)
-        registry = await build_registry(
-            tenants, settings, RealSlackPoster, RealNotionAPI, credentials.slack_bot_token
+
+        # The tenant's Drive reader comes from its connection row, resolved like its Notion
+        # token: a tenant admitted after start-up and a rebuilt runtime both carry it.
+        # Indexing and search read the row fresh besides, so a connect while the worker
+        # runs reaches them on the next run.
+        async def drive_reader(config: AgentsConfig) -> DriveReader | None:
+            if google is None:
+                return None
+            row = await drive_connections.get(config.tenant_id)
+            return DriveReader(google, row.service_account_email) if row is not None else None
+
+        registry, tenant_sync = await build_tenant_clients(
+            tenants, directory, settings, credentials, keys, log, drive=drive_reader
         )
-        failures = []
+        audit_store = PostgresAuditStore(pool)
+        idempotency = PostgresIdempotencyStore(pool)
+        members = PostgresMemberStore(pool)
+        health = PostgresAgentHealthStore(pool)
+        creator_access = PostgresCreatorAccessStore(pool)
+        health_checker = AgentHealthChecker(
+            registry,
+            agent_store,
+            health,
+            audit_store,
+            idempotency,
+            members,
+            uow=PostgresUnitOfWork(pool),
+            creator_access=creator_access,
+        )
+        # A broken grant disables its agent with the reason; the worker starts and
+        # serves every other agent and tenant. Platform-wide problems above still exit.
+        # One tenant's check failing never skips the rest: it is logged, and the worker
+        # starts; the health refresh checks that tenant's agents again on its cadence.
         for tenant_id in registry.tenants():
-            runtime = registry.get(tenant_id)
             log.info("tenant_id=%s checking grants", tenant_id)
-            failure = await check_grants_at_startup(
-                runtime.notion_api, published.tenants[tenant_id], log
-            )
-            if failure:
-                failures.append(f"tenant '{tenant_id}': {failure}")
-        if failures:
-            raise SystemExit("\n".join(failures))
+            try:
+                await health_checker.check_tenant(tenant_id, published.tenants[tenant_id].agents)
+            except Exception as err:  # noqa: BLE001 - one tenant never stops start-up
+                log.error(
+                    "tenant_id=%s grant check failed error_type=%s", tenant_id, type(err).__name__
+                )
         # Provider and model name only; never a key.
         log.info("llm provider=%s model=%s", settings.llm_provider, settings.model)
         if embedder is not None:
@@ -341,8 +369,6 @@ async def main() -> None:
         log.info("prices entries=%d path=%s", len(prices.entries), settings.prices_path)
         pauses = PostgresPauseStore(pool)
         switches = PostgresSwitchStore(pool)
-        audit_store = PostgresAuditStore(pool)
-        idempotency = PostgresIdempotencyStore(pool)
         activities = AgentActivities(
             settings=settings,
             registry=registry,
@@ -363,11 +389,17 @@ async def main() -> None:
             threads=PostgresThreadStore(pool),
             owner_pings=PostgresOwnerPingStore(pool),
             content=PostgresContentStore(pool),
+            health=health,
+            tasks=PostgresTaskStore(pool),
+            policies=PostgresApprovalPolicyStore(pool),
+            test_sets=PostgresTestSetStore(pool),
+            google=google,
+            drive_connections=drive_connections,
         )
         watch = AudienceWatchActivities(
             registry,
             agent_store,
-            PostgresMemberStore(pool),
+            members,
             pauses,
             audit_store,
             idempotency,
@@ -377,13 +409,24 @@ async def main() -> None:
             TaskWorkflow,
             AudienceWatchWorkflow,
             RetentionWorkflow,
+            CreatorAccessWorkflow,
         ]
         all_activities = (
-            activities.all() + watch.all() + RetentionActivities(PostgresRetentionStore(pool)).all()
+            activities.all()
+            + watch.all()
+            + RetentionActivities(PostgresRetentionStore(pool)).all()
+            + CreatorAccessActivities(
+                registry,
+                agent_store,
+                PostgresGrantPickStore(pool),
+                credentials,
+                creator_access,
+                health_checker,
+            ).all()
         )
         if embedder is not None:
-            # Indexing runs only where some published agent has a page grant.
-            workflows += [IndexingWorkflow, PageRefreshWorkflow]
+            # Indexing runs only where some published agent has a knowledge grant.
+            workflows += [IndexingWorkflow, PageRefreshWorkflow, DriveIndexingWorkflow]
             all_activities += IndexActivities(
                 registry,
                 knowledge,
@@ -394,16 +437,25 @@ async def main() -> None:
                 budget_guard,
                 idempotency,
             ).all()
+            all_activities += DriveIndexActivities(
+                registry,
+                knowledge,
+                embedder,
+                agent_store,
+                google,
+                drive_connections,
+                usage,
+                switches,
+                budget_guard,
+                idempotency,
+            ).all()
         client = await build_temporal_client(settings, keys)
-        tenant_sync = RegistrySync(
-            directory,
-            registry,
-            RealSlackPoster,
-            RealNotionAPI,
-            admit=lambda config: admit_new_tenant(config, keys, agent_store, log),
-            slack_token=credentials.slack_bot_token,
-            on_drop=credentials.forget,
-        )
+        # Every served tenant's nightly schedules (index, retention, creator-access) are
+        # ensured here and kept current by the refresh below, so a tenant added by
+        # "Add to Slack" needs no operator command. One tenant's failure is logged with
+        # its ID and retried on the next pass; it never stops start-up or serving.
+        ensured_schedules: dict[str, tuple[tuple[str, str], ...]] = {}
+        await refresh_schedules_once(client, registry, agent_store, ensured_schedules)
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
@@ -411,19 +463,51 @@ async def main() -> None:
             activities=all_activities,
             max_concurrent_activities=settings.max_concurrent_activities,
         )
-        log.info("tenants=%s worker started on %s", ",".join(registry.tenants()), TASK_QUEUE)
+        # Test runs poll their own queue, so a burst of them never parks the turns and
+        # tasks of the main queue. The same activities serve both; only TestRunWorkflow
+        # is registered here, and it calls no write activity.
+        test_worker = Worker(
+            client,
+            task_queue=TEST_TASK_QUEUE,
+            workflows=[TestRunWorkflow],
+            activities=all_activities,
+            max_concurrent_activities=settings.max_concurrent_activities,
+        )
+        log.info(
+            "tenants=%s worker started on %s and %s",
+            ",".join(registry.tenants()),
+            TASK_QUEUE,
+            TEST_TASK_QUEUE,
+        )
         # A tenant added to, changed in or disabled in the database is picked up here,
-        # without a restart. Its own start-up work (key check, grant check) runs when
-        # it first appears; see ``admit_new_tenant``.
+        # without a restart. Its own start-up work (the key check) runs when it first
+        # appears; see ``admit_new_tenant``.
         key_refresh = start_key_refresh(keys)
         refresher = asyncio.create_task(tenant_sync.run(TENANT_SYNC_SECONDS))
+        # Unavailable agents are re-checked on the same cadence, bounded per agent, and
+        # a newly published version is checked at once: recovery needs no restart.
+        health_refresher = asyncio.create_task(
+            run_health_refresh(health_checker, registry, agent_store, health, TENANT_SYNC_SECONDS)
+        )
+        # A newly admitted tenant, a reinstall or a changed page grant gets its schedules
+        # on this cadence too; an unchanged tenant causes no schedule call (fingerprint).
+        schedule_refresher = asyncio.create_task(
+            run_schedule_refresh(
+                client, registry, agent_store, ensured_schedules, TENANT_SYNC_SECONDS
+            )
+        )
         try:
-            await worker.run()
+            await asyncio.gather(worker.run(), test_worker.run())
         finally:
             refresher.cancel()
+            health_refresher.cancel()
+            schedule_refresher.cancel()
+            stopped = [health_refresher, schedule_refresher]
             if key_refresh is not None:
                 key_refresh.cancel()
-                await asyncio.gather(key_refresh, return_exceptions=True)
+                stopped.append(key_refresh)
+            # Gathered before the pool closes, whether or not a key refresh runs.
+            await asyncio.gather(*stopped, return_exceptions=True)
     finally:
         await pool.close()
 

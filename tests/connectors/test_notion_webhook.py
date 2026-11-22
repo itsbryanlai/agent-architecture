@@ -15,21 +15,26 @@ import pytest
 from fastapi.testclient import TestClient
 from slack_sdk.signature import SignatureVerifier
 
-from agentos.agent_store import seeded_agent_store
+from agentos.agent_store import InMemoryAgentStore, seeded_agent_store
 from agentos.audit import InMemoryAuditStore, event_json
 from agentos.config import Settings, TenantsConfig
+from agentos.control import ControlPlane, Forbidden
 from agentos.crypto_keys import EnvKeyStore, key_var_name
 from agentos.gateway.app import create_app
 from agentos.gateway.notion_signature import verify_notion_signature
+from agentos.grant_checker import NotionGrantChecker
+from agentos.members import InMemoryMemberStore
 from agentos.notion_webhook import (
     InMemoryWebhookTokenStore,
+    WebhookTokenError,
     WebhookTokens,
     build_parser,
     execute,
 )
 from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant
 from agentos.stores import InMemoryTaskLinkStore
-from tests.conftest import TENANT
+from agentos.unit_of_work import InMemoryUnitOfWork
+from tests.conftest import TENANT, make_fake_notion
 from tests.helpers.gateway import FakeTemporalClient
 
 TOKEN = "secret_verification_token_abc123"
@@ -338,6 +343,21 @@ async def test_an_event_is_verified_only_against_the_confirmed_token(
     assert len(temporal.signals) == (1 if state == "confirmed" else 0)
 
 
+def webhook_plane(agents, members, store, audit, keys) -> ControlPlane:
+    """A control plane whose webhook steps run on the given stores, as the console's does."""
+    return ControlPlane(
+        InMemoryAgentStore(),
+        members,
+        audit,
+        TenantsConfig.of(agents),
+        NotionGrantChecker(lambda t: make_fake_notion()),
+        webhook_tokens=WebhookTokens(store, keys),
+        unit_of_work=InMemoryUnitOfWork(store, audit),
+        clock=lambda: NOW,
+    )
+
+
+@pytest.mark.parametrize("surface", ["cli", "console"])
 @pytest.mark.parametrize(
     ("command", "before", "code", "after", "prints_token", "audited"),
     [
@@ -350,10 +370,10 @@ async def test_an_event_is_verified_only_against_the_confirmed_token(
         ("clear", None, 1, None, False, []),
     ],
 )
-async def test_a_token_command_changes_only_the_state_it_names_and_audits_the_operator(
-    monkeypatch, capsys, command, before, code, after, prints_token, audited
+async def test_a_token_command_changes_only_the_state_it_names_and_audits_the_actor(
+    agents, monkeypatch, capsys, surface, command, before, code, after, prints_token, audited
 ):
-    """Fails if a token command acts on a token in the wrong state, prints a token it must not, or audits without the operator or with the token."""
+    """Fails if a token command, from the host CLI or the console, acts on a token in the wrong state, shows a token it must not, or audits without the actor or with the token."""
     store = InMemoryWebhookTokenStore()
     audit = InMemoryAuditStore()
     keys = EnvKeyStore(
@@ -363,13 +383,58 @@ async def test_a_token_command_changes_only_the_state_it_names_and_audits_the_op
         await store.put_pending(TENANT, *encrypt_for_tenant(keys, TENANT, TOKEN.encode()))
         if before == "active":
             await store.confirm(TENANT, NOW)
-    monkeypatch.setattr("agentos.notion_webhook.operator_identity", lambda: "operator:ops")
-    args = build_parser().parse_args(["--tenant", TENANT, command])
 
-    assert await execute(args, store, audit, keys, request_id="inv-1") == code
+    if surface == "cli":
+        monkeypatch.setattr("agentos.notion_webhook.operator_identity", lambda: "operator:ops")
+        args = build_parser().parse_args(["--tenant", TENANT, command])
+        assert await execute(args, store, audit, keys, request_id="inv-1") == code
+        shown = TOKEN in capsys.readouterr().out
+        identity = "operator:ops"
+    else:
+        members = InMemoryMemberStore()
+        await members.add_member(TENANT, "U_ADMIN", "admin", "U_ROOT")
+        plane = webhook_plane(agents, members, store, audit, keys)
+        call = {
+            "show": plane.reveal_webhook_token,
+            "confirm": plane.confirm_webhook_token,
+            "clear": plane.clear_webhook_token,
+        }[command]
+        if code == 0:
+            result = await call(TENANT, "U_ADMIN", request_id="inv-1")
+            shown = result == TOKEN if command == "show" else False
+        else:
+            with pytest.raises(WebhookTokenError):
+                await call(TENANT, "U_ADMIN", request_id="inv-1")
+            shown = False
+        identity = "user:U_ADMIN"
 
     row = await store.get(TENANT)
     assert (row.state if row else None) == after
-    assert (TOKEN in capsys.readouterr().out) is prints_token
-    assert [(e.tool, e.identity) for e in audit.events] == [(c, "operator:ops") for c in audited]
+    assert shown is prints_token
+    assert [(e.tool, e.identity) for e in audit.events] == [(c, identity) for c in audited]
     assert [e for e in audit.events if TOKEN in event_json(e)] == []
+
+
+@pytest.mark.parametrize("command", ["show", "confirm", "clear"])
+async def test_a_non_admin_cannot_touch_the_webhook_token(agents, command):
+    """Fails if a creator can reveal, confirm or clear the tenant's webhook token."""
+    store = InMemoryWebhookTokenStore()
+    audit = InMemoryAuditStore()
+    keys = EnvKeyStore(
+        {key_var_name(TENANT, 1): base64.b64encode(secrets.token_bytes(32)).decode()}
+    )
+    await store.put_pending(TENANT, *encrypt_for_tenant(keys, TENANT, TOKEN.encode()))
+    members = InMemoryMemberStore()
+    await members.add_member(TENANT, "U_CREATOR", "creator", "U_ROOT")
+    plane = webhook_plane(agents, members, store, audit, keys)
+    call = {
+        "show": plane.reveal_webhook_token,
+        "confirm": plane.confirm_webhook_token,
+        "clear": plane.clear_webhook_token,
+    }[command]
+
+    with pytest.raises(Forbidden):
+        await call(TENANT, "U_CREATOR", request_id="inv-1")
+
+    assert (await store.get(TENANT)).state == "pending"
+    assert audit.events == []

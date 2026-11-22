@@ -11,13 +11,17 @@ import httpx
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from agentos.agent_feedback import InMemoryAgentFeedbackStore
+from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.agent_store import InMemoryAgentStore
+from agentos.approval_policy import InMemoryApprovalPolicyStore
 from agentos.audience_pauses import InMemoryPauseStore
 from agentos.audit import InMemoryAuditStore
 from agentos.budgets import InMemoryBudgetStore
 from agentos.config import TenantsConfig, parse_agents_config
 from agentos.control import ControlPlane
 from agentos.control_api import create_app
+from agentos.feedback import InMemoryFeedbackStore
 from agentos.grant_checker import NotionGrantChecker
 from agentos.members import InMemoryMemberStore
 from agentos.sessions import InMemorySessionStore
@@ -30,7 +34,10 @@ from agentos.slack_signin import (
     SlackSession,
     SlackSignInError,
 )
+from agentos.stores import InMemoryHistoryStore
 from agentos.switches import InMemorySwitchStore
+from agentos.tenant_store import TenantDirectory
+from agentos.test_sets import InMemoryTestSetStore
 from agentos.usage import InMemoryUsageStore
 from tests.conftest import (
     TEAM,
@@ -116,15 +123,29 @@ class ConsoleHarness:
         audience=None,
         picker=None,
         require_grant_picker: bool = False,
+        tenant_store=None,
+        credentials=None,
+        webhook_tokens=None,
+        slack_for=None,
+        directory_ttl: float = 0,
+        creator_access=None,
+        drive=None,
+        google=None,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
         self.audit = InMemoryAuditStore()
+        self.feedback = InMemoryFeedbackStore()
+        self.history = InMemoryHistoryStore()
+        self.feedback_reads = InMemoryAgentFeedbackStore(self.audit, self.feedback, self.history)
         self.usage = InMemoryUsageStore()
         self.budgets = InMemoryBudgetStore()
         self.pauses = InMemoryPauseStore()
         self.switches = InMemorySwitchStore()
+        self.health = InMemoryAgentHealthStore()
+        self.policies = InMemoryApprovalPolicyStore()
         self.sessions = InMemorySessionStore()
+        self.test_sets = InMemoryTestSetStore()
         self.notion = make_fake_notion()
         self.clock = Clock()
         self.slack = FakeSlack(self.clock)
@@ -134,11 +155,19 @@ class ConsoleHarness:
         if not single_tenant:
             configs.append(parse_agents_config(globex))
         self.tenants = TenantsConfig.of(*configs)
+        # With a tenant store the settings writes are live: the plane and the app read
+        # through a directory that re-reads the store on every ask (ttl 0), unless a
+        # test sets a real TTL to exercise the cache.
+        source = (
+            self.tenants
+            if tenant_store is None
+            else TenantDirectory(tenant_store, ttl_seconds=directory_ttl)
+        )
         self.plane = ControlPlane(
             self.agents,
             self.members,
             self.audit,
-            self.tenants,
+            source,
             NotionGrantChecker(lambda tenant_id: self.notion),
             audience,
             usage=self.usage,
@@ -147,12 +176,23 @@ class ConsoleHarness:
             pauses=self.pauses,
             switches=self.switches,
             require_grant_picker=require_grant_picker,
+            credentials=credentials,
+            tenant_store=tenant_store,
+            webhook_tokens=webhook_tokens,
+            slack_for=slack_for,
+            health=self.health,
+            creator_access=creator_access,
+            feedback_reads=self.feedback_reads,
+            policies=self.policies,
+            test_sets=self.test_sets,
+            drive=drive,
+            google=google,
         )
         self.sign_in = SignInConfig(CLIENT_ID, "made-up-client-secret", console_url)
         self.console = Console(self.sign_in, self.slack, self.clock)
         self.app = create_app(
             self.plane,
-            self.tenants,
+            source,
             SlackSession(),
             sessions=self.sessions,
             console=self.console,

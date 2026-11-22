@@ -1,0 +1,90 @@
+# Google Drive connector manifest. The runtime reads it (see agentos.connectors.manifest).
+#
+# Drive reads are knowledge: the indexed folders and files are searched through
+# search_knowledge, not a Drive tool. The write actions declare their risk, idempotency
+# and preview shape here; comment is the first (D-47), append a row the second (D-48),
+# create a Doc from a template the third (D-49), replace a marked section the fourth
+# (D-50). A Drive write always asks the requester's approval: no tool carries low_risk
+# (maintainer, 2026-11-21 / 2026-11-19).
+connector: drive
+tools:
+  comment_on_file:
+    risk: write_reversible
+    idempotency: marker_text
+    description: >-
+      Draft a comment on a Google Drive file. Nothing is posted until the
+      requester approves the draft in Slack.
+    input_schema:
+      type: object
+      properties:
+        file:
+          type: string
+          description: Link or ID of the Drive file to comment on, from search results.
+        comment:
+          type: string
+          description: The comment text.
+      required: [file, comment]
+
+  append_row:
+    risk: write_irreversible
+    idempotency: developer_metadata
+    description: >-
+      Draft a row to append to one of the agent's granted Google Sheets. Nothing is
+      appended until the requester approves the draft in Slack. The row's keys must be
+      columns of the chosen sheet; the granted sheets and their columns are listed below.
+    input_schema:
+      type: object
+      properties:
+        sheet:
+          type: string
+          description: ID or name of one of the granted sheets listed in this description.
+        row:
+          type: object
+          description: >-
+            The row to append, as column name to value (text or a number). Use only the
+            sheet's columns; a column left out is appended empty.
+      required: [sheet, row]
+
+  create_doc_from_template:
+    risk: write_irreversible
+    idempotency: app_properties
+    description: >-
+      Draft a new Google Doc copied from one of the agent's granted templates, into the
+      template's shared-drive folder. Nothing is created until the requester approves the
+      draft in Slack. Give the new Doc a title and a value for every blank of the chosen
+      template; the granted templates and their blanks are listed below.
+    input_schema:
+      type: object
+      properties:
+        template:
+          type: string
+          description: ID or name of one of the granted templates listed in this description.
+        title:
+          type: string
+          description: The title of the new Doc.
+        values:
+          type: object
+          description: >-
+            The value for every blank of the template, as blank name to text. Use only the
+            template's blanks; every blank needs a value.
+      required: [template, title, values]
+
+  replace_section:
+    risk: write_irreversible
+    idempotency: revision
+    description: >-
+      Draft a replacement for one headed section of one of the agent's granted Google Docs.
+      Nothing is written until the requester approves the draft in Slack. The section is
+      everything under the named heading up to the next heading of the same or higher level;
+      the heading itself is kept. The granted sections and their headings are listed below.
+    input_schema:
+      type: object
+      properties:
+        section:
+          type: string
+          description: ID or name of one of the granted sections listed in this description.
+        text:
+          type: string
+          description: >-
+            The new text for the section, inserted literally as plain text under the heading.
+      required: [section, text]

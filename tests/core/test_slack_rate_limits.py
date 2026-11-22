@@ -18,6 +18,7 @@ from agentos.config import Settings, parse_agents_config
 from agentos.llm import ScriptedLLMClient
 from agentos.models import TurnContext
 from agentos.slack_client import (
+    MAX_PAGES,
     FakeSlack,
     RealSlackPoster,
     SlackHistoryUnavailable,
@@ -202,6 +203,57 @@ async def test_a_history_read_refused_for_a_missing_scope_names_the_scope(serve)
     assert (refused.value.code, refused.value.scope) == ("missing_scope", "channels:history")
 
 
+def channel_page(channels: list[dict], cursor: str) -> dict:
+    return {
+        "ok": True,
+        "channels": channels,
+        "response_metadata": {"next_cursor": cursor},
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["two pages then end", "non-member filtered", "too many pages", "missing scope"],
+    ids=["two-pages", "non-member-filtered", "too-many-pages", "missing-scope"],
+)
+async def test_list_channels_over_the_wire(serve, case):
+    """Fails if the channel read loses a page, offers a channel the app is not in, reads
+    past the page bound, or drops the scope Slack names when it refuses the read."""
+    member = {"id": "C1", "name": "general", "is_member": True, "is_private": False}
+    outsider = {"id": "C2", "name": "not-joined", "is_member": False, "is_private": False}
+    private_member = {"id": "C3", "name": "team", "is_member": True, "is_private": True}
+    scripts = {
+        "two pages then end": [
+            (200, None, channel_page([member], "c2")),
+            (200, None, channel_page([private_member], "")),
+        ],
+        "non-member filtered": [(200, None, channel_page([member, outsider], ""))],
+        "too many pages": [(200, None, channel_page([member], "again"))],
+        "missing scope": [
+            (200, None, {"ok": False, "error": "missing_scope", "needed": "channels:read"})
+        ],
+    }
+    server, url = await serve(scripts[case])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    if case == "too many pages":
+        with pytest.raises(SlackLookupError) as err:
+            await poster.list_channels()
+        assert err.value.code == "too_many_pages"
+        assert len(server.requests) == MAX_PAGES
+        return
+    if case == "missing scope":
+        with pytest.raises(SlackLookupError) as err:
+            await poster.list_channels()
+        assert (err.value.code, err.value.scope) == ("missing_scope", "channels:read")
+        return
+
+    channels = await poster.list_channels()
+
+    assert [c.id for c in channels] == (["C1", "C3"] if case == "two pages then end" else ["C1"])
+    assert server.requests == ["conversations.list"] * len(scripts[case])
+
+
 def wire_blocks(sent: dict) -> list:
     blocks = sent["blocks"]
     return json.loads(blocks) if isinstance(blocks, str) else blocks
@@ -247,6 +299,42 @@ async def test_update_carries_the_cards_channel_ts_and_section_only_blocks_over_
     sent = server.sent[1]
     assert (sent["channel"], sent["ts"]) == ("D1", "1.2")
     assert wire_blocks(sent) == refusal_blocks
+
+
+@pytest.mark.parametrize("case", ["found", "not found", "missing scope"])
+async def test_user_by_email_over_the_wire(serve, case):
+    """Fails if the email lookup misses users.lookupByEmail, or maps Slack's answers wrong."""
+    scripts = {
+        "found": [(200, None, {"ok": True, "user": {"id": "U1"}})],
+        "not found": [(200, None, {"ok": False, "error": "users_not_found"})],
+        "missing scope": [
+            (200, None, {"ok": False, "error": "missing_scope", "needed": "users:read.email"})
+        ],
+    }
+    server, url = await serve(scripts[case])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    if case == "found":
+        assert await poster.user_by_email("a@b.c") == "U1"
+    elif case == "not found":
+        assert await poster.user_by_email("a@b.c") is None
+    else:
+        with pytest.raises(SlackLookupError) as err:
+            await poster.user_by_email("a@b.c")
+        assert (err.value.code, err.value.scope) == ("missing_scope", "users:read.email")
+    assert server.requests == ["users.lookupByEmail"]
+    assert server.sent[0]["email"] == "a@b.c"
+
+
+async def test_open_dm_over_the_wire(serve):
+    """Fails if opening a DM misses conversations.open with the user, or loses the channel ID."""
+    server, url = await serve([(200, None, {"ok": True, "channel": {"id": "D1"}})])
+    poster = RealSlackPoster("xoxb-test", TENANT, base_url=url)
+
+    assert await poster.open_dm("U1") == "D1"
+
+    assert server.requests == ["conversations.open"]
+    assert server.sent[0]["users"] == "U1"
 
 
 async def test_update_with_no_blocks_sends_an_empty_list_over_the_wire(serve):

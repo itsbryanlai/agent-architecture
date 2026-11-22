@@ -12,6 +12,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.activities import AgentActivities
+from agentos.agent_health import InMemoryAgentHealthStore
 from agentos.audience import decision_text
 from agentos.config import TASK_QUEUE
 from agentos.models import ApprovalDecision, TaskSpec, ToolCall, TurnContext
@@ -289,6 +290,21 @@ async def test_a_pre_write_check_that_cannot_finish_fails_closed_and_clears_the_
     assert all(b["type"] == "section" for b in last["blocks"])
 
 
+async def test_an_unreadable_health_row_fails_the_step_so_temporal_retries(harness):
+    """Fails if an unreadable health row lets the step act instead of failing it for a retry."""
+    h = harness
+
+    class Broken(InMemoryAgentHealthStore):
+        async def get(self, tenant_id, agent_id):
+            raise ConnectionError("down")
+
+    h.acts.health = Broken()
+
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(h.acts.call_llm, ctx(), f"{TENANT}:conv:C:1")
+    assert h.llm.calls == []
+
+
 # --- a draft_ref refusal replaces the card in place ---------------------------------------------
 
 
@@ -382,6 +398,8 @@ NOT_GATED = {
     "update_progress": "edits the placeholder to a fixed runtime progress label; the reply or off notice replaces it, so it must still run",
     "finalize_reply": "posts the reply or the fixed off notice that call_llm returned",
     "post_final_reply": "posts that same reply as a new message when a progress edit was dropped",
+    "finalize_searched_reply": "posts that same reply plus the turn's Searched line; no agent effect",
+    "post_final_searched_reply": "posts that same reply as a new message when a progress edit was dropped",
     "finalize_notice": "shows a fixed non-answer notice and records its audit row; no agent effect",
     "post_final_notice": "posts that same notice as a new message when a progress edit was dropped",
     "post_in_thread": "posts a fixed notice (reminder, refusal, failure); no agent effect",
@@ -397,8 +415,21 @@ NOT_GATED = {
     "discard_message": "clears the inbound event's text when a turn ended before ingest; no model, connector or post",
     "finalize_model_reply": "posts the reply or the fixed off notice that call_model stored",
     "post_final_model_reply": "posts that same reply as a new message when a progress edit was dropped",
+    "finalize_searched_model_reply": "posts that same reply plus the turn's Searched line; no agent effect",
+    "post_final_searched_model_reply": "posts that same reply as a new message when a progress edit was dropped",
     "apply_edit": "stores the requester's saved edit as the next draft revision; no model or connector",
     "post_task_notice": "posts a fixed line about a task in its thread; no agent effect",
+    "post_stale_notice": "posts the fixed stale line (with the nudge offer's button); no agent effect",
+    "clear_stale_offer": "removes the spent offer's button from the fixed stale line; no agent effect",
+    "record_task_state": "stores the task's state row in the platform's store; no model, connector or post",
+    "task_in_thread": "reads the asker's task row to poke its watch; no model or connector",
+    "wait_task_refresh": "reads the task row until the poke's poll reports; no model or connector",
+    "comment_approval_policy": "reads the tenant's policy and the platform's task records; no model, connector or post",
+    "load_test_run": "reads the run's row and its cases' references; the workflow needs them to start",
+    "start_test_case": "moves the case's question from its row into the run's history; no model, connector or post",
+    "judge_test_case": "reads the case's stored final step to judge it; no model, connector or post",
+    "test_run_spend": "reads the run's usage rows for the cap; no model, connector or post",
+    "finish_test_run": "stores the run's results and spend; no model, connector or post",
 }
 
 

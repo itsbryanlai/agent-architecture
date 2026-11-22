@@ -1,22 +1,57 @@
-"""An approved Notion write happens once, whatever the attempts, delays and failures around it."""
+"""An approved write happens once, whatever the attempts, delays and failures around it:
+a Notion item or comment, a nudge's two effects, a Drive comment."""
 
 import asyncio
+import dataclasses
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from slack_sdk.errors import SlackApiError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.config import TASK_QUEUE
+from agentos.connectors.google_iam import DriveSection, GoogleError
 from agentos.connectors.notion import comment_ref
 from agentos.models import ApprovalDecision, TaskSpec, TurnContext
 from agentos.slack_client import SlackUser
 from agentos.stores import InMemoryExternalWriteStore
 from agentos.workflows.task import TaskWorkflow
-from tests.conftest import ALICE, ALICE_NOTION, DB_ID, TEAM, TENANT, eventually, title_prop
+from tests.conftest import (
+    ALICE,
+    ALICE_NOTION,
+    BOB,
+    BOB_NOTION,
+    DB_ID,
+    TEAM,
+    TENANT,
+    eventually,
+    title_prop,
+)
+from tests.helpers.agents import republish
+from tests.helpers.drive import (
+    DRIVE_DOC,
+    DRIVE_SECTION,
+    DRIVE_SHEET,
+    DRIVE_TEMPLATE,
+    SECTION_BEFORE,
+    SECTION_HEADING,
+    SECTION_PARAGRAPHS,
+    SHEET_COLUMNS,
+    SHEET_TAB,
+    TEMPLATE_BLANKS,
+    TEMPLATE_FOLDER,
+    add_roster_sheet,
+    add_section_doc,
+    add_template_tree,
+    section_grant_block,
+    sheet_grant_block,
+    template_grant_block,
+)
+from tests.helpers.slack import slack_error
 
 NONCE = "nonce-eo"
 DETAILS = "Mine flickers."
@@ -284,3 +319,501 @@ async def test_a_second_comment_attempt_beside_a_running_one_writes_nothing(harn
 
     assert await run(h.acts.add_notion_comment, comment_spec(page["id"]), task_id) == comment_id
     assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+# --- a comment under the approval policy (no card) -------------------------------------
+
+
+def policy_comment_spec(page_id: str) -> TaskSpec:
+    return dataclasses.replace(comment_spec(page_id), under_policy=True)
+
+
+async def test_a_policy_comment_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a policy-allowed comment whose response was lost posts it a second time."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "policy-comment-lost")
+    h.notion.delay_visibility(1)
+    h.notion.fail_after_write("comment")
+    with pytest.raises(TimeoutError):
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+
+    await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_second_policy_comment_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a policy-allowed comment attempt starting while another is mid-write posts a second comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "policy-comment-overlap")
+    hang = h.notion.hang_after_write("comment")
+    first = asyncio.create_task(
+        run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+    )
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert (
+        await run(h.acts.add_notion_comment, policy_comment_spec(page["id"]), task_id) == comment_id
+    )
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+# --- the nudge's two effects ---------------------------------------------------------
+
+
+def nudge_spec(page_id: str) -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": page_id,
+        "database_id": DB_ID,
+        "item_title": "Broken VPN",
+        "item_url": "https://www.notion.so/brokenvpn",
+        "comment": "Any update on this?",
+        "assignee_name": "Bob",
+        "assignee_notion_id": BOB_NOTION,
+        "assignee_slack_id": BOB,
+        "requester_name": "Alice",
+    }
+    return TaskSpec(ctx, "nudge", payload, NONCE)
+
+
+def dm_posts(h) -> list[dict]:
+    return [p for p in h.slack.posts() if p["channel"] == f"D-{BOB}"]
+
+
+async def test_a_nudge_comment_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a nudge comment whose response was lost posts it a second time."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "nudge-comment-lost")
+    h.notion.delay_visibility(1)
+    h.notion.fail_after_write("comment")
+    with pytest.raises(TimeoutError):
+        await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+
+    await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_second_nudge_comment_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a nudge comment attempt starting while another is mid-write posts a second comment."""
+    h = harness
+    page = h.notion.add_page(DB_ID, {"Name": title_prop("Broken VPN")})
+    task_id = ids.task_id(TENANT, "nudge-comment-overlap")
+    hang = h.notion.hang_after_write("comment")
+    first = asyncio.create_task(run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert await run(h.acts.nudge_comment, nudge_spec(page["id"]), task_id) == comment_id
+    assert len(h.notion.comments[page["id"].replace("-", "")]) == 1
+
+
+async def test_a_nudge_dm_whose_response_was_lost_is_found_by_the_retry(harness):
+    """Fails if the retry of a nudge DM whose response was lost sends it a second time."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-lost")
+    h.slack.fail_after_post()
+    with pytest.raises(TimeoutError):
+        await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+
+    ts = await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+
+    [dm] = dm_posts(h)
+    assert dm["ts"] == ts
+
+
+async def test_a_second_nudge_dm_attempt_beside_a_running_one_writes_nothing(harness):
+    """Fails if a nudge DM attempt starting while another is mid-send sends a second DM."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-overlap")
+    hang = h.slack.hang_after_post()
+    first = asyncio.create_task(run(h.acts.nudge_dm, nudge_spec("page-1"), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    ts = await first
+
+    assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id) == ts
+    assert len(dm_posts(h)) == 1
+
+
+@pytest.mark.parametrize(
+    ("stage", "code", "refused"),
+    [
+        ("post", "channel_not_found", True),
+        ("post", "account_inactive", True),
+        ("open_dm", "user_not_found", True),
+        ("post", "internal_error", False),
+    ],
+    ids=["gone-channel", "inactive-account", "gone-user", "transient"],
+)
+async def test_a_slack_refusal_of_the_dm_is_audited_and_only_a_transient_one_is_retried(
+    harness, stage, code, refused
+):
+    """Fails if a permanent Slack refusal of the DM is retryable or unaudited, or a transient one ends the nudge."""
+    h = harness
+    task_id = ids.task_id(TENANT, "nudge-dm-refused")
+    error = slack_error(code, "https://slack.com/api/conversations.open")
+    if stage == "open_dm":
+        h.slack.fail_next_open_dm(error, times=1)
+    else:
+        h.slack.fail_next_post(error, times=1, channel=f"D-{BOB}")
+
+    if refused:
+        with pytest.raises(ApplicationError) as err:
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert err.value.non_retryable
+        assert dm_posts(h) == []
+        outcome = "error"
+    else:
+        # The first attempt fails retryably; the next attempt sends the DM.
+        with pytest.raises(SlackApiError):
+            await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert await run(h.acts.nudge_dm, nudge_spec("page-1"), task_id)
+        assert len(dm_posts(h)) == 1
+        outcome = "ok"
+
+    events = [(e.kind, e.tool, e.outcome) for e in h.audit.events if e.task_id == task_id]
+    assert events == [("approval", "nudge", "ok"), ("write", "nudge_dm", outcome)]
+
+
+# --- a Drive comment (D-47) -----------------------------------------------------------
+
+
+def drive_comment_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_DOC,
+        "comment": "Any update?",
+        "item_title": "Guide",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_DOC}",
+    }
+    return TaskSpec(ctx, "add_comment", payload, NONCE, tool="comment_on_file")
+
+
+async def test_a_drive_comment_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a Drive comment whose response was lost posts it a second time."""
+    h = dharness
+    task_id = ids.task_id(TENANT, "drive-comment-lost")
+    h.google.fail_after_write("comment")
+    with pytest.raises(GoogleError):
+        await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+
+    await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+
+    assert len(h.google.drive_comments[DRIVE_DOC]) == 1
+
+
+async def test_a_second_drive_comment_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a Drive comment attempt starting while another is mid-write posts a second comment."""
+    h = dharness
+    task_id = ids.task_id(TENANT, "drive-comment-overlap")
+    hang = h.google.hang_after_write("comment")
+    first = asyncio.create_task(run(h.acts.add_notion_comment, drive_comment_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.add_notion_comment, drive_comment_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    comment_id = await first
+
+    assert await run(h.acts.add_notion_comment, drive_comment_spec(), task_id) == comment_id
+    assert len(h.google.drive_comments[DRIVE_DOC]) == 1
+
+
+# --- a Drive sheet append (D-48) -------------------------------------------------------
+
+
+async def grant_append_sheet(h):
+    """Publish it-helper with the Roster sheet grant and serve its Q1 tab from the fake."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sheets=[sheet_grant_block()]),
+    )
+    add_roster_sheet(h.google)
+
+
+def append_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_SHEET,
+        "sheet_id": DRIVE_SHEET,
+        "tab": SHEET_TAB,
+        "columns": list(SHEET_COLUMNS),
+        "row": {"name": "bob", "role": "people"},
+        "item_title": "Roster",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_SHEET}",
+    }
+    return TaskSpec(ctx, "append_row", payload, NONCE, tool="append_row")
+
+
+async def test_a_drive_append_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a Drive append whose response was lost appends the row a second time."""
+    h = dharness
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-lost")
+    h.google.fail_after_write("append")
+    with pytest.raises(GoogleError):
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a Drive append attempt starting while another is mid-write appends a second row."""
+    h = dharness
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-overlap")
+    hang = h.google.hang_after_write("append")
+    first = asyncio.create_task(run(h.acts.append_sheet_row, append_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    metadata_id = await first
+
+    assert await run(h.acts.append_sheet_row, append_spec(), task_id) == metadata_id
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+async def test_a_drive_append_whose_marker_lags_is_found_by_the_retry_looking_again(dharness):
+    """Fails if a retry whose metadata search lags the append appends the row a second time,
+    instead of looking again until the marker is visible."""
+    h = dharness
+    h.acts.visibility_interval = 0
+    await grant_append_sheet(h)
+    task_id = ids.task_id(TENANT, "drive-append-lag")
+    h.google.delay_visibility(2)
+    h.google.fail_after_write("append")
+    with pytest.raises(GoogleError):
+        await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    await run(h.acts.append_sheet_row, append_spec(), task_id)
+
+    rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
+    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
+
+
+# --- a Drive create-from-template (D-49) -----------------------------------------------
+
+
+async def grant_create_template(h):
+    """Publish it-helper with the offer-template grant and serve the template tree."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(templates=[template_grant_block()]),
+    )
+    add_template_tree(h.google)
+
+
+def create_doc_spec() -> TaskSpec:
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_TEMPLATE,
+        "template_id": DRIVE_TEMPLATE,
+        "folder_id": TEMPLATE_FOLDER,
+        "blanks": list(TEMPLATE_BLANKS),
+        "title": "Offer for Bob",
+        "values": {"name": "Bob", "role": "engineer"},
+        "item_title": "Offer for Bob",
+        "item_url": f"https://drive.google.com/drive/folders/{TEMPLATE_FOLDER}",
+    }
+    return TaskSpec(ctx, "create_doc", payload, NONCE, tool="create_doc_from_template")
+
+
+async def test_a_drive_create_whose_copy_response_was_lost_fills_the_found_copy(dharness):
+    """Fails if the retry of a create whose copy response was lost copies a second Doc, or
+    leaves the copy an earlier attempt made unfilled."""
+    h = dharness
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-lost")
+    h.google.fail_after_write("copy")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+
+
+async def test_a_second_drive_create_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a create attempt starting while another is mid-copy copies a second Doc."""
+    h = dharness
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-overlap")
+    hang = h.google.hang_after_write("copy")
+    first = asyncio.create_task(run(h.acts.create_drive_doc, create_doc_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    item = await first
+
+    assert (await run(h.acts.create_drive_doc, create_doc_spec(), task_id)).page_id == item.page_id
+    assert len(h.google.drive_children[TEMPLATE_FOLDER]) == 1
+
+
+async def test_a_drive_create_whose_marker_lags_is_found_by_the_retry_looking_again(dharness):
+    """Fails if a retry whose appProperty search lags the copy copies a second Doc, instead
+    of looking again until the marker is visible."""
+    h = dharness
+    h.acts.visibility_interval = 0
+    await grant_create_template(h)
+    task_id = ids.task_id(TENANT, "drive-create-lag")
+    h.google.delay_visibility(2)
+    h.google.fail_after_write("copy")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "template_text",
+    [
+        "Dear {{name}},\nYou are hired as {{role}}.",
+        "Dear {{ name }},\nYou are hired as {{ role }}.",
+    ],
+    ids=["canonical", "spaced"],
+)
+async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_the_retry(
+    dharness, template_text
+):
+    """Fails if the retry of a create whose fill response was lost fills the copy a second
+    time or copies a second Doc, or a spaced blank is left unfilled so the filled copy
+    reads as not done."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_content(DRIVE_TEMPLATE, [DriveSection("", template_text)])
+    task_id = ids.task_id(TENANT, "drive-create-fill-lost")
+    h.google.fail_after_write("fill")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
+    assert len(h.google.copy_calls) == 1
+    assert len(h.google.fill_calls) == 1
+
+
+# --- a Drive section replace (D-50) ------------------------------------------------------
+
+
+async def grant_section_doc(h):
+    """Publish it-helper with the VPN guide's Status section grant and serve the Doc."""
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+    )
+    add_section_doc(h.google)
+
+
+def replace_spec() -> TaskSpec:
+    from agentos.connectors.drive import heading_matches, section_bounds
+    from agentos.connectors.google_iam import DocParagraph, utf16_len
+
+    paragraphs = []
+    idx = 0
+    for p in SECTION_PARAGRAPHS:
+        end = idx + utf16_len(p["text"])
+        paragraphs.append(DocParagraph(p["text"], p["style"], idx, end))
+        idx = end
+    start, end, _ = section_bounds(
+        tuple(paragraphs), heading_matches(tuple(paragraphs), SECTION_HEADING)[0]
+    )
+    ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
+    payload = {
+        "page_id": DRIVE_SECTION,
+        "section_id": DRIVE_SECTION,
+        "doc_id": DRIVE_SECTION,
+        "heading": SECTION_HEADING,
+        "text": "The VPN is back up.",
+        "before": SECTION_BEFORE,
+        "revision_id": "1",
+        "content_start": start,
+        "content_end": end,
+        "item_title": "VPN guide",
+        "item_url": f"https://drive.google.com/file/d/{DRIVE_SECTION}",
+    }
+    return TaskSpec(ctx, "replace_section", payload, NONCE, tool="replace_section")
+
+
+async def test_a_drive_replace_whose_response_was_lost_is_found_by_the_retry(dharness):
+    """Fails if the retry of a section replace whose response was lost replaces the section a
+    second time, instead of finding the section already holding the approved text."""
+    h = dharness
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-replace-lost")
+    h.google.fail_after_write("replace")
+    with pytest.raises(GoogleError):
+        await run(h.acts.replace_doc_section, replace_spec(), task_id)
+
+    await run(h.acts.replace_doc_section, replace_spec(), task_id)
+
+    paras = h.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[1]["text"] == "The VPN is back up.\n"
+    assert paras[0]["text"] == "Status\n"
+    assert len(h.google.doc_replace_calls) == 1
+
+
+async def test_a_second_drive_replace_attempt_beside_a_running_one_writes_nothing(dharness):
+    """Fails if a section replace attempt starting while another is mid-write replaces the
+    section a second time."""
+    h = dharness
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-replace-overlap")
+    hang = h.google.hang_after_write("replace")
+    first = asyncio.create_task(run(h.acts.replace_doc_section, replace_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.replace_doc_section, replace_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    ref = await first
+
+    assert await run(h.acts.replace_doc_section, replace_spec(), task_id) == ref
+    paras = h.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[1]["text"] == "The VPN is back up.\n"
+    assert len(h.google.doc_replace_calls) == 1

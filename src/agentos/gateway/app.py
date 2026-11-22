@@ -13,12 +13,18 @@ people wrote into Temporal history:
   A channel shared with another organisation (``channel_shared``) starts an
   ``AudienceWatchWorkflow`` (one per Slack event ID, never reused), which pauses the
   agents that answer in that channel. People joining a channel start nothing.
+  An uninstall (``app_uninstalled``, or ``tokens_revoked`` naming bot tokens) disables
+  the workspace's tenant and deletes its Slack credential in one unit of work, audited
+  ``uninstall``; the Notion credential is kept, and a repeat event changes nothing more.
 * ``POST /slack/interactivity``: Submit / Cancel clicks become a ``decision``
   signal to the task named on the card. The gateway passes on who clicked; the
   task workflow decides whether that person may approve. An Edit click opens a
   form prefilled from the task's current draft (only for the requester, only
   while the draft is editable); saving the form stores the values in Postgres and
-  becomes an ``edit`` signal that names them. Slack does not retry a click, so a click is
+  becomes an ``edit`` signal that names them. A 👍/👎 click on an answer records the
+  signed clicker's vote in Postgres (``answer_feedback``) and audits it as ``feedback``;
+  a 👎 also opens a form for an optional one-line reason. No workflow hears of a vote:
+  feedback is the user's action, not the agent's. Slack does not retry a click, so a click is
   handled before the reply, within ``CLICK_TIMEOUT_SECONDS``; when Temporal or the
   database does not answer in time, the person is told to try again (an ephemeral
   message, or an error on the form) and nothing is half done.
@@ -48,6 +54,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -58,30 +65,52 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from agentos import ids
 from agentos.agent_store import AgentStore, startup_agent_failure
+from agentos.audit import AuditStore
 from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
+from agentos.connectors.drive import fill_markup_error
+from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
+from agentos.credentials import SLACK_BOT, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
+from agentos.drive_connections import DriveConnectionStore
+from agentos.feedback import (
+    FEEDBACK_ACTIONS,
+    FEEDBACK_CALLBACK,
+    REASON_MAX,
+    THANKS,
+    AnswerFeedback,
+    FeedbackStore,
+)
 from agentos.gateway.notion_signature import verify_notion_signature
 from agentos.models import (
     EDITABLE_FIELDS,
     ApprovalDecision,
     AudienceEvent,
+    AuditEvent,
     DraftView,
     EditRequest,
     ExternalUpdate,
+    NudgeRequest,
+    blank_limits,
     field_error,
+    row_limits,
 )
 from agentos.notion_webhook import WebhookTokens
 from agentos.slack_format import from_slack_text
 from agentos.stores import TaskLinkStore
 from agentos.switches import WRITES_OFF_TEXT, SwitchStore, read_state
-from agentos.tenant_store import TenantSource, as_source
+from agentos.tenant_store import TenantSource, TenantStore, as_source
+from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 
 log = logging.getLogger("agentos.gateway")
 
 LEADING_MENTION = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 APPROVAL_ACTIONS = {"task_approve": True, "task_cancel": False}
+# The Slack events that end a tenant: the app was uninstalled, or its bot token was
+# revoked. Both disable the tenant and delete its Slack credential; Notion is kept.
+UNINSTALL_EVENTS = {"app_uninstalled", "tokens_revoked"}
+UNINSTALL_IDENTITY = "system:uninstall"
 # Page events that can change what a task or the knowledge index should see.
 # Locking and unlocking a page change neither.
 NOTION_PAGE_EVENTS = {
@@ -94,14 +123,21 @@ NOTION_PAGE_EVENTS = {
 }
 EDIT_ACTION = "task_edit"
 EDIT_CALLBACK = "task_edit"
+NUDGE_ACTION = "task_nudge"
 STALE_EDIT = "This request changed after you opened the form. Close it and click Edit again."
-FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment"}
-MULTILINE_FIELDS = {"details", "comment"}
+# Fixed-field labels. "text" is the section replace's new text only: a dynamic form's column
+# or blank named "text" keeps its own name (the label is chosen per tool in ``_edit_view``).
+FIELD_LABELS = {"title": "Title", "details": "Details", "comment": "Comment", "text": "New text"}
+MULTILINE_FIELDS = {"details", "comment", "text"}
 # Slack wants an answer to a click within 3 seconds and does not repeat it. The click's work
 # gets this long, and the "try again" notice a little less than what is left.
 CLICK_TIMEOUT_SECONDS = 2.0
 NOTICE_TIMEOUT_SECONDS = 0.7
 TRY_AGAIN = "That didn't go through. Please try again in a moment."
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass
@@ -128,8 +164,27 @@ class GatewayDeps:
     # The Notion webhook verification tokens, encrypted per tenant. None keeps the
     # local file flow for a gateway built without a database.
     webhook_tokens: WebhookTokens | None = None
+    # The uninstall flow's stores: the tenants table (a disabled row is still found by
+    # its Slack team), the credentials, the audit log and the unit of work that commits
+    # the disable, the token deletion and the audit together. None (a gateway built
+    # without a database) ignores uninstall events with a log line.
+    tenant_store: TenantStore | None = None
+    credentials: TenantCredentials | None = None
+    audit: AuditStore | None = None
+    uow: UnitOfWork | None = None
     # The app's name from the manifest, for the not-set-up reply; "This app" without one.
     app_name: str = "This app"
+    # Where answer votes and their reasons are kept. A vote records into ``audit`` in the
+    # same ``uow`` transaction (both above, shared with the uninstall flow); create_app
+    # defaults ``uow`` for the in-memory stores. None in tests that never click a button.
+    feedback: FeedbackStore | None = None
+    # When a vote is recorded; tests inject a fixed clock.
+    clock: Callable[[], datetime] = _utcnow
+    # The uninstall flow's Drive stores (D-45): the connection row is deleted with the
+    # disable, the tenant's Google account best effort under the same tenant lock, row
+    # or no row. None (a gateway without Drive configured) leaves uninstall as it was.
+    drive: DriveConnectionStore | None = None
+    google: GoogleAccounts | None = None
 
 
 def create_app(
@@ -145,10 +200,22 @@ def create_app(
     content: ContentStore | None = None,
     webhook_tokens: WebhookTokens | None = None,
     app_name: str = "This app",
+    feedback: FeedbackStore | None = None,
+    audit: AuditStore | None = None,
+    uow: UnitOfWork | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    tenant_store: TenantStore | None = None,
+    credentials: TenantCredentials | None = None,
+    drive: DriveConnectionStore | None = None,
+    google: GoogleAccounts | None = None,
 ) -> FastAPI:
     """Build the gateway. Tests pass fakes; production fills deps on startup."""
     app = FastAPI(lifespan=lifespan)
     if settings is not None:
+        # A vote and its audit event commit together; the in-memory stores roll back as one
+        # unit. Stores in Postgres need a PostgresUnitOfWork, passed by the real lifespan.
+        if uow is None and feedback is not None:
+            uow = InMemoryUnitOfWork(*[s for s in (feedback, audit) if s is not None])
         app.state.deps = GatewayDeps(
             settings,
             as_source(tenants),
@@ -161,6 +228,14 @@ def create_app(
             content or InMemoryContentStore(),
             webhook_tokens=webhook_tokens,
             app_name=app_name,
+            feedback=feedback,
+            audit=audit,
+            uow=uow,
+            clock=clock,
+            tenant_store=tenant_store,
+            credentials=credentials,
+            drive=drive,
+            google=google,
         )
 
     def deps(request: Request) -> GatewayDeps:
@@ -197,12 +272,17 @@ def create_app(
         if payload.get("type") != "event_callback":
             return Response(status_code=200)
         team_id = payload.get("team_id")
+        event = payload.get("event") or {}
+        if event.get("type") in UNINSTALL_EVENTS:
+            # Resolved through the store, not the directory: a repeat or out-of-order
+            # event arrives after the tenant is disabled, and must change nothing more.
+            await _uninstall(d, team_id, payload, event)
+            return Response(status_code=200)
         tenant = await d.tenants.for_slack_team(team_id)
         if tenant is None:
             log.warning("ignored event from an unknown Slack workspace team_id=%s", team_id)
             return Response(status_code=200)
 
-        event = payload.get("event") or {}
         watched = _audience_event(tenant, payload, event)
         if watched is not None:
             await _start_audience_watch(d, watched)
@@ -277,6 +357,8 @@ def create_app(
         if payload.get("type") == "view_submission":
             try:
                 async with asyncio.timeout(CLICK_TIMEOUT_SECONDS):
+                    if (payload.get("view") or {}).get("callback_id") == FEEDBACK_CALLBACK:
+                        return await _feedback_reason_submitted(d, tenant, payload)
                     return await _edit_submitted(d, tenant, payload)
             except Exception as err:  # noqa: BLE001 - the form stays open with a message
                 log.warning(
@@ -316,6 +398,13 @@ async def _handle_actions(d: GatewayDeps, tenant: str, payload: dict, clicker: s
     for action in payload.get("actions") or []:
         if action.get("action_id") == EDIT_ACTION:
             await _open_edit_form(d, tenant, payload, action, clicker)
+            continue
+        if action.get("action_id") == NUDGE_ACTION:
+            await _nudge_clicked(d, tenant, action, clicker)
+            continue
+        vote = FEEDBACK_ACTIONS.get(action.get("action_id"))
+        if vote is not None:
+            await _feedback_clicked(d, tenant, payload, action, clicker, vote)
             continue
         approved = APPROVAL_ACTIONS.get(action.get("action_id"))
         if approved is None:
@@ -404,6 +493,98 @@ async def _start_audience_watch(d: GatewayDeps, event: AudienceEvent) -> None:
         event.tenant_id,
         workflow_id,
     )
+
+
+async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: dict) -> None:
+    """Disable the workspace's tenant and delete its Slack credential, once per event.
+
+    In one unit of work: the tenant row disabled, its ``slack_bot`` credential deleted,
+    its Drive connection row deleted (D-45) and one ``uninstall`` audit event (the event
+    type in ``tool``, the team ID in ``target``, never a token). The Notion credential is
+    kept: a reinstall resumes the tenant with its data. The tenant's Google service
+    account is deleted at Google under the same tenant lock, best effort: a refusal is
+    logged with the tenant ID and never blocks the uninstall (a reconnect finds the same
+    account by its deterministic ID). The delete is tried whenever Google is configured,
+    row or no row, targeting the row's stored email else the derived account. The event's
+    audit key is authoritative: a retry of an event already processed changes nothing even
+    after a reinstall re-enabled the tenant and stored a fresh token, while a new uninstall
+    event (a new ``event_id``) still acts.
+    An out-of-order event with a different ID finds the tenant already disabled with no
+    credential and changes nothing more. Both checks sit inside the unit's tenant lock,
+    so two events arriving together still record one uninstall. ``tokens_revoked`` acts
+    only when bot tokens were revoked; an unknown team is ignored with a log line.
+    """
+    kind = event.get("type")
+    if kind == "tokens_revoked" and not (event.get("tokens") or {}).get("bot"):
+        log.info("team_id=%s tokens_revoked names no bot token; ignored", team_id)
+        return
+    if d.tenant_store is None or d.credentials is None or d.audit is None or d.uow is None:
+        log.warning("team_id=%s uninstall event ignored: the gateway has no tenant store", team_id)
+        return
+    ref = await d.tenant_store.ref_for_slack_team(team_id or "")
+    if ref is None:
+        log.warning("ignored uninstall event from an unknown Slack workspace team_id=%s", team_id)
+        return
+    tenant = ref.tenant_id
+    event_key = ids.audit_control_key(
+        tenant, "uninstall", payload.get("event_id") or uuid.uuid4().hex
+    )
+    async with d.uow.begin(tenant) as conn:
+        if await d.audit.get(tenant, event_key, conn=conn) is not None:
+            log.info(
+                "tenant_id=%s team_id=%s uninstall event already processed; %s changes nothing",
+                tenant,
+                team_id,
+                kind,
+            )
+            return
+        row = await d.tenant_store.load(tenant)
+        if row is None:
+            return
+        deleted = await d.credentials.delete(tenant, SLACK_BOT, conn=conn)
+        if not row.enabled and not deleted:
+            log.info(
+                "tenant_id=%s team_id=%s already uninstalled; %s changes nothing",
+                tenant,
+                team_id,
+                kind,
+            )
+            return
+        await d.tenant_store.set_enabled(tenant, False, conn=conn)
+        drive_row = None if d.drive is None else await d.drive.get(tenant, conn=conn)
+        if drive_row is not None:
+            await d.drive.delete(tenant, conn=conn)
+        await d.audit.record(
+            AuditEvent(
+                tenant_id=tenant,
+                event_key=event_key,
+                kind="uninstall",
+                agent_id=None,
+                agent_version=None,
+                requester_user_id=UNINSTALL_IDENTITY,
+                identity=UNINSTALL_IDENTITY,
+                tool=kind,
+                target=team_id,
+            ),
+            conn=conn,
+        )
+        if d.google is not None:
+            email = (
+                drive_row.service_account_email
+                if drive_row is not None
+                else d.google.account_email(ids.drive_account_id(tenant))
+            )
+            try:
+                await d.google.delete_account(email)
+            except Exception as err:  # noqa: BLE001 - the uninstall stands even if Google refuses
+                log.warning(
+                    "tenant_id=%s drive account not deleted at Google error_type=%s",
+                    tenant,
+                    type(err).__name__,
+                )
+            else:
+                log.info("tenant_id=%s drive account deleted at Google", tenant)
+    log.info("tenant_id=%s team_id=%s uninstalled event=%s", tenant, team_id, kind)
 
 
 # Slack events are a few KB and an interactivity payload (a form submission) well
@@ -620,6 +801,25 @@ def _write_token_file(configured: str, token: str) -> str:
     return path
 
 
+async def _nudge_clicked(d: GatewayDeps, tenant: str, action: dict, clicker: str) -> None:
+    """Signal the task whose stale notice offered a nudge.
+
+    Like an approval click, the gateway passes on who clicked and the button's nonce;
+    the workflow accepts it only from the requester on the live offer. Nothing is
+    written by the click itself: the nudge drafts an approval card first.
+    """
+    try:
+        value = json.loads(action.get("value") or "{}")
+        task_id, nonce = value["task_id"], value["nonce"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored nudge click with a bad value", tenant)
+        return
+    if not task_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored nudge click for another tenant", tenant)
+        return
+    await _signal(d, tenant, task_id, "nudge", NudgeRequest(nonce, clicker))
+
+
 async def _open_edit_form(
     d: GatewayDeps, tenant: str, payload: dict, action: dict, clicker: str
 ) -> None:
@@ -660,6 +860,25 @@ async def _stored_fields(d: GatewayDeps, tenant: str, task_id: str, draft: Draft
     if not draft.revision or d.content is None:
         return {}
     stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
+    if draft.tool_name == "append_row":
+        # An append's editable fields are its draft's columns — one input each, empty for a
+        # cell the row left out — the same set apply_edit checks against.
+        row = stored.get("row", {})
+        return {column: str(row.get(column, "")) for column in stored.get("columns", [])}
+    if draft.tool_name == "create_doc":
+        # A create-from-template's editable fields are the title and its draft's blanks —
+        # one input each, empty for a blank the values left out — the same set apply_edit
+        # checks against. A blank named title shares the title's input (the Doc's name).
+        values = stored.get("values", {})
+        fields = {"title": str(stored.get("title", ""))}
+        fields.update(
+            {
+                blank: str(values.get(blank, ""))
+                for blank in stored.get("blanks", [])
+                if blank != "title"
+            }
+        )
+        return fields
     return {k: stored[k] for k in EDITABLE_FIELDS.get(draft.tool_name, {}) if k in stored}
 
 
@@ -676,20 +895,35 @@ async def _query_draft(d: GatewayDeps, tenant: str, task_id: str) -> DraftView |
 
 def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
     """The Edit form: one input per editable field, prefilled from the draft."""
-    limits = EDITABLE_FIELDS[draft.tool_name]
+    if draft.tool_name == "append_row":
+        limits = row_limits(list(fields))
+    elif draft.tool_name == "create_doc":
+        limits = blank_limits(list(fields))
+    else:
+        limits = EDITABLE_FIELDS[draft.tool_name]
     blocks = []
+    dynamic = draft.tool_name in ("append_row", "create_doc")
     for name, current in fields.items():
+        # A dynamic form's fields are the sheet's columns / the template's blanks: they keep
+        # their own names (a blank named "text" is not the section replace's new text). Only
+        # the create's title is a fixed field; the fixed tools use their field labels.
+        if dynamic:
+            label = "Title" if draft.tool_name == "create_doc" and name == "title" else name
+        else:
+            label = FIELD_LABELS.get(name, name)
         blocks.append(
             {
                 "type": "input",
                 "block_id": name,
-                "label": {"type": "plain_text", "text": FIELD_LABELS.get(name, name)},
+                "label": {"type": "plain_text", "text": label},
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "value",
                     "initial_value": current,
                     "max_length": limits[name],
-                    "multiline": name in MULTILINE_FIELDS,
+                    "multiline": name in MULTILINE_FIELDS
+                    or draft.tool_name == "append_row"
+                    or (draft.tool_name == "create_doc" and name != "title"),
                 },
             }
         )
@@ -707,8 +941,9 @@ def _edit_view(task_id: str, draft: DraftView, fields: dict) -> dict:
 async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Response:
     """Handle the saved Edit form: keep the form open on a bad value, else signal ``edit``.
 
-    A value is bad when it is empty or does not fit once escaped, and the whole form is
-    stale when the draft has moved on. Only a valid edit reaches the workflow.
+    A value is bad when it is empty (an append's cell excepted: empty clears it) or does
+    not fit once escaped, and the whole form is stale when the draft has moved on. Only a
+    valid edit reaches the workflow.
     """
     view = payload.get("view") or {}
     if view.get("callback_id") != EDIT_CALLBACK:
@@ -724,16 +959,11 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         return Response(status_code=200)
     values = (view.get("state") or {}).get("values") or {}
     fields: dict[str, str] = {}
-    errors: dict[str, str] = {}
     for block_id, actions in values.items():
         raw = (actions.get("value") or {}).get("value")
-        text = raw.strip() if isinstance(raw, str) else ""
-        if not text:
-            errors[block_id] = "This can't be empty."
-        fields[block_id] = text
-    if errors:
-        return _form_errors(errors)
+        fields[block_id] = raw.strip() if isinstance(raw, str) else ""
     draft = await _query_draft(d, tenant, task_id)
+    errors: dict[str, str] = {}
     if draft is None:
         errors = {next(iter(fields), ""): "This request is no longer open."}
     elif nonce != draft.nonce:
@@ -742,9 +972,21 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
         errors = {next(iter(fields), ""): "This request can no longer be edited."}
     else:
         # The workflow checks every field again; this is the same check, shown here.
+        dynamic = draft.tool_name in ("append_row", "create_doc")
+        blanks: list[str] = []
+        if draft.tool_name == "create_doc" and draft.revision and d.content is not None:
+            stored = await d.content.get_draft(tenant, task_id, draft.revision) or {}
+            blanks = list(stored.get("blanks", []))
         for name, value in fields.items():
-            known = name in EDITABLE_FIELDS[draft.tool_name]
+            # An empty cell clears the column / blank; a create's title and every other
+            # field needs a value.
+            titled = draft.tool_name == "create_doc" and name == "title"
+            if not value and (not dynamic or titled):
+                errors[name] = "This can't be empty."
+            known = dynamic or name in EDITABLE_FIELDS[draft.tool_name]
             if known and (message := field_error(draft.tool_name, name, value)):
+                errors[name] = message
+            if draft.tool_name == "create_doc" and (message := fill_markup_error(value, blanks)):
                 errors[name] = message
     if errors:
         return _form_errors(errors)
@@ -761,6 +1003,184 @@ async def _edit_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Respons
     else:
         await _signal(d, tenant, task_id, "edit", EditRequest(nonce, clicker, fields))
     return Response(status_code=200)
+
+
+def _feedback_ref(tenant: str, action: dict) -> tuple[str, str, str, int] | None:
+    """The answer a feedback button names, or None when the value is bad or another tenant's.
+
+    The value carries references only (the conversation ID, the answer's ts, the agent and
+    version that answered). The voter is never read from it: that is the signed request's user.
+    """
+    try:
+        value = json.loads(action.get("value") or "{}")
+        conversation_id = value["conversation_id"]
+        answer_ts = value["answer_ts"]
+        agent_id = value["agent_id"]
+        agent_version = value["agent_version"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored feedback click with a bad value", tenant)
+        return None
+    if not isinstance(conversation_id, str) or not conversation_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored feedback click for another tenant", tenant)
+        return None
+    if not (
+        isinstance(answer_ts, str)
+        and answer_ts
+        and isinstance(agent_id, str)
+        and agent_id
+        and isinstance(agent_version, int)
+        and not isinstance(agent_version, bool)
+        and agent_version >= 1
+    ):
+        log.warning("tenant_id=%s ignored feedback click with a bad value", tenant)
+        return None
+    return conversation_id, answer_ts, agent_id, agent_version
+
+
+async def _feedback_clicked(
+    d: GatewayDeps, tenant: str, payload: dict, action: dict, clicker: str, vote: str
+) -> None:
+    """Record the signed clicker's vote on the answer the button names, and acknowledge it.
+
+    A second click replaces the voter's earlier vote. Every click is audited as its own event
+    (the key carries the vote's time), and the vote and its event commit in one transaction, so
+    a failed audit insert leaves no vote behind. A 👎 also opens the reason form. The vote stands
+    even when the form or the ephemeral thanks cannot be shown; a failed store write propagates
+    and the click is told to try again.
+    """
+    ref = _feedback_ref(tenant, action)
+    if ref is None or not clicker:
+        return
+    conversation_id, answer_ts, agent_id, agent_version = ref
+    if d.feedback is None:
+        raise RuntimeError("the gateway has no feedback store to keep a vote in")
+    if d.uow is None:
+        raise RuntimeError("the gateway has no unit of work to commit a vote with its audit event")
+    at = d.clock()
+    async with d.uow.begin(tenant) as conn:
+        await d.feedback.record_vote(
+            AnswerFeedback(
+                tenant,
+                conversation_id,
+                answer_ts,
+                clicker,
+                agent_id,
+                agent_version,
+                vote,
+                None,
+                at,
+            ),
+            conn=conn,
+        )
+        if d.audit is not None:
+            await d.audit.record(
+                AuditEvent(
+                    tenant_id=tenant,
+                    event_key=ids.audit_feedback_key(conversation_id, answer_ts, clicker, vote, at),
+                    kind="feedback",
+                    agent_id=agent_id,
+                    agent_version=agent_version,
+                    requester_user_id=clicker,
+                    identity=f"user:{clicker}",
+                    conversation_id=conversation_id,
+                    tool="feedback",
+                    target=vote,
+                ),
+                conn=conn,
+            )
+    if vote == "down":
+        if d.slack_for is None:
+            log.warning("tenant_id=%s feedback form not opened: no Slack client", tenant)
+        else:
+            try:
+                slack = await d.slack_for(tenant)
+                await slack.open_view(
+                    payload.get("trigger_id", ""), _reason_view(conversation_id, answer_ts)
+                )
+            except Exception as err:  # noqa: BLE001 - the vote stands without the form
+                log.warning(
+                    "tenant_id=%s feedback form not opened error_type=%s",
+                    tenant,
+                    type(err).__name__,
+                )
+    await _thank_voter(d, tenant, payload, clicker)
+
+
+def _reason_view(conversation_id: str, answer_ts: str) -> dict:
+    """The 👎 reason form: one optional line. The voter is the signed submitter, not metadata."""
+    return {
+        "type": "modal",
+        "callback_id": FEEDBACK_CALLBACK,
+        "private_metadata": json.dumps(
+            {"conversation_id": conversation_id, "answer_ts": answer_ts}
+        ),
+        "title": {"type": "plain_text", "text": "Feedback"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "reason",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "What was wrong? (optional)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "max_length": REASON_MAX,
+                },
+            }
+        ],
+    }
+
+
+async def _feedback_reason_submitted(d: GatewayDeps, tenant: str, payload: dict) -> Response:
+    """Store the optional reason on the submitter's 👎; the vote stands either way.
+
+    An empty reason stores nothing; an over-long one keeps the form open with a message.
+    A reason reaches only a vote that is still a 👎: one changed to a 👍 meanwhile keeps none.
+    """
+    view = payload.get("view") or {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        conversation_id, answer_ts = meta["conversation_id"], meta["answer_ts"]
+    except (ValueError, KeyError, TypeError):
+        log.warning("tenant_id=%s ignored feedback form with bad metadata", tenant)
+        return Response(status_code=200)
+    if not isinstance(conversation_id, str) or not conversation_id.startswith(f"{tenant}:"):
+        log.warning("tenant_id=%s ignored feedback form for another tenant", tenant)
+        return Response(status_code=200)
+    if not isinstance(answer_ts, str) or not answer_ts:
+        log.warning("tenant_id=%s ignored feedback form with bad metadata", tenant)
+        return Response(status_code=200)
+    values = (view.get("state") or {}).get("values") or {}
+    raw = ((values.get("reason") or {}).get("value") or {}).get("value")
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if len(reason) > REASON_MAX:
+        return _form_errors({"reason": f"Keep it to {REASON_MAX} characters or fewer."})
+    voter = (payload.get("user") or {}).get("id", "")
+    if reason and voter:
+        if d.feedback is None:
+            raise RuntimeError("the gateway has no feedback store to keep a reason in")
+        await d.feedback.set_reason(tenant, conversation_id, answer_ts, voter, reason)
+    return Response(status_code=200)
+
+
+async def _thank_voter(d: GatewayDeps, tenant: str, payload: dict, clicker: str) -> None:
+    """Acknowledge the vote to the voter alone; best effort, the vote is already stored."""
+    channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get(
+        "channel_id"
+    )
+    thread_ts = (payload.get("message") or {}).get("thread_ts")
+    if d.slack_for is None or not channel:
+        return
+    try:
+        async with asyncio.timeout(NOTICE_TIMEOUT_SECONDS):
+            slack = await d.slack_for(tenant)
+            await slack.post_ephemeral(channel, clicker, THANKS, thread_ts)
+    except Exception as err:  # noqa: BLE001 - the vote stands even if the thanks fails
+        log.warning(
+            "tenant_id=%s feedback thanks not shown error_type=%s", tenant, type(err).__name__
+        )
 
 
 async def _writes_off(d: GatewayDeps, tenant: str) -> bool:
@@ -837,7 +1257,9 @@ async def _real_lifespan(app: FastAPI):
     from slack_sdk.signature import SignatureVerifier
 
     from agentos.agent_store import PostgresAgentStore
+    from agentos.audit import PostgresAuditStore
     from agentos.config import load_settings
+    from agentos.connectors.google_iam import GoogleError, accounts_from_settings
     from agentos.content_store import PostgresContentStore
     from agentos.credentials import PostgresCredentialStore, TenantCredentials
     from agentos.crypto_keys import (
@@ -846,6 +1268,8 @@ async def _real_lifespan(app: FastAPI):
         start_key_refresh,
         startup_key_failure,
     )
+    from agentos.drive_connections import PostgresDriveConnectionStore
+    from agentos.feedback import PostgresFeedbackStore
     from agentos.gateway.relay import InboundRelay
     from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
@@ -855,6 +1279,7 @@ async def _real_lifespan(app: FastAPI):
     from agentos.switches import PostgresSwitchStore
     from agentos.temporal_client import build_temporal_client
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
+    from agentos.unit_of_work import PostgresUnitOfWork
 
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
@@ -866,7 +1291,8 @@ async def _real_lifespan(app: FastAPI):
     key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
-        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenant_store = PostgresTenantStore(pool)
+        directory = TenantDirectory(tenant_store)
         tenants = await startup_tenants(directory)
         try:
             keys = await build_key_store(settings, pool)
@@ -900,6 +1326,15 @@ async def _real_lifespan(app: FastAPI):
         # A tenant whose Slack token is unavailable is refused at start-up, as before.
         for config in tenants.tenants.values():
             await slack_for(config.tenant_id)
+        # Drive (D-45): configured only with both deployment settings; a malformed key
+        # stops start-up with a plain message, never at the first uninstall.
+        try:
+            google = accounts_from_settings(
+                settings.google_project_id, settings.google_service_account_key
+            )
+        except GoogleError as err:
+            raise SystemExit(str(err)) from err
+        drive = None if google is None else PostgresDriveConnectionStore(pool)
         content = PostgresContentStore(pool)
         relay = InboundRelay(content, directory, client)
         app.state.deps = GatewayDeps(
@@ -915,6 +1350,13 @@ async def _real_lifespan(app: FastAPI):
             on_inbound=relay.wake,
             webhook_tokens=WebhookTokens(PostgresWebhookTokenStore(pool), keys),
             app_name=app_name_from_manifest(DEFAULT_MANIFEST_PATH),
+            feedback=PostgresFeedbackStore(pool),
+            tenant_store=tenant_store,
+            credentials=credentials,
+            audit=PostgresAuditStore(pool),
+            uow=PostgresUnitOfWork(pool),
+            drive=drive,
+            google=google,
         )
         # Events stored while the gateway was down, or while Temporal was, are delivered now.
         relay_task = asyncio.create_task(relay.run(), name="inbound-relay")

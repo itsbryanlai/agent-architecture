@@ -33,6 +33,7 @@ from agentos.stores import (
 from agentos.tenants import TenantRegistry, runtime_for
 from tests.conftest import ALICE, DB_ID, TENANT, agents_dict, make_fake_notion
 from tests.helpers.agents import ADMIN, EDITOR, helper_block, republish
+from tests.helpers.drive import drive_grants_dict
 from tests.helpers.front_door import front_door_dict
 
 NONCE = "n-1"
@@ -57,8 +58,11 @@ async def test_a_definition_is_validated_like_a_yaml_block():
     assert await store.versions(TENANT, "ghost") == []
 
 
-def test_definition_round_trips_through_the_yaml_parser():
-    config = parse_agents_config(front_door_dict())
+@pytest.mark.parametrize(
+    "build", [front_door_dict, drive_grants_dict], ids=["notion", "drive-folder-and-file"]
+)
+def test_definition_round_trips_through_the_yaml_parser(build):
+    config = parse_agents_config(build())
     for agent in config.agents.values():
         again = parse_agent(agent.agent_id, agent_definition(agent), agent.version)
         assert again == agent

@@ -14,8 +14,16 @@ import pytest
 
 from agentos.access_diff import WideningNotAcknowledged, diff_access
 from agentos.audience import EffectiveAudience
-from agentos.config import NotionPageGrant
+from agentos.config import DriveGrant, NotionPageGrant
+from agentos.connectors.notion import normalize_id
 from agentos.control_api import create_app
+from agentos.creator_access import (
+    CANNOT_VERIFY,
+    LOST,
+    VERIFIED,
+    AccessResult,
+    InMemoryCreatorAccessStore,
+)
 from agentos.grant_picks import GrantNotPicked
 from agentos.notion_picker import HttpNotionOAuth, Picker, PickerConfig
 from tests.conftest import DB_ID, TENANT, agents_dict, parse_agents_config
@@ -30,6 +38,14 @@ from tests.helpers.console_harness import (
     using,
 )
 from tests.helpers.control_api import JSON
+from tests.helpers.drive import (
+    DRIVE_FOLDER,
+    DRIVE_SECTION,
+    DRIVE_SHEET,
+    DRIVE_TEMPLATE,
+    TEMPLATE_FOLDER,
+    TEMPLATE_PLAIN_FOLDER,
+)
 
 API = f"/tenants/{TENANT}"
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
@@ -139,6 +155,13 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ("grant_change", "audience", "widens"),
     [
         ("add_page", BASE, True),
+        ("add_drive_folder", BASE, True),
+        ("add_drive_sheet", BASE, True),
+        ("sheet_changed_tab", BASE, True),
+        ("add_drive_template", BASE, True),
+        ("template_changed_folder", BASE, True),
+        ("add_drive_section", BASE, True),
+        ("section_changed_heading", BASE, True),
         ("other_properties", BASE, True),
         ("none", replace(BASE, channels=("C111", "C222")), True),
         ("none", replace(BASE, dm_everyone=True), True),
@@ -152,12 +175,73 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
     ],
 )
 def test_which_changes_widen_access(grant_change, audience, widens):
-    """Fails if a new grant, other properties, a new channel, wider direct messages or
-    guests do not count as widening, or if a removal, a relabel or no change does."""
+    """Fails if a new grant (a Drive folder, sheet, template or section included), other
+    properties (a sheet's tab, a template's folder or a section's heading included), a new
+    channel, wider direct messages or guests do not count as widening, or if a removal, a
+    relabel or no change does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
         new.grants.notion_pages.append(NotionPageGrant(PAGE, "Handbook"))
+    elif grant_change == "add_drive_folder":
+        new.grants.drive.append(DriveGrant(DRIVE_FOLDER, "Team folder", "folder"))
+    elif grant_change == "add_drive_sheet":
+        new.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q1", columns=("name", "role"))
+        )
+    elif grant_change == "sheet_changed_tab":
+        old.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q1", columns=("name", "role"))
+        )
+        new.grants.drive.append(
+            DriveGrant(DRIVE_SHEET, "Roster", "sheet", tab="Q2", columns=("name", "role"))
+        )
+    elif grant_change == "add_drive_template":
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_FOLDER,
+                blanks=("name", "role"),
+            )
+        )
+    elif grant_change == "template_changed_folder":
+        old.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_FOLDER,
+                blanks=("name", "role"),
+            )
+        )
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_TEMPLATE,
+                "Offer template",
+                "template",
+                folder_id=TEMPLATE_PLAIN_FOLDER,
+                blanks=("name", "role"),
+            )
+        )
+    elif grant_change == "add_drive_section":
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Status"
+            )
+        )
+    elif grant_change == "section_changed_heading":
+        old.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Status"
+            )
+        )
+        new.grants.drive.append(
+            DriveGrant(
+                DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Overview"
+            )
+        )
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"
     elif grant_change == "remove_database":
@@ -256,6 +340,29 @@ async def test_a_narrowing_version_shows_no_banner_and_publishes_freely(h):
     await h.plane.publish_version(
         TENANT, ROOT, "it-helper", version, reviewed_sha256=await hash_of(h, version)
     )
+
+
+@pytest.mark.parametrize(
+    ("audience", "warns"),
+    [
+        ({"channels": ["C0REQUESTS"]}, True),
+        ({"channels": ["C0REQUESTS"], "dm": "everyone"}, False),
+    ],
+    ids=["omits dm", "dm everyone"],
+)
+async def test_a_draft_closing_direct_messages_warns_plainly(h, audience, warns):
+    """Fails if a draft whose audience omits dm does not say plainly that direct messages
+    will be closed, on the version page and in the diff the publish confirmation shows,
+    or a draft keeping dm open warns."""
+    await publish_first(h)
+    version = await second_version(h, lambda d: d.update(audience=audience))
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(f"/ui/{TENANT}/agents/it-helper/versions/{version}")).text
+    warning = "Direct messages: nobody (add <code>dm: everyone</code> to keep them open)"
+    assert (warning in page) is warns
+    diff_line = "changed: direct messages: nobody (add dm: everyone to keep them open)"
+    assert (diff_line in page) is warns
 
 
 # --- check-grants detail -------------------------------------------------------------
@@ -415,3 +522,33 @@ async def test_a_grant_not_picked_cannot_be_submitted_when_the_picker_is_require
         TENANT, OWNER, "it-helper", 1, [PickedObject(DB_ID.upper(), "database")]
     )
     await hp.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+
+
+@pytest.mark.parametrize(
+    ("status", "cell"),
+    [
+        (VERIFIED, "verified 2026-11-14 12:00 UTC"),
+        (LOST, '<span class="error">lost</span>'),
+        (CANNOT_VERIFY, "cannot verify (no consent)"),
+        (None, '<span class="muted">not checked yet</span>'),
+    ],
+    ids=["verified", "lost", "cannot-verify", "not-checked"],
+)
+async def test_the_version_page_shows_the_creators_access_per_grant(status, cell):
+    """Fails if the version page hides the nightly verdict on a grant, or shows the wrong one."""
+    access = InMemoryCreatorAccessStore()
+    harness = ConsoleHarness(picker=make_picker({}), creator_access=access)
+    await harness.seed_members()
+    await pending(harness)
+    if status is not None:
+        await access.record(
+            TENANT,
+            "it-helper",
+            [AccessResult(normalize_id(DB_ID), status)],
+            harness.clock(),
+            {normalize_id(DB_ID)},
+        )
+    c = await harness.signed_in(ROOT)
+    async with using(c):
+        page = (await c.get(VERSION)).text
+    assert cell in page

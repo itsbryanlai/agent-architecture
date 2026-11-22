@@ -1,6 +1,7 @@
 import pytest
 
 from agentos.config import DEFAULT_TEMPORAL_ADDRESS, ConfigError, load_settings
+from agentos.connectors.google_iam import GoogleError, accounts_from_settings
 
 
 def test_generic_infra_vars_are_ignored(monkeypatch):
@@ -53,3 +54,24 @@ def test_the_key_source_setting_is_read_and_an_unknown_source_is_refused(
             load_settings()
     else:
         assert load_settings().key_source == expected
+
+
+@pytest.mark.parametrize(
+    ("project", "key", "outcome"),
+    [
+        (None, None, "unset"),
+        ("p", None, "unset"),
+        (None, "k", "unset"),
+        ("p", "not-json", "invalid"),
+    ],
+    ids=["neither", "no-key", "no-project", "malformed-key"],
+)
+def test_drive_is_configured_only_with_both_google_settings(project, key, outcome):
+    """Fails if Drive reads as configured with either Google setting unset, or a
+    malformed deployment key is accepted past start-up."""
+    if outcome == "unset":
+        assert accounts_from_settings(project, key) is None
+    else:
+        with pytest.raises(GoogleError) as err:
+            accounts_from_settings(project, key)
+        assert err.value.code == "invalid_key"

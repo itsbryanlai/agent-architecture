@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Choose the tab to append to{% endblock %}
+{% block body %}
+<p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
+<h1>Choose the tab to append to</h1>
+<p>Each Sheet below is shared with this workspace's Drive address. Pick the tab this agent may append a row to; the tab's columns are read when the version is submitted, and an admin approves them before the agent writes.</p>
+<form method="post" action="{{ version_url }}/drive/pick/tabs">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  {% for s in sheets %}
+  <input type="hidden" name="sheet_id_{{ loop.index0 }}" value="{{ s.item.id }}">
+  <p><strong><a href="{{ s.item.link }}">{{ s.item.name }}</a></strong> (<code>{{ s.item.id }}</code>)</p>
+  <p>
+    <label for="tab_{{ loop.index0 }}">Tab</label>
+    <select name="tab_{{ loop.index0 }}" id="tab_{{ loop.index0 }}">
+      {% for tab in s.tabs %}<option value="{{ loop.index0 }}">{{ tab }}</option>{% endfor %}
+    </select>
+  </p>
+  {% endfor %}
+  <p><button type="submit">Add to this agent</button></p>
+</form>
+{% endblock %}

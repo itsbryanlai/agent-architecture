@@ -1,27 +1,31 @@
-"""Index each agent's granted Notion pages, now or on a nightly schedule.
+"""Index each agent's granted Notion pages and Drive folders/files, now or on a nightly schedule.
 
     uv run python -m agentos.index_knowledge             # start one run per scope
     uv run python -m agentos.index_knowledge --wait      # ... and wait for each summary
     uv run python -m agentos.index_knowledge --schedule  # nightly runs at 03:00 UTC
     uv run python -m agentos.index_knowledge --tenant acme  # only one tenant
-    uv run python -m agentos.index_knowledge --confirm-gone # delete the index of a root page
+    uv run python -m agentos.index_knowledge --confirm-gone # delete the index of a root
                                                             # that is gone, without waiting
 
 Needs a running worker (``uv run python -m agentos.worker``), which does the
-reading and embedding with its own Notion token and Qwen key. This command
-only asks Temporal to start the work and never reads a token itself.
+reading and embedding with its own Notion token, Drive account and Qwen key.
+This command only asks Temporal to start the work and never reads a token itself.
 
 Indexing calls the embeddings endpoint, so it spends embedding credit; pages
-whose content has not changed are not embedded again.
+and files whose content has not changed are not embedded again.
 
-One run starts per distinct granted scope of each tenant: two agents of the
-same tenant granted the same root page share one run. A run that is already
-going is not started twice. Schedules are planned and deleted per tenant, by
-that tenant's ID prefix, so one tenant's command never touches another's.
+One run starts per distinct granted scope of each tenant, Notion and Drive alike:
+two agents of the same tenant granted the same root share one run. A run that is
+already going is not started twice. Schedules are planned and deleted per tenant,
+by that tenant's ID prefix, so one tenant's command never touches another's.
 
-A scope whose root page is gone or unshared is not deleted by one run: the owner is told, and
+The worker ensures every served tenant's schedules automatically, at start-up
+and when its grants change (``agentos.schedules``); ``--schedule`` is a manual
+repair.
+
+A scope whose root is gone or unshared is not deleted by one run: the owner is told, and
 the index is deleted when three nightly runs in a row find the root gone. ``--confirm-gone``
-is the admin's way to delete it now. It changes nothing for a scope whose root page is back.
+is the admin's way to delete it now. It changes nothing for a scope whose root is back.
 """
 
 from __future__ import annotations
@@ -59,10 +63,18 @@ from agentos.config import (
 from agentos.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from agentos.temporal_client import build_temporal_client
 from agentos.tenant_store import load_stored_tenants
-from agentos.tenants import granted_roots
+from agentos.tenants import granted_drive_roots, granted_roots
+from agentos.workflows.drive_indexing import DriveIndexingWorkflow
 from agentos.workflows.indexing import IndexingWorkflow
 
-__all__ = ["apply_schedules", "granted_roots", "plan_schedules", "start_indexing"]
+__all__ = [
+    "apply_drive_schedules",
+    "apply_schedules",
+    "granted_roots",
+    "plan_schedules",
+    "start_drive_indexing",
+    "start_indexing",
+]
 
 
 async def start_indexing(
@@ -156,11 +168,96 @@ async def apply_schedules(
     for schedule_id in plan.delete:
         await client.get_schedule_handle(schedule_id).delete()
     if store is not None:
-        granted = granted_roots(agents)
+        # A stored scope is kept while any agent grants it, whether it is a Notion page
+        # or a Drive folder/file; only a scope neither connector grants any more is purged.
+        granted = set(granted_roots(agents)) | set(granted_drive_roots(agents))
         for scope in await store.scopes(agents.tenant_id):
             if scope not in granted:
                 await store.delete_scope(agents.tenant_id, scope)
                 plan.purged.append(scope)
+    return plan
+
+
+# The walk state of a Drive run that has only begun: nothing seen, no counts, no start
+# time, a complete walk so far, no error code.
+_DRIVE_FRESH_RUN = (None, None, None, 0, 0, 0, 0, 0, None, False, True, False, None, None)
+
+
+async def start_drive_indexing(
+    client: Client, agents: AgentsConfig, confirm_gone: bool = False
+) -> list[tuple[str, WorkflowHandle]]:
+    """Start one DriveIndexingWorkflow per distinct Drive scope; reuse a run already going.
+
+    With ``confirm_gone``, a run that finds its scope's root gone or unreadable deletes the
+    scope's index at once instead of waiting for repeated runs.
+    """
+    started = []
+    for scope, grant in granted_drive_roots(agents).items():
+        workflow_id = ids.drive_index_workflow_id(agents.tenant_id, scope)
+        handle = await client.start_workflow(
+            DriveIndexingWorkflow.run,
+            args=[agents.tenant_id, scope, grant.id, *_DRIVE_FRESH_RUN, confirm_gone],
+            id=workflow_id,
+            task_queue=TASK_QUEUE,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+        started.append((workflow_id, handle))
+    return started
+
+
+def plan_drive_schedules(agents: AgentsConfig, existing_ids: list[str]) -> SchedulePlan:
+    """One nightly schedule per granted Drive scope; stale ones of this tenant are deleted.
+
+    Only IDs with this tenant's Drive-index-schedule prefix are considered.
+    """
+    prefix = ids.drive_index_schedule_id(agents.tenant_id, "")
+    wanted = [
+        ids.drive_index_schedule_id(agents.tenant_id, scope)
+        for scope in granted_drive_roots(agents)
+    ]
+    ours = {i for i in existing_ids if i.startswith(prefix)}
+    return SchedulePlan(
+        create=[i for i in wanted if i not in ours],
+        update=[i for i in wanted if i in ours],
+        delete=sorted(ours - set(wanted)),
+    )
+
+
+def _drive_schedule(agents: AgentsConfig, scope: str, root_id: str) -> Schedule:
+    return Schedule(
+        action=ScheduleActionStartWorkflow(
+            DriveIndexingWorkflow.run,
+            args=[agents.tenant_id, scope, root_id],
+            id=ids.drive_index_workflow_id(agents.tenant_id, scope),
+            task_queue=TASK_QUEUE,
+        ),
+        # Every day at 03:00 UTC, like the Notion walk; a run still going is skipped.
+        spec=ScheduleSpec(
+            calendars=[ScheduleCalendarSpec(hour=[ScheduleRange(3)], minute=[ScheduleRange(0)])]
+        ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+    )
+
+
+async def apply_drive_schedules(client: Client, agents: AgentsConfig) -> SchedulePlan:
+    """Create or update one nightly schedule per granted Drive scope and delete stale ones.
+
+    Stored Drive pages of revoked scopes are purged by ``apply_schedules`` (which keeps a
+    scope granted by either connector), so this only manages the schedules.
+    """
+    existing = [s.id async for s in await client.list_schedules()]
+    plan = plan_drive_schedules(agents, existing)
+    for scope, grant in granted_drive_roots(agents).items():
+        schedule_id = ids.drive_index_schedule_id(agents.tenant_id, scope)
+        schedule = _drive_schedule(agents, scope, grant.id)
+        if schedule_id in plan.create:
+            await client.create_schedule(schedule_id, schedule)
+        elif schedule_id in plan.update:
+            await client.get_schedule_handle(schedule_id).update(
+                lambda _input, schedule=schedule: ScheduleUpdate(schedule=schedule)
+            )
+    for schedule_id in plan.delete:
+        await client.get_schedule_handle(schedule_id).delete()
     return plan
 
 
@@ -205,8 +302,8 @@ async def run(
             f"tenant(s) {', '.join(empty)} have no published agents. "
             "Run `uv run python -m agentos.agent_store import` first."
         )
-    if not schedule and not any(granted_roots(a) for a in selected):
-        print("No published agent has a Notion page grant, so there is nothing to index.")
+    if not schedule and not any(granted_roots(a) or granted_drive_roots(a) for a in selected):
+        print("No published agent has a Notion page or Drive grant, so there is nothing to index.")
         return
     async with AsyncExitStack() as stack:
         pool = None
@@ -223,19 +320,22 @@ async def run(
             async with open_store(settings) as store:
                 for agents in selected:
                     plan = await apply_schedules(client, agents, store)
+                    drive_plan = await apply_drive_schedules(client, agents)
                     for label, items in (
-                        ("created schedule", plan.create),
-                        ("updated schedule", plan.update),
-                        ("deleted schedule", plan.delete),
+                        ("created schedule", plan.create + drive_plan.create),
+                        ("updated schedule", plan.update + drive_plan.update),
+                        ("deleted schedule", plan.delete + drive_plan.delete),
                         ("deleted stored pages of", plan.purged),
                     ):
                         for item in items:
                             print(f"{label} {item}")
             return
         started = []
+        drive_started = []
         for agents in selected:
             started += await start_indexing(client, agents, confirm_gone)
-        for workflow_id, _ in started:
+            drive_started += await start_drive_indexing(client, agents, confirm_gone)
+        for workflow_id, _ in started + drive_started:
             print(f"started {workflow_id}")
         if wait:
             for workflow_id, handle in started:
@@ -245,13 +345,23 @@ async def run(
                     f"skipped={summary.skipped} failed={summary.failed} pruned={summary.pruned}"
                     + (" root-gone" if summary.root_gone else "")
                 )
+            for workflow_id, handle in drive_started:
+                summary = await handle.result()
+                print(
+                    f"{workflow_id}: files={summary.files} changed={summary.changed} "
+                    f"skipped={summary.skipped_type} deferred={summary.deferred} "
+                    f"failed={summary.failed} pruned={summary.pruned}"
+                    + (" root-gone" if summary.root_gone else "")
+                    + (" capped" if summary.capped else "")
+                )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Index the Notion pages granted to agents. Needs a running worker. "
-            "Indexing spends embedding credit; unchanged pages are not embedded again."
+            "Index the Notion pages and Drive folders/files granted to agents. Needs a "
+            "running worker. Indexing spends embedding credit; unchanged pages and files "
+            "are not embedded again."
         )
     )
     parser.add_argument("--wait", action="store_true", help="wait for each run and print a summary")
@@ -265,7 +375,7 @@ def main() -> None:
         "--confirm-gone",
         action="store_true",
         help=(
-            "start runs that delete the index of a scope whose root page is gone, "
+            "start runs that delete the index of a scope whose root is gone, "
             "without waiting for three nightly runs"
         ),
     )

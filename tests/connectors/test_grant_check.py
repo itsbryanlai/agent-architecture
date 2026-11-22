@@ -1,7 +1,7 @@
-import logging
 from dataclasses import replace
 
 import httpx
+import psycopg
 import pytest
 from notion_client.errors import RequestTimeoutError
 
@@ -10,7 +10,6 @@ from agentos.check_grants import check_published
 from agentos.config import ConfigError, NotionDatabaseGrant, TenantsConfig, parse_agents_config
 from agentos.connectors.notion import NotionConnector, check_grant
 from agentos.grant_checker import GrantCheckUnavailable, NotionGrantChecker, is_transient
-from agentos.worker import check_grants_at_startup
 from tests.conftest import DB_ID, TENANT, agents_dict, default_schema, make_fake_notion
 from tests.helpers.agents import helper_block, make_published
 
@@ -91,6 +90,34 @@ async def test_check_renamed_property_by_id_is_note(agents):
     assert "'Status'" in check.notes[0] and "'Stage'" in check.notes[0]
 
 
+@pytest.mark.parametrize(
+    ("broken", "reported"),
+    [("missing", True), ("wrong-type", True), ("no-id", True), ("healthy", False)],
+)
+async def test_a_broken_assignee_mapping_is_reported_but_never_disables_the_agent(
+    agents, broken, reported
+):
+    """Fails if a broken assignee mapping becomes a grant problem, or goes unreported."""
+    api = make_fake_notion()
+    grant = replace(grant_from(agents), assignee_prop="Assignee", assignee_prop_id="asg1")
+    schema = default_schema()
+    if broken != "missing":
+        schema["Assignee"] = {
+            "id": "asg1",
+            "type": "rich_text" if broken == "wrong-type" else "people",
+        }
+    if broken == "no-id":
+        grant = replace(grant, assignee_prop_id=None)
+    api.set_schema(DB_ID, schema)
+    agent = agents.agents["it-helper"]
+    version = replace(agent, grants=replace(agent.grants, notion_databases=[grant]))
+
+    [report] = await NotionGrantChecker(lambda t: api).check(TENANT, version)
+
+    assert report.ok
+    assert any("assignee" in note for note in report.notes) == reported
+
+
 async def test_connector_uses_ids_in_filters_and_create(agents):
     api = make_fake_notion()
     # Names differ from the config; only IDs can work.
@@ -142,32 +169,6 @@ def test_config_parses_property_ids(agents):
     assert parsed.agents["it-helper"].grants.notion_databases[0].title_prop_id is None
 
 
-async def test_worker_refuses_to_start_on_problems(agents):
-    api = make_fake_notion()
-    schema = default_schema()
-    schema["Agent request ID"] = {"id": "reqid1", "type": "people"}
-    api.set_schema(DB_ID, schema)
-    failure = await check_grants_at_startup(api, agents, logging.getLogger("test"))
-    assert failure is not None
-    assert "will not start" in failure
-
-
-async def test_worker_starts_when_grants_are_clean(agents):
-    api = make_fake_notion()
-    assert await check_grants_at_startup(api, agents, logging.getLogger("test")) is None
-
-
-async def test_worker_refuses_to_start_without_ids(agents):
-    api = make_fake_notion()
-    raw = agents_dict()
-    del raw["agents"]["it-helper"]["grants"]["notion"]["databases"][0]["property_ids"]
-    failure = await check_grants_at_startup(
-        api, parse_agents_config(raw), logging.getLogger("test")
-    )
-    assert failure is not None
-    assert "agentos.check_grants" in failure
-
-
 def test_connector_rejects_grant_without_ids(agents):
     with pytest.raises(ConfigError):
         NotionConnector(make_fake_notion(), [names_only(agents)])
@@ -215,14 +216,29 @@ def test_anything_else_is_not_transient(error):
     assert not is_transient(error)
 
 
-async def test_a_failure_building_the_client_is_not_a_notion_outage(agents):
-    def no_client(tenant_id):
-        raise ConfigError("tenant 'acme': environment variable NOTION_TOKEN is not set")
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ConfigError("tenant 'acme': environment variable NOTION_TOKEN is not set"), ConfigError),
+        (ConnectionError("database is down"), GrantCheckUnavailable),
+        (psycopg.OperationalError("connection failed"), GrantCheckUnavailable),
+        (RuntimeError("a bug"), RuntimeError),
+    ],
+    ids=["setup-error", "store-down", "driver-outage", "bug"],
+)
+async def test_a_failure_resolving_the_client_keeps_setup_errors_and_maps_outages(
+    agents, error, expected
+):
+    """Fails if a setup error resolving the Notion client is reported as an outage, a store
+    outage surfaces as itself instead of the unavailable answer, or a bug is hidden."""
 
-    checker = NotionGrantChecker(no_client)
+    def resolve(tenant_id):
+        raise error
 
-    with pytest.raises(ConfigError, match="NOTION_TOKEN"):
-        await checker.check("acme", agents.agents["it-helper"])
+    with pytest.raises(expected) as err:
+        await NotionGrantChecker(resolve).check("acme", agents.agents["it-helper"])
+    if expected is GrantCheckUnavailable:
+        assert err.value.__cause__ is error
 
 
 async def test_an_unexpected_error_while_checking_propagates_as_itself(agents):
@@ -284,6 +300,25 @@ async def test_a_label_contained_in_the_live_title_is_not_flagged(agents, label,
     assert report.live_title == live_title
 
 
+@pytest.mark.parametrize(
+    ("container_title", "data_source_title"),
+    [("New database", "IT requests"), ("IT requests", None)],
+    ids=["container differs", "no data source"],
+)
+async def test_a_single_data_sources_title_is_the_live_title(
+    agents, container_title, data_source_title
+):
+    """Fails if a database whose container title differs from its single data source's title
+    shows the container's title instead of the name people see in Notion."""
+    api = make_fake_notion()
+    api.set_database_info(DB_ID, container_title, data_source_title=data_source_title)
+
+    [report] = await NotionGrantChecker(lambda t: api).check(TENANT, agents.agents["it-helper"])
+
+    assert report.live_title == "IT requests"
+    assert api.count("retrieve_data_source") == (1 if data_source_title is not None else 0)
+
+
 async def test_the_check_command_reads_published_definitions_from_the_database_not_the_yaml(
     agents, capsys
 ):
@@ -329,3 +364,19 @@ async def test_the_check_command_prints_property_ids_for_a_draft_before_it_is_pu
     assert code == 0
     assert "version 2" in out and "grant 'IT requests'" in out
     assert 'status: "stat1"' in out
+
+
+async def test_the_check_command_resolves_the_client_through_an_async_resolver(agents, capsys):
+    """Fails if the command cannot build the tenant's Notion client through a credential
+    resolver that reads the database (an async notion_for)."""
+    store = InMemoryAgentStore()
+    await make_published(store, "db-helper", helper_block())
+    api = make_fake_notion()
+
+    async def notion_for(config):
+        return api
+
+    code = await check_published(TenantsConfig.of(agents), store, notion_for)
+
+    assert code == 0
+    assert "agent 'db-helper'" in capsys.readouterr().out

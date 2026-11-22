@@ -5,9 +5,10 @@ deletes the row (the audit log keeps the history). There are four scopes:
 
 * ``agent``: one agent answers every turn with a fixed text and calls no model.
 * ``all_agents``: the same for every agent of the tenant.
-* ``connector``: one connector (Notion) is unavailable to the tenant. Its tool calls
-  return an error the model passes on, knowledge search refuses, indexing and
-  follow-up polling do nothing until it is back on.
+* ``connector``: one connector (Notion or Drive) is unavailable to the tenant. Its own
+  tool calls return an error the model passes on, knowledge search leaves out its
+  scopes, indexing and follow-up polling do nothing until it is back on. The platform's
+  own reads (``my_tasks``) answer to no connector switch; an agent switch still stops them.
 * ``writes``: read-only mode. Drafting still works; Submit is refused, and a write that
   was approved but has not run yet is refused too, so nothing is changed.
 
@@ -54,6 +55,7 @@ from agentos.agent_store import AgentNotFound, AgentStore
 from agentos.audit import AuditStore
 from agentos.config import TENANT_ID_PATTERN
 from agentos.models import AuditEvent
+from agentos.slack_format import escape_slack
 from agentos.stores import joined_transaction, tenant_transaction
 from agentos.unit_of_work import InMemoryUnitOfWork, PostgresUnitOfWork, UnitOfWork
 from agentos.usage import utcnow
@@ -67,13 +69,22 @@ WRITES = "writes"
 SCOPES = (AGENT, ALL_AGENTS, CONNECTOR, WRITES)
 
 NOTION = "notion"
-CONNECTORS = (NOTION,)
+DRIVE = "drive"
+CONNECTORS = (NOTION, DRIVE)
+
+# Knowledge search reads through both Notion and Drive, so its connector switch is checked
+# per scope inside the search activity (a Notion scope answers to the Notion switch, a Drive
+# scope to the Drive switch), not by mapping the whole tool to one connector here. The
+# platform connector reads the platform's own store and answers to no connector switch.
+READS_THROUGH: dict[str, str] = {}
 
 SWITCHED_OFF = "switched_off"
 
 
 def agent_off_text(agent_name: str) -> str:
-    return f"{agent_name} is turned off by an admin."
+    """The fixed reply of an agent an admin turned off. The name is escaped here, once;
+    callers pass it raw."""
+    return f"{escape_slack(agent_name)} is turned off by an admin."
 
 
 def agent_off_card_text(agent_name: str) -> str:
@@ -189,18 +200,22 @@ class SwitchState:
     def connector_off(self, connector: str) -> bool:
         return self._has(CONNECTOR, connector)
 
-    def refusal(self, agent_id: str, effect: Effect) -> Exception | None:
+    def refusal(self, agent_id: str, effect: Effect, connector: str = NOTION) -> Exception | None:
         """Why ``agent_id`` may not do ``effect`` now, or None. One read of the switches.
 
-        The agent switches stop every effect; ``writes`` stops a write; the connector
-        switch stops a read, a write and a poll.
+        The agent switches stop every effect; ``writes`` stops a write; a connector
+        switch stops a read, a write and a poll of its own connector (and of the
+        connectors that read through it). ``connector`` is the tool's manifest connector;
+        it defaults to Notion, the connector every effect went through before the
+        platform manifest existed.
         """
         if (stopped := self.agent_stopped_by(agent_id)) is not None:
             return AgentOff(stopped)
         if effect == Effect.WRITE and self.writes_off:
             return WritesOff(WRITE_REFUSED_TEXT)
-        if effect != Effect.MODEL and self.connector_off(NOTION):
-            return ConnectorOff(connector_off_text(NOTION))
+        connector = READS_THROUGH.get(connector, connector)
+        if effect != Effect.MODEL and self.connector_off(connector):
+            return ConnectorOff(connector_off_text(connector))
         return None
 
     def of(self, scope: str, target: str = "") -> Switch | None:

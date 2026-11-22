@@ -680,13 +680,18 @@ async def _real_lifespan(app: FastAPI):
     """Build the real dependencies when the server starts, not at import."""
     from psycopg_pool import AsyncConnectionPool
 
+    from agentos.agent_feedback import PostgresAgentFeedbackStore
+    from agentos.agent_health import PostgresAgentHealthStore
     from agentos.agent_store import PostgresAgentStore
+    from agentos.approval_policy import PostgresApprovalPolicyStore
     from agentos.audience import SlackAudienceInspector
     from agentos.audience_pauses import PostgresPauseStore
     from agentos.audit import PostgresAuditStore
     from agentos.budgets import PostgresBudgetStore
     from agentos.config import KEY_SOURCE_DB
+    from agentos.connectors.google_iam import GoogleError, accounts_from_settings
     from agentos.connectors.notion import RealNotionAPI
+    from agentos.creator_access import PostgresCreatorAccessStore
     from agentos.credentials import PostgresCredentialStore, TenantCredentials
     from agentos.crypto_keys import (
         TenantKeyError,
@@ -695,15 +700,19 @@ async def _real_lifespan(app: FastAPI):
         start_key_refresh,
         tenant_key_material,
     )
+    from agentos.drive_connections import PostgresDriveConnectionStore
     from agentos.grant_checker import NotionGrantChecker
     from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
+    from agentos.notion_webhook import PostgresWebhookTokenStore, WebhookTokens
     from agentos.schema_version import require_current_schema
     from agentos.sessions import PostgresSessionStore
     from agentos.slack_client import RealSlackPoster
     from agentos.switches import PostgresSwitchStore
+    from agentos.temporal_client import build_temporal_client
     from agentos.tenant_store import PostgresTenantStore, TenantDirectory, startup_tenants
     from agentos.tenants import require_tenant_secret
+    from agentos.test_sets import PostgresTestSetStore
     from agentos.unit_of_work import PostgresUnitOfWork
     from agentos.usage import PostgresUsageStore
 
@@ -714,7 +723,8 @@ async def _real_lifespan(app: FastAPI):
     key_refresh: asyncio.Task | None = None
     try:
         await require_current_schema(pool)
-        directory = TenantDirectory(PostgresTenantStore(pool))
+        tenant_store = PostgresTenantStore(pool)
+        directory = TenantDirectory(tenant_store)
         # A tenant with no Notion token is served Slack-only; its grant checks fail at
         # publish time with a message naming the variable, not at start-up.
         await startup_tenants(directory)
@@ -726,13 +736,31 @@ async def _real_lifespan(app: FastAPI):
         # refresh loads it (and every other new key) without a restart, as in the gateway.
         key_refresh = start_key_refresh(keys)
         credentials = TenantCredentials(PostgresCredentialStore(pool), keys)
-        apis: dict[str, RealNotionAPI] = {}
+        webhook_tokens = WebhookTokens(PostgresWebhookTokenStore(pool), keys)
+        # Drive (D-45): configured only with both deployment settings; a malformed key
+        # stops start-up with a plain message, never at the first click.
+        try:
+            google = accounts_from_settings(
+                settings.google_project_id, settings.google_service_account_key
+            )
+        except GoogleError as err:
+            raise SystemExit(str(err)) from err
+        drive = None if google is None else PostgresDriveConnectionStore(pool)
+        apis: dict[str, tuple[str, RealNotionAPI]] = {}
 
-        def notion_for(tenant_id: str) -> RealNotionAPI:
-            if tenant_id not in apis:
-                config = directory.latest().get(tenant_id)
-                apis[tenant_id] = RealNotionAPI(require_tenant_secret(config, "notion_token_env"))
-            return apis[tenant_id]
+        async def notion_for(tenant_id: str) -> RealNotionAPI:
+            # Built on first use and rebuilt when the credential changes (Connect Notion,
+            # a reconnect), as the Slack client is; a tenant with no token fails its own
+            # publish with a message naming the variable, not the whole console.
+            config = directory.latest().get(tenant_id)
+            token = await credentials.notion_token(config) or require_tenant_secret(
+                config, "notion_token_env"
+            )
+            entry = apis.get(tenant_id)
+            if entry is None or entry[0] != token:
+                entry = (token, RealNotionAPI(token))
+                apis[tenant_id] = entry
+            return entry[1]
 
         slack_clients: dict[str, tuple[str, RealSlackPoster]] = {}
 
@@ -751,6 +779,32 @@ async def _real_lifespan(app: FastAPI):
         def team_for(tenant_id: str) -> str:
             return directory.latest().get(tenant_id).slack_team_id
 
+        # Test runs start on Temporal's own queue. The client connects on the first run,
+        # so the console starts and serves every other page with Temporal down; a run
+        # started then fails with a message, and its row is closed as failed.
+        test_client = None
+
+        async def start_test_run(tenant_id: str, run_id: str) -> None:
+            nonlocal test_client
+            from temporalio.exceptions import WorkflowAlreadyStartedError
+
+            from agentos.config import TEST_TASK_QUEUE
+            from agentos.test_sets import RUN_LIMIT
+            from agentos.workflows.test_run import TestRunWorkflow
+
+            if test_client is None:
+                test_client = await build_temporal_client(settings, keys)
+            try:
+                await test_client.start_workflow(
+                    TestRunWorkflow.run,
+                    args=[tenant_id, run_id],
+                    id=run_id,
+                    task_queue=TEST_TASK_QUEUE,
+                    execution_timeout=RUN_LIMIT,
+                )
+            except WorkflowAlreadyStartedError:
+                pass  # a retried start finds the run already going
+
         app.state.deps.sessions = PostgresSessionStore(pool)
         app.state.deps.plane = ControlPlane(
             PostgresAgentStore(pool),
@@ -766,6 +820,18 @@ async def _real_lifespan(app: FastAPI):
             unit_of_work=PostgresUnitOfWork(pool),
             grant_picks=PostgresGrantPickStore(pool),
             require_grant_picker=settings.require_grant_picker,
+            credentials=credentials,
+            tenant_store=tenant_store,
+            webhook_tokens=webhook_tokens,
+            slack_for=slack_for,
+            health=PostgresAgentHealthStore(pool),
+            creator_access=PostgresCreatorAccessStore(pool),
+            feedback_reads=PostgresAgentFeedbackStore(pool),
+            policies=PostgresApprovalPolicyStore(pool),
+            test_sets=PostgresTestSetStore(pool),
+            start_test_run=start_test_run,
+            drive=drive,
+            google=google,
         )
         app.state.deps.tenants = directory
         if app.state.deps.console is not None:
@@ -794,6 +860,9 @@ async def _real_lifespan(app: FastAPI):
         if key_refresh is not None:
             key_refresh.cancel()
             await asyncio.gather(key_refresh, return_exceptions=True)
+        # The SDK's client has no close API; dropping the reference lets its bridge
+        # connection go with the console instead of outliving the lifespan.
+        test_client = None
         await pool.close()
 
 

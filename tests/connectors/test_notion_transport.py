@@ -81,3 +81,108 @@ async def test_a_successful_create_returns_the_page_and_sends_the_body():
     sent = json.loads(page_posts(requests)[0].content)
     assert sent["parent"] == {"type": "data_source_id", "data_source_id": "ds-1"}
     assert sent["children"] == children
+
+
+@pytest.mark.parametrize(
+    ("reply", "found"),
+    [
+        (
+            httpx.Response(
+                200,
+                json={
+                    "object": "data_source",
+                    "id": "ds-1",
+                    "title": [{"plain_text": "IT requests"}],
+                },
+            ),
+            True,
+        ),
+        (
+            httpx.Response(404, json=error_body("object_not_found", "Could not find data source")),
+            False,
+        ),
+    ],
+    ids=["success", "not shared"],
+)
+async def test_retrieve_data_source_reads_the_data_source_object(reply, found):
+    """Fails if retrieve_data_source does not read /v1/data_sources/{id}, or a Notion refusal
+    comes back as anything but the SDK's own error with its status."""
+    api, requests = api_with(lambda request: reply)
+
+    if found:
+        source = await api.retrieve_data_source("ds-1")
+        assert source["title"][0]["plain_text"] == "IT requests"
+    else:
+        with pytest.raises(APIResponseError) as err:
+            await api.retrieve_data_source("ds-1")
+        assert err.value.status == 404
+    assert [r.url.path for r in requests] == ["/v1/data_sources/ds-1"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "status", "code"),
+    [
+        ("database", 404, "object_not_found"),
+        ("page", 403, "restricted_resource"),
+        ("database", 401, "unauthorized"),
+    ],
+    ids=["database-gone", "page-unshared", "dead-token"],
+)
+async def test_a_creator_read_surfaces_notions_refusal_with_its_status(kind, status, code):
+    """Fails if the nightly creator read's 403/404/401 comes back as anything but the SDK's
+    own error with its status, so the check cannot tell a lost object from a dead token or a
+    transient failure."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json=error_body(code, "the creator cannot see it"))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = RealNotionAPI("creator-token", http_client=http)
+    object_id = DB if kind == "database" else "page-1"
+    read = api.retrieve_database if kind == "database" else api.retrieve_page
+
+    with pytest.raises(APIResponseError) as err:
+        await read(object_id)
+
+    assert err.value.status == status
+    assert requests[0].headers["authorization"] == "Bearer creator-token"
+    assert [r.url.path for r in requests] == [
+        f"/v1/databases/{DB}" if kind == "database" else "/v1/pages/page-1"
+    ]
+
+
+async def test_aclose_closes_the_creator_clients_connection_pool():
+    """Fails if the nightly pass's aclose leaves the creator client's HTTP pool open."""
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+    api = RealNotionAPI("creator-token", http_client=http)
+
+    await api.aclose()
+
+    assert http.is_closed
+
+
+@pytest.mark.parametrize("mention", [None, "user-1"], ids=["plain", "mention"])
+async def test_create_comment_sends_the_mention_as_a_user_object(mention):
+    """Fails if a mention comment does not open with a user mention object, or a plain one grows one."""
+    api, requests = api_with(
+        lambda request: httpx.Response(200, json={"object": "comment", "id": "c1"})
+    )
+
+    await api.create_comment("page-1", "Any update?", mention_user_id=mention)
+
+    [sent] = [
+        json.loads(r.content)
+        for r in requests
+        if r.method == "POST" and r.url.path == "/v1/comments"
+    ]
+    assert sent["parent"] == {"page_id": "page-1"}
+    if mention:
+        assert sent["rich_text"][0] == {
+            "type": "mention",
+            "mention": {"type": "user", "user": {"id": "user-1"}},
+        }
+        assert sent["rich_text"][1]["text"]["content"] == " Any update?"
+    else:
+        assert sent["rich_text"] == [{"type": "text", "text": {"content": "Any update?"}}]

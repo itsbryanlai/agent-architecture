@@ -33,6 +33,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from agentos.agent_health import UNAVAILABLE as HEALTH_UNAVAILABLE
+from agentos.agent_health import HealthStore, agent_unavailable_text
 from agentos.agent_store import AgentStore
 from agentos.audience_pauses import PauseStore
 from agentos.config import AgentsConfig, AgentVersion
@@ -56,6 +58,7 @@ DEACTIVATED = "deactivated"
 UNAVAILABLE = "unavailable"  # the lookups failed, so the asker was refused
 OFF = "off"  # an admin turned the agent off
 PAUSED = "paused"  # the agent is paused in this channel until its owner confirms the audience
+HEALTH = "health"  # the agent's grant check failed, so it is unavailable until a check passes
 
 
 @dataclass
@@ -190,11 +193,13 @@ class AudienceChecker:
         clock: Callable[[], float] = time.monotonic,
         pauses: PauseStore | None = None,
         switches: SwitchStore | None = None,
+        health: HealthStore | None = None,
     ):
         self._registry = registry
         self._agents = agents
         self._pauses = pauses
         self._switches = switches
+        self._health = health
         self._ttl = ttl
         self._clock = clock
         self._directories: dict[str, SlackDirectory] = {}
@@ -248,13 +253,25 @@ class AudienceChecker:
     ) -> list[AgentVersion]:
         """The agents among ``agents`` this asker may use here; a failed lookup keeps none.
 
-        An agent an admin turned off is never kept, so a thread is not offered to it.
+        An agent an admin turned off, or one whose grant check failed, is never kept,
+        so a thread is not offered to it.
         """
         published = await self._agents.published_all(tenant_id)
         state = None if self._switches is None else await read_state(self._switches, tenant_id)
+        unavailable = (
+            set()
+            if self._health is None
+            else {
+                h.agent_id
+                for h in await self._health.list(tenant_id)
+                if h.status == HEALTH_UNAVAILABLE
+            }
+        )
         kept = []
         for agent in agents:
             if state is not None and state.agent_stopped_by(agent.agent_id) is not None:
+                continue
+            if agent.agent_id in unavailable:
                 continue
             try:
                 decision = await self.decide(
@@ -322,7 +339,9 @@ def decision_text(agent_name: str, decision: AudienceDecision) -> str:
     if decision.reason == PAUSED:
         return paused_text(agent_name)
     if decision.reason == OFF:
-        return agent_off_text(escape_slack(agent_name))
+        return agent_off_text(agent_name)
+    if decision.reason == HEALTH:
+        return agent_unavailable_text(agent_name)
     return refusal_text(agent_name, decision.owner, decision.notify_owner)
 
 
@@ -338,7 +357,26 @@ class ChannelOutsideAudience(AudienceError):
 
 
 class AudienceNotConfirmed(AudienceError):
-    """The approver did not confirm the people who can reach the agent, or the people changed."""
+    """The approver did not confirm the people who can reach the agent, or the people changed.
+
+    The message is the API's machine-readable refusal. ``counts`` is the fresh count the
+    confirmation must match, ``place`` is ``agent`` for a publish or ``channel`` for a
+    resume, and ``changed`` says a confirmation was given but no longer matches; the
+    console renders its own sentence from these, never by rewriting the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        counts: dict[str, int] | None = None,
+        place: str = "agent",
+        changed: bool = False,
+    ):
+        super().__init__(message)
+        self.counts = counts
+        self.place = place
+        self.changed = changed
 
 
 class AudienceCheckUnavailable(AudienceError):

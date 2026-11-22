@@ -7,7 +7,8 @@ messages opened wider, guests let in. A widening publish needs the approver's
 acknowledgement (``ControlPlane.publish_version``), which names the published version the
 diff was computed against. With no published version to compare with, everything the version
 grants and every place it answers is new, so a first publish widens whenever it grants or
-reaches anything.
+reaches anything. An audience that closes direct messages to nobody says so plainly, with
+the way to keep them open; that is a narrowing, not a widening.
 """
 
 from __future__ import annotations
@@ -48,8 +49,18 @@ class AccessDiff:
         return any(c.widens for c in self.changes)
 
 
+_DRIVE_KIND_LABELS = {
+    "folder": "drive folder",
+    "file": "drive file",
+    "shared_drive": "drive shared drive",
+    "sheet": "drive sheet",
+    "template": "drive template",
+    "section": "drive section",
+}
+
+
 def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
-    """Normalised ID -> (kind, label, mapping) of every Notion grant."""
+    """Normalised ID -> (kind, label, mapping) of every Notion and Drive grant."""
     found: dict[str, tuple[str, str, tuple]] = {}
     for db in agent.grants.notion_databases:
         mapping = (
@@ -57,10 +68,26 @@ def _grants(agent: AgentVersion) -> dict[str, tuple[str, str, tuple]]:
             db.status_prop_id or db.status_prop,
             db.requested_by_prop_id or db.requested_by_prop,
             db.request_id_prop_id or db.request_id_prop,
+            db.assignee_prop_id or db.assignee_prop,
         )
         found[normalize_id(db.id)] = ("database", db.name, mapping)
     for page in agent.grants.notion_pages:
         found[normalize_id(page.id)] = ("page", page.name, ())
+    for grant in agent.grants.drive:
+        # A sheet's mapping is its tab and columns: pointing the append at another tab or
+        # other columns reads as "uses other properties", a widening the approver sees.
+        # A template's mapping is its folder, shared drive and blanks: another folder,
+        # drive or blanks reads the same way. A section's mapping is its Doc and heading:
+        # another Doc or heading reads the same way (D-50).
+        if grant.kind == "sheet":
+            mapping = (grant.tab, *grant.columns)
+        elif grant.kind == "template":
+            mapping = (grant.folder_id, grant.drive_id, *grant.blanks)
+        elif grant.kind == "section":
+            mapping = (grant.doc_id, grant.heading)
+        else:
+            mapping = ()
+        found[grant.id] = (_DRIVE_KIND_LABELS[grant.kind], grant.name, mapping)
     return found
 
 
@@ -100,7 +127,16 @@ def diff_access(
         changes.append(AccessChange("removed", f"channel {channel}", False))
     if new_audience.any_unmapped_channel and not old_audience.any_unmapped_channel:
         changes.append(AccessChange("added", "every channel the tenant file does not map", True))
-    if new_audience.dm_everyone != old_audience.dm_everyone:
+    dm_closed = not new_audience.dm_everyone and not new_audience.dm_user_groups
+    if dm_closed and (old_audience.dm_everyone or old_audience.dm_user_groups or not baseline):
+        # An audience that omits dm closes direct messages to nobody; say so plainly,
+        # with the way to keep them open, rather than as a technical comparison.
+        changes.append(
+            AccessChange(
+                "changed", "direct messages: nobody (add dm: everyone to keep them open)", False
+            )
+        )
+    elif new_audience.dm_everyone != old_audience.dm_everyone:
         wider = new_audience.dm_everyone
         changes.append(
             AccessChange(

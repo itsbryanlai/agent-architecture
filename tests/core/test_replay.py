@@ -13,7 +13,7 @@ from tests.helpers.replay_support import FIXTURES, load_fixture, replay
 NAMES = sorted(p.stem for p in FIXTURES.glob("*.json"))
 
 
-def test_there_are_fixtures_for_both_workflow_types_and_both_shapes():
+def test_there_are_fixtures_for_every_workflow_type_and_both_shapes():
     """Fails if the fixture directory is emptied or loses a workflow type, so replay checks nothing."""
     started = {
         load_fixture(FIXTURES / f"{n}.json")[0]
@@ -22,7 +22,13 @@ def test_there_are_fixtures_for_both_workflow_types_and_both_shapes():
         for n in NAMES
     }
 
-    assert started == {"ConversationWorkflow", "TaskWorkflow"}
+    assert started == {
+        "ConversationWorkflow",
+        "TaskWorkflow",
+        "CreatorAccessWorkflow",
+        "TestRunWorkflow",
+        "DriveIndexingWorkflow",
+    }
     assert any("_inline" in n for n in NAMES) and any("_stored" in n for n in NAMES)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from psycopg import errors
 
+from agentos.models import AUDIT_OUTCOMES
 from agentos.stores import tenant_transaction
 from tests.helpers.pg_seed import seed_version
 from tests.pg.conftest import TestDatabase
@@ -18,6 +19,8 @@ SEEDS = {
     "idempotency_records": "INSERT INTO idempotency_records (tenant_id, idem_key, value) "
     "VALUES (%(t)s, 'k', '{}')",
     "task_links": "INSERT INTO task_links (tenant_id, page_id, task_id) VALUES (%(t)s, 'p', 'k')",
+    "tasks": "INSERT INTO tasks (tenant_id, task_id, requester_user_id, agent_id, state, channel, "
+    "thread_ts) VALUES (%(t)s, 'k', 'u', 'aa', 'watching', 'C1', '1.1')",
     "tool_outputs": "INSERT INTO tool_outputs "
     "(tenant_id, conversation_id, tool_use_id, content, is_error) "
     "VALUES (%(t)s, 'c', 'u', 'x', false)",
@@ -36,6 +39,14 @@ SEEDS = {
     "agent_versions": "INSERT INTO agent_versions "
     "(tenant_id, agent_id, version, status, definition, created_by) "
     "VALUES (%(t)s, 'aa', 1, 'draft', '{}', 'u')",
+    "test_cases": "INSERT INTO test_cases "
+    "(tenant_id, agent_id, version, case_id, question, expect, target, seq, created_by) "
+    "VALUES (%(t)s, 'aa', 1, 'k', 'q', 'cite', 'n', 1, 'u')",
+    "test_runs": "INSERT INTO test_runs "
+    "(tenant_id, run_id, agent_id, version, status, started_by, definition_sha256, cases_sha256) "
+    "VALUES (%(t)s, 'k', 'aa', 1, 'running', 'u', "
+    "'0000000000000000000000000000000000000000000000000000000000000000', "
+    "'1111111111111111111111111111111111111111111111111111111111111111')",
     "members": "INSERT INTO members (tenant_id, user_id, role, added_by) "
     "VALUES (%(t)s, 'u', 'admin', 'u')",
     "sessions": "INSERT INTO sessions (tenant_id, session_hash, user_id, csrf_secret, expires_at) "
@@ -80,6 +91,20 @@ SEEDS = {
     "(tenant_id, version, wrapped_key, master_version) VALUES (%(t)s, 1, '\\x00', 1)",
     "tenant_credentials": "INSERT INTO tenant_credentials "
     "(tenant_id, kind, ciphertext, key_version) VALUES (%(t)s, 'slack_bot', '\\x00', 1)",
+    "agent_health": "INSERT INTO agent_health "
+    "(tenant_id, agent_id, agent_version, status, reason, checked_at) "
+    "VALUES (%(t)s, 'aa', 1, 'unavailable', 'grant g: problem', now())",
+    "creator_access": "INSERT INTO creator_access "
+    "(tenant_id, agent_id, notion_id, status, checked_at) "
+    "VALUES (%(t)s, 'aa', 'n', 'verified', now())",
+    "answer_feedback": "INSERT INTO answer_feedback "
+    "(tenant_id, conversation_id, answer_ts, voter, agent_id, agent_version, vote) "
+    "VALUES (%(t)s, 'c', 'a1', 'u', 'aa', 1, 'up')",
+    "approval_policies": "INSERT INTO approval_policies (tenant_id, action, policy) "
+    "VALUES (%(t)s, 'add_comment', 'none')",
+    "drive_connections": "INSERT INTO drive_connections "
+    "(tenant_id, service_account_email, status, connected_at) "
+    "VALUES (%(t)s, 'ag-x@test-project.iam.gserviceaccount.com', 'connected', now())",
 }
 
 # Tables only the owner writes (the app role has SELECT): seeded through the owner connection.
@@ -95,6 +120,7 @@ PRIVILEGES = {
     "conversation_messages": "SELECT INSERT UPDATE DELETE",
     "idempotency_records": "SELECT INSERT UPDATE DELETE",
     "task_links": "SELECT INSERT UPDATE DELETE",
+    "tasks": "SELECT INSERT UPDATE",
     "tool_outputs": "SELECT INSERT UPDATE DELETE",
     "knowledge_pages": "SELECT INSERT UPDATE DELETE",
     "knowledge_chunks": "SELECT INSERT UPDATE DELETE",
@@ -102,6 +128,8 @@ PRIVILEGES = {
     "audit_events": "SELECT INSERT",
     "agents": "SELECT INSERT",
     "agent_versions": "SELECT INSERT UPDATE",
+    "test_cases": "SELECT INSERT UPDATE DELETE",
+    "test_runs": "SELECT INSERT UPDATE",
     "members": "SELECT INSERT UPDATE DELETE",
     "sessions": "SELECT INSERT DELETE",
     "usage_events": "SELECT INSERT",
@@ -121,7 +149,12 @@ PRIVILEGES = {
     "task_drafts": "SELECT INSERT DELETE",
     "notion_webhook_tokens": "SELECT INSERT UPDATE DELETE",
     "tenant_payload_keys": "SELECT INSERT",
-    "tenant_credentials": "SELECT INSERT UPDATE",
+    "tenant_credentials": "SELECT INSERT UPDATE DELETE",
+    "agent_health": "SELECT INSERT UPDATE",
+    "creator_access": "SELECT INSERT UPDATE DELETE",
+    "answer_feedback": "SELECT INSERT UPDATE DELETE",
+    "approval_policies": "SELECT INSERT UPDATE",
+    "drive_connections": "SELECT INSERT UPDATE DELETE",
     "audit_kinds": "",
     "schema_migrations": "SELECT",
 }
@@ -378,6 +411,9 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
         ("answer", "aa", True),
         ("answer", None, False),
         ("agent_publish", None, False),
+        ("agent_health", None, False),
+        ("test_case", "aa", True),
+        ("test_run", None, False),
         *[
             (kind, None, True)
             for kind in (
@@ -390,6 +426,10 @@ async def test_updating_a_tenant_always_moves_updated_at(pool, tenant: str, chan
                 "webhook_token",
                 "payload_key",
                 "install",
+                "uninstall",
+                "connector",
+                "tenant_settings",
+                "policy_change",
             )
         ],
     ],
@@ -411,3 +451,23 @@ async def test_only_membership_budget_and_switch_events_may_name_no_agent(
         with pytest.raises(errors.CheckViolation):
             async with insert as conn:
                 await conn.execute(statement, args)
+
+
+@pytest.mark.parametrize("outcome", [*AUDIT_OUTCOMES, "maybe"])
+async def test_the_audit_log_accepts_exactly_the_outcomes_the_code_lists(
+    pool, tenant: str, outcome
+):
+    """Fails if the audit log refuses an outcome the code lists, or accepts one it does not."""
+    statement = (
+        "INSERT INTO audit_events (tenant_id, event_key, kind, agent_id, agent_version, "
+        "requester_user_id, identity, outcome) "
+        "VALUES (%s, 'e', 'write', 'aa', 1, 'u', 'agent:aa', %s)"
+    )
+    if outcome in AUDIT_OUTCOMES:
+        async with tenant_transaction(pool, tenant) as conn:
+            await conn.execute(statement, (tenant, outcome))
+        assert await count(pool, tenant, "audit_events", "outcome = %s", (outcome,)) == 1
+    else:
+        with pytest.raises(errors.CheckViolation):
+            async with tenant_transaction(pool, tenant) as conn:
+                await conn.execute(statement, (tenant, outcome))

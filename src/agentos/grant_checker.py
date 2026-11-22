@@ -2,29 +2,35 @@
 
 A grant names a Notion database and maps the agent's roles (title, status,
 requested by, request ID) to that database's properties. A mapping that does
-not match the live database makes the worker refuse to start, so the control
-plane checks every database grant of a version when an admin publishes it, and
-on request for an editor, and refuses a publish when any grant has a problem.
+not match the live database makes the agent unavailable, so the control plane
+checks every database grant of a version when an admin publishes it, and on
+request for an editor, and refuses a publish when any grant has a problem; the
+worker's health check (``agent_health.py``) re-checks published agents and
+disables one whose grants fail, never the whole worker.
 
 The check only reads: the schemas of the granted databases and the granted pages.
 A page grant must be readable and not trashed. A transient Notion failure (network
 error, rate limit, server error) is not a grant problem: it raises
-``GrantCheckUnavailable``, so a publish is refused for now but not judged. Any other
-failure (a tenant without its Notion key, a bug) is not a statement about Notion and
-propagates as itself. It uses the tenant's own Notion client, because agents run with
-tenant-level credentials.
+``GrantCheckUnavailable``, so a publish is refused for now but not judged. The same
+holds when the tenant's Notion client cannot be resolved right now (the credential
+store did not answer); a setup error while resolving it (no token, a credential that
+cannot be decrypted) keeps its own message. Any other failure (a bug) is not a
+statement about Notion and propagates as itself. It uses the tenant's own Notion
+client, because agents run with tenant-level credentials.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 import httpx
+import psycopg
 from notion_client.errors import RequestTimeoutError
 
-from agentos.config import AgentVersion
+from agentos.config import AgentVersion, ConfigError
 from agentos.connectors.notion import (
     LiveObject,
     NotionAPI,
@@ -183,7 +189,7 @@ class _ReadErrors:
 
 
 class NotionGrantChecker:
-    def __init__(self, api_for: Callable[[str], NotionAPI]):
+    def __init__(self, api_for: Callable[[str], NotionAPI | Awaitable[NotionAPI]]):
         self._api_for = api_for
 
     async def check(self, tenant_id: str, agent: AgentVersion) -> list[GrantReport]:
@@ -191,8 +197,20 @@ class NotionGrantChecker:
         pages = agent.grants.notion_pages
         if not grants and not pages:
             return []
-        # Outside the try: a missing key is a setup error, not a Notion outage.
-        api = self._api_for(tenant_id)
+        # A setup error (no token, an undecryptable credential) keeps its own message;
+        # a store that cannot be read right now is an outage, not a grant problem.
+        try:
+            api = self._api_for(tenant_id)
+            if inspect.isawaitable(api):
+                api = await api
+        except ConfigError:
+            raise
+        except Exception as err:
+            if is_transient(err) or isinstance(err, psycopg.OperationalError):
+                raise GrantCheckUnavailable(
+                    f"could not resolve the tenant's Notion client ({type(err).__name__})"
+                ) from err
+            raise
         try:
             return await self._reports(api, grants, pages)
         except Exception as err:

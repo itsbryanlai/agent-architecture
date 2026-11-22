@@ -91,6 +91,13 @@ def seed(db: TestDatabase, tenant: str, retention: str = "{}") -> None:
                 "VALUES (%s, %s, 'aa', %s)",
                 (tenant, thread, ago(at)),
             )
+        for voter, at in [("old", 400), ("young", 1)]:
+            c.execute(
+                "INSERT INTO answer_feedback "
+                "(tenant_id, conversation_id, answer_ts, voter, agent_id, agent_version, "
+                "vote, reason, at) VALUES (%s, 'c', 'a1', %s, 'aa', 1, 'down', 'why', %s)",
+                (tenant, voter, ago(at)),
+            )
         for asker, day in [
             ("long-ago", "2026-11-01"),
             ("yesterday", "2026-11-15"),
@@ -144,6 +151,7 @@ def remaining(db: TestDatabase, tenant: str) -> dict[str, set]:
         "inbound_events": "SELECT event_id FROM inbound_events",
         "threads": "SELECT thread_key FROM threads",
         "owner_pings": "SELECT asker_user_id FROM owner_pings",
+        "answer_feedback": "SELECT voter FROM answer_feedback",
         "idempotency": "SELECT idem_key FROM idempotency_records",
         "sessions": "SELECT session_hash FROM sessions",
         "external_writes": "SELECT idem_key FROM external_writes",
@@ -175,6 +183,7 @@ async def test_only_this_tenants_expired_rows_go_and_what_a_live_task_reads_stay
     assert after["task_drafts"] == {"open:1", "open:2"}  # a task edited a day ago is whole
     assert after["inbound_events"] == {"recent", "pending"}  # delivered long ago, edits too, go
     assert after["threads"] == {"active"} and after["owner_pings"] == {"yesterday", "today"}
+    assert after["answer_feedback"] == {"young"}  # the old vote and its reason go with the row
     assert after["idempotency"] == {"middle", "young"}  # younger than the longest task life
     assert after["sessions"] == {"just-expired", "valid"}
     assert after["external_writes"] == {"w"} and after["task_links"] == {"p"}
@@ -187,6 +196,7 @@ async def test_only_this_tenants_expired_rows_go_and_what_a_live_task_reads_stay
         2,
     )
     assert (total.threads, total.owner_pings) == (1, 1)
+    assert total.answer_feedback == 1
     assert remaining(db, other_tenant) == before_other
 
 
@@ -322,7 +332,7 @@ async def test_the_purge_command_deletes_the_tenants_expired_rows_and_prints_cou
     assert remaining(db, tenant)["idempotency"] == {"middle", "young"}
     assert capsys.readouterr().out.strip() == (
         f"tenant_id={tenant} messages=2 tool_outputs=1 idempotency=1 sessions=1 tool_inputs=1 "
-        "model_steps=1 inbound_events=2 task_drafts=2 threads=1 owner_pings=1"
+        "model_steps=1 inbound_events=2 task_drafts=2 threads=1 owner_pings=1 answer_feedback=1"
     )
 
 

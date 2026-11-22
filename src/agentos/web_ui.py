@@ -22,12 +22,12 @@ import hmac
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 import yaml
 from fastapi import FastAPI
@@ -37,10 +37,12 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos import ids
 from agentos.access_diff import WideningNotAcknowledged
+from agentos.agent_feedback import FEEDBACK_DAYS
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
-from agentos.audience import AudienceError
+from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
 from agentos.config import ConfigError
+from agentos.connectors.google_iam import MIME_DOC, DriveItem, GoogleError
 from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
@@ -85,6 +87,8 @@ from agentos.slack_signin import (
     read_session_cookie,
     session_cookie_value,
 )
+from agentos.test_sets import EXPECT_KINDS, EXPECT_LABELS
+from agentos.test_sets import REASON_TEXT as CASE_REASON_TEXT
 from agentos.usage import NO_TEAM
 
 log = logging.getLogger("agentos.web_ui")
@@ -118,6 +122,8 @@ NOTICES = {
     "rejected": "Rejected; the version is a draft again.",
     "published": "Published.",
     "picked": "Recorded. The objects you chose can now be granted in the definition.",
+    "consent-revoked": "Your Notion sign-in is no longer kept. The nightly check will show "
+    "your grants as cannot verify.",
     "resumed": "Resumed; the agent answers in that channel again.",
     "member-added": "Member added.",
     "member-role": "Role changed.",
@@ -126,6 +132,20 @@ NOTICES = {
     "budget-removed": "Budget removed.",
     "switch-off": "Turned off. It takes effect on the next step.",
     "switch-on": "Turned back on.",
+    "routing-saved": "Routing saved. Every process picks it up on its next refresh.",
+    "approval-policy-saved": "Approval policy saved. The next task reads it.",
+    "notion-connected": "Notion connected.",
+    "notion-disconnected": "Notion disconnected.",
+    "drive-connected": "Google Drive connected. Share folders and files with the address on this page.",
+    "drive-disconnected": "Google Drive disconnected. The organisation's account was deleted at Google.",
+    "drive-picked": "Google Drive grants added to the draft.",
+    "drive-removed": "Google Drive grant removed from the draft.",
+    "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
+    "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
+    "case-added": "Test case added to the draft. Choose its expected behaviour.",
+    "case-expect": "Expected behaviour saved.",
+    "case-removed": "Test case removed.",
+    "test-run": "Test run started. Its results appear on this page when it finishes.",
 }
 
 # What the version page shows after a refused publish. Like NOTICES, the redirect
@@ -169,6 +189,11 @@ def recent_months(now: datetime, count: int = 12) -> list[str]:
     return [f"{(i // 12):04d}-{(i % 12) + 1:02d}" for i in range(index, index - count, -1)]
 
 
+def _feedback_days(raw: str) -> int:
+    """The feedback window the query asked for: one of the fixed choices, else the default."""
+    return int(raw) if raw.isdigit() and int(raw) in FEEDBACK_DAYS else FEEDBACK_DAYS[0]
+
+
 # --- definitions as YAML text ----------------------------------------------------------
 
 
@@ -204,13 +229,15 @@ def parse_definition(text: str) -> dict[str, Any]:
     return parsed
 
 
-def grant_rows(agent, review) -> list[dict[str, Any]]:
+def grant_rows(agent, review, creator_access=None) -> list[dict[str, Any]]:
     """The version's grants as table rows: the creator's label and ID, who picked each from
-    Notion, and (for an admin, on a draft or pending version) the live title and parent."""
+    Notion, the nightly creator-access verdict, and (for an admin, on a draft or pending
+    version) the live title and parent."""
     live = {}
     if review is not None and review.reports:
         live = {normalize_id(r.database_id): r for r in review.reports}
     picks = {} if review is None else review.picks
+    access = {} if creator_access is None else creator_access
     rows = []
     for kind, grant in (
         *(("database", g) for g in agent.grants.notion_databases),
@@ -224,6 +251,7 @@ def grant_rows(agent, review) -> list[dict[str, Any]]:
                 "id": grant.id,
                 "pick": picks.get(key),
                 "live": live.get(key),
+                "access": access.get(key),
             }
         )
     return rows
@@ -286,6 +314,7 @@ class WebUI:
         self.route("GET", base + "/agents", self.agents)
         self.route("POST", base + "/agents", self.add_agent)
         self.route("GET", agent, self.agent)
+        self.route("GET", agent + "/feedback", self.feedback)
         self.route("POST", agent + "/channels/{channel}/resume", self.resume_channel)
         self.route("POST", agent + "/drafts", self.new_draft)
         self.route("GET", version, self.version)
@@ -294,6 +323,21 @@ class WebUI:
         self.route("POST", version + "/pick/start", self.pick_start)
         self.route("GET", version + "/pick", self.pick_page)
         self.route("POST", version + "/pick/choose", self.pick_choose)
+        self.route("POST", version + "/pick/revoke", self.pick_revoke)
+        self.route("GET", version + "/drive/pick", self.drive_pick_page)
+        self.route("POST", version + "/drive/pick/choose", self.drive_pick_choose)
+        self.route("GET", version + "/drive/pick/tabs", self.drive_tab_page)
+        self.route("POST", version + "/drive/pick/tabs", self.drive_tab_choose)
+        self.route("GET", version + "/drive/pick/template", self.drive_template_page)
+        self.route("POST", version + "/drive/pick/template", self.drive_template_choose)
+        self.route("GET", version + "/drive/pick/section", self.drive_section_page)
+        self.route("POST", version + "/drive/pick/section", self.drive_section_choose)
+        self.route("POST", version + "/drive/remove", self.drive_remove)
+        self.route("POST", version + "/test-cases", self.add_test_case)
+        self.route("POST", version + "/test-cases/{case_id}/expect", self.set_case_expect)
+        self.route("POST", version + "/test-cases/{case_id}/remove", self.remove_test_case)
+        self.route("POST", version + "/test-run", self.run_tests)
+        self.route("POST", agent + "/test-cases", self.case_from_feedback)
         app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
@@ -308,6 +352,17 @@ class WebUI:
         self.route("GET", base + "/switches", self.switches)
         self.route("POST", base + "/switches/off", self.turn_off)
         self.route("POST", base + "/switches/on", self.turn_on)
+        self.route("GET", base + "/settings", self.settings)
+        self.route("POST", base + "/settings/routing", self.set_routing)
+        self.route("POST", base + "/settings/approvals", self.set_approval_policy)
+        self.route("POST", base + "/settings/notion/start", self.notion_connect_start)
+        self.route("POST", base + "/settings/notion/disconnect", self.notion_disconnect)
+        self.route("POST", base + "/settings/drive/connect", self.drive_connect)
+        self.route("POST", base + "/settings/drive/disconnect", self.drive_disconnect)
+        self.route("POST", base + "/settings/webhook/reveal", self.webhook_reveal)
+        self.route("POST", base + "/settings/webhook/confirm", self.webhook_confirm)
+        self.route("POST", base + "/settings/webhook/clear", self.webhook_clear)
+        app.add_route("/static/console.js", self.console_js, methods=["GET"])
         if self.deps.console is not None:
             # Public pages: the install runs before any tenant (or session) exists.
             app.add_route(INSTALL_PATH, self.install_page, methods=["GET"])
@@ -419,20 +474,25 @@ class WebUI:
         err: Exception,
         back: str | None = None,
         rerender: Callable[[int, str], Awaitable[Response]] | None = None,
+        message: str | None = None,
     ) -> Response:
-        """A refusal as a page: the control plane's message with the status the API maps."""
+        """A refusal as a page: the control plane's message with the status the API maps.
+
+        ``message`` overrides the text when the console words a refusal itself.
+        """
         status = status_of(err)
         status = None if status is None else page_status(status)
         if status is None:
             log.error("console error: %s", type(err).__name__)
             return _message("Something went wrong", "Internal error.", 500, ctx, back)
+        text = str(err) if message is None else message
         if rerender is not None:
             try:
-                return await rerender(status, str(err))
+                return await rerender(status, text)
             except AgentNotFound:
                 # The page to show again is one this person may not read.
                 pass
-        return _message(_TITLES.get(status, "Refused"), str(err), status, ctx, back)
+        return _message(_TITLES.get(status, "Refused"), text, status, ctx, back)
 
     def base(self, ctx: Ctx) -> str:
         return f"/ui/{quote(ctx.tenant_id, safe='')}"
@@ -627,6 +687,7 @@ class WebUI:
             status,
             ctx=ctx,
             agents=agents,
+            health=await ctx.plane.agent_health(ctx.tenant_id, ctx.principal),
             error=error,
             notice=notice,
             new_id=ctx.get("agent_id"),
@@ -696,6 +757,21 @@ class WebUI:
     async def paused_of(ctx: Ctx, agent_id: str):
         return await ctx.plane.paused_channels(ctx.tenant_id, ctx.principal, agent_id)
 
+    async def feedback(self, request: Request, ctx: Ctx, agent_id: str) -> Response:
+        """The agent's feedback page: its creator and admins, never who asked or voted."""
+        days = _feedback_days(request.query_params.get("days", ""))
+        view = await ctx.plane.agent_feedback(ctx.tenant_id, ctx.principal, agent_id, days)
+        return _page(
+            "feedback.html",
+            ctx=ctx,
+            view=view,
+            agent_id=agent_id,
+            days=days,
+            days_choices=FEEDBACK_DAYS,
+            base=self.base(ctx),
+            agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
+        )
+
     async def resume_channel(self, request: Request, ctx: Ctx, agent_id: str, channel: str):
         try:
             await ctx.plane.resume_channel(
@@ -711,7 +787,9 @@ class WebUI:
             async def again(status: int, message: str) -> Response:
                 return await self.agent_page(request, ctx, agent_id, status, message)
 
-            return await self.failure(request, ctx, err, rerender=again)
+            return await self.failure(
+                request, ctx, err, rerender=again, message=_console_refusal(err)
+            )
         return _redirect(f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}?done=resumed")
 
     async def owner_of(self, ctx: Ctx, agent_id: str) -> str | None:
@@ -775,6 +853,26 @@ class WebUI:
             else None
         )
         picker = self.deps.picker
+        may_see_access = picker is not None and (editor or ctx.is_admin)
+        creator_access = (
+            await ctx.plane.creator_access_view(ctx.tenant_id, ctx.principal, agent_id)
+            if may_see_access
+            else {}
+        )
+        creator_consented = (
+            await ctx.plane.creator_consent(ctx.tenant_id, ctx.principal)
+            if may_see_access
+            else False
+        )
+        cases = await ctx.plane.test_cases(ctx.tenant_id, ctx.principal, agent_id, version)
+        run_review = await ctx.plane.test_run_review(
+            ctx.tenant_id, ctx.principal, agent_id, version
+        )
+        drive_configured = drive_connected = False
+        if editor or ctx.is_admin:
+            drive_configured, drive_connected = await ctx.plane.drive_connection_state(
+                ctx.tenant_id, ctx.principal
+            )
         return _page(
             "version.html",
             status,
@@ -782,9 +880,13 @@ class WebUI:
             record=record,
             audience=audience,
             review=review,
-            grant_rows=grant_rows(record.agent(), review),
+            grant_rows=grant_rows(record.agent(), review, creator_access),
+            drive_grants=record.agent().grants.drive,
+            drive_configured=drive_configured,
+            drive_connected=drive_connected,
             widens=bool(review and review.diff and review.diff.widens),
             picker_enabled=picker is not None,
+            creator_consented=creator_consented,
             paused=await self.paused_of(ctx, agent_id) if editor or ctx.is_admin else [],
             definition=text if text is not None else definition_text(record.definition),
             editor=editor,
@@ -794,6 +896,11 @@ class WebUI:
             notice=notice,
             reports=reports,
             grants_ok=None if reports is None else all(r.ok for r in reports),
+            cases=cases,
+            run_review=run_review,
+            expect_kinds=EXPECT_KINDS,
+            expect_labels=EXPECT_LABELS,
+            case_reason=CASE_REASON_TEXT,
             base=self.base(ctx),
             agent_url=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}",
             version_url=self.version_url(ctx, agent_id, version),
@@ -820,6 +927,108 @@ class WebUI:
 
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.version_url(ctx, agent_id, version, "saved"))
+
+    # --- test sets --------------------------------------------------------------------
+
+    async def add_test_case(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            await ctx.plane.add_test_case(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                ctx.get("question"),
+                ctx.get("expect"),
+                ctx.get("target"),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-added"))
+
+    async def set_case_expect(
+        self, request: Request, ctx: Ctx, agent_id: str, version: int, case_id: str
+    ):
+        try:
+            await ctx.plane.set_case_expect(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                case_id,
+                ctx.get("expect"),
+                ctx.get("target"),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-expect"))
+
+    async def remove_test_case(
+        self, request: Request, ctx: Ctx, agent_id: str, version: int, case_id: str
+    ):
+        try:
+            await ctx.plane.remove_test_case(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                case_id,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "case-removed"))
+
+    async def run_tests(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            await ctx.plane.run_tests(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "test-run"))
+
+    async def case_from_feedback(self, request: Request, ctx: Ctx, agent_id: str):
+        """The feedback page's "Make a test case": the row's question onto the next draft."""
+        raw = ctx.get("question_seq")
+        try:
+            draft = await ctx.plane.make_test_case_from_feedback(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                ctx.get("conversation_id"),
+                int(raw) if raw.isdigit() else 0,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+            return await self.failure(
+                request,
+                ctx,
+                err,
+                back=f"{self.base(ctx)}/agents/{quote(agent_id, safe='')}/feedback",
+            )
+        return _redirect(self.version_url(ctx, agent_id, draft.version, "case-added"))
 
     async def notion_down(
         self, request: Request, ctx: Ctx, agent_id: str, version: int
@@ -850,7 +1059,11 @@ class WebUI:
         if picker is None:
             return _message("Not available", "Choosing from Notion is not set up.", 404, ctx)
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
-        state = picker.sessions.begin(self.picker_flow(request, ctx, agent_id, version), ctx.now)
+        flow = replace(
+            self.picker_flow(request, ctx, agent_id, version),
+            consent=ctx.get("consent") == "yes",
+        )
+        state = picker.sessions.begin(flow, ctx.now)
         return _redirect(notion_authorize_url(picker.config, self.deps.console.sign_in, state))
 
     async def notion_callback(self, request: Request) -> Response:
@@ -871,14 +1084,18 @@ class WebUI:
         )
         if not mine or flow is None:
             return _message("Could not sign in", "That Notion sign-in is not valid.", 400)
+        if flow.purpose == "connect":
+            return await self.notion_connect_callback(request, flow)
         back = self.version_url_for(flow)
         code = request.query_params.get("code", "")
         if request.query_params.get("error") or not code:
             return _redirect(back)
+        redirect_uri = picker.config.redirect_uri(self.deps.console.sign_in)
         try:
-            objects = await picker.oauth.list_visible(
-                code, picker.config.redirect_uri(self.deps.console.sign_in)
-            )
+            if flow.consent:
+                objects, token = await picker.oauth.list_and_keep(code, redirect_uri)
+            else:
+                objects = await picker.oauth.list_visible(code, redirect_uri)
         except NotionPickerError as err:
             log.warning("notion picker failed: %s", err)
             return _message(
@@ -886,6 +1103,32 @@ class WebUI:
                 "Couldn't list your Notion pages just now. Try again.",
                 page_status(502),
             )
+        if flow.consent:
+            try:
+                await self.deps.plane.store_creator_consent(flow.tenant_id, flow.user_id, token)
+            except Forbidden as err:
+                return _message("Not allowed", str(err), 403, back=back)
+            except ConfigError as err:
+                return _message("Not possible now", str(err), 409, back=back)
+            except TenantKeyError:
+                log.warning("notion consent refused tenant_id=%s: key unavailable", flow.tenant_id)
+                return _message(
+                    "Not available",
+                    "This organisation's encryption key is not available yet. Try again in a moment.",
+                    503,
+                    back=back,
+                )
+        else:
+            # The consent box is a per-pick choice: completing a re-pick with it unticked
+            # revokes the sign-in a former pick kept. Nothing stored revokes nothing, and
+            # a console that cannot keep sign-ins has nothing to revoke.
+            try:
+                if await self.deps.plane.creator_consent(flow.tenant_id, flow.user_id):
+                    await self.deps.plane.revoke_creator_consent(flow.tenant_id, flow.user_id)
+            except Forbidden as err:
+                return _message("Not allowed", str(err), 403, back=back)
+            except ConfigError as err:
+                return _message("Not possible now", str(err), 409, back=back)
         picker.sessions.store(flow, objects, now)
         return _redirect(back + "/pick")
 
@@ -929,6 +1172,311 @@ class WebUI:
         picker.sessions.drop(flow)
         return _redirect(self.version_url(ctx, agent_id, version, "picked"))
 
+    async def pick_revoke(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """Stop keeping the signed-in creator's Notion sign-in; the token is deleted."""
+        try:
+            changed = await ctx.plane.revoke_creator_consent(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.version_page(
+                request,
+                ctx,
+                agent_id,
+                version,
+                409,
+                "Nothing is stored to revoke: you have not kept your Notion sign-in.",
+            )
+        return _redirect(self.version_url(ctx, agent_id, version, "consent-revoked"))
+
+    # --- Choose from Google Drive -----------------------------------------------------
+    # The workspace's Drive account, not a per-creator sign-in: the picker lists what the
+    # account can see and a click grants it. The admin's approval at publish is the check.
+
+    async def drive_pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        return _page(
+            "drive_pick.html",
+            ctx=ctx,
+            listing=listing,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=self.version_url(ctx, agent_id, version),
+        )
+
+    async def drive_pick_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        # Only a position in the listing the workspace's account produced can be chosen.
+        chosen = [item for i, item in enumerate(listing.items) if ctx.get(f"pick_{i}") == "yes"]
+        sheets = [item for item in chosen if item.kind == "sheet"]
+        others = [item for item in chosen if item.kind != "sheet"]
+        if others:
+            await ctx.plane.add_drive_grants(
+                ctx.tenant_id, ctx.user_id, agent_id, version, others, _form_request_id(ctx)
+            )
+        if not sheets:
+            return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+        # A Sheet is granted for one tab: the next step reads its tabs and asks which one.
+        query = urlencode([("sheet", item.id) for item in sheets])
+        return _redirect(f"{back}/drive/pick/tabs?{query}")
+
+    async def drive_tab_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The tab step: each chosen Sheet with its live tab titles, one pick per Sheet."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            wanted = request.query_params.getlist("sheet")
+            sheets = []
+            for item in listing.items:
+                if item.kind != "sheet" or item.id not in wanted:
+                    continue
+                tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, item.id)
+                sheets.append({"item": item, "tabs": tabs})
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        if not sheets:
+            return _message(
+                "Choose again",
+                "Pick a Sheet from the Drive list first.",
+                409,
+                ctx,
+                back=back,
+            )
+        return _page(
+            "drive_tabs.html",
+            ctx=ctx,
+            sheets=sheets,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
+        )
+
+    async def drive_tab_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        by_id = {item.id: item for item in listing.items if item.kind == "sheet"}
+        chosen: list[DriveItem] = []
+        i = 0
+        while sheet_id := ctx.get(f"sheet_id_{i}"):
+            item = by_id.get(sheet_id)
+            if item is None:
+                return _message(
+                    "Choose again",
+                    "That Sheet is no longer in the workspace's Drive list. Choose from "
+                    "Google Drive again.",
+                    409,
+                    ctx,
+                    back=back,
+                )
+            try:
+                tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, sheet_id)
+            except GoogleError as err:
+                return _message(
+                    "Google Drive unavailable", str(err), page_status(502), ctx, back=back
+                )
+            # Only a position in the tab list the account's read produced can be chosen.
+            position = ctx.get(f"tab_{i}")
+            if not position.isdigit() or int(position) >= len(tabs):
+                return _message("Choose again", "Pick a tab for each Sheet.", 409, ctx, back=back)
+            chosen.append(
+                DriveItem(
+                    id=item.id,
+                    name=item.name,
+                    link=item.link,
+                    kind="sheet",
+                    tab=tabs[int(position)],
+                )
+            )
+            i += 1
+        if chosen:
+            await ctx.plane.add_drive_grants(
+                ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+            )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_template_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The template step: pick a granted Doc as the template and a folder as the
+        destination of the new Docs (D-49). Only Docs and shared-drive folders the account
+        sees are offered: a destination outside a shared drive cannot hold a new Doc."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        templates = [item for item in listing.items if item.mime_type == MIME_DOC]
+        folders = [item for item in listing.items if item.kind == "folder" and item.drive_id]
+        return _page(
+            "drive_template.html",
+            ctx=ctx,
+            templates=templates,
+            folders=folders,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
+        )
+
+    async def drive_template_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        # Only a position in the listing the workspace's account produced can be chosen.
+        template = next(
+            (i for i in listing.items if i.id == ctx.get("template") and i.mime_type == MIME_DOC),
+            None,
+        )
+        folder = next(
+            (
+                i
+                for i in listing.items
+                if i.id == ctx.get("folder") and i.kind == "folder" and i.drive_id
+            ),
+            None,
+        )
+        if template is None or folder is None:
+            return _message(
+                "Choose again",
+                "Pick a template Doc and a destination folder from the Drive list.",
+                409,
+                ctx,
+                back=back,
+            )
+        chosen = [
+            DriveItem(
+                id=template.id,
+                name=template.name,
+                link=template.link,
+                kind="template",
+                folder_id=folder.id,
+            )
+        ]
+        await ctx.plane.add_drive_grants(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_section_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The section step's first page: pick a granted Doc to replace a section of (D-50).
+        Only Docs the account sees are offered; the next step reads the chosen Doc's headings."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        docs = [item for item in listing.items if item.mime_type == MIME_DOC]
+        return _page(
+            "drive_section.html",
+            ctx=ctx,
+            docs=docs,
+            agent_id=agent_id,
+            version=version,
+            base=self.base(ctx),
+            version_url=back,
+        )
+
+    async def drive_section_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        """The section step: read the chosen Doc's headings once and offer them (or a typed
+        name); the chosen heading creates the section grant. A Doc already granted to the
+        agent (a read file) shows a plain message: a Doc is granted once across kinds (D-50)."""
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        back = self.version_url(ctx, agent_id, version)
+        try:
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        doc = next(
+            (i for i in listing.items if i.id == ctx.get("doc") and i.mime_type == MIME_DOC),
+            None,
+        )
+        if doc is None:
+            return _message("Choose again", "Pick a Doc from the Drive list.", 409, ctx, back=back)
+        record = await ctx.plane.get_version(ctx.tenant_id, ctx.principal, agent_id, version)
+        if record is not None and any(g.id == doc.id for g in record.agent().grants.drive):
+            return _message(
+                "Already granted",
+                f"'{doc.name}' is already granted to this agent. A Doc is granted once; "
+                "remove its read grant first to replace a section of it.",
+                409,
+                ctx,
+                back=back,
+            )
+        try:
+            headings = await ctx.plane.drive_doc_headings(ctx.tenant_id, ctx.principal, doc.id)
+        except GoogleError as err:
+            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+        typed = ctx.get("heading_text").strip()
+        position = ctx.get("heading_pos")
+        heading = ""
+        if typed:
+            heading = typed
+        elif position.isdigit() and int(position) < len(headings):
+            heading = headings[int(position)]
+        if not heading:
+            # No heading chosen yet: show the Doc's headings (one read) and a type-it field.
+            return _page(
+                "drive_section_heading.html",
+                ctx=ctx,
+                doc=doc,
+                headings=headings,
+                agent_id=agent_id,
+                version=version,
+                base=self.base(ctx),
+                version_url=back,
+            )
+        chosen = [
+            DriveItem(
+                id=doc.id,
+                name=doc.name,
+                link=doc.link,
+                kind="section",
+                heading=heading,
+            )
+        ]
+        await ctx.plane.add_drive_grants(
+            ctx.tenant_id, ctx.user_id, agent_id, version, chosen, _form_request_id(ctx)
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
+
+    async def drive_remove(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
+        await ctx.plane.remove_drive_grant(
+            ctx.tenant_id,
+            ctx.user_id,
+            agent_id,
+            version,
+            ctx.get("grant_id"),
+            _form_request_id(ctx),
+        )
+        return _redirect(self.version_url(ctx, agent_id, version, "drive-removed"))
+
     async def move_version(self, request: Request, ctx: Ctx, agent_id: str, version: int, action):
         plane = ctx.plane
         moves = {
@@ -959,7 +1507,9 @@ class WebUI:
             )
         except (AudienceError, WideningNotAcknowledged, GrantNotPicked) as err:
             status = page_status(status_of(err) or 409)
-            return await self.version_page(request, ctx, agent_id, version, status, str(err))
+            return await self.version_page(
+                request, ctx, agent_id, version, status, _console_refusal(err) or str(err)
+            )
         except GrantProblems as err:
             return await self.version_page(
                 request, ctx, agent_id, version, 409, str(err), reports=err.reports
@@ -1093,6 +1643,234 @@ class WebUI:
         )
         return _redirect(self.base(ctx) + "/switches?done=switch-on")
 
+    # --- tenant settings --------------------------------------------------------
+
+    async def settings(self, request: Request, ctx: Ctx) -> Response:
+        return await self.settings_page(request, ctx, notice=self.notice(request))
+
+    async def settings_page(
+        self,
+        request: Request,
+        ctx: Ctx,
+        status: int = 200,
+        error: str | None = None,
+        notice: str | None = None,
+        webhook_token: str | None = None,
+    ) -> Response:
+        """The admin settings page. ``webhook_token`` is shown once, after a reveal."""
+        view = await ctx.plane.tenant_settings(ctx.tenant_id, ctx.principal)
+        return _page(
+            "settings.html",
+            status,
+            ctx=ctx,
+            view=view,
+            picker_enabled=self.deps.picker is not None,
+            webhook_token=webhook_token,
+            error=error,
+            notice=notice,
+            base=self.base(ctx),
+        )
+
+    async def set_routing(self, request: Request, ctx: Ctx) -> Response:
+        """The routing form: a select per mapped channel, one row to add a mapping."""
+        try:
+            channels = {
+                name[len("route_") :]: value
+                for name, value in ctx.form.items()
+                if name.startswith("route_") and value
+            }
+            new_channel = ctx.get("new_channel").strip()
+            if new_channel:
+                new_agent = ctx.get("new_agent").strip()
+                if not new_agent:
+                    raise ConfigError("pick an agent for the channel you are adding")
+                if new_channel in channels:
+                    raise ConfigError(
+                        f"channel '{new_channel}' is already mapped; change it in the table"
+                    )
+                channels[new_channel] = new_agent
+            await ctx.plane.set_tenant_routing(
+                ctx.tenant_id,
+                ctx.user_id,
+                ctx.get("default_agent").strip() or None,
+                channels,
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=routing-saved")
+
+    async def set_approval_policy(self, request: Request, ctx: Ctx) -> Response:
+        """One low-risk action's approval switch; the control plane checks the role."""
+        try:
+            await ctx.plane.set_approval_policy(
+                ctx.tenant_id,
+                ctx.user_id,
+                ctx.get("action").strip(),
+                ctx.get("policy").strip(),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=approval-policy-saved")
+
+    async def notion_connect_start(self, request: Request, ctx: Ctx) -> Response:
+        """Begin Connect Notion: the picker's state mechanism, purpose ``connect``."""
+        picker = self.deps.picker
+        if picker is None:
+            return _message(
+                "Not available", "Connecting Notion is not set up on this console.", 404, ctx
+            )
+        await ctx.plane.require_settings_admin(ctx.tenant_id, ctx.principal)
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        token = parsed[1] if parsed else ""
+        flow = Flow(ctx.tenant_id, ctx.user_id, session_hash(token), "", 0, purpose="connect")
+        state = picker.sessions.begin(flow, ctx.now)
+        return _redirect(
+            notion_authorize_url(picker.config, self.deps.console.sign_in, state, owner="workspace")
+        )
+
+    async def notion_connect_callback(self, request: Request, flow: Flow) -> Response:
+        """Notion sent the browser back from a workspace authorization."""
+        back = f"/ui/{quote(flow.tenant_id, safe='')}/settings"
+        query = request.query_params
+        code = query.get("code", "")
+        if query.get("error") or not code or len(code) > 1024:
+            return _redirect(back)
+        picker = self.deps.picker
+        try:
+            grant = await picker.oauth.connect_workspace(
+                code, picker.config.redirect_uri(self.deps.console.sign_in)
+            )
+        except NotionPickerError as err:
+            log.warning("notion connect failed tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Notion unavailable",
+                "Couldn't connect Notion just now. Nothing was changed; try again.",
+                page_status(502),
+                back=back,
+            )
+        try:
+            await self.deps.plane.connect_notion(flow.tenant_id, flow.user_id, grant)
+        except Forbidden as err:
+            return _message("Not allowed", str(err), 403, back=back)
+        except ConfigError as err:
+            return _message("Not possible now", str(err), 409, back=back)
+        except TenantKeyError as err:
+            log.warning("notion connect refused tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Not available",
+                "This organisation's encryption key is not available yet. Try again in a moment.",
+                503,
+                back=back,
+            )
+        return _redirect(back + "?done=notion-connected")
+
+    async def notion_disconnect(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            changed = await ctx.plane.disconnect_notion(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.settings_page(
+                request,
+                ctx,
+                409,
+                "Nothing is stored to disconnect: Notion is not connected in the console. "
+                "The environment variable, if set, is unchanged.",
+            )
+        return _redirect(self.base(ctx) + "/settings?done=notion-disconnected")
+
+    async def drive_connect(self, request: Request, ctx: Ctx) -> Response:
+        """Connect Google Drive: the control plane creates the tenant's account and checks
+        the role; a Google failure shows on the settings page with nothing stored."""
+        try:
+            await ctx.plane.connect_drive(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=drive-connected")
+
+    async def drive_disconnect(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            changed = await ctx.plane.disconnect_drive(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        if not changed:
+            return await self.settings_page(
+                request, ctx, 409, "Nothing is stored to disconnect: Google Drive is not connected."
+            )
+        return _redirect(self.base(ctx) + "/settings?done=drive-disconnected")
+
+    async def webhook_reveal(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            token = await ctx.plane.reveal_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return await self.settings_page(request, ctx, webhook_token=token)
+
+    async def webhook_confirm(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            await ctx.plane.confirm_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=webhook-confirmed")
+
+    async def webhook_clear(self, request: Request, ctx: Ctx) -> Response:
+        try:
+            await ctx.plane.clear_webhook_token(
+                ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.settings_page(request, ctx, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.base(ctx) + "/settings?done=webhook-cleared")
+
+    async def console_js(self, request: Request) -> Response:
+        """The one script the pages use (the Copy button). Served from our own origin,
+        which the Content-Security-Policy allows; the pages carry no inline script."""
+        return Response(CONSOLE_JS, media_type="application/javascript; charset=utf-8")
+
     async def usage_csv(self, request: Request, ctx: Ctx) -> Response:
         """The page's aggregates as a download. It only reads, so it is a GET."""
         month = request.query_params.get("month") or None
@@ -1106,6 +1884,28 @@ class WebUI:
 
 NOTION_DOWN = "Couldn't reach Notion just now; nothing was changed. Try again."
 
+# The Copy button on the settings page: copy the named element's text, or select it
+# when the clipboard is not available (plain http on a non-loopback host).
+CONSOLE_JS = """\
+document.addEventListener("click", function (event) {
+  var button = event.target.closest("[data-copy]");
+  if (!button) { return; }
+  var source = document.getElementById(button.getAttribute("data-copy"));
+  if (!source) { return; }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(source.textContent).then(function () {
+      button.textContent = "Copied";
+    });
+  } else {
+    var range = document.createRange();
+    range.selectNodeContents(source);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+});
+"""
+
 _TITLES = {
     403: "Not allowed",
     404: "Not found",
@@ -1113,6 +1913,32 @@ _TITLES = {
     422: "Invalid",
     503: "Notion could not be reached",
 }
+
+
+def _console_refusal(err: Exception) -> str | None:
+    """The console's own sentence for a refused audience confirmation, or None.
+
+    Rendered from the refusal's structured counts and place, never by rewriting the
+    API's message; every other refusal keeps the control plane's text.
+    """
+    if not isinstance(err, AudienceNotConfirmed) or err.counts is None:
+        return None
+    c = err.counts
+    people = f"{c['total']} people: {c['guests']} guests, {c['external']} from other workspaces"
+    if err.place == "channel":
+        box = "I confirm these people may see what this agent says here"
+        action = "resume"
+        who = "The people in this channel"
+    else:
+        box = "I confirm these people may see what this agent can access"
+        action = "publish"
+        who = "The people who can reach this agent"
+    if err.changed:
+        return (
+            f"{who} changed since they were counted ({people}). "
+            f"Review them, tick '{box}' and {action} again."
+        )
+    return f"Tick '{box}' ({people}) and {action} again."
 
 
 def _audience_confirmation(ctx: Ctx) -> dict[str, int] | None:

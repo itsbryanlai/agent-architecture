@@ -24,6 +24,9 @@ Roles. A tenant has admins and creators.
   any agent.
 - An admin reads usage and cost for every agent; a creator reads it for the agents
   they created. Usage is never broken down by requester.
+- An admin reads any agent's feedback page; a creator reads the feedback of the agents
+  they created. The page shows counts, outcomes and votes, and a question's text only
+  while retention keeps it — never who asked or who voted.
 - An admin sets, raises and removes monthly budgets (one for the tenant, one per agent). An
   admin reads all of them; a creator reads the budgets of the agents they created, and
   never sets one. Every change is audited as ``budget_set`` with the new amount in
@@ -70,6 +73,20 @@ or all writes off and on; each change is audited as ``switch_off`` or ``switch_o
 admin reads every switch. A creator reads the state of the agents they created and the
 tenant-wide switches that stop them, and never changes one.
 
+Tenant settings (the admin settings page, ``tenant_settings``): an admin sets the default
+agent and the channel routing, validated like the YAML import (a published agent, channels
+inside the agent's audience), audited as ``tenant_settings``; connects the tenant's Notion
+workspace (the OAuth workspace bot token stored encrypted as the ``notion`` credential,
+audited as ``connector``, never the token) and disconnects it; and reveals, confirms or
+clears the Notion webhook verification token exactly as the host command does, audited as
+``webhook_token`` as the user instead of the operator. An admin also turns requester
+approval off or on per low-risk action (``policy_change``): a comment on an item the
+requester filed may then run without a card (D-43). An admin connects the tenant's
+Google Drive (``connect_drive``): the deployment's Google service account creates one
+service account per tenant, and the connection row and its ``connector`` event commit
+together (``drive_connect``); ``disconnect_drive`` deletes the account at Google and the
+row (D-45). No key is stored per tenant.
+
 Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
 title and parent of each granted object, the creator's label and any mismatch, and the
 problems. A creator gets ok or a problem category per grant and nothing else (no property
@@ -78,7 +95,12 @@ the published version. A version that widens access is published only with
 ``acknowledge_widening``; the acknowledgement is audited as ``widening_confirm``. With the
 picker required (``require_grant_picker``), submit refuses a grant that is new since the
 published version and was not chosen from the creator's own Notion (``record_grant_picks``,
-audited as ``grant_pick``).
+audited as ``grant_pick``). A creator who consents keeps their Notion sign-in
+(``store_creator_consent``, encrypted per tenant and creator, audited as ``connector``);
+``revoke_creator_consent`` deletes it, and dropping a member or moving a creator to a role
+that does not create deletes it in the same unit of work as the member change.
+``creator_access_view`` reads the nightly verdicts the worker's check wrote
+(``creator_access``).
 
 A refused action is not audited yet.
 
@@ -93,14 +115,25 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
+
+from cryptography.exceptions import InvalidTag
 
 from agentos import ids
 from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
+from agentos.agent_feedback import (
+    FEEDBACK_DAYS,
+    AgentFeedbackStore,
+    AgentFeedbackView,
+    empty_view,
+)
+from agentos.agent_health import AgentHealth, HealthStore
 from agentos.agent_store import (
+    DRAFT,
     PENDING,
     AgentNotFound,
     AgentRecord,
@@ -108,6 +141,11 @@ from agentos.agent_store import (
     AgentStoreError,
     AgentVersionRecord,
     version_changed,
+)
+from agentos.approval_policy import (
+    POLICIES,
+    ApprovalPolicyStore,
+    InMemoryApprovalPolicyStore,
 )
 from agentos.audience import (
     AudienceCheckUnavailable,
@@ -130,8 +168,50 @@ from agentos.budgets import (
     month_spend,
     parse_amount,
 )
-from agentos.config import AgentVersion, ConfigError, TenantsConfig, channel_audience_problems
+from agentos.config import (
+    CHANNEL_ID,
+    MAX_BLANK_NAME,
+    MAX_COLUMN_NAME,
+    MAX_SHEET_COLUMNS,
+    MAX_TEMPLATE_BLANKS,
+    AgentsConfig,
+    AgentVersion,
+    ConfigError,
+    TenantsConfig,
+    agent_definition,
+    channel_audience_problems,
+    read_secret,
+)
+from agentos.connectors.drive import (
+    SHARED_DRIVE_FOLDER_TEXT,
+    DriveReader,
+    heading_duplicated_text,
+    heading_level,
+    heading_matches,
+    heading_missing_text,
+    section_plain_error,
+    template_blank_names,
+)
+from agentos.connectors.google_iam import (
+    MIME_DOC,
+    MIME_FOLDER,
+    DriveItem,
+    DriveListing,
+    GoogleAccounts,
+    GoogleError,
+    problem_text,
+)
+from agentos.connectors.manifest import low_risk_actions
 from agentos.connectors.notion import normalize_id
+from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
+from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
+from agentos.crypto_keys import TenantKeyError
+from agentos.drive_connections import (
+    CONNECTED,
+    ERROR,
+    DriveConnection,
+    DriveConnectionStore,
+)
 from agentos.grant_checker import (
     GrantChecker,
     GrantCheckUnavailable,
@@ -156,7 +236,10 @@ from agentos.members import (
     MemberStore,
 )
 from agentos.models import AuditEvent
-from agentos.slack_client import SlackLookupError
+from agentos.notion_picker import WorkspaceGrant
+from agentos.notion_webhook import PENDING as WEBHOOK_PENDING
+from agentos.notion_webhook import WebhookTokenError, WebhookTokens
+from agentos.slack_client import SlackChannel, SlackLookupError, SlackPoster
 from agentos.switches import (
     InMemorySwitchStore,
     SwitchesView,
@@ -164,7 +247,24 @@ from agentos.switches import (
     read_state,
     set_switch,
 )
-from agentos.tenant_store import TenantSource, as_source
+from agentos.tenant_store import TenantSource, TenantStore, as_source
+from agentos.test_sets import (
+    CITE,
+    EXPECT_KINDS,
+    FAILED,
+    HAND_OFF,
+    QUESTION_MAX,
+    REFUSE,
+    RUN_LIMIT,
+    RUNNING,
+    WRITE,
+    InMemoryTestSetStore,
+    TestCase,
+    TestRun,
+    TestSetError,
+    TestSetStore,
+    case_set_sha256,
+)
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import (
     InMemoryUsageStore,
@@ -228,10 +328,53 @@ class PausedChannel:
     problem: str | None = None
 
 
+@dataclass
+class TenantSettingsView:
+    """What the admin settings page shows: routing, the Notion connection, the webhook token.
+
+    ``published`` are the agents a default or a channel may name. ``slack_channels`` is
+    None when Slack could not be read (``slack_problem`` says why); the page still renders.
+    ``notion_connected_by``/``at`` come from the tenant's newest ``connector`` connect
+    event. ``notion_env_var`` names the environment variable in use when no credential
+    is connected; None when Notion is connected or the tenant has no token at all.
+    ``health`` holds the worker's last check of each published agent, by agent ID.
+    ``approvals`` holds the tenant's approval policy for each low-risk action (D-43).
+    ``drive_configured`` is False on a deployment without the Google settings; ``drive``
+    is the tenant's connection row as stored (None when never connected), ``drive_items``
+    what its account can see now (None when the live list failed or was not run),
+    ``drive_more`` when more than the first 100 items are shared, and ``drive_problem``
+    the plain words for the failed live check or the row's last error. The GET writes
+    nothing (D-45).
+    """
+
+    default_agent: str | None
+    channels: dict[str, str]
+    published: list[AgentVersion]
+    slack_channels: list[SlackChannel] | None = None
+    slack_problem: str | None = None
+    notion_connected: bool = False
+    notion_workspace_id: str | None = None
+    notion_workspace_name: str | None = None
+    notion_connected_by: str | None = None
+    notion_connected_at: datetime | None = None
+    notion_env_var: str | None = None
+    webhook_state: str | None = None
+    # The tenant's health rows by agent ID; an agent with no row was never checked.
+    health: dict[str, AgentHealth] = field(default_factory=dict)
+    # The approval policy of each low-risk action, by action name.
+    approvals: dict[str, str] = field(default_factory=dict)
+    drive_configured: bool = False
+    drive: DriveConnection | None = None
+    drive_items: list[DriveItem] | None = None
+    drive_more: bool = False
+    drive_problem: str | None = None
+
+
 def _slack_problem(err: Exception) -> str:
     """A reason fit to show: the Slack error code or the configuration message, no secrets."""
     if isinstance(err, SlackLookupError):
-        return f"Slack said '{err.code}'"
+        scope = f" (needs {err.scope})" if err.scope else ""
+        return f"Slack said '{err.code}'{scope}"
     return str(err)
 
 
@@ -266,6 +409,19 @@ class VersionReview:
     picks: dict[str, PickRecord] = field(default_factory=dict)
 
 
+@dataclass
+class TestRunReview:
+    """A version's latest test run, and whether what it ran against changed since.
+
+    ``stale`` compares the two hashes the run recorded with the version now: its
+    definition and its case set (ids and expectations). An edit of either after the
+    run makes the results old; a withdraw and resubmit alone changes neither.
+    """
+
+    run: TestRun | None
+    stale: bool = False
+
+
 def _all_grant_ids(agent: AgentVersion) -> dict[str, str]:
     """Normalised ID -> label of every Notion grant of a version."""
     ids_: dict[str, str] = {}
@@ -291,8 +447,27 @@ class ControlPlane:
         unit_of_work: UnitOfWork | None = None,
         grant_picks: GrantPickStore | None = None,
         require_grant_picker: bool = False,
+        credentials: TenantCredentials | None = None,
+        tenant_store: TenantStore | None = None,
+        webhook_tokens: WebhookTokens | None = None,
+        slack_for: Callable[[str], Awaitable[SlackPoster]] | None = None,
+        health: HealthStore | None = None,
+        creator_access: CreatorAccessStore | None = None,
+        feedback_reads: AgentFeedbackStore | None = None,
+        policies: ApprovalPolicyStore | None = None,
+        test_sets: TestSetStore | None = None,
+        start_test_run: Callable[[str, str], Awaitable[None]] | None = None,
+        drive: DriveConnectionStore | None = None,
+        google: GoogleAccounts | None = None,
     ):
         self._picks = InMemoryGrantPickStore() if grant_picks is None else grant_picks
+        self._policies = InMemoryApprovalPolicyStore() if policies is None else policies
+        self._test_sets = InMemoryTestSetStore() if test_sets is None else test_sets
+        # Starts one run's workflow (tenant, run ID); idempotent. None leaves runs unavailable.
+        self._start_test_run = start_test_run
+        self._creator_access = (
+            InMemoryCreatorAccessStore() if creator_access is None else creator_access
+        )
         self._require_picker = require_grant_picker
         self._switches = InMemorySwitchStore() if switches is None else switches
         self._pauses = InMemoryPauseStore() if pauses is None else pauses
@@ -305,10 +480,36 @@ class ControlPlane:
         self._audit = audit
         self._tenants = as_source(tenants)
         self._grant_checker = grant_checker
+        # Tenant settings: None leaves the settings page's writes unconfigured.
+        self._credentials = credentials
+        self._tenant_store = tenant_store
+        self._webhook_tokens = webhook_tokens
+        self._slack_for = slack_for
+        # Google Drive (D-45): either one None leaves Drive not set up on this console.
+        self._drive = drive
+        self._google = google
+        # Agent health is read-only here: the worker's checks write it. None leaves the
+        # console without health to show.
+        self._health = health
+        # The feedback page's reads are read-only here too: the worker and the gateway
+        # write the rows. None leaves the page with empty sections.
+        self._feedback_reads = feedback_reads
         # Stores in Postgres need a PostgresUnitOfWork; the default covers the in-memory ones.
+        settings_stores = [
+            s for s in (credentials, tenant_store, webhook_tokens, drive) if s is not None
+        ]
         self._uow = (
             InMemoryUnitOfWork(
-                agents, members, audit, self._budgets, self._switches, self._pauses, self._picks
+                agents,
+                members,
+                audit,
+                self._budgets,
+                self._switches,
+                self._pauses,
+                self._picks,
+                self._policies,
+                self._test_sets,
+                *settings_stores,
             )
             if unit_of_work is None
             else unit_of_work
@@ -401,14 +602,16 @@ class ControlPlane:
         tool: str | None = None,
         request_id: str | None = None,
         conn: Any = None,
+        input_sha256: str | None = None,
     ) -> None:
         """One event, on the unit of work's connection. A definition is hashed, never stored.
 
         ``input_sha256`` is the hash the version was submitted (and so reviewed) with, or the
-        canonical hash of the definition while it is still a draft.
+        canonical hash of the definition while it is still a draft. A caller may name its
+        own hash instead (a test case's content, never the text).
         """
-        digest = None
-        if version is not None:
+        digest = input_sha256
+        if digest is None and version is not None:
             digest = version.definition_sha256 or canonical_sha256(version.definition)
         await self._audit.record(
             AuditEvent(
@@ -437,6 +640,37 @@ class ControlPlane:
         """Every agent for an admin; the agents they created for a creator."""
         who = await self._require(tenant_id, actor, ADMIN, CREATOR)
         return [a for a in await self._agents.list_agents(tenant_id) if who.sees(a.agent_id)]
+
+    async def agent_health(self, tenant_id: str, actor: Actor) -> dict[str, AgentHealth]:
+        """The health rows of the agents this person may read, by agent ID.
+
+        An admin reads every agent's, a creator their own. The status is what the
+        agents list badges; the reason is shown only on the admin settings page.
+        A plane built without a health store has no rows.
+        """
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._health is None:
+            return {}
+        return {h.agent_id: h for h in await self._health.list(tenant_id) if who.sees(h.agent_id)}
+
+    async def agent_feedback(
+        self, tenant_id: str, actor: Actor, agent_id: str, days: int = FEEDBACK_DAYS[0]
+    ) -> AgentFeedbackView:
+        """The agent's feedback page: outcomes, votes and questions of the last ``days``.
+
+        An admin reads any agent's, a creator their own; another creator's agent is
+        refused the same as one that does not exist. The view never names who asked
+        or who voted, and shows a question's text only while retention keeps it.
+        A plane built without a feedback store has empty sections.
+        """
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        agent = await self._agents.get_agent(tenant_id, agent_id)
+        if agent is None or not who.sees(agent_id):
+            raise AgentNotFound(f"agent '{agent_id}' does not exist")
+        since = self._clock() - timedelta(days=days)
+        if self._feedback_reads is None:
+            return empty_view(agent_id, since)
+        return await self._feedback_reads.read(tenant_id, agent_id, since)
 
     async def versions(
         self, tenant_id: str, actor: Actor, agent_id: str
@@ -683,12 +917,17 @@ class ControlPlane:
         if confirm is None:
             raise AudienceNotConfirmed(
                 f"{said}. Confirm that they may see what this agent says here: send "
-                f"confirm_audience {json.dumps(now)}."
+                f"confirm_audience {json.dumps(now)}.",
+                counts=now,
+                place="channel",
             )
         if confirm != now:
             raise AudienceNotConfirmed(
                 f"The people in this channel changed since they were counted: {said}. "
-                "Review them and confirm again."
+                "Review them and confirm again.",
+                counts=now,
+                place="channel",
+                changed=True,
             )
         return summary
 
@@ -731,12 +970,17 @@ class ControlPlane:
         if confirm is None:
             raise AudienceNotConfirmed(
                 f"{said}. Confirm that they may see what this agent can access: send "
-                f"confirm_audience {json.dumps(now)}."
+                f"confirm_audience {json.dumps(now)}.",
+                counts=now,
+                place="agent",
             )
         if confirm != now:
             raise AudienceNotConfirmed(
                 f"The people who can reach this agent changed since they were counted: {said}. "
-                "Review them and confirm again."
+                "Review them and confirm again.",
+                counts=now,
+                place="agent",
+                changed=True,
             )
         return summary
 
@@ -793,6 +1037,16 @@ class ControlPlane:
             record = await self._agents.create_draft(
                 tenant_id, agent_id, actor, from_version, conn=conn
             )
+            # The new draft carries the source version's test cases, as it carries its
+            # definition. create_draft found a source, so there is one to copy from.
+            source = from_version
+            if source is None:
+                published = await self._agents.published(tenant_id, agent_id)
+                source = None if published is None else published.version
+            if source is not None:
+                await self._test_sets.copy_cases(
+                    tenant_id, agent_id, source, record.version, conn=conn
+                )
             await self._record(
                 "agent_draft", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
@@ -827,16 +1081,232 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
         await self._require_picked(tenant_id, agent_id, version)
+        # A sheet grant's header row and a template grant's blanks and destination drive are
+        # read once here, as the definition is frozen for the admin's review, and stored as
+        # its columns / blanks / drive_id (D-48, D-49): the creator names none of them, and
+        # the admin approves what the agent will write. The Google reads run outside the unit
+        # of work; inside it the draft is re-read and only those fields merged, so an edit
+        # made during the reads survives, and the merged definition and the submit commit
+        # together — the hash the admin reviews covers them.
+        columns = await self._sheet_columns(tenant_id, agent_id, version)
+        template_reads = await self._template_reads(tenant_id, agent_id, version)
+        await self._section_reads(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
+            if columns is not None or template_reads is not None:
+                fresh = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
+                if fresh is not None and fresh.status == "draft":
+                    definition = agent_definition(fresh.agent())
+                    drive_block = definition.get("grants", {}).get("drive", {})
+                    for entry in drive_block.get("sheets", []):
+                        if columns is not None and entry["id"] in columns:
+                            entry["columns"] = columns[entry["id"]]
+                    for entry in drive_block.get("templates", []):
+                        if template_reads is not None and entry["id"] in template_reads:
+                            entry.update(template_reads[entry["id"]])
+                    await self._agents.replace_draft(
+                        tenant_id, agent_id, version, definition, conn=conn
+                    )
             record = await self._agents.submit(tenant_id, agent_id, version, actor, conn=conn)
             await self._record(
                 "agent_submit", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
         return record
 
-    async def _require_picked(self, tenant_id: str, agent_id: str, version: int) -> None:
+    async def _sheet_columns(
+        self, tenant_id: str, agent_id: str, version: int
+    ) -> dict[str, list[str]] | None:
+        """Each granted sheet's live header row by sheet ID, or None when there is nothing
+        to read (no sheet grant, or not a draft).
+
+        Refuses when Drive is not set up or connected, or a sheet's header cannot be read,
+        does not fit the card and the Edit form, or repeats a column name (D-48). The write
+        reads the header again just before appending, so a column changed after this still
+        refuses the append.
+        """
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None or record.status != "draft":
+            return None
+        sheets = [g for g in record.agent().grants.drive if g.kind == "sheet"]
+        if not sheets:
+            return None
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        reader = DriveReader(self._google, row.service_account_email)
+        columns: dict[str, list[str]] = {}
+        for grant in sheets:
+            try:
+                tab = await reader.read_sheet(grant.id, grant.tab, header_only=True)
+            except GoogleError as err:
+                raise ConfigError(
+                    f"could not read the header row of sheet '{grant.name}': {err}"
+                ) from err
+            header = list(tab.header)
+            if not header:
+                raise ConfigError(
+                    f"the tab '{grant.tab}' of sheet '{grant.name}' has no header row"
+                )
+            if any(not name.strip() for name in header):
+                raise ConfigError(
+                    f"the header row of sheet '{grant.name}' has an empty column name"
+                )
+            duplicates = [name for i, name in enumerate(header) if name in header[:i]]
+            if duplicates:
+                raise ConfigError(
+                    f"the header row of sheet '{grant.name}' has a duplicate column name "
+                    f"('{duplicates[0]}'); each column needs its own name"
+                )
+            if len(header) > MAX_SHEET_COLUMNS:
+                raise ConfigError(f"sheet '{grant.name}' has more than {MAX_SHEET_COLUMNS} columns")
+            if any(len(name) > MAX_COLUMN_NAME for name in header):
+                raise ConfigError(
+                    f"a column name of sheet '{grant.name}' is longer than "
+                    f"{MAX_COLUMN_NAME} characters"
+                )
+            columns[grant.id] = header
+        return columns
+
+    async def _template_reads(
+        self, tenant_id: str, agent_id: str, version: int
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each granted template's ``{{field name}}`` blanks and destination folder's shared
+        drive by template ID, or None when there is nothing to read (no template grant, or
+        not a draft).
+
+        Refuses when Drive is not set up or connected, a template is not an untrashed Google
+        Doc, its text cannot be read or its blanks do not fit the card and the Edit form
+        (D-49). The reads are the template's metadata and text and the folder's metadata
+        only, never the whole Drive; duplicate blank names collapse to one. The write fills
+        the blanks the definition froze here and refuses a folder whose live shared drive is
+        not the one recorded here.
+        """
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None or record.status != "draft":
+            return None
+        templates = [g for g in record.agent().grants.drive if g.kind == "template"]
+        if not templates:
+            return None
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        reader = DriveReader(self._google, row.service_account_email)
+        reads: dict[str, dict[str, Any]] = {}
+        for grant in templates:
+            try:
+                file = await reader.get_file(grant.id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the template '{grant.name}': {err}") from err
+            if file.mime_type != MIME_DOC or file.trashed:
+                raise ConfigError(f"template '{grant.name}' must be a Google Doc")
+            try:
+                sections = await reader.export_file(grant.id, MIME_DOC)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the template '{grant.name}': {err}") from err
+            names = list(template_blank_names("\n".join(s.text for s in sections)))
+            if len(names) > MAX_TEMPLATE_BLANKS:
+                raise ConfigError(
+                    f"template '{grant.name}' has more than {MAX_TEMPLATE_BLANKS} blanks"
+                )
+            if any(len(name) > MAX_BLANK_NAME for name in names):
+                raise ConfigError(
+                    f"a blank name of template '{grant.name}' is longer than "
+                    f"{MAX_BLANK_NAME} characters"
+                )
+            try:
+                folder = await reader.get_file(grant.folder_id)
+            except GoogleError as err:
+                raise ConfigError(
+                    f"could not read the destination folder of template '{grant.name}': {err}"
+                ) from err
+            reads[grant.id] = {"blanks": names, "drive_id": folder.drive_id}
+        return reads
+
+    async def _section_reads(self, tenant_id: str, agent_id: str, version: int) -> None:
+        """Check each granted section's heading exists exactly once in its Doc and the section
+        is plain paragraphs (D-50), reading the Doc's metadata (``files.get``) and its body
+        (``documents.get``). The creator names the heading; submit verifies it so the admin
+        reviews a section the agent can actually replace. Refuses when Drive is not set up or
+        connected, the Doc is not an untrashed Google Doc, the heading is missing or appears more
+        than once, or the section holds a table or image. Nothing is merged: the heading is the
+        creator's, frozen as typed (stripped of surrounding whitespace at parse)."""
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None or record.status != "draft":
+            return
+        sections = [g for g in record.agent().grants.drive if g.kind == "section"]
+        if not sections:
+            return
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        reader = DriveReader(self._google, row.service_account_email)
+        for grant in sections:
+            try:
+                file = await reader.get_file(grant.doc_id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the Doc '{grant.name}': {err}") from err
+            if file.mime_type != MIME_DOC or file.trashed:
+                raise ConfigError(f"section '{grant.name}' must be a Google Doc")
+            try:
+                doc = await reader.read_doc(grant.doc_id)
+            except GoogleError as err:
+                raise ConfigError(f"could not read the Doc '{grant.name}': {err}") from err
+            matches = heading_matches(doc.paragraphs, grant.heading)
+            if not matches:
+                raise ConfigError(heading_missing_text(grant.heading, grant.name))
+            if len(matches) > 1:
+                raise ConfigError(heading_duplicated_text(grant.heading, grant.name))
+            if error := section_plain_error(doc, grant.heading, matches[0]):
+                raise ConfigError(error)
+
+    async def _check_template_folders(self, tenant_id: str, agent: AgentVersion) -> None:
+        """Refuse a publish whose template destination folder is not in a shared drive (D-49).
+
+        The pilot's service account cannot own files, so a new Doc can only be created inside
+        a shared drive: the folder's ``driveId`` must be set, and the grant must record the
+        shared drive the submit read (the admin reviewed it). A folder outside a shared drive
+        is refused with plain words; a folder that cannot be read refuses the publish too.
+        """
+        templates = [g for g in agent.grants.drive if g.kind == "template"]
+        if not templates:
+            return
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        reader = DriveReader(self._google, row.service_account_email)
+        for grant in templates:
+            try:
+                folder = await reader.get_file(grant.folder_id)
+            except GoogleError as err:
+                raise ConfigError(
+                    f"could not read the destination folder of template '{grant.name}': {err}"
+                ) from err
+            if folder.mime_type != MIME_FOLDER or folder.trashed:
+                raise ConfigError(f"the destination of template '{grant.name}' is not a folder")
+            if not folder.drive_id:
+                raise ConfigError(SHARED_DRIVE_FOLDER_TEXT)
+            if not grant.drive_id:
+                raise ConfigError(
+                    f"the destination of template '{grant.name}' has no shared drive recorded; "
+                    "submit the version again so it is read"
+                )
+
+    async def _require_picked(
+        self, tenant_id: str, agent_id: str, version: int, action: str = "submit again"
+    ) -> None:
         """With the picker required, a grant new since the published version must have been
-        chosen from the creator's own Notion. Grants an admin already approved are kept."""
+        chosen from the creator's own Notion. Grants an admin already approved are kept.
+
+        Checked at submit and again at a test run: a grant picked after the last submit
+        still needs its pick before a run reads with it. ``action`` names what to retry.
+        """
         if not self._require_picker:
             return
         record = await self._agents.get_version(tenant_id, agent_id, version)
@@ -854,7 +1324,7 @@ class ControlPlane:
             names = ", ".join(f"'{label}' ({nid})" for nid, label in missing.items())
             raise GrantNotPicked(
                 f"not chosen from your Notion: {names}. Use 'Choose from Notion' on the "
-                "version page, then submit again."
+                f"version page, then {action}."
             )
 
     async def record_grant_picks(
@@ -967,6 +1437,7 @@ class ControlPlane:
             reports = await self._grant_checker.check(tenant_id, pending.agent())
             if not all(report.ok for report in reports):
                 raise GrantProblems(reports)
+            await self._check_template_folders(tenant_id, pending.agent())
             if self._audience is not None:
                 confirmed = await self._confirmed_audience(
                     tenant_id, pending.agent(), confirm_audience
@@ -1023,6 +1494,335 @@ class ControlPlane:
                     conn=conn,
                 )
         return record
+
+    # --- test sets -------------------------------------------------------------
+
+    async def test_cases(
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
+    ) -> list[TestCase]:
+        """The version's test cases, in the order they were added. Editors and admins."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        return await self._test_sets.cases(tenant_id, agent_id, version)
+
+    async def add_test_case(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        question: str,
+        expect: str = "",
+        target: str = "",
+        request_id: str | None = None,
+    ) -> TestCase:
+        """Add one case to a draft. The expectation may be left unset (the feedback
+        page's "Make a test case" does), for the creator to choose on the version page."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        text = question.strip()
+        if not text or len(text) > QUESTION_MAX:
+            raise TestSetError(f"a test question must be 1 to {QUESTION_MAX} characters")
+        expect, target = self._validated_expectation(expect, target, record.agent())
+        case = TestCase(
+            tenant_id,
+            agent_id,
+            version,
+            ids.test_case_id(tenant_id, uuid.uuid4().hex),
+            text,
+            expect,
+            target,
+            created_by=actor,
+        )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._test_sets.add_case(tenant_id, case, conn=conn)
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="add",
+                target=case.case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256(
+                    {"question": text, "expect": expect, "target": target}
+                ),
+            )
+        return case
+
+    async def set_case_expect(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        case_id: str,
+        expect: str,
+        target: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Choose one case's expected behaviour: a kind and the object it names."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        expect, target = self._validated_expectation(expect, target, record.agent())
+        if not expect:
+            raise TestSetError("choose an expected behaviour for the case")
+        async with self._uow.begin(tenant_id) as conn:
+            found = await self._test_sets.set_expect(
+                tenant_id, agent_id, version, case_id, expect, target, conn=conn
+            )
+            if not found:
+                raise AgentNotFound(f"agent '{agent_id}' version {version} has no such test case")
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="expect",
+                target=case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256({"expect": expect, "target": target}),
+            )
+
+    async def remove_test_case(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        case_id: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Remove one case from a draft."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        async with self._uow.begin(tenant_id) as conn:
+            found = await self._test_sets.remove_case(
+                tenant_id, agent_id, version, case_id, conn=conn
+            )
+            if not found:
+                raise AgentNotFound(f"agent '{agent_id}' version {version} has no such test case")
+            await self._record(
+                "test_case",
+                tenant_id,
+                actor,
+                version=record,
+                tool="remove",
+                target=case_id,
+                request_id=request_id,
+                conn=conn,
+                input_sha256=canonical_sha256({"case_id": case_id}),
+            )
+
+    async def run_tests(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        request_id: str | None = None,
+    ) -> TestRun:
+        """Run a draft's cases against the draft definition. The agent's creator or an admin.
+
+        Every case needs an expectation first, and a grant new since the published version
+        must have been picked, as at submit. One run of a version at a time: a second start
+        while one is running is refused, unless that run outlived the run limit, in which
+        case its row is closed as failed first so a dead run never blocks the version. With
+        a ``request_id`` the call is idempotent: a retry finds the event the first attempt
+        recorded and returns that run. The checks and the row's insert share the unit of
+        work's tenant lock, so two starts never interleave. The row and its audit event
+        commit before the workflow starts on its own task queue; a start that fails closes
+        the row as failed, so the console never shows a run that is not coming.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._draft_for_cases(tenant_id, agent_id, version)
+        async with self._uow.begin(tenant_id) as conn:
+            if request_id is not None:
+                key = self._event_key(tenant_id, "test_run", request_id)
+                seen = await self._audit.get(tenant_id, key, conn=conn)
+                if seen is not None:
+                    first = (
+                        None
+                        if not seen.target
+                        else await self._test_sets.get_run(tenant_id, seen.target)
+                    )
+                    if first is None or first.agent_id != agent_id or first.version != version:
+                        raise TestSetError("this request ID was used for another change")
+                    return first
+            cases = await self._test_sets.cases(tenant_id, agent_id, version)
+            if not cases:
+                raise TestSetError("this draft has no test cases yet")
+            unset = sum(not c.expect for c in cases)
+            if unset:
+                raise TestSetError(
+                    f"{unset} test case(s) have no expected behaviour yet; "
+                    "choose one for each before running"
+                )
+            await self._require_picked(tenant_id, agent_id, version, "run the tests again")
+            if self._start_test_run is None:
+                raise TestSetError("test runs are not available in this console")
+            latest = await self._test_sets.latest_run(tenant_id, agent_id, version)
+            if latest is not None and latest.status == RUNNING:
+                if not self._run_outlived_limit(latest):
+                    raise TestSetError("A test run is already going on this version")
+                # The run outlived its limit and can never finish on its own; close it as
+                # failed (its results and spend kept) so this version can run again.
+                await self._test_sets.finish_run(
+                    tenant_id,
+                    latest.run_id,
+                    latest.results,
+                    latest.spend_usd,
+                    status=FAILED,
+                    conn=conn,
+                )
+            run = TestRun(
+                tenant_id,
+                ids.test_run_id(tenant_id, uuid.uuid4().hex),
+                agent_id,
+                version,
+                RUNNING,
+                actor,
+                canonical_sha256(record.definition),
+                case_set_sha256(cases),
+            )
+            await self._test_sets.start_run(tenant_id, run, conn=conn)
+            await self._record(
+                "test_run",
+                tenant_id,
+                actor,
+                version=record,
+                target=run.run_id,
+                request_id=request_id,
+                conn=conn,
+            )
+        try:
+            await self._start_test_run(tenant_id, run.run_id)
+        except Exception as err:  # any start failure closes the row and is shown
+            await self._test_sets.finish_run(tenant_id, run.run_id, [], Decimal(0), status=FAILED)
+            raise TestSetError(
+                f"the test run could not start ({type(err).__name__}); try again"
+            ) from err
+        return run
+
+    async def test_run_review(
+        self, tenant_id: str, actor: Actor, agent_id: str, version: int
+    ) -> TestRunReview:
+        """The version's latest run for the version page and the approving admin's view:
+        the run itself, and whether the definition or the case set changed since it ran."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        run = await self._test_sets.latest_run(tenant_id, agent_id, version)
+        if run is not None and run.status == RUNNING and self._run_outlived_limit(run):
+            # Shown as failed; the page only reads, the next run start closes the row.
+            run = replace(run, status=FAILED)
+        stale = run is not None and (
+            run.definition_sha256 != canonical_sha256(record.definition)
+            or run.cases_sha256
+            != case_set_sha256(await self._test_sets.cases(tenant_id, agent_id, version))
+        )
+        return TestRunReview(run, stale)
+
+    def _run_outlived_limit(self, run: TestRun) -> bool:
+        """Whether a running row is too old to ever finish on its own.
+
+        Temporal ends the workflow at ``RUN_LIMIT``; the extra grace covers clock skew
+        and the run's final write, so a row still running past it is dead, not slow.
+        """
+        return (
+            run.started_at is not None
+            and self._clock() - run.started_at > RUN_LIMIT + timedelta(minutes=10)
+        )
+
+    async def make_test_case_from_feedback(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        conversation_id: str,
+        question_seq: int,
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Add a stored feedback question to the agent's next draft, expectation unset.
+
+        The next draft is the agent's newest one; with none, a draft is made from the
+        published version, carrying its cases forward. The question is read from stored
+        history: a user message of a conversation an audit row ties to this agent. One
+        retention has purged, another agent's conversation, or a message that is not the
+        asker's is refused. Returns the draft the case landed on.
+        """
+        await self._require_editor(tenant_id, actor, agent_id)
+        question = (
+            None
+            if self._feedback_reads is None
+            else await self._feedback_reads.question_text(
+                tenant_id, agent_id, conversation_id, question_seq
+            )
+        )
+        if not question:
+            raise TestSetError("that question is no longer stored, so it cannot become a test case")
+        versions = await self._agents.versions(tenant_id, agent_id)
+        draft = next((v for v in versions if v.status == DRAFT), None)
+        if draft is None:
+            draft = await self.new_draft(tenant_id, actor, agent_id, request_id=request_id)
+        await self.add_test_case(
+            tenant_id, actor, agent_id, draft.version, question, request_id=request_id
+        )
+        return draft
+
+    async def _draft_for_cases(
+        self, tenant_id: str, agent_id: str, version: int
+    ) -> AgentVersionRecord:
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        if record.status != DRAFT:
+            raise AgentStoreError(
+                f"agent '{agent_id}' version {version} is {record.status}; "
+                "test cases are written on a draft"
+            )
+        return record
+
+    @staticmethod
+    def _validated_expectation(expect: str, target: str, agent: AgentVersion) -> tuple[str, str]:
+        """The case's expectation as stored: a known kind, and a target this draft grants
+        (a page, a database, a Drive file) or lists (a specialist). Notion IDs are
+        normalized; a Drive file ID is kept as it is."""
+        expect, target = expect.strip(), target.strip()
+        if expect and expect not in EXPECT_KINDS:
+            raise TestSetError(f"unknown expected behaviour '{expect}'")
+        if not expect or expect == REFUSE:
+            return expect, ""
+        if not target:
+            raise TestSetError("choose the source, database, Drive file or agent this case expects")
+        if expect == CITE:
+            # A template's boilerplate is not knowledge (D-49): it is never cited. A section's
+            # Doc is granted as for reads (D-50), so it is cited by its Doc ID.
+            drive_files = {g.id for g in agent.grants.drive if g.kind in ("file", "sheet")}
+            drive_files |= {g.doc_id for g in agent.grants.drive if g.kind == "section"}
+            if target in drive_files:
+                return expect, target
+            granted = {normalize_id(g.id) for g in agent.grants.notion_pages}
+            what = "a page or Drive file granted to this draft"
+        elif expect == WRITE:
+            drive_files = {
+                g.id for g in agent.grants.drive if g.kind in ("file", "sheet", "template")
+            }
+            # A section replace aims at the section's Doc ID (D-50).
+            drive_files |= {g.doc_id for g in agent.grants.drive if g.kind == "section"}
+            if target in drive_files:
+                return expect, target
+            granted = {normalize_id(g.id) for g in agent.grants.notion_databases}
+            what = "a database or Drive file granted to this draft"
+        else:
+            granted = set(agent.specialists)
+            what = "a specialist this draft lists"
+        normalized = target if expect == HAND_OFF else normalize_id(target)
+        if normalized not in granted:
+            raise TestSetError(f"'{target}' is not {what}")
+        return expect, normalized
 
     # --- budgets -------------------------------------------------------------
 
@@ -1133,6 +1933,655 @@ class ControlPlane:
             uow=self._uow,
         )
 
+    # --- tenant settings -----------------------------------------------------
+
+    async def require_settings_admin(self, tenant_id: str, actor: Actor) -> None:
+        """Raise ``Forbidden`` unless the actor is an admin of the tenant."""
+        await self._require_role(tenant_id, actor, ADMIN)
+
+    async def tenant_settings(self, tenant_id: str, actor: Actor) -> TenantSettingsView:
+        """The settings page's reads, for an admin. A Slack read failure is reported, not fatal.
+
+        The tenant row is read fresh from the store, not from the directory cache: a
+        routing change shows on the page at once, even inside the cache's TTL.
+        """
+        await self._require(tenant_id, actor, ADMIN)
+        config = await self._fresh_config(tenant_id)
+        if config is None:
+            raise ConfigError(f"tenant '{tenant_id}' is not available")
+        published = sorted(
+            (await self._agents.published_all(tenant_id)).values(), key=lambda a: a.agent_id
+        )
+        slack_channels: list[SlackChannel] | None = None
+        slack_problem: str | None = None
+        if self._slack_for is not None:
+            try:
+                slack = await self._slack_for(tenant_id)
+                slack_channels = await slack.list_channels()
+            except (SlackLookupError, ConfigError) as err:
+                slack_problem = _slack_problem(err)
+        connected = False
+        connected_by: str | None = None
+        connected_at: datetime | None = None
+        if self._credentials is not None:
+            connected = await self._credentials.notion_connected(tenant_id)
+            if connected:
+                event = await self._audit.latest(tenant_id, "connector", "connect")
+                if event is not None:
+                    connected_by, connected_at = event.requester_user_id, event.at
+        env_var = config.secrets.notion_token_env
+        notion_env_var = None if connected or not read_secret(env_var) else env_var
+        webhook_state = (
+            None if self._webhook_tokens is None else await self._webhook_tokens.state(tenant_id)
+        )
+        health = (
+            {}
+            if self._health is None
+            else {h.agent_id: h for h in await self._health.list(tenant_id)}
+        )
+        approvals = {
+            action: await self._policies.get(tenant_id, action) for action in low_risk_actions()
+        }
+        drive_configured = self._drive is not None and self._google is not None
+        drive_row = None if self._drive is None else await self._drive.get(tenant_id)
+        drive_items: list[DriveItem] | None = None
+        drive_more = False
+        drive_problem: str | None = None
+        if drive_row is not None and self._google is not None:
+            # A read of Google for this view only: its outcome is shown, never stored.
+            # The row's status is written by connect and disconnect; a later check
+            # polls it.
+            try:
+                listing = await self._google.list_shared(drive_row.service_account_email)
+            except GoogleError as err:
+                drive_problem = str(err)
+            else:
+                drive_items = listing.items
+                drive_more = listing.more
+        elif drive_row is not None and drive_row.status == ERROR:
+            drive_problem = problem_text(drive_row.last_error)
+        return TenantSettingsView(
+            default_agent=config.default_agent,
+            channels=dict(config.channels),
+            published=published,
+            slack_channels=slack_channels,
+            slack_problem=slack_problem,
+            notion_connected=connected,
+            notion_workspace_id=config.notion_workspace_id,
+            notion_workspace_name=config.notion_workspace_name,
+            notion_connected_by=connected_by,
+            notion_connected_at=connected_at,
+            notion_env_var=notion_env_var,
+            webhook_state=webhook_state,
+            health=health,
+            approvals=approvals,
+            drive_configured=drive_configured,
+            drive=drive_row,
+            drive_items=drive_items,
+            drive_more=drive_more,
+            drive_problem=drive_problem,
+        )
+
+    async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:
+        """The tenant's stored settings as they are now, or None when unknown or disabled.
+
+        With a store, the row is read directly, bypassing the directory's cache; a plane
+        without one (a fixed tenant set) answers from its source, which holds no cache.
+        """
+        if self._tenant_store is None:
+            return await self._tenants.get(tenant_id)
+        row = await self._tenant_store.load(tenant_id)
+        return row.config if row is not None and row.enabled else None
+
+    async def set_tenant_routing(
+        self,
+        tenant_id: str,
+        actor: str,
+        default_agent: str | None,
+        channels: dict[str, str],
+        request_id: str | None = None,
+    ) -> None:
+        """Set the default agent and the channel map. Only an admin.
+
+        Validated like the YAML import: the default and every mapped agent must have a
+        published version, and a mapped channel must be inside its agent's audience.
+        Setting what is already in force changes nothing and records nothing. The
+        directory refresh picks the change up without a restart.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._tenant_store is None:
+            raise ConfigError("tenant settings cannot be changed on this console")
+        # Fresh, not the directory cache: the no-op comparison must see a change this
+        # page made moments ago, or an unchanged resubmit records a second event.
+        config = await self._fresh_config(tenant_id)
+        if config is None:
+            raise ConfigError(f"tenant '{tenant_id}' is not available")
+        published = await self._agents.published_all(tenant_id)
+        default_agent = default_agent or None
+        if default_agent is not None and default_agent not in published:
+            raise ConfigError(f"default agent '{default_agent}' has no published version")
+        for channel, agent_id in channels.items():
+            if not CHANNEL_ID.fullmatch(channel):
+                raise ConfigError(f"'{channel}' is not a Slack channel ID")
+            if agent_id not in published:
+                raise ConfigError(
+                    f"channel '{channel}': agent '{agent_id}' has no published version"
+                )
+        if problems := channel_audience_problems(channels, published):
+            raise ConfigError(problems[0])
+        if default_agent == config.default_agent and channels == config.channels:
+            return
+        mapping = ",".join(f"{c}->{a}" for c, a in sorted(channels.items()))
+        async with self._uow.begin(tenant_id) as conn:
+            await self._tenant_store.set_routing(tenant_id, default_agent, channels, conn=conn)
+            await self._record(
+                "tenant_settings",
+                tenant_id,
+                actor,
+                tool="routing",
+                target=f"default={default_agent or '-'}; {mapping}"[:300],
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def set_approval_policy(
+        self,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        policy: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Set the tenant's approval policy for one low-risk action. Only an admin.
+
+        The action must be one the manifests mark low-risk (a comment action), and
+        the policy one of the two the store holds. Setting what is already in force
+        changes nothing and records nothing; a real change and its ``policy_change``
+        event commit in one unit of work, with the admin's identity.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if action not in low_risk_actions():
+            raise ConfigError(f"'{action}' is not a low-risk action")
+        if policy not in POLICIES:
+            raise ConfigError(f"'{policy}' is not an approval policy")
+        if await self._policies.get(tenant_id, action) == policy:
+            return
+        async with self._uow.begin(tenant_id) as conn:
+            await self._policies.set(tenant_id, action, policy, conn=conn)
+            await self._record(
+                "policy_change",
+                tenant_id,
+                actor,
+                tool=action,
+                target=policy,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def connect_notion(
+        self,
+        tenant_id: str,
+        actor: str,
+        grant: WorkspaceGrant,
+        request_id: str | None = None,
+    ) -> None:
+        """Store the workspace bot token ``grant`` carries, encrypted. Only an admin.
+
+        The token, the workspace on the tenant row and the ``connector`` event commit in
+        one unit of work; a workspace another tenant already uses refuses the whole
+        change. A reconnect replaces the credential and the workspace, and records again.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._credentials is None or self._tenant_store is None:
+            raise ConfigError("Notion cannot be connected on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            await self._credentials.store_with_current_key(
+                tenant_id, NOTION, grant.token, conn=conn
+            )
+            await self._tenant_store.set_notion_workspace(
+                tenant_id, grant.workspace_id, grant.workspace_name, conn=conn
+            )
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="connect",
+                target=grant.workspace_id,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def disconnect_notion(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Remove the tenant's Notion credential and workspace. Only an admin.
+
+        False, and nothing changes or is recorded, when Notion is not connected.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._credentials is None or self._tenant_store is None:
+            raise ConfigError("Notion cannot be connected on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            deleted = await self._credentials.delete(tenant_id, NOTION, conn=conn)
+            if not deleted:
+                return False
+            await self._tenant_store.set_notion_workspace(tenant_id, None, None, conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="disconnect",
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    async def connect_drive(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Create (or find) the tenant's Google service account and store the connection.
+        Only an admin.
+
+        The account ID is deterministic from the tenant (``ids.drive_account_id``), so a
+        second click, a retry after a lost create response and an overlapping attempt all
+        find the same account. The tenant's unit-of-work lock is held across the Google
+        call and the row write, so a connect and a disconnect never interleave: the row
+        and its ``connector`` event (``drive_connect``, the account email as target)
+        commit in one unit of work after the call succeeds. A tenant already connected to
+        the same account changes nothing and records nothing; a reconnect after an error
+        records again. No key is created or stored for the tenant.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        async with self._uow.begin(tenant_id) as conn:
+            email = await self._google.ensure_account(ids.drive_account_id(tenant_id))
+            # Under the tenant lock: an overlapping attempt that committed first makes
+            # this one a no-op, so two clicks record one event.
+            existing = await self._drive.get(tenant_id, conn=conn)
+            if (
+                existing is not None
+                and existing.status == CONNECTED
+                and existing.service_account_email == email
+            ):
+                return
+            await self._drive.connect(tenant_id, email, self._clock(), conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="drive_connect",
+                target=email,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def disconnect_drive(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Delete the tenant's Google service account and its connection row. Only an admin.
+
+        False, and nothing is recorded, when Drive is not connected; the derived account
+        is still deleted at Google, so an account left by a connect whose row write failed
+        does not stay orphaned. The delete targets the row's stored email — a project move
+        must not orphan the old account — and a 404 (already gone, as after a lost delete
+        response) still clears the row. The tenant's unit-of-work lock is held across the
+        Google call and the row write, so a connect and a disconnect never interleave; the
+        row's deletion and the ``connector`` event (``drive_disconnect``, the account email
+        as target) commit in one unit of work.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        async with self._uow.begin(tenant_id) as conn:
+            row = await self._drive.get(tenant_id, conn=conn)
+            email = (
+                row.service_account_email
+                if row is not None
+                else self._google.account_email(ids.drive_account_id(tenant_id))
+            )
+            await self._google.delete_account(email)
+            if row is None:
+                return False
+            await self._drive.delete(tenant_id, conn=conn)
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="drive_disconnect",
+                target=row.service_account_email,
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    # --- Drive grants (the picker) ----------------------------------------------------
+    # A creator picks any folder or file shared with the workspace's Drive address; the
+    # admin's approval at publish is the check, so there is no per-creator sign-in and no
+    # pick gate (the Notion ``_require_picked`` does not apply to Drive grants).
+
+    async def drive_connection_state(self, tenant_id: str, actor: Actor) -> tuple[bool, bool]:
+        """(configured, connected) for the version page's Drive section. Configured means the
+        deployment has a Google client; connected means the tenant has a connection row."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        configured = self._drive is not None and self._google is not None
+        row = None if self._drive is None else await self._drive.get(tenant_id)
+        return configured, row is not None
+
+    async def drive_picker_listing(self, tenant_id: str, actor: Actor) -> DriveListing:
+        """What the workspace's Drive account can see, for the grant picker (the capped D-2
+        list). A read of Google; nothing is stored. Refused when Drive is not set up or not
+        connected."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        return await self._google.list_shared(row.service_account_email)
+
+    async def drive_sheet_tabs(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
+        """The tab titles of a Sheet shared with the workspace's account, for the picker's
+        tab step (one ``spreadsheets.get`` of the titles only). Refused when Drive is not
+        set up or not connected."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        return await self._google.list_sheet_tabs(row.service_account_email, file_id)
+
+    async def drive_doc_headings(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
+        """The heading names of a Doc shared with the workspace's account, for the picker's
+        heading step (one ``documents.get`` of the body, the heading paragraphs' text). The
+        names are distinct, in first-seen order; the creator picks one or types it. Refused
+        when Drive is not set up or connected (D-50)."""
+        await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._drive is None or self._google is None:
+            raise ConfigError("Google Drive is not set up on this deployment")
+        row = await self._drive.get(tenant_id)
+        if row is None:
+            raise ConfigError("Google Drive is not connected for this organisation")
+        doc = await self._google.read_doc(row.service_account_email, file_id)
+        names: list[str] = []
+        for p in doc.paragraphs:
+            if heading_level(p.style) is not None:
+                name = p.text.strip()
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    async def add_drive_grants(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        items: list[DriveItem],
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Add the picked folders/files/shared drives/sheets/templates to the draft's Drive
+        grants. ``items`` come from a listing of the workspace's account (the picker matches
+        them), so only what is shared with the address is granted. A sheet carries the tab its
+        picker step chose; a template carries the destination folder its picker step chose;
+        their columns / blanks are read at submit. An item already granted is not added twice."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        if not items:
+            return record
+        definition = agent_definition(record.agent())
+        drive_block = definition["grants"].setdefault("drive", {})
+        existing = {g.id for g in record.agent().grants.drive}
+        keys = {
+            "folder": "folders",
+            "file": "files",
+            "shared_drive": "shared_drives",
+            "sheet": "sheets",
+            "template": "templates",
+            "section": "sections",
+        }
+        for item in items:
+            if item.id in existing:
+                continue
+            entry = {"id": item.id, "name": item.name}
+            if item.kind == "sheet":
+                entry["tab"] = item.tab
+            if item.kind == "template":
+                entry["folder_id"] = item.folder_id
+            if item.kind == "section":
+                entry["doc_id"] = item.id
+                entry["heading"] = item.heading
+            drive_block.setdefault(keys[item.kind], []).append(entry)
+            existing.add(item.id)
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.replace_draft(
+                tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
+        return record
+
+    async def remove_drive_grant(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        grant_id: str,
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Remove one Drive grant from the draft. Removing what is not granted changes nothing."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        record = await self._agents.get_version(tenant_id, agent_id, version)
+        if record is None:
+            raise AgentNotFound(f"agent '{agent_id}' has no version {version}")
+        definition = agent_definition(record.agent())
+        drive_block = definition.get("grants", {}).get("drive")
+        if drive_block is not None:
+            for key in ("folders", "files", "shared_drives", "sheets", "templates", "sections"):
+                drive_block[key] = [g for g in drive_block.get(key, []) if g["id"] != grant_id]
+            if not any(drive_block.values()):
+                del definition["grants"]["drive"]
+        async with self._uow.begin(tenant_id) as conn:
+            record = await self._agents.replace_draft(
+                tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
+        return record
+
+    async def creator_consent(self, tenant_id: str, actor: Actor) -> bool:
+        """Whether the actor's Notion sign-in is kept for the nightly check. Reads no token."""
+        who = await self._require(tenant_id, actor, ADMIN, CREATOR)
+        if self._credentials is None:
+            return False
+        return await self._credentials.creator_consent(tenant_id, who.user_id)
+
+    async def store_creator_consent(
+        self, tenant_id: str, actor: str, token: str, request_id: str | None = None
+    ) -> None:
+        """Store the actor's own Notion sign-in encrypted, with the consent they gave.
+
+        A consented pick replaces any sign-in already stored for them. The token and the
+        ``connector`` event commit in one unit of work; the token is never logged or audited.
+        A user ID outside the credential kind's class is refused before anything is stored.
+        """
+        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        if not CREATOR_USER_ID_PATTERN.fullmatch(actor):
+            raise InvalidMember(f"'{actor}' is not a Slack user ID a sign-in can be kept for")
+        if self._credentials is None:
+            raise ConfigError("the Notion sign-in cannot be kept on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            await self._credentials.store_with_current_key(
+                tenant_id, ids.notion_creator_kind(actor), token, conn=conn
+            )
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent",
+                target=actor,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def revoke_creator_consent(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> bool:
+        """Delete the actor's kept Notion sign-in. False, and nothing recorded, when none is."""
+        await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        if self._credentials is None:
+            raise ConfigError("the Notion sign-in cannot be kept on this console")
+        async with self._uow.begin(tenant_id) as conn:
+            deleted = await self._credentials.delete(
+                tenant_id, ids.notion_creator_kind(actor), conn=conn
+            )
+            if not deleted:
+                return False
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent_revoked",
+                request_id=request_id,
+                conn=conn,
+            )
+        return True
+
+    async def _revoke_creator_signin(
+        self, tenant_id: str, actor: str, user_id: str, conn: Any, request_id: str | None = None
+    ) -> None:
+        """Delete a member's kept Notion sign-in in the caller's unit of work, audited as a
+        consent revoke with the member as the target. A member who never consented leaves
+        nothing to delete and nothing to record."""
+        if self._credentials is None:
+            return
+        deleted = await self._credentials.delete(
+            tenant_id, ids.notion_creator_kind(user_id), conn=conn
+        )
+        if deleted:
+            await self._record(
+                "connector",
+                tenant_id,
+                actor,
+                tool="creator_consent_revoked",
+                target=user_id,
+                request_id=request_id,
+                conn=conn,
+            )
+
+    async def creator_access_view(
+        self, tenant_id: str, actor: Actor, agent_id: str
+    ) -> dict[str, AccessRow]:
+        """The nightly creator-access verdicts for an agent's grants. An editor or an admin."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        return await self._creator_access.for_agent(tenant_id, agent_id)
+
+    def _require_webhook_tokens(self) -> WebhookTokens:
+        if self._webhook_tokens is None:
+            raise ConfigError("the webhook token cannot be managed on this console")
+        return self._webhook_tokens
+
+    @staticmethod
+    def _webhook_nonce(command: str, request_id: str | None) -> str:
+        # The host command's key shape, so a console step and a command step read alike.
+        return f"{command}:{request_id or uuid.uuid4().hex}"
+
+    async def reveal_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> str:
+        """The pending webhook token, shown once to an admin, audited as the CLI's ``show``.
+
+        Refused when there is no pending token or it cannot be decrypted; a refusal
+        records nothing. The token goes to the page only, never to a log or the audit.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        state = await tokens.state(tenant_id)
+        if state is None:
+            raise WebhookTokenError(
+                f"no webhook token for tenant '{tenant_id}'; a handshake stores one"
+            )
+        if state != WEBHOOK_PENDING:
+            raise WebhookTokenError(
+                f"the webhook token of tenant '{tenant_id}' is already confirmed; "
+                "clear it and re-subscribe for a new one"
+            )
+        try:
+            token = await tokens.pending(tenant_id)
+        except InvalidTag:
+            raise WebhookTokenError(
+                f"the webhook token of tenant '{tenant_id}' cannot be decrypted; "
+                "clear it and re-subscribe"
+            ) from None
+        except TenantKeyError as err:
+            raise WebhookTokenError(str(err)) from None
+        if token is None:
+            raise WebhookTokenError(
+                f"no webhook token for tenant '{tenant_id}'; a handshake stores one"
+            )
+        async with self._uow.begin(tenant_id) as conn:
+            await self._record(
+                "webhook_token",
+                tenant_id,
+                actor,
+                tool="show",
+                request_id=self._webhook_nonce("show", request_id),
+                conn=conn,
+            )
+        return token
+
+    async def confirm_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Make the pending webhook token active, audited as the CLI's ``confirm``.
+
+        Refused, and nothing recorded, when there is no pending token.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        async with self._uow.begin(tenant_id) as conn:
+            changed = await tokens.confirm(tenant_id, self._clock(), conn=conn)
+            if changed:
+                await self._record(
+                    "webhook_token",
+                    tenant_id,
+                    actor,
+                    tool="confirm",
+                    request_id=self._webhook_nonce("confirm", request_id),
+                    conn=conn,
+                )
+        if not changed:
+            raise WebhookTokenError(f"nothing to confirm for tenant '{tenant_id}'")
+
+    async def clear_webhook_token(
+        self, tenant_id: str, actor: str, request_id: str | None = None
+    ) -> None:
+        """Remove the webhook token so a new handshake is accepted, audited as ``clear``.
+
+        Refused, and nothing recorded, when there is no token.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        tokens = self._require_webhook_tokens()
+        async with self._uow.begin(tenant_id) as conn:
+            changed = await tokens.clear(tenant_id, conn=conn)
+            if changed:
+                await self._record(
+                    "webhook_token",
+                    tenant_id,
+                    actor,
+                    tool="clear",
+                    request_id=self._webhook_nonce("clear", request_id),
+                    conn=conn,
+                )
+        if not changed:
+            raise WebhookTokenError(f"nothing to clear for tenant '{tenant_id}'")
+
     # --- members -------------------------------------------------------------
 
     async def invite_member(
@@ -1195,6 +2644,7 @@ class ControlPlane:
             await self._record(
                 "member_remove", tenant_id, actor, target=user_id, request_id=request_id, conn=conn
             )
+            await self._revoke_creator_signin(tenant_id, actor, user_id, conn, request_id)
 
     async def _protected_member(
         self, tenant_id: str, user_id: str, configured: tuple[str, ...], conn: Any = None

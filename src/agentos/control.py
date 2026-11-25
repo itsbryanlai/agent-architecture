@@ -195,6 +195,7 @@ from agentos.connectors.drive import (
 from agentos.connectors.google_iam import (
     MIME_DOC,
     MIME_FOLDER,
+    DriveFile,
     DriveItem,
     DriveListing,
     GoogleAccounts,
@@ -428,6 +429,21 @@ def _all_grant_ids(agent: AgentVersion) -> dict[str, str]:
     for grant in (*agent.grants.notion_databases, *agent.grants.notion_pages):
         ids_[normalize_id(grant.id)] = grant.name
     return ids_
+
+
+@dataclass(frozen=True)
+class DriveLocation:
+    """Where the Drive picker is: a file or folder, or a shared drive's root (a drive is
+    read with ``drives.get``, so it carries no parents and no ``drive_id``)."""
+
+    file: DriveFile
+    shared_drive: bool
+
+    @property
+    def up(self) -> str:
+        """The ID of the folder this one sits in (its first parent), empty at a shared
+        drive's root: the picker's Up link, with no further walk."""
+        return "" if self.shared_drive or not self.file.parents else self.file.parents[0]
 
 
 class ControlPlane:
@@ -2268,17 +2284,44 @@ class ControlPlane:
         row = None if self._drive is None else await self._drive.get(tenant_id)
         return configured, row is not None
 
-    async def drive_picker_listing(self, tenant_id: str, actor: Actor) -> DriveListing:
-        """What the workspace's Drive account can see, for the grant picker (the capped D-2
-        list). A read of Google; nothing is stored. Refused when Drive is not set up or not
-        connected."""
+    async def _drive_account(self, tenant_id: str, actor: Actor) -> str:
+        """The tenant's Drive account email, for a picker read."""
         await self._require(tenant_id, actor, ADMIN, CREATOR)
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
         row = await self._drive.get(tenant_id)
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
-        return await self._google.list_shared(row.service_account_email)
+        return row.service_account_email
+
+    async def drive_picker_listing(
+        self, tenant_id: str, actor: Actor, folder: str = ""
+    ) -> DriveListing:
+        """What the workspace's Drive account can see, for the grant picker (the capped D-2
+        list): the top level, or one level of ``folder`` (a folder or a shared drive's
+        root). Google refuses a folder the account cannot see. A read of Google; nothing is
+        stored. Refused when Drive is not set up or not connected."""
+        email = await self._drive_account(tenant_id, actor)
+        assert self._google is not None
+        if folder:
+            return await self._google.list_folder(email, folder)
+        return await self._google.list_shared(email)
+
+    async def drive_picker_location(
+        self, tenant_id: str, actor: Actor, folder: str
+    ) -> DriveLocation:
+        """One file, folder or shared drive the account can see, by ID: the picker's
+        current location, and a template re-read before its grant is added. The same two
+        reads the indexer makes: ``drives.get`` first, and a 404 means a file or folder
+        (``files.get``)."""
+        email = await self._drive_account(tenant_id, actor)
+        assert self._google is not None
+        try:
+            return DriveLocation(await self._google.get_drive(email, folder), shared_drive=True)
+        except GoogleError as err:
+            if err.status != 404:
+                raise
+        return DriveLocation(await self._google.get_file(email, folder), shared_drive=False)
 
     async def drive_sheet_tabs(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
         """The tab titles of a Sheet shared with the workspace's account, for the picker's

@@ -53,6 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Protocol
+from urllib.parse import quote
 
 import requests
 from google.auth.exceptions import RefreshError, TransportError
@@ -313,6 +314,12 @@ class GoogleAccounts(Protocol):
     async def list_shared(self, email: str) -> DriveListing:
         """The first 100 files shared with the account and shared drives it is a member
         of, and whether more are shared."""
+        ...
+
+    async def list_folder(self, email: str, folder_id: str) -> DriveListing:
+        """One level of a folder or a shared drive's root for the grant picker: its
+        non-trashed children, folders first then by name, at most 100, and whether more
+        are there. A folder the account cannot see raises ``GoogleError``."""
         ...
 
     async def list_children(self, email: str, folder_id: str) -> list[DriveFile]:
@@ -670,28 +677,7 @@ class RealGoogleAccounts:
                     body = _json_object(response)
                     try:
                         for file in body.get("files", []):
-                            link = (
-                                file.get("webViewLink")
-                                or f"https://drive.google.com/file/d/{file['id']}"
-                            )
-                            mime = file.get("mimeType")
-                            kind = (
-                                "folder"
-                                if mime == MIME_FOLDER
-                                else "sheet"
-                                if mime == MIME_SHEET
-                                else "file"
-                            )
-                            items.append(
-                                DriveItem(
-                                    file["id"],
-                                    file["name"],
-                                    link,
-                                    kind,
-                                    mime_type=mime or "",
-                                    drive_id=file.get("driveId") or "",
-                                )
-                            )
+                            items.append(_picker_item(file))
                     except (KeyError, TypeError) as err:
                         raise GoogleError("unavailable") from err
                     page_token = body.get("nextPageToken")
@@ -752,6 +738,76 @@ class RealGoogleAccounts:
     def _drive_session_for_call(self) -> requests.Session:
         return self._drive_session if self._drive_session is not None else requests.Session()
 
+    async def list_folder(self, email: str, folder_id: str) -> DriveListing:
+        token = await self._drive_token(email)
+
+        def call() -> DriveListing:
+            session = self._drive_session_for_call()
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                # The same two reads the indexer makes: ``drives.get`` says the ID is a
+                # shared drive's root (listed drive-scoped, as a member can only list it);
+                # a 404 means a folder, read with ``files.get`` (which refuses an ID the
+                # account cannot see) and listed unscoped.
+                drive_id = ""
+                response = self._send(
+                    session,
+                    "GET",
+                    f"{DRIVE}/drives/{quote(folder_id, safe='')}",
+                    headers=headers,
+                    params={"fields": "id,name"},
+                )
+                if response.status_code == 404:
+                    response = self._send(
+                        session,
+                        "GET",
+                        f"{DRIVE}/files/{quote(folder_id, safe='')}",
+                        headers=headers,
+                        params={"fields": "id", "supportsAllDrives": "true"},
+                    )
+                else:
+                    drive_id = folder_id
+                self._check_drive(response)
+                items: list[DriveItem] = []
+                more = False
+                page_token = None
+                while True:
+                    params = {
+                        "q": f"'{folder_id}' in parents and trashed=false",
+                        "fields": "nextPageToken,files(id,name,mimeType,webViewLink,driveId)",
+                        "includeItemsFromAllDrives": "true",
+                        "supportsAllDrives": "true",
+                        "orderBy": "folder,name",
+                        "pageSize": str(LIST_CAP),
+                    }
+                    if drive_id:
+                        params["corpora"] = "drive"
+                        params["driveId"] = drive_id
+                    if page_token:
+                        params["pageToken"] = page_token
+                    response = self._send(
+                        session, "GET", f"{DRIVE}/files", headers=headers, params=params
+                    )
+                    self._check_drive(response)
+                    body = _json_object(response)
+                    try:
+                        for file in body.get("files", []):
+                            items.append(_picker_item(file))
+                    except (KeyError, TypeError) as err:
+                        raise GoogleError("unavailable") from err
+                    page_token = body.get("nextPageToken")
+                    if len(items) >= LIST_CAP:
+                        more = bool(page_token) or len(items) > LIST_CAP
+                        break
+                    if not page_token:
+                        break
+                return DriveListing(items[:LIST_CAP], more)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
     async def list_children(self, email: str, folder_id: str) -> list[DriveFile]:
         token = await self._drive_token(email)
 
@@ -803,7 +859,11 @@ class RealGoogleAccounts:
                     "supportsAllDrives": "true",
                 }
                 response = self._send(
-                    session, "GET", f"{DRIVE}/files/{file_id}", headers=headers, params=params
+                    session,
+                    "GET",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}",
+                    headers=headers,
+                    params=params,
                 )
                 self._check_drive(response)
                 try:
@@ -828,7 +888,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DRIVE}/files/{file_id}/export",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}/export",
                     headers=headers,
                     params={"mimeType": "text/plain"},
                 )
@@ -850,7 +910,11 @@ class RealGoogleAccounts:
         authorizes the Sheets API)."""
         params = {"fields": "sheets(properties.title,data.rowData.values.formattedValue)"}
         response = self._send(
-            session, "GET", f"{SHEETS}/spreadsheets/{file_id}", headers=headers, params=params
+            session,
+            "GET",
+            f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
+            headers=headers,
+            params=params,
         )
         self._check_drive(response)
         body = _json_object(response)
@@ -880,7 +944,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DRIVE}/drives/{drive_id}",
+                    f"{DRIVE}/drives/{quote(drive_id, safe='')}",
                     headers=headers,
                     params={"fields": "id,name"},
                 )
@@ -968,7 +1032,7 @@ class RealGoogleAccounts:
                     response = self._send(
                         session,
                         "GET",
-                        f"{DRIVE}/files/{file_id}/comments",
+                        f"{DRIVE}/files/{quote(file_id, safe='')}/comments",
                         headers=headers,
                         params=params,
                     )
@@ -1004,7 +1068,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DRIVE}/files/{file_id}/comments",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}/comments",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "id", "supportsAllDrives": "true"},
                     json={"content": content},
@@ -1035,7 +1099,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{SHEETS}/spreadsheets/{file_id}",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={
                         "ranges": _tab_range(tab, header_only),
@@ -1069,7 +1133,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{SHEETS}/spreadsheets/{file_id}",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "sheets.properties.title"},
                 )
@@ -1096,7 +1160,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{SHEETS}/spreadsheets/{file_id}/developerMetadata:search",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}/developerMetadata:search",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "dataFilters": [
@@ -1156,7 +1220,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{SHEETS}/spreadsheets/{file_id}:batchUpdate",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": [
@@ -1226,7 +1290,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DRIVE}/files/{template_id}/copy",
+                    f"{DRIVE}/files/{quote(template_id, safe='')}/copy",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "id,name,mimeType,webViewLink", "supportsAllDrives": "true"},
                     json={
@@ -1305,7 +1369,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": [
@@ -1336,7 +1400,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DOCS}/documents/{file_id}",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "documentId,title,revisionId,body.content"},
                 )
@@ -1408,7 +1472,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": requests,
@@ -1619,6 +1683,27 @@ def _sheet_tab(sheet_id: int, rows: list[dict]) -> SheetTab:
         if any(value != "" for value in row):
             data_rows = i + 1
     return SheetTab(sheet_id, header, data_rows)
+
+
+def _picker_item(file: dict) -> DriveItem:
+    """One Drive file as a picker row: the kind the grant picker acts on, its link and
+    the shared drive it sits in. Both listings (the top level and one folder) map here."""
+    link = file.get("webViewLink") or f"https://drive.google.com/file/d/{file['id']}"
+    mime = file.get("mimeType")
+    kind = "folder" if mime == MIME_FOLDER else "sheet" if mime == MIME_SHEET else "file"
+    return DriveItem(
+        file["id"],
+        file["name"],
+        link,
+        kind,
+        mime_type=mime or "",
+        drive_id=file.get("driveId") or "",
+    )
+
+
+def _is_drive_root(file: DriveFile) -> bool:
+    """A shared drive's root: its ``driveId`` is its own ID."""
+    return bool(file.drive_id) and file.drive_id == file.id
 
 
 def _drive_file(file: dict) -> DriveFile:
@@ -1978,6 +2063,35 @@ class FakeGoogleAccounts:
             if c in self.drive_files and not self.drive_files[c].trashed
         ]
 
+    async def list_folder(self, email: str, folder_id: str) -> DriveListing:
+        # The same two paths as the real client: a shared drive's root through
+        # ``get_drive``, a folder through ``get_file``; either refuses an ID the account
+        # cannot see.
+        try:
+            await self.get_drive(email, folder_id)
+        except GoogleError as err:
+            if err.status != 404:
+                raise
+            await self.get_file(email, folder_id)
+        children = await self.list_children(email, folder_id)
+        children.sort(key=lambda f: (f.mime_type != MIME_FOLDER, f.name))
+        items = [
+            DriveItem(
+                f.id,
+                f.name,
+                f.web_view_link,
+                "folder"
+                if f.mime_type == MIME_FOLDER
+                else "sheet"
+                if f.mime_type == MIME_SHEET
+                else "file",
+                mime_type=f.mime_type,
+                drive_id=f.drive_id,
+            )
+            for f in children
+        ]
+        return DriveListing(items[:LIST_CAP], len(items) > LIST_CAP)
+
     async def get_file(self, email: str, file_id: str) -> DriveFile:
         self.get_calls.append((email, file_id))
         if self._get_error is not None:
@@ -1988,7 +2102,9 @@ class FakeGoogleAccounts:
         if file_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         file = self.drive_files.get(file_id)
-        if file is None:
+        # Google answers ``files.get`` for a shared drive's ID with a 404: a drive is not a
+        # file; ``drives.get`` is how it is read.
+        if file is None or _is_drive_root(file):
             raise GoogleError("not_found", status=404)
         return file
 
@@ -2010,7 +2126,7 @@ class FakeGoogleAccounts:
         if drive_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         drive = self.drive_files.get(drive_id)
-        if drive is None:
+        if drive is None or not _is_drive_root(drive):
             raise GoogleError("not_found", status=404)
         return DriveFile(
             drive.id,

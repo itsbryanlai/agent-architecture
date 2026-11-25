@@ -199,7 +199,7 @@ def add_section_doc(google: FakeGoogleAccounts, parent: str = DRIVE_FOLDER) -> N
 
 def add_shared_drive_tree(google: FakeGoogleAccounts) -> None:
     """A shared drive with a Doc at its root and a sub-folder holding one more Doc."""
-    google.add_drive_folder(DRIVE_SHARED, "Team drive")
+    google.add_drive_folder(DRIVE_SHARED, "Team drive", drive_id=DRIVE_SHARED)
     google.add_drive_file(
         DRIVE_SHARED_DOC,
         "Shared guide",

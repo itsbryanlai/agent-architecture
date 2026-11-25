@@ -1,28 +1,61 @@
 {% extends "base.html" %}
+{% from "_drive_nav.html" import where, name, more %}
 {% block title %}Choose a template and a destination folder{% endblock %}
 {% block body %}
 <p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
 <h1>Choose a template and a destination folder</h1>
-<p>Pick a Doc shared with this workspace's Drive address as the template, and a folder inside a shared drive where the new Docs will be created. The template's <code>{{ '{{field name}}' }}</code> blanks are read when the version is submitted, and an admin approves them before the agent writes. New Docs can only be created in a shared drive folder.</p>
-{% if templates and folders %}
+{% if not chosen_template %}
+<p>Step 1 of 2: open folders and shared drives to find a Doc shared with this workspace's Drive address, and pick it as the template. The template's <code>{{ '{{field name}}' }}</code> blanks are read when the version is submitted, and an admin approves them before the agent writes.</p>
+{% else %}
+<p>Step 2 of 2: template <strong>{{ chosen_template.name }}</strong>. Open folders and shared drives and pick where the new Docs are created: a folder inside a shared drive. New Docs can only be created in a folder inside a shared drive, not in a shared drive's top level or in My Drive. An admin approves them before the agent writes.</p>
+{% endif %}
+{{ where(location, page_url, extra) }}
+<table>
+  <tr><th>Name</th><th>Kind</th></tr>
+  {% for item in listing.items %}
+  <tr><td>{{ name(item, page_url, extra) }}</td><td>{{ item.kind }}</td></tr>
+  {% endfor %}
+</table>
+{{ more(listing) }}
+{% if not chosen_template and templates %}
 <form method="post" action="{{ version_url }}/drive/pick/template">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
   <p>
-    <label for="template">Template Doc</label>
+    <label for="template">Template Doc here</label>
     <select name="template" id="template">
       {% for t in templates %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}
     </select>
   </p>
+  <p><button type="submit">Use this template</button></p>
+</form>
+{% elif chosen_template and (folders or can_use_here) %}
+{% if can_use_here %}
+<form method="post" action="{{ version_url }}/drive/pick/template">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
+  <input type="hidden" name="template" value="{{ chosen_template.id }}">
+  <p><button type="submit" name="here" value="yes">Put new Docs in this folder</button></p>
+</form>
+{% endif %}
+{% if folders %}
+<form method="post" action="{{ version_url }}/drive/pick/template">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
+  <input type="hidden" name="template" value="{{ chosen_template.id }}">
   <p>
-    <label for="folder">Destination folder (in a shared drive)</label>
-    <select name="folder" id="folder">
+    <label for="dest">Destination folder here (in a shared drive)</label>
+    <select name="dest" id="dest">
       {% for f in folders %}<option value="{{ f.id }}">{{ f.name }}</option>{% endfor %}
     </select>
   </p>
   <p><button type="submit">Add to this agent</button></p>
 </form>
+{% endif %}
 {% else %}
-<p class="muted">Share a Doc and a shared-drive folder with this workspace's Drive address, then choose again.</p>
+<p class="muted">{% if chosen_template %}No shared-drive folder here. Open a shared drive or a folder inside one.{% else %}No Doc here. Open a folder or shared drive to find one.{% endif %}</p>
 {% endif %}
 {% endblock %}

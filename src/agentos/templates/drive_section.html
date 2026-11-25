@@ -1,15 +1,25 @@
 {% extends "base.html" %}
+{% from "_drive_nav.html" import where, name, more %}
 {% block title %}Choose a Doc to replace a section of{% endblock %}
 {% block body %}
 <p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
 <h1>Choose a Doc to replace a section of</h1>
-<p>Pick a Doc shared with this workspace's Drive address. Next you choose the heading whose section the agent may replace; the section must be plain paragraphs (no table or image). Share the Doc as Editor for the write; an admin approves the agent before it writes.</p>
+<p>Open folders and shared drives to find a Doc shared with this workspace's Drive address. Next you choose the heading whose section the agent may replace; the section must be plain paragraphs (no table or image). Share the Doc as Editor for the write; an admin approves the agent before it writes.</p>
+{{ where(location, page_url, extra) }}
+<table>
+  <tr><th>Name</th><th>Kind</th></tr>
+  {% for item in listing.items %}
+  <tr><td>{{ name(item, page_url, extra) }}</td><td>{{ item.kind }}</td></tr>
+  {% endfor %}
+</table>
+{{ more(listing) }}
 {% if docs %}
 <form method="post" action="{{ version_url }}/drive/pick/section">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
   <p>
-    <label for="doc">Doc</label>
+    <label for="doc">Doc here</label>
     <select name="doc" id="doc">
       {% for d in docs %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
     </select>
@@ -17,6 +27,6 @@
   <p><button type="submit">Choose a heading</button></p>
 </form>
 {% else %}
-<p class="muted">Share a Doc with this workspace's Drive address, then choose again.</p>
+<p class="muted">No Doc here. Open a folder or shared drive to find one.</p>
 {% endif %}
 {% endblock %}

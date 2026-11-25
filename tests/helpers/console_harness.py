@@ -278,4 +278,4 @@ async def post(client: httpx.AsyncClient, path: str, token: str | None, **fields
     if token is not None:
         data["csrf"] = token
     headers = {**form_headers(), "Content-Type": "application/x-www-form-urlencoded"}
-    return await client.post(path, content=urlencode(data), headers=headers)
+    return await client.post(path, content=urlencode(data, doseq=True), headers=headers)

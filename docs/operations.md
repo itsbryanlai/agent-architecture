@@ -542,7 +542,9 @@ the Doc's body: the platform reads the exported body text, so blanks written
 only in a header or footer are not read. To grant it, the creator picks the
 template Doc and the destination folder from what the account can see on the
 version page (**Choose a template**) — only Google Docs are offered as
-templates and only folders inside a shared drive as destinations; the
+templates and only folders inside a shared drive as destinations (a
+shared drive's top level is not one: open it and pick a folder, or browse into a
+folder and choose **Put new Docs in this folder**); the
 definition editor can also add it directly as `grants.drive.templates` with the
 template's file ID, a label and the folder's ID (`{id, name, folder_id}`). Two
 shares are needed: the template Doc shared with the workspace's Drive address

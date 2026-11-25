@@ -1,5 +1,5 @@
 {% macro where(location, page_url, extra) %}
-<p>Where you are: <a href="{{ page_url }}{% if extra %}?{{ extra[1:] }}{% endif %}">Top</a>{% if location %} / <strong>{{ location.name }}</strong> <a href="{{ location.web_view_link }}">open in Drive</a>{% endif %}</p>
+<p>Where you are: <a href="{{ page_url }}{% if extra %}?{{ extra[1:] }}{% endif %}">Top</a>{% if location %} / {% if location.up %}… / {% endif %}<strong>{{ location.file.name }}</strong> <a href="{{ location.file.web_view_link }}">open in Drive</a> <a href="{{ page_url }}{% if location.up %}?folder={{ location.up|urlencode }}{{ extra }}{% elif extra %}?{{ extra[1:] }}{% endif %}">Up</a>{% endif %}</p>
 {% endmacro %}
 {% macro name(item, page_url, extra) %}{% if item.kind in ("folder", "shared_drive") %}<a href="{{ page_url }}?folder={{ item.id|urlencode }}{{ extra }}">{{ item.name }}</a> <a href="{{ item.link }}">open in Drive</a>{% else %}<a href="{{ item.link }}">{{ item.name }}</a>{% endif %}{% endmacro %}
 {% macro more(listing) %}{% if listing.more %}<p class="muted">Showing the first 100 items in this place.</p>{% endif %}{% endmacro %}

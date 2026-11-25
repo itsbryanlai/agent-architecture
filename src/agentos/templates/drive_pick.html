@@ -16,7 +16,7 @@
   <table>
     <tr><th></th><th>Name</th><th>Kind</th><th>Drive ID</th></tr>
     {% for item in listing.items %}
-    <tr><td><input type="checkbox" name="pick_{{ loop.index0 }}" value="yes"></td><td>{{ name(item, page_url, extra) }}</td><td>{{ item.kind }}</td><td><code>{{ item.id }}</code></td></tr>
+    <tr><td><input type="checkbox" name="pick" value="{{ item.id }}"></td><td>{{ name(item, page_url, extra) }}</td><td>{{ item.kind }}</td><td><code>{{ item.id }}</code></td></tr>
     {% endfor %}
   </table>
   {{ more(listing) }}

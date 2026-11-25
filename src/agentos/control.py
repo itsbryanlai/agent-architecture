@@ -431,6 +431,21 @@ def _all_grant_ids(agent: AgentVersion) -> dict[str, str]:
     return ids_
 
 
+@dataclass(frozen=True)
+class DriveLocation:
+    """Where the Drive picker is: a file or folder, or a shared drive's root (a drive is
+    read with ``drives.get``, so it carries no parents and no ``drive_id``)."""
+
+    file: DriveFile
+    shared_drive: bool
+
+    @property
+    def up(self) -> str:
+        """The ID of the folder this one sits in (its first parent), empty at a shared
+        drive's root: the picker's Up link, with no further walk."""
+        return "" if self.shared_drive or not self.file.parents else self.file.parents[0]
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -2292,12 +2307,21 @@ class ControlPlane:
             return await self._google.list_folder(email, folder)
         return await self._google.list_shared(email)
 
-    async def drive_picker_location(self, tenant_id: str, actor: Actor, folder: str) -> DriveFile:
-        """One file, folder or shared drive the account can see, by ID (one read): the
-        picker's current location, and a template re-read before its grant is added."""
+    async def drive_picker_location(
+        self, tenant_id: str, actor: Actor, folder: str
+    ) -> DriveLocation:
+        """One file, folder or shared drive the account can see, by ID: the picker's
+        current location, and a template re-read before its grant is added. The same two
+        reads the indexer makes: ``drives.get`` first, and a 404 means a file or folder
+        (``files.get``)."""
         email = await self._drive_account(tenant_id, actor)
         assert self._google is not None
-        return await self._google.get_file(email, folder)
+        try:
+            return DriveLocation(await self._google.get_drive(email, folder), shared_drive=True)
+        except GoogleError as err:
+            if err.status != 404:
+                raise
+        return DriveLocation(await self._google.get_file(email, folder), shared_drive=False)
 
     async def drive_sheet_tabs(self, tenant_id: str, actor: Actor, file_id: str) -> list[str]:
         """The tab titles of a Sheet shared with the workspace's account, for the picker's

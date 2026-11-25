@@ -41,10 +41,10 @@ from agentos.agent_feedback import FEEDBACK_DAYS
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
 from agentos.audience_pauses import REASON_TEXT
-from agentos.config import ConfigError
-from agentos.connectors.google_iam import MIME_DOC, DriveItem, GoogleError
+from agentos.config import DRIVE_ID, ConfigError
+from agentos.connectors.google_iam import MIME_DOC, MIME_FOLDER, DriveItem, GoogleError
 from agentos.connectors.notion import normalize_id
-from agentos.control import ControlPlane, Forbidden, Principal
+from agentos.control import ControlPlane, DriveLocation, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.crypto_keys import TenantKeyError
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
@@ -281,6 +281,16 @@ class Ctx:
     def get(self, name: str) -> str:
         return self.form.get(name, "")
 
+    def getlist(self, name: str) -> list[str]:
+        """Every value posted under a repeated field (a checkbox per item)."""
+        return list(getattr(self.form, "lists", {}).get(name, []))
+
+
+class Form(dict):
+    """The posted fields (the first value of each) and every value of a repeated field."""
+
+    lists: dict[str, list[str]]
+
 
 _TEMPLATE_GONE = (
     "That template is not an untrashed Google Doc the workspace's Drive account can see."
@@ -288,9 +298,29 @@ _TEMPLATE_GONE = (
 
 
 def _is_destination(item: DriveItem) -> bool:
-    """A place a templated Doc can be created: a folder inside a shared drive, or a shared
-    drive's root. A folder in My Drive cannot hold a new Doc."""
-    return item.kind == "shared_drive" or (item.kind == "folder" and bool(item.drive_id))
+    """A place a templated Doc can be created: a folder inside a shared drive. A folder in
+    My Drive cannot hold a new Doc, and a shared drive's root is not offered."""
+    return item.kind == "folder" and bool(item.drive_id)
+
+
+def _is_destination_folder(location: DriveLocation) -> bool:
+    """The location read is a live folder inside a shared drive (a drive's own root is not)."""
+    file = location.file
+    return (
+        not location.shared_drive
+        and file.mime_type == MIME_FOLDER
+        and not file.trashed
+        and bool(file.drive_id)
+    )
+
+
+def _bad_ids(*values: str) -> bool:
+    """True when any non-empty picker ID is not shaped like a Drive ID: the ID goes into a
+    Google path and query, so a crafted one is refused before any Google call."""
+    return any(value and not DRIVE_ID.fullmatch(value) for value in values)
+
+
+_NOT_A_DRIVE_ID = "That is not an item from the Drive list. Choose from Google Drive again."
 
 
 def _redirect(url: str) -> RedirectResponse:
@@ -459,7 +489,8 @@ class WebUI:
             parsed = parse_qs(body.decode(), keep_blank_values=True, max_num_fields=50)
         except ValueError:
             return _message("Bad request", "That form could not be read.", 400, ctx)
-        fields = {name: values[0] for name, values in parsed.items()}
+        fields = Form({name: values[0] for name, values in parsed.items()})
+        fields.lists = {name: list(values) for name, values in parsed.items()}
         token = fields.pop("csrf", "")
         if not token or not _same(token, csrf):
             return _message(
@@ -1228,6 +1259,10 @@ class WebUI:
             location = await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, folder)
         return listing, location
 
+    @staticmethod
+    def _choose_again(ctx: Ctx, back: str, text: str = _NOT_A_DRIVE_ID):
+        return _message("Choose again", text, 409, ctx, back=back)
+
     def _drive_unavailable(self, ctx: Ctx, err: GoogleError, back: str):
         return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
 
@@ -1235,6 +1270,8 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
+        if _bad_ids(folder):
+            return self._choose_again(ctx, back)
         try:
             listing, location = await self._drive_browse(ctx, folder)
         except GoogleError as err:
@@ -1257,12 +1294,15 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
+        ticked = ctx.getlist("pick")
+        if _bad_ids(folder, *ticked):
+            return self._choose_again(ctx, back)
         try:
             listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
         except GoogleError as err:
             return self._drive_unavailable(ctx, err, back)
-        # Only a position in the listing the workspace's account produced can be chosen.
-        chosen = [item for i, item in enumerate(listing.items) if ctx.get(f"pick_{i}") == "yes"]
+        # Only an ID in the listing the workspace's account produced here can be chosen.
+        chosen = [item for item in listing.items if item.id in ticked]
         sheets = [item for item in chosen if item.kind == "sheet"]
         others = [item for item in chosen if item.kind != "sheet"]
         if others:
@@ -1280,9 +1320,11 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
+        wanted = request.query_params.getlist("sheet")
+        if _bad_ids(folder, *wanted):
+            return self._choose_again(ctx, back)
         try:
             listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
-            wanted = request.query_params.getlist("sheet")
             sheets = []
             for item in listing.items:
                 if item.kind != "sheet" or item.id not in wanted:
@@ -1313,16 +1355,21 @@ class WebUI:
     async def drive_tab_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
+        sheet_ids = []
+        while sheet_id := ctx.get(f"sheet_id_{len(sheet_ids)}"):
+            sheet_ids.append(sheet_id)
+        if _bad_ids(folder, *sheet_ids):
+            return self._choose_again(ctx, back)
         try:
-            listing = await ctx.plane.drive_picker_listing(
-                ctx.tenant_id, ctx.principal, self._folder(request, ctx)
-            )
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
         except GoogleError as err:
             return self._drive_unavailable(ctx, err, back)
         by_id = {item.id: item for item in listing.items if item.kind == "sheet"}
         chosen: list[DriveItem] = []
         i = 0
-        while sheet_id := ctx.get(f"sheet_id_{i}"):
+        while i < len(sheet_ids):
+            sheet_id = sheet_ids[i]
             item = by_id.get(sheet_id)
             if item is None:
                 return _message(
@@ -1359,16 +1406,21 @@ class WebUI:
 
     async def drive_template_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         """The template picker, in two steps (D-49): browse to the template Doc, then browse
-        to its destination folder. A destination is a folder inside a shared drive or a
-        shared drive's root: a destination outside a shared drive cannot hold a new Doc."""
+        to its destination folder. A destination is a folder inside a shared drive, picked
+        from a folder list or as the folder being browsed; a shared drive's root is not one
+        and a folder outside a shared drive cannot hold a new Doc."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
         template_id = request.query_params.get("template", "")
+        if _bad_ids(folder, template_id):
+            return self._choose_again(ctx, back)
         try:
             listing, location = await self._drive_browse(ctx, folder)
             template = (
-                await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, template_id)
+                (
+                    await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, template_id)
+                ).file
                 if template_id
                 else None
             )
@@ -1383,6 +1435,7 @@ class WebUI:
             templates=[item for item in listing.items if item.mime_type == MIME_DOC],
             folders=[item for item in listing.items if _is_destination(item)],
             chosen_template=template,
+            can_use_here=location is not None and _is_destination_folder(location),
             folder=folder,
             location=location,
             page_url=f"{back}/drive/pick/template",
@@ -1396,21 +1449,19 @@ class WebUI:
     async def drive_template_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
-        try:
-            listing = await ctx.plane.drive_picker_listing(
-                ctx.tenant_id, ctx.principal, self._folder(request, ctx)
-            )
-        except GoogleError as err:
-            return self._drive_unavailable(ctx, err, back)
-        dest_id = ctx.get("dest")
-        if not dest_id:
+        folder = self._folder(request, ctx)
+        template_id, dest_id = ctx.get("template"), ctx.get("dest")
+        here = ctx.get("here") == "yes"
+        if not template_id or _bad_ids(folder, template_id, dest_id):
+            return self._choose_again(ctx, back)
+        if not dest_id and not here:
             # Step one: the template, from the listing the account produced here.
+            try:
+                listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
+            except GoogleError as err:
+                return self._drive_unavailable(ctx, err, back)
             template = next(
-                (
-                    i
-                    for i in listing.items
-                    if i.id == ctx.get("template") and i.mime_type == MIME_DOC
-                ),
+                (i for i in listing.items if i.id == template_id and i.mime_type == MIME_DOC),
                 None,
             )
             if template is None:
@@ -1418,20 +1469,28 @@ class WebUI:
                     "Choose again", "Pick a template Doc from the Drive list.", 409, ctx, back=back
                 )
             return _redirect(f"{back}/drive/pick/template?template={quote(template.id)}")
-        # Step two: the destination, from the listing here; the template is read again.
-        dest = next((i for i in listing.items if i.id == dest_id and _is_destination(i)), None)
-        if dest is None:
-            return _message(
-                "Choose again",
-                "Pick a destination folder inside a shared drive from the Drive list.",
-                409,
-                ctx,
-                back=back,
-            )
+        # Step two: the destination, then the template is read again.
+        destination_text = "Pick a destination folder inside a shared drive from the Drive list."
         try:
-            template = await ctx.plane.drive_picker_location(
-                ctx.tenant_id, ctx.principal, ctx.get("template")
-            )
+            if here:
+                # The folder being browsed, read again: it must still be a folder inside a
+                # shared drive.
+                if not folder:
+                    return self._choose_again(ctx, back, destination_text)
+                location = await ctx.plane.drive_picker_location(
+                    ctx.tenant_id, ctx.principal, folder
+                )
+                if not _is_destination_folder(location):
+                    return self._choose_again(ctx, back, destination_text)
+                dest_id = location.file.id
+            else:
+                listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
+                dest = next((i for i in listing.items if i.id == dest_id), None)
+                if dest is None or not _is_destination(dest):
+                    return self._choose_again(ctx, back, destination_text)
+            template = (
+                await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, template_id)
+            ).file
         except GoogleError as err:
             return self._drive_unavailable(ctx, err, back)
         if template.mime_type != MIME_DOC or template.trashed:
@@ -1442,7 +1501,7 @@ class WebUI:
                 name=template.name,
                 link=template.web_view_link,
                 kind="template",
-                folder_id=dest.id,
+                folder_id=dest_id,
             )
         ]
         await ctx.plane.add_drive_grants(
@@ -1456,6 +1515,8 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
+        if _bad_ids(folder):
+            return self._choose_again(ctx, back)
         try:
             listing, location = await self._drive_browse(ctx, folder)
         except GoogleError as err:
@@ -1482,6 +1543,8 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         folder = self._folder(request, ctx)
+        if _bad_ids(folder, ctx.get("doc")):
+            return self._choose_again(ctx, back)
         try:
             listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
         except GoogleError as err:

@@ -324,13 +324,12 @@ async def test_listing_mints_a_drive_token_once_and_reuses_it_until_it_expires(d
 
 
 @pytest.mark.parametrize("is_drive_root", [True, False], ids=["shared-drive-root", "folder"])
-async def test_listing_one_folder_asks_for_one_capped_level_scoped_to_the_drive_when_it_is_one(
+async def test_listing_one_folder_reads_drives_get_first_and_lists_a_drive_root_drive_scoped(
     is_drive_root, deployment_key
 ):
     """Fails if a shared drive's root is listed without the drive-scoped query, a plain folder
-    is listed drive-scoped, the level is not ordered folders first, or a full page does not
-    stop at the cap and say there is more."""
-    probe = {"id": "node-1", "driveId": "node-1"} if is_drive_root else {"id": "node-1"}
+    (drives.get 404, then files.get) is listed drive-scoped, the level is not ordered folders
+    first, or a full page does not stop at the cap and say there is more."""
     children = [
         {"id": f"c{i}", "name": f"n{i}", "mimeType": MIME_DOC, "driveId": "node-1"}
         for i in range(LIST_CAP)
@@ -339,14 +338,22 @@ async def test_listing_one_folder_asks_for_one_capped_level_scoped_to_the_drive_
     def handler(request):
         if request.path_url == MINT_PATH:
             return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        if request.path_url.startswith("/drive/v3/drives/node-1"):
+            if is_drive_root:
+                return reply(request, 200, {"id": "node-1", "name": "Team drive"})
+            return reply(request, 404, {"error": {"code": 404}})
         if request.path_url.startswith("/drive/v3/files/node-1"):
-            return reply(request, 200, probe)
+            return reply(request, 200, {"id": "node-1"})
         return reply(request, 200, {"files": children, "nextPageToken": "more"})
 
     client, sent = client_with(handler, deployment_key)
     listing = await client.list_folder(EMAIL, "node-1")
     assert len(listing.items) == LIST_CAP and listing.more is True
     assert listing.items[0].drive_id == "node-1"
+    reads = [p for p in (urlsplit(r.url).path for r in sent) if p.startswith("/drive/")]
+    expected = ["/drive/v3/drives/node-1"]
+    expected += [] if is_drive_root else ["/drive/v3/files/node-1"]
+    assert reads == [*expected, "/drive/v3/files"]
     query = parse_qs(urlsplit(sent[-1].url).query)
     assert query["q"] == ["'node-1' in parents and trashed=false"]
     assert query["orderBy"] == ["folder,name"]

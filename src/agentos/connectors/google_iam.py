@@ -53,6 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Protocol
+from urllib.parse import quote
 
 import requests
 from google.auth.exceptions import RefreshError, TransportError
@@ -744,18 +745,29 @@ class RealGoogleAccounts:
             session = self._drive_session_for_call()
             try:
                 headers = {"Authorization": f"Bearer {token}"}
-                # One read refuses an ID the account cannot see and says which shared drive
-                # the node is in (a drive root's driveId is its own ID); a node in one is
-                # listed drive-scoped, as a member can only list it that way.
+                # The same two reads the indexer makes: ``drives.get`` says the ID is a
+                # shared drive's root (listed drive-scoped, as a member can only list it);
+                # a 404 means a folder, read with ``files.get`` (which refuses an ID the
+                # account cannot see) and listed unscoped.
+                drive_id = ""
                 response = self._send(
                     session,
                     "GET",
-                    f"{DRIVE}/files/{folder_id}",
+                    f"{DRIVE}/drives/{quote(folder_id, safe='')}",
                     headers=headers,
-                    params={"fields": "id,driveId", "supportsAllDrives": "true"},
+                    params={"fields": "id,name"},
                 )
+                if response.status_code == 404:
+                    response = self._send(
+                        session,
+                        "GET",
+                        f"{DRIVE}/files/{quote(folder_id, safe='')}",
+                        headers=headers,
+                        params={"fields": "id", "supportsAllDrives": "true"},
+                    )
+                else:
+                    drive_id = folder_id
                 self._check_drive(response)
-                drive_id = _json_object(response).get("driveId") or ""
                 items: list[DriveItem] = []
                 more = False
                 page_token = None
@@ -847,7 +859,11 @@ class RealGoogleAccounts:
                     "supportsAllDrives": "true",
                 }
                 response = self._send(
-                    session, "GET", f"{DRIVE}/files/{file_id}", headers=headers, params=params
+                    session,
+                    "GET",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}",
+                    headers=headers,
+                    params=params,
                 )
                 self._check_drive(response)
                 try:
@@ -872,7 +888,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DRIVE}/files/{file_id}/export",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}/export",
                     headers=headers,
                     params={"mimeType": "text/plain"},
                 )
@@ -894,7 +910,11 @@ class RealGoogleAccounts:
         authorizes the Sheets API)."""
         params = {"fields": "sheets(properties.title,data.rowData.values.formattedValue)"}
         response = self._send(
-            session, "GET", f"{SHEETS}/spreadsheets/{file_id}", headers=headers, params=params
+            session,
+            "GET",
+            f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
+            headers=headers,
+            params=params,
         )
         self._check_drive(response)
         body = _json_object(response)
@@ -924,7 +944,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DRIVE}/drives/{drive_id}",
+                    f"{DRIVE}/drives/{quote(drive_id, safe='')}",
                     headers=headers,
                     params={"fields": "id,name"},
                 )
@@ -1012,7 +1032,7 @@ class RealGoogleAccounts:
                     response = self._send(
                         session,
                         "GET",
-                        f"{DRIVE}/files/{file_id}/comments",
+                        f"{DRIVE}/files/{quote(file_id, safe='')}/comments",
                         headers=headers,
                         params=params,
                     )
@@ -1048,7 +1068,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DRIVE}/files/{file_id}/comments",
+                    f"{DRIVE}/files/{quote(file_id, safe='')}/comments",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "id", "supportsAllDrives": "true"},
                     json={"content": content},
@@ -1079,7 +1099,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{SHEETS}/spreadsheets/{file_id}",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={
                         "ranges": _tab_range(tab, header_only),
@@ -1113,7 +1133,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{SHEETS}/spreadsheets/{file_id}",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "sheets.properties.title"},
                 )
@@ -1140,7 +1160,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{SHEETS}/spreadsheets/{file_id}/developerMetadata:search",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}/developerMetadata:search",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "dataFilters": [
@@ -1200,7 +1220,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{SHEETS}/spreadsheets/{file_id}:batchUpdate",
+                    f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": [
@@ -1270,7 +1290,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DRIVE}/files/{template_id}/copy",
+                    f"{DRIVE}/files/{quote(template_id, safe='')}/copy",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "id,name,mimeType,webViewLink", "supportsAllDrives": "true"},
                     json={
@@ -1349,7 +1369,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": [
@@ -1380,7 +1400,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "GET",
-                    f"{DOCS}/documents/{file_id}",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"fields": "documentId,title,revisionId,body.content"},
                 )
@@ -1452,7 +1472,7 @@ class RealGoogleAccounts:
                 response = self._send(
                     session,
                     "POST",
-                    f"{DOCS}/documents/{file_id}:batchUpdate",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
                     json={
                         "requests": requests,
@@ -1679,6 +1699,11 @@ def _picker_item(file: dict) -> DriveItem:
         mime_type=mime or "",
         drive_id=file.get("driveId") or "",
     )
+
+
+def _is_drive_root(file: DriveFile) -> bool:
+    """A shared drive's root: its ``driveId`` is its own ID."""
+    return bool(file.drive_id) and file.drive_id == file.id
 
 
 def _drive_file(file: dict) -> DriveFile:
@@ -2039,6 +2064,15 @@ class FakeGoogleAccounts:
         ]
 
     async def list_folder(self, email: str, folder_id: str) -> DriveListing:
+        # The same two paths as the real client: a shared drive's root through
+        # ``get_drive``, a folder through ``get_file``; either refuses an ID the account
+        # cannot see.
+        try:
+            await self.get_drive(email, folder_id)
+        except GoogleError as err:
+            if err.status != 404:
+                raise
+            await self.get_file(email, folder_id)
         children = await self.list_children(email, folder_id)
         children.sort(key=lambda f: (f.mime_type != MIME_FOLDER, f.name))
         items = [
@@ -2068,7 +2102,9 @@ class FakeGoogleAccounts:
         if file_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         file = self.drive_files.get(file_id)
-        if file is None:
+        # Google answers ``files.get`` for a shared drive's ID with a 404: a drive is not a
+        # file; ``drives.get`` is how it is read.
+        if file is None or _is_drive_root(file):
             raise GoogleError("not_found", status=404)
         return file
 
@@ -2090,7 +2126,7 @@ class FakeGoogleAccounts:
         if drive_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         drive = self.drive_files.get(drive_id)
-        if drive is None:
+        if drive is None or not _is_drive_root(drive):
             raise GoogleError("not_found", status=404)
         return DriveFile(
             drive.id,

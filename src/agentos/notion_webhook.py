@@ -33,7 +33,6 @@ import asyncio
 import dataclasses
 import logging
 import sys
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -48,7 +47,7 @@ from agentos.crypto_keys import KeyStore, TenantKeyError, build_key_store
 from agentos.models import AuditEvent
 from agentos.payload_codec import decrypt_for_tenant, encrypt_for_tenant
 from agentos.stores import joined_transaction, tenant_transaction
-from agentos.switches import operator_identity
+from agentos.switches import add_request_id_argument, command_request_id, operator_identity
 from agentos.unit_of_work import InMemoryUnitOfWork, PostgresUnitOfWork, UnitOfWork
 from agentos.usage import utcnow
 
@@ -303,7 +302,7 @@ async def execute(
         print(f"'{args.tenant}' is not a valid tenant ID")
         return 2
     identity = operator_identity()
-    invocation = request_id or uuid.uuid4().hex
+    invocation = command_request_id(request_id or args.request_id)
     unit = InMemoryUnitOfWork(store, audit) if uow is None else uow
     try:
         if args.command == "show":
@@ -376,9 +375,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tenant", required=True, help="the tenant whose token to manage")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("show", help="print the pending token once, to paste into Notion")
-    commands.add_parser("confirm", help="make the pending token active (events are accepted)")
-    commands.add_parser("clear", help="remove the token so a new handshake is accepted")
+    for name, text in (
+        ("show", "print the pending token once, to paste into Notion"),
+        ("confirm", "make the pending token active (events are accepted)"),
+        ("clear", "remove the token so a new handshake is accepted"),
+    ):
+        add_request_id_argument(commands.add_parser(name, help=text))
     return parser
 
 

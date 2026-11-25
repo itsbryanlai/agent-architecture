@@ -452,6 +452,26 @@ def operator_identity() -> str:
     return f"operator:{pwd.getpwuid(os.getuid()).pw_name}"
 
 
+def command_request_id(given: str | None) -> str:
+    """The ID a host command's audit rows are keyed by: the one given, else a new one, printed.
+
+    A retry that passes the printed ID writes nothing a second time. It goes to stderr so a
+    command that prints a value on stdout (a token) stays pasteable. It is not a secret.
+    """
+    if given:
+        return given
+    new = uuid.uuid4().hex
+    print(f"request id: {new}; pass --request-id {new} to retry this exact change", file=sys.stderr)
+    return new
+
+
+def add_request_id_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--request-id",
+        help="reuse a printed request ID so a retried command writes its audit event once",
+    )
+
+
 def _targets(args: argparse.Namespace) -> list[tuple[str, str | None]]:
     if args.everything:
         return [(ALL_AGENTS, None), (WRITES, None)] + [(CONNECTOR, c) for c in CONNECTORS]
@@ -489,7 +509,7 @@ async def execute(
                 print("nothing is turned off")
             return 0
         identity = operator_identity()
-        invocation = request_id or uuid.uuid4().hex
+        invocation = command_request_id(request_id or args.request_id)
         for scope, target in _targets(args):
             changed = await set_switch(
                 store,
@@ -541,6 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("list", help="show what is turned off")
     for name, text in (("off", "turn a switch off"), ("on", "turn a switch back on")):
         sub = commands.add_parser(name, help=text)
+        add_request_id_argument(sub)
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument("--agent", help="one agent, by ID")
         group.add_argument("--all-agents", action="store_true", help="every agent of the tenant")

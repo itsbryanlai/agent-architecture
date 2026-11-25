@@ -8,6 +8,7 @@
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">
   <input type="hidden" name="doc" value="{{ doc.id }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
   {% if headings %}
   <p>
     {% for h in headings %}

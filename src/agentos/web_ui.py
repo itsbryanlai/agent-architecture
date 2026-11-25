@@ -282,6 +282,17 @@ class Ctx:
         return self.form.get(name, "")
 
 
+_TEMPLATE_GONE = (
+    "That template is not an untrashed Google Doc the workspace's Drive account can see."
+)
+
+
+def _is_destination(item: DriveItem) -> bool:
+    """A place a templated Doc can be created: a folder inside a shared drive, or a shared
+    drive's root. A folder in My Drive cannot hold a new Doc."""
+    return item.kind == "shared_drive" or (item.kind == "folder" and bool(item.drive_id))
+
+
 def _redirect(url: str) -> RedirectResponse:
     return RedirectResponse(url, status_code=303)
 
@@ -1199,30 +1210,57 @@ class WebUI:
     # The workspace's Drive account, not a per-creator sign-in: the picker lists what the
     # account can see and a click grants it. The admin's approval at publish is the check.
 
+    @staticmethod
+    def _folder(request: Request, ctx: Ctx) -> str:
+        """The folder or shared drive the picker is showing: the query on a page, the hidden
+        field on a form. Empty is the top level. Any ID is taken; Google refuses one the
+        account cannot see."""
+        if request.method == "GET":
+            return request.query_params.get("folder", "")
+        return ctx.get("folder")
+
+    async def _drive_browse(self, ctx: Ctx, folder: str):
+        """The listing of the picker's current location, and its name when it is not the
+        top. A listing is one level, capped like the top level."""
+        listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
+        location = None
+        if folder:
+            location = await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, folder)
+        return listing, location
+
+    def _drive_unavailable(self, ctx: Ctx, err: GoogleError, back: str):
+        return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+
     async def drive_pick_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing, location = await self._drive_browse(ctx, folder)
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+            return self._drive_unavailable(ctx, err, back)
         return _page(
             "drive_pick.html",
             ctx=ctx,
             listing=listing,
+            folder=folder,
+            location=location,
+            page_url=f"{back}/drive/pick",
+            extra="",
             agent_id=agent_id,
             version=version,
             base=self.base(ctx),
-            version_url=self.version_url(ctx, agent_id, version),
+            version_url=back,
         )
 
     async def drive_pick_choose(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+            return self._drive_unavailable(ctx, err, back)
         # Only a position in the listing the workspace's account produced can be chosen.
         chosen = [item for i, item in enumerate(listing.items) if ctx.get(f"pick_{i}") == "yes"]
         sheets = [item for item in chosen if item.kind == "sheet"]
@@ -1234,15 +1272,16 @@ class WebUI:
         if not sheets:
             return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
         # A Sheet is granted for one tab: the next step reads its tabs and asks which one.
-        query = urlencode([("sheet", item.id) for item in sheets])
+        query = urlencode([("sheet", item.id) for item in sheets] + [("folder", folder)])
         return _redirect(f"{back}/drive/pick/tabs?{query}")
 
     async def drive_tab_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
         """The tab step: each chosen Sheet with its live tab titles, one pick per Sheet."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
             wanted = request.query_params.getlist("sheet")
             sheets = []
             for item in listing.items:
@@ -1251,7 +1290,7 @@ class WebUI:
                 tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, item.id)
                 sheets.append({"item": item, "tabs": tabs})
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+            return self._drive_unavailable(ctx, err, back)
         if not sheets:
             return _message(
                 "Choose again",
@@ -1264,6 +1303,7 @@ class WebUI:
             "drive_tabs.html",
             ctx=ctx,
             sheets=sheets,
+            folder=folder,
             agent_id=agent_id,
             version=version,
             base=self.base(ctx),
@@ -1274,9 +1314,11 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing = await ctx.plane.drive_picker_listing(
+                ctx.tenant_id, ctx.principal, self._folder(request, ctx)
+            )
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+            return self._drive_unavailable(ctx, err, back)
         by_id = {item.id: item for item in listing.items if item.kind == "sheet"}
         chosen: list[DriveItem] = []
         i = 0
@@ -1294,9 +1336,7 @@ class WebUI:
             try:
                 tabs = await ctx.plane.drive_sheet_tabs(ctx.tenant_id, ctx.principal, sheet_id)
             except GoogleError as err:
-                return _message(
-                    "Google Drive unavailable", str(err), page_status(502), ctx, back=back
-                )
+                return self._drive_unavailable(ctx, err, back)
             # Only a position in the tab list the account's read produced can be chosen.
             position = ctx.get(f"tab_{i}")
             if not position.isdigit() or int(position) >= len(tabs):
@@ -1318,22 +1358,35 @@ class WebUI:
         return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
 
     async def drive_template_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
-        """The template step: pick a granted Doc as the template and a folder as the
-        destination of the new Docs (D-49). Only Docs and shared-drive folders the account
-        sees are offered: a destination outside a shared drive cannot hold a new Doc."""
+        """The template picker, in two steps (D-49): browse to the template Doc, then browse
+        to its destination folder. A destination is a folder inside a shared drive or a
+        shared drive's root: a destination outside a shared drive cannot hold a new Doc."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
+        template_id = request.query_params.get("template", "")
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing, location = await self._drive_browse(ctx, folder)
+            template = (
+                await ctx.plane.drive_picker_location(ctx.tenant_id, ctx.principal, template_id)
+                if template_id
+                else None
+            )
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
-        templates = [item for item in listing.items if item.mime_type == MIME_DOC]
-        folders = [item for item in listing.items if item.kind == "folder" and item.drive_id]
+            return self._drive_unavailable(ctx, err, back)
+        if template is not None and (template.mime_type != MIME_DOC or template.trashed):
+            return _message("Choose again", _TEMPLATE_GONE, 409, ctx, back=back)
         return _page(
             "drive_template.html",
             ctx=ctx,
-            templates=templates,
-            folders=folders,
+            listing=listing,
+            templates=[item for item in listing.items if item.mime_type == MIME_DOC],
+            folders=[item for item in listing.items if _is_destination(item)],
+            chosen_template=template,
+            folder=folder,
+            location=location,
+            page_url=f"{back}/drive/pick/template",
+            extra=f"&template={quote(template_id)}" if template_id else "",
             agent_id=agent_id,
             version=version,
             base=self.base(ctx),
@@ -1344,37 +1397,52 @@ class WebUI:
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing = await ctx.plane.drive_picker_listing(
+                ctx.tenant_id, ctx.principal, self._folder(request, ctx)
+            )
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
-        # Only a position in the listing the workspace's account produced can be chosen.
-        template = next(
-            (i for i in listing.items if i.id == ctx.get("template") and i.mime_type == MIME_DOC),
-            None,
-        )
-        folder = next(
-            (
-                i
-                for i in listing.items
-                if i.id == ctx.get("folder") and i.kind == "folder" and i.drive_id
-            ),
-            None,
-        )
-        if template is None or folder is None:
+            return self._drive_unavailable(ctx, err, back)
+        dest_id = ctx.get("dest")
+        if not dest_id:
+            # Step one: the template, from the listing the account produced here.
+            template = next(
+                (
+                    i
+                    for i in listing.items
+                    if i.id == ctx.get("template") and i.mime_type == MIME_DOC
+                ),
+                None,
+            )
+            if template is None:
+                return _message(
+                    "Choose again", "Pick a template Doc from the Drive list.", 409, ctx, back=back
+                )
+            return _redirect(f"{back}/drive/pick/template?template={quote(template.id)}")
+        # Step two: the destination, from the listing here; the template is read again.
+        dest = next((i for i in listing.items if i.id == dest_id and _is_destination(i)), None)
+        if dest is None:
             return _message(
                 "Choose again",
-                "Pick a template Doc and a destination folder from the Drive list.",
+                "Pick a destination folder inside a shared drive from the Drive list.",
                 409,
                 ctx,
                 back=back,
             )
+        try:
+            template = await ctx.plane.drive_picker_location(
+                ctx.tenant_id, ctx.principal, ctx.get("template")
+            )
+        except GoogleError as err:
+            return self._drive_unavailable(ctx, err, back)
+        if template.mime_type != MIME_DOC or template.trashed:
+            return _message("Choose again", _TEMPLATE_GONE, 409, ctx, back=back)
         chosen = [
             DriveItem(
                 id=template.id,
                 name=template.name,
-                link=template.link,
+                link=template.web_view_link,
                 kind="template",
-                folder_id=folder.id,
+                folder_id=dest.id,
             )
         ]
         await ctx.plane.add_drive_grants(
@@ -1383,19 +1451,24 @@ class WebUI:
         return _redirect(self.version_url(ctx, agent_id, version, "drive-picked"))
 
     async def drive_section_page(self, request: Request, ctx: Ctx, agent_id: str, version: int):
-        """The section step's first page: pick a granted Doc to replace a section of (D-50).
+        """The section step's first page: browse to a Doc to replace a section of (D-50).
         Only Docs the account sees are offered; the next step reads the chosen Doc's headings."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing, location = await self._drive_browse(ctx, folder)
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
-        docs = [item for item in listing.items if item.mime_type == MIME_DOC]
+            return self._drive_unavailable(ctx, err, back)
         return _page(
             "drive_section.html",
             ctx=ctx,
-            docs=docs,
+            listing=listing,
+            docs=[item for item in listing.items if item.mime_type == MIME_DOC],
+            folder=folder,
+            location=location,
+            page_url=f"{back}/drive/pick/section",
+            extra="",
             agent_id=agent_id,
             version=version,
             base=self.base(ctx),
@@ -1408,10 +1481,11 @@ class WebUI:
         agent (a read file) shows a plain message: a Doc is granted once across kinds (D-50)."""
         await ctx.plane.require_agent_editor(ctx.tenant_id, ctx.principal, agent_id)
         back = self.version_url(ctx, agent_id, version)
+        folder = self._folder(request, ctx)
         try:
-            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal)
+            listing = await ctx.plane.drive_picker_listing(ctx.tenant_id, ctx.principal, folder)
         except GoogleError as err:
-            return _message("Google Drive unavailable", str(err), page_status(502), ctx, back=back)
+            return self._drive_unavailable(ctx, err, back)
         doc = next(
             (i for i in listing.items if i.id == ctx.get("doc") and i.mime_type == MIME_DOC),
             None,
@@ -1445,6 +1519,7 @@ class WebUI:
                 "drive_section_heading.html",
                 ctx=ctx,
                 doc=doc,
+                folder=folder,
                 headings=headings,
                 agent_id=agent_id,
                 version=version,

@@ -1,22 +1,25 @@
 {% extends "base.html" %}
 {% block title %}Choose from Google Drive{% endblock %}
+{% from "_drive_nav.html" import where, name, more %}
 {% block body %}
 <p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
 <h1>Choose from Google Drive</h1>
-{% if not listing.items %}
+{{ where(location, page_url, extra) }}
+{% if not listing.items and not folder %}
 <p>Nothing is shared with this workspace's Drive address yet. Share a folder or file with the address on the Settings page, then choose again.</p>
 {% else %}
-<p>These are the folders, files and Sheets shared with this workspace's Drive address. Anything shared with it is available to every agent creator here; tick the ones this agent may read, and the Sheets it may append a row to (a Sheet asks for its tab next). An admin approves the agent before it reads or writes them.</p>
+<p>These are the folders, files and Sheets shared with this workspace's Drive address; open a folder or shared drive to pick what is inside it. Anything shared with it is available to every agent creator here; tick the ones this agent may read, and the Sheets it may append a row to (a Sheet asks for its tab next). An admin approves the agent before it reads or writes them.</p>
 <form method="post" action="{{ version_url }}/drive/pick/choose">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">
+  <input type="hidden" name="folder" value="{{ folder }}">
   <table>
     <tr><th></th><th>Name</th><th>Kind</th><th>Drive ID</th></tr>
     {% for item in listing.items %}
-    <tr><td><input type="checkbox" name="pick_{{ loop.index0 }}" value="yes"></td><td><a href="{{ item.link }}">{{ item.name }}</a></td><td>{{ item.kind }}</td><td><code>{{ item.id }}</code></td></tr>
+    <tr><td><input type="checkbox" name="pick_{{ loop.index0 }}" value="yes"></td><td>{{ name(item, page_url, extra) }}</td><td>{{ item.kind }}</td><td><code>{{ item.id }}</code></td></tr>
     {% endfor %}
   </table>
-  {% if listing.more %}<p class="muted">Showing the first 100 items shared with this address.</p>{% endif %}
+  {{ more(listing) }}
   <p><button type="submit">Add to this agent</button></p>
 </form>
 {% endif %}

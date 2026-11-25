@@ -500,8 +500,10 @@ included); no re-consent is needed — the accounts are service accounts.
 `append_row`: it drafts a row for one named tab of that Sheet, and nothing is
 appended until the requester approves the card in Slack — an append always
 asks, never low-risk. To grant a Sheet, the creator picks it from what the
-account can see on the version page (**Choose from Google Drive**); a Sheet
-asks for its tab next — the platform reads the Sheet's tab titles and the
+account can see on the version page (**Choose from Google Drive**), opening
+shared drives and folders one level at a time, so one share of a shared drive
+is enough to pick a Sheet, a template, a destination folder or a Doc inside it;
+a Sheet asks for its tab next — the platform reads the Sheet's tab titles and the
 creator picks the one to append to. The definition editor can also add it
 directly as `grants.drive.sheets` with the file's ID, a label and the tab name
 (`{id, name, tab}`). The file must be shared with the workspace's Drive address

@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from agentos import ids
-from agentos.connectors.google_iam import MIME_DOC, MIME_SHEET, DriveItem, FakeGoogleAccounts
+from agentos.connectors.google_iam import (
+    MIME_DOC,
+    MIME_SHEET,
+    DriveItem,
+    DriveSection,
+    FakeGoogleAccounts,
+)
 from agentos.drive_connections import InMemoryDriveConnectionStore
 from tests.conftest import TENANT
 from tests.helpers.agents import helper_block
@@ -14,12 +20,19 @@ from tests.helpers.drive import (
     DRIVE_DOC,
     DRIVE_FOLDER,
     DRIVE_SHARED,
+    DRIVE_SHARED_DOC,
+    DRIVE_SHARED_NESTED,
+    DRIVE_SHARED_SUB,
     DRIVE_SHEET,
+    DRIVE_TEMPLATE,
     TEMPLATE_DRIVE,
     TEMPLATE_FOLDER,
+    TEMPLATE_PLAIN_FOLDER,
+    add_template_tree,
 )
 
 VERSION = f"/ui/{TENANT}/agents/it-helper/versions/1"
+NESTED_SHEET = "drive-nested-sheet-0001"
 
 
 def tenant_email() -> str:
@@ -168,54 +181,57 @@ async def test_removing_a_drive_grant():
 
 
 @pytest.mark.parametrize(
-    ("folder", "accepted"),
-    [(TEMPLATE_FOLDER, True), (DRIVE_FOLDER, False)],
-    ids=["shared-drive-folder", "plain-folder"],
+    ("browse", "dest", "folder_id"),
+    [
+        (TEMPLATE_DRIVE, TEMPLATE_FOLDER, TEMPLATE_FOLDER),
+        ("", TEMPLATE_DRIVE, TEMPLATE_DRIVE),
+        ("", TEMPLATE_PLAIN_FOLDER, None),
+    ],
+    ids=["nested-shared-drive-folder", "shared-drive-root", "my-drive-folder"],
 )
-async def test_the_template_picker_offers_only_shared_drive_folders(folder, accepted):
-    """Fails if the template picker offers a folder outside a shared drive as a destination
-    or refuses one inside a shared drive."""
+async def test_the_template_picker_takes_a_nested_template_then_a_shared_drive_destination(
+    browse, dest, folder_id
+):
+    """Fails if the template picker does not browse into a shared drive for the template and
+    again for its destination, offers a My Drive folder as a destination, or refuses a
+    shared-drive folder or a shared drive's root."""
     h, google = await picker_harness()
+    add_template_tree(google)
     google.shared[tenant_email()] = [
-        DriveItem(
-            DRIVE_DOC,
-            "Guide",
-            f"https://drive.google.com/file/d/{DRIVE_DOC}",
-            "file",
-            mime_type=MIME_DOC,
-        ),
-        DriveItem(
-            TEMPLATE_FOLDER,
-            "Offer letters",
-            f"https://drive.google.com/drive/folders/{TEMPLATE_FOLDER}",
-            "folder",
-            drive_id=TEMPLATE_DRIVE,
-        ),
-        DriveItem(
-            DRIVE_FOLDER,
-            "Team folder",
-            f"https://drive.google.com/drive/folders/{DRIVE_FOLDER}",
-            "folder",
-        ),
+        DriveItem(TEMPLATE_DRIVE, "HR shared drive", "https://x", "shared_drive"),
+        DriveItem(TEMPLATE_PLAIN_FOLDER, "My folder", "https://x", "folder"),
     ]
     c = await h.signed_in(ROOT)
     async with using(c):
-        pick = (await c.get(VERSION + "/drive/pick/template")).text
-        assert "Offer letters" in pick
-        assert "Team folder" not in pick
+        top = (await c.get(VERSION + "/drive/pick/template")).text
+        assert f"?folder={TEMPLATE_DRIVE}" in top
+        step_one = (await c.get(VERSION + f"/drive/pick/template?folder={TEMPLATE_DRIVE}")).text
+        assert "Offer template" in step_one
         resp = await post(
             c,
             VERSION + "/drive/pick/template",
-            csrf_in(pick),
-            template=DRIVE_DOC,
-            folder=folder,
+            csrf_in(step_one),
+            template=DRIVE_TEMPLATE,
+            folder=TEMPLATE_DRIVE,
             request_id="r1",
         )
+        assert resp.status_code == 303
+        step_two = (await c.get(resp.headers["location"])).text
+        assert "Offer template" in step_two
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/template",
+            csrf_in(step_two),
+            template=DRIVE_TEMPLATE,
+            folder=browse,
+            dest=dest,
+            request_id="r2",
+        )
     record = await h.agents.get_version(TENANT, "it-helper", 1)
-    if accepted:
+    if folder_id:
         assert resp.status_code == 303
         assert [(g.id, g.kind, g.folder_id) for g in record.agent().grants.drive] == [
-            (DRIVE_DOC, "template", TEMPLATE_FOLDER)
+            (DRIVE_TEMPLATE, "template", folder_id)
         ]
     else:
         assert resp.status_code == 409
@@ -223,22 +239,31 @@ async def test_the_template_picker_offers_only_shared_drive_folders(folder, acce
 
 
 @pytest.mark.parametrize(
-    "case", ["from list", "typed", "already granted"], ids=["list", "typed", "already-granted"]
+    "case",
+    ["from list", "typed", "already granted", "nested"],
+    ids=["list", "typed", "already-granted", "nested"],
 )
 async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_grant(case):
     """Fails if the section picker grants a Doc without asking for its heading, does not offer
     the Doc's headings from one read (or a typed name), adds the wrong heading, or accepts a
     Doc already granted as a read file instead of showing a plain message."""
     h, google = await picker_harness()
-    google.shared[tenant_email()] = [
-        DriveItem(
-            DRIVE_DOC,
-            "Guide",
-            f"https://drive.google.com/file/d/{DRIVE_DOC}",
-            "file",
-            mime_type=MIME_DOC,
-        )
-    ]
+    nested = case == "nested"
+    # A nested Doc is reached by opening the shared folder: the form carries where it was.
+    where = {"folder": DRIVE_FOLDER} if nested else {}
+    google.shared[tenant_email()] = (
+        []
+        if nested
+        else [
+            DriveItem(
+                DRIVE_DOC,
+                "Guide",
+                f"https://drive.google.com/file/d/{DRIVE_DOC}",
+                "file",
+                mime_type=MIME_DOC,
+            )
+        ]
+    )
     google.add_drive_folder(DRIVE_FOLDER, "Team folder")
     google.add_drive_doc(
         DRIVE_DOC,
@@ -256,10 +281,16 @@ async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_gran
         )
     c = await h.signed_in(ROOT)
     async with using(c):
-        pick = (await c.get(VERSION + "/drive/pick/section")).text
+        query = f"?folder={DRIVE_FOLDER}" if nested else ""
+        pick = (await c.get(VERSION + "/drive/pick/section" + query)).text
         assert "Guide" in pick
         resp = await post(
-            c, VERSION + "/drive/pick/section", csrf_in(pick), doc=DRIVE_DOC, request_id="r1"
+            c,
+            VERSION + "/drive/pick/section",
+            csrf_in(pick),
+            doc=DRIVE_DOC,
+            request_id="r1",
+            **where,
         )
         if case == "already granted":
             assert resp.status_code == 409
@@ -270,7 +301,7 @@ async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_gran
         assert resp.status_code == 200
         heading_page = resp.text
         assert "Status" in heading_page and "Other" in heading_page
-        if case == "from list":
+        if case in ("from list", "nested"):
             resp = await post(
                 c,
                 VERSION + "/drive/pick/section",
@@ -278,6 +309,7 @@ async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_gran
                 doc=DRIVE_DOC,
                 heading_pos="0",
                 request_id="r2",
+                **where,
             )
             expected_heading = "Status"
         else:
@@ -288,6 +320,7 @@ async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_gran
                 doc=DRIVE_DOC,
                 heading_text="Overview",
                 request_id="r2",
+                **where,
             )
             expected_heading = "Overview"
         assert resp.status_code == 303
@@ -295,3 +328,112 @@ async def test_the_section_picker_asks_for_the_heading_and_adds_the_section_gran
     assert [(g.id, g.kind, g.heading, g.doc_id) for g in record.agent().grants.drive] == [
         (DRIVE_DOC, "section", expected_heading, DRIVE_DOC)
     ]
+
+
+def add_shared_tree(google: FakeGoogleAccounts) -> None:
+    """The shared drive's contents as Drive holds them: a folder and a Doc at its root, a Doc
+    and a Sheet inside the folder."""
+    google.add_drive_folder(DRIVE_SHARED, "Team drive", drive_id=DRIVE_SHARED)
+    google.add_drive_folder(DRIVE_SHARED_SUB, "Policies", parent=DRIVE_SHARED)
+    google.add_drive_file(DRIVE_SHARED_DOC, "Handbook", MIME_DOC, DRIVE_SHARED, [])
+    google.add_drive_file(
+        DRIVE_SHARED_NESTED, "Leave policy", MIME_DOC, DRIVE_SHARED_SUB, [DriveSection("", "x")]
+    )
+    google.add_drive_file(NESTED_SHEET, "Nested roster", MIME_SHEET, DRIVE_SHARED_SUB, [])
+    google.add_sheet_tab(NESTED_SHEET, "Staff", ["name"])
+
+
+@pytest.mark.parametrize(
+    ("folder", "listed", "tick", "granted"),
+    [
+        (DRIVE_SHARED, ["Policies", "Handbook"], "pick_1", DRIVE_SHARED_DOC),
+        (DRIVE_SHARED_SUB, ["Leave policy", "Nested roster"], "pick_0", DRIVE_SHARED_NESTED),
+    ],
+    ids=["shared-drive-root", "folder"],
+)
+async def test_the_picker_opens_a_shared_drive_and_a_folder_and_grants_what_is_inside(
+    folder, listed, tick, granted
+):
+    """Fails if opening a shared drive or a folder lists anything but its own children, the
+    page does not say where it is, or ticking a nested Doc does not add a read grant."""
+    h, google = await picker_harness()
+    add_shared_tree(google)
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        top = (await c.get(VERSION + "/drive/pick")).text
+        assert f"/drive/pick?folder={DRIVE_SHARED}" in top
+        page = (await c.get(VERSION + f"/drive/pick?folder={folder}")).text
+        assert all(name in page for name in listed)
+        assert "Top" in page and "open in Drive" in page
+        assert "Team folder" not in page
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/choose",
+            csrf_in(page),
+            folder=folder,
+            request_id="r1",
+            **{tick: "yes"},
+        )
+        assert resp.status_code == 303
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    assert [(g.id, g.kind) for g in record.agent().grants.drive] == [(granted, "file")]
+
+
+@pytest.mark.parametrize(
+    ("sheet", "folder", "granted"),
+    [(NESTED_SHEET, DRIVE_SHARED_SUB, True), (DRIVE_SHEET, DRIVE_SHARED_SUB, False)],
+    ids=["in-the-posted-folder", "not-in-the-posted-folder"],
+)
+async def test_a_nested_sheet_asks_for_its_tab_and_only_an_id_in_the_posted_folder_is_taken(
+    sheet, folder, granted
+):
+    """Fails if a Sheet inside a folder skips the tab step or is not granted with its tab,
+    or the tab step accepts a Sheet ID that is not in the posted folder's listing."""
+    h, google = await picker_harness()
+    add_shared_tree(google)
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        pick = (await c.get(VERSION + f"/drive/pick?folder={folder}")).text
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/choose",
+            csrf_in(pick),
+            folder=folder,
+            pick_1="yes",
+            request_id="r1",
+        )
+        tabs_url = resp.headers["location"]
+        assert f"sheet={NESTED_SHEET}" in tabs_url and f"folder={folder}" in tabs_url
+        tabs_page = (await c.get(tabs_url)).text
+        assert "Staff" in tabs_page
+        resp = await post(
+            c,
+            VERSION + "/drive/pick/tabs",
+            csrf_in(tabs_page),
+            folder=folder,
+            sheet_id_0=sheet,
+            tab_0="0",
+            request_id="r2",
+        )
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    if granted:
+        assert resp.status_code == 303
+        assert [(g.id, g.kind, g.tab) for g in record.agent().grants.drive] == [
+            (NESTED_SHEET, "sheet", "Staff")
+        ]
+    else:
+        assert resp.status_code == 409
+        assert record.agent().grants.drive == []
+
+
+async def test_a_folder_the_account_cannot_see_shows_google_drive_unavailable():
+    """Fails if a folder Google refuses shows a stack trace or an empty list instead of the
+    Google Drive unavailable message."""
+    h, google = await picker_harness()
+    add_shared_tree(google)
+    google.drive_refused.add(DRIVE_SHARED_SUB)
+    c = await h.signed_in(ROOT)
+    async with using(c):
+        resp = await c.get(VERSION + f"/drive/pick?folder={DRIVE_SHARED_SUB}")
+    assert resp.status_code == 503
+    assert "Google Drive unavailable" in resp.text

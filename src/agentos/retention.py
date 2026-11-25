@@ -504,6 +504,8 @@ async def run(tenant: str | None, schedule: bool, clock=_utcnow) -> None:
 
 
 def build_set_parser() -> argparse.ArgumentParser:
+    from agentos.switches import add_request_id_argument
+
     parser = argparse.ArgumentParser(
         prog="python -m agentos.retention set",
         description=(
@@ -519,11 +521,12 @@ def build_set_parser() -> argparse.ArgumentParser:
         default=OWNER_URL_VAR,
         help=f"the variable holding the owner's database URL (default {OWNER_URL_VAR})",
     )
+    add_request_id_argument(parser)
     return parser
 
 
 async def run_set(args: argparse.Namespace) -> int:
-    from agentos.switches import operator_identity
+    from agentos.switches import command_request_id, operator_identity
 
     if not TENANT_ID_PATTERN.fullmatch(args.tenant):
         print(f"'{args.tenant}' is not a valid tenant ID")
@@ -533,10 +536,11 @@ async def run_set(args: argparse.Namespace) -> int:
         print(f"{args.url_var} is not set. Export the owner role's database URL in this shell.")
         return 2
     changes = {k: getattr(args, k) for k in DEFAULT_DAYS if getattr(args, k) is not None}
+    request_id = command_request_id(args.request_id)
     pool = AsyncConnectionPool(url, open=False, **load_settings().pool_args())
     await pool.open()
     try:
-        await set_limits(pool, args.tenant, changes, operator_identity(), uuid.uuid4().hex)
+        await set_limits(pool, args.tenant, changes, operator_identity(), request_id)
     except ConfigError as err:
         print(f"refused: {err}")
         return 2

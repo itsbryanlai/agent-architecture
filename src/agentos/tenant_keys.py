@@ -39,7 +39,6 @@ import asyncio
 import base64
 import secrets
 import sys
-import uuid
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -67,7 +66,7 @@ from agentos.crypto_keys import (
     rotate_tenant_key,
 )
 from agentos.models import AuditEvent
-from agentos.switches import operator_identity
+from agentos.switches import add_request_id_argument, command_request_id, operator_identity
 from agentos.unit_of_work import PostgresUnitOfWork, UnitOfWork
 
 
@@ -161,16 +160,22 @@ async def execute_db(
         print(f"'{args.tenant_id}' is not a valid tenant ID")
         return 2
     identity = operator_identity()
-    invocation = request_id or uuid.uuid4().hex
+    invocation = command_request_id(request_id or args.request_id)
+    event = _key_event(args.tenant_id, args.command, identity, invocation)
     try:
         async with uow.begin(args.tenant_id) as conn:
+            # A retried rotate with the same request ID already added its version: adding
+            # another would be a second change for one request (create is idempotent anyway).
+            if args.command == "rotate" and await audit.get(
+                args.tenant_id, event.event_key, conn=conn
+            ):
+                print(f"rotate: tenant '{args.tenant_id}' already rotated for this request id")
+                return 0
             if args.command == "create":
                 version = await ensure_tenant_key(pool, masters, args.tenant_id, conn=conn)
             else:
                 version = await rotate_tenant_key(pool, masters, args.tenant_id, conn=conn)
-            await audit.record(
-                _key_event(args.tenant_id, args.command, identity, invocation), conn=conn
-            )
+            await audit.record(event, conn=conn)
     except TenantKeyError as err:
         print(f"refused: {err}", file=sys.stderr)
         return 2
@@ -204,8 +209,10 @@ def build_parser() -> argparse.ArgumentParser:
         "create", help="create the tenant's key (file, or database row in db mode)"
     )
     create.add_argument("tenant_id")
+    add_request_id_argument(create)
     rotate = sub.add_parser("rotate", help="add the tenant's next key version")
     rotate.add_argument("tenant_id")
+    add_request_id_argument(rotate)
     value = sub.add_parser("value", help="print a new key value once, for a host variable")
     value.add_argument("tenant_id")
     value.add_argument("--next", action="store_true", help="the version after the tenant's newest")

@@ -33,7 +33,7 @@ from agentos import ids
 from agentos.audit import AuditStore
 from agentos.config import DEFAULT_PRICES_PATH, TENANT_ID_PATTERN, ConfigError, load_settings
 from agentos.models import AuditEvent
-from agentos.switches import operator_identity
+from agentos.switches import add_request_id_argument, command_request_id, operator_identity
 from agentos.unit_of_work import InMemoryUnitOfWork, UnitOfWork
 from agentos.usage import Adjustment, Prices, UsageStore, load_prices, month_bounds, utcnow
 
@@ -153,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=OWNER_URL_VAR,
         help=f"the variable holding the owner's database URL (default {OWNER_URL_VAR})",
     )
+    add_request_id_argument(sub)
     return parser
 
 
@@ -186,7 +187,7 @@ async def run(args: argparse.Namespace) -> int:
             write=args.yes,
             identity=operator_identity(),
             uow=PostgresUnitOfWork(pool),
-            request_id=uuid.uuid4().hex,
+            request_id=command_request_id(args.request_id),
         )
     finally:
         await pool.close()

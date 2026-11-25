@@ -1176,7 +1176,11 @@ that documents it.
    [CLI](https://docs.railway.com/cli)), then `railway login`
    ([login](https://docs.railway.com/cli/login)). The first `railway ssh` asks to
    register an SSH key ([ssh](https://docs.railway.com/cli/ssh)); the schema check
-   in step 9 needs it.
+   in step 9 needs it. When the key is not the default one, add `-i <key file>` to
+   each `railway ssh` below (`scripts/railway-status.sh` reads the key file's path
+   from `RAILWAY_SSH_KEY`). The host key of `ssh.railway.com` rotates and Railway
+   publishes none, so a changed-host-key warning from `railway ssh` is expected:
+   remove the old line for that host from `~/.ssh/known_hosts` and retry.
 2. **Create the project and apply the config.** `railway init --name
    agent-architecture` creates the project and links this directory
    ([init](https://docs.railway.com/cli/init)). Install the authoring SDK the CLI
@@ -1219,6 +1223,11 @@ that documents it.
 
    `config/agents.yaml` ships in the image for these imports; afterwards the
    database is the source of truth.
+
+   A host command that writes an audit event (`switches`, `tenant_keys`,
+   `notion_webhook`, `retention set`, `usage reprice`) prints a `request id` when it
+   runs. If the connection drops before you see the result, run the same command with
+   `--request-id <that id>`: the change is recorded once.
 7. **Point the Slack app at the fixed URLs**, once: Event Subscriptions
    `https://<gateway domain>/slack/events`, Interactivity & Shortcuts
    `https://<gateway domain>/slack/interactivity`, OAuth redirect

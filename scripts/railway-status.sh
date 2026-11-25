@@ -9,6 +9,8 @@
 #   scripts/railway-status.sh GATEWAY_URL CONSOLE_URL  URLs given (custom domains)
 #
 # Needs the Railway CLI, logged in, run from a directory linked to the project.
+# RAILWAY_SSH_KEY (optional): the path to the SSH key file `railway ssh` should use
+# (-i), when it is not the default key. A path, not a secret value.
 # Exit: 0 every check passed, 1 a check failed, 2 the CLI is missing or not logged in.
 #
 # Every Railway command and flag below is verified against https://docs.railway.com/cli:
@@ -34,7 +36,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/dev-lib.sh"
 RC=0
 
 case "${1:-}" in
-  -h | --help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 GW_URL=""
 CON_URL=""
@@ -101,7 +103,11 @@ for name in gateway console; do
 done
 
 # The schema check runs inside the worker, where the database URL resolves.
-if out="$(railway ssh --service worker -- python -m agentos.schema_version 2>&1 </dev/null)"; then
+SSH_KEY_ARGS=()
+if [[ -n "${RAILWAY_SSH_KEY:-}" ]]; then
+  SSH_KEY_ARGS=(-i "$RAILWAY_SSH_KEY")
+fi
+if out="$(railway ssh ${SSH_KEY_ARGS[@]+"${SSH_KEY_ARGS[@]}"} --service worker -- python -m agentos.schema_version 2>&1 </dev/null)"; then
   ok "schema: $(printf '%s\n' "$out" | tail -n 1)"
 else
   bad "schema: $(printf '%s\n' "$out" | tail -n 1 | cut -c1-120)"; RC=1

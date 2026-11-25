@@ -35,6 +35,7 @@ from tests.helpers.knowledge import (
     answer,
     call,
     converse,
+    converse_stored,
     index,
     index_both,
     plain,
@@ -225,6 +226,90 @@ async def test_uncited_answer_shows_where_this_turn_searched(kharness):
         == f"Try the steps in the guidebook.\n\nSearched: <{url}|{title}>"
     )
     assert h.slack.updates()[1]["text"] == "No numbers here either."
+
+
+@pytest.mark.parametrize(
+    ("script", "shown", "model_calls"),
+    [
+        (
+            [
+                tool_turn(call("tu_1", "reset your vpn password")),
+                answer("Try the guidebook."),
+                answer("Use the portal [1]."),
+                answer("spare"),
+            ],
+            "Use the portal [1].\n\nSources: [1] <",
+            3,
+        ),
+        (
+            [
+                tool_turn(call("tu_1", "reset your vpn password")),
+                answer("Try the guidebook."),
+                answer("Still no numbers."),
+                answer("spare"),
+            ],
+            "Still no numbers.\n\nSearched: <",
+            3,
+        ),
+        ([answer("Hello there."), answer("spare")], "Hello there.", 1),
+        (
+            [
+                tool_turn(call("tu_1", "reset your vpn password")),
+                answer("Use the portal [1]."),
+                answer("spare"),
+            ],
+            "Use the portal [1].\n\nSources: [1] <",
+            2,
+        ),
+    ],
+    ids=[
+        "uncited answer retried once, cited second answer gets Sources",
+        "uncited second answer is final and gets the Searched line, never a third call",
+        "a turn that did not search is never retried",
+        "a cited answer is never retried",
+    ],
+)
+async def test_an_answer_that_searched_but_cited_nothing_is_asked_once_more(
+    kharness, script, shown, model_calls
+):
+    """Fails if a searched, uncited answer is not retried exactly once, or any other answer is."""
+    h = kharness
+    await index_both(h)
+    h.llm.queue(*script)
+    await converse_stored(h, "it-helper", "1700000000.000310", "how do I reset my VPN password?")
+    await eventually(lambda: len(h.slack.updates()) >= 1)
+
+    assert h.slack.updates()[0]["text"].startswith(shown)
+    assert len(h.llm.calls) == model_calls
+
+
+async def test_the_retry_is_shown_the_first_answer_and_the_instruction_but_history_keeps_neither(
+    kharness,
+):
+    """Fails if the retry instruction or the uncited first answer is written to the thread's history."""
+    h = kharness
+    await index_both(h)
+    h.llm.queue(
+        tool_turn(call("tu_1", "reset your vpn password")),
+        answer("Try the guidebook."),
+        answer("Use the portal [1]."),
+    )
+    thread = "1700000000.000320"
+    await converse_stored(h, "it-helper", thread, "how do I reset my VPN password?")
+    await eventually(lambda: len(h.slack.updates()) >= 1)
+    conv = ids.conversation_id(TENANT, CHANNEL, thread)
+
+    async def reply_stored() -> bool:
+        return (await h.history.load(TENANT, conv))[-1]["role"] == "assistant"
+
+    await eventually(reply_stored)
+    *_, asked_before, instruction = h.llm.calls[2]["messages"]
+    assert asked_before["content"][0]["text"] == "Try the guidebook."
+    assert (asked_before["role"], instruction["role"]) == ("assistant", "user")
+    stored = await h.history.load(TENANT, conv)
+    assert len(stored) == 4
+    assert stored[-1]["content"][0]["text"] == "Use the portal [1]."
+    assert instruction["content"] not in [m["content"] for m in stored]
 
 
 PAGE_A3 = "aaaaaaaa-0000-0000-0000-000000000004"

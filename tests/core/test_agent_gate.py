@@ -413,6 +413,7 @@ NOT_GATED = {
     "remember_thread_agent": "stores which agent a thread was handed to; no model or connector",
     "ingest_message": "moves the text a person wrote from the inbound event into history",
     "discard_message": "clears the inbound event's text when a turn ended before ingest; no model, connector or post",
+    "needs_citation_retry": "reads the stored answer and says whether it cites a passage; no model, connector or post",
     "finalize_model_reply": "posts the reply or the fixed off notice that call_model stored",
     "post_final_model_reply": "posts that same reply as a new message when a progress edit was dropped",
     "finalize_searched_model_reply": "posts that same reply plus the turn's Searched line; no agent effect",

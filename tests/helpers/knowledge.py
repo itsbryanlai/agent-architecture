@@ -84,6 +84,33 @@ async def converse(h, agent_id: str, thread: str, text: str = "hello"):
     )
 
 
+async def converse_stored(h, agent_id: str, thread: str, text: str = "hello"):
+    """``converse`` with the text left in the content store, the shape a message has now."""
+    event_id = f"Ev-{thread}"
+    await h.acts.content.put_inbound(
+        TENANT,
+        event_id,
+        {
+            "kind": "message",
+            "agent_id": agent_id,
+            "user_id": ALICE,
+            "text": text,
+            "channel": CHANNEL,
+            "thread_ts": thread,
+            "channel_kind": "channel",
+        },
+    )
+    msg = InboundMessage(event_id, ALICE, "", CHANNEL, thread, "channel", text_stored=True)
+    return await h.client.start_workflow(
+        ConversationWorkflow.run,
+        ConversationRef(TENANT, agent_id, CHANNEL, thread),
+        id=ids.conversation_id(TENANT, CHANNEL, thread),
+        task_queue=TASK_QUEUE,
+        start_signal="message",
+        start_signal_args=[msg],
+    )
+
+
 def call(tool_id: str, query: str) -> ToolCall:
     return ToolCall(id=tool_id, name="search_knowledge", input={"query": query})
 

@@ -172,6 +172,8 @@ PATCH_MY_TASKS = "my-tasks"
 # One refresh per turn, and no poke for a task that just reported: a my-tasks history
 # recorded before this patch pokes and waits on every call, even a second in the turn.
 PATCH_MY_TASKS_ONCE = "my-tasks-once-per-turn"
+# One more model call when a turn that searched answered without citing a passage.
+PATCH_CITATION_RETRY = "citation-retry"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -248,6 +250,8 @@ class _TurnState:
         # True once this turn refreshed the thread's task, or found it fresh enough: a
         # second my_tasks call lists the store without another poke and wait.
         self.task_refreshed = False
+        # True once the turn asked the model again for a citation: at most once per turn.
+        self.cite_retried = False
 
 
 @workflow.defn(name="ConversationWorkflow")
@@ -578,6 +582,20 @@ class ConversationWorkflow:
             cut_off = stop_reason == MAX_TOKENS_STOP and (refs or workflow.patched(PATCH_CUT_OFF))
             if not calls:
                 if refs:
+                    if await self._needs_citation_retry(
+                        ctx, state, conv_id, key, cut_off, step, agent.max_steps
+                    ):
+                        # The answer drew on the searched pages without citing one: ask
+                        # once more. The second answer is final whatever it contains.
+                        state.cite_retried = True
+                        first_key, key = key, f"{key}:cite"
+                        outcome = await workflow.execute_activity_method(
+                            AgentActivities.retry_model_for_citations,
+                            args=[ctx, conv_id, first_key, key],
+                            start_to_close_timeout=LLM_TIMEOUT,
+                            retry_policy=RETRY,
+                        )
+                        cut_off = outcome.stop_reason == MAX_TOKENS_STOP
                     await self._reply_stored(
                         ctx, state, placeholder_ts, key, cut_off and outcome.has_text
                     )
@@ -752,6 +770,33 @@ class ConversationWorkflow:
                 AgentActivities.post_final_reply,
                 [ctx, placeholder_ts, OUT_OF_STEPS, [], False],
             )
+
+    async def _needs_citation_retry(
+        self,
+        ctx: TurnContext,
+        state: "_TurnState",
+        conv_id: str,
+        key: str,
+        cut_off: bool,
+        step: int,
+        max_steps: int,
+    ) -> bool:
+        """Whether the stored final answer searched but cites no passage, and may be asked again.
+
+        Not for a reply cut off at the token limit, a second retry, or a turn on its last
+        step (the step budget is spent, so it gets no extra call). The activity also says no
+        for a fixed stop text (agent off, budget reached).
+        """
+        if cut_off or state.cite_retried or not state.searched or step >= max_steps - 1:
+            return False
+        if not workflow.patched(PATCH_CITATION_RETRY):
+            return False
+        return await workflow.execute_activity_method(
+            AgentActivities.needs_citation_retry,
+            args=[ctx, conv_id, key, list(self.citations)],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
 
     async def _finalize(self, state: "_TurnState", activity, post_activity, args: list) -> None:
         """Show the turn's final text. ``args[1]`` is the placeholder ts in every finalize

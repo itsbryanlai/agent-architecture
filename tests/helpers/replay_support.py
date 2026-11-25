@@ -636,6 +636,7 @@ async def knowledge_uncited(r: Rig, stored: bool) -> list[Recorded]:
             ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"}),
         ),
         answer("Try the steps in the guidebook."),
+        *([answer("Try the steps in the guidebook.")] if stored else []),  # the citation retry
     )
     await start_conversation(r, "it-helper", thread, "how do I reset my vpn?", stored=stored)
     await replies(r, 1)
@@ -647,6 +648,27 @@ async def knowledge_uncited(r: Rig, stored: bool) -> list[Recorded]:
         r.slack.updates()[0]["text"]
         == f"Try the steps in the guidebook.\n\nSearched: <{url}|{title}>"
     )
+    return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
+async def knowledge_uncited_retry(r: Rig) -> list[Recorded]:
+    """A searched answer that cites nothing is asked once more; the cited second answer posts."""
+    thread = thread_ts(208)
+    scope = ids.knowledge_scope(ROOT_A)
+    await r.client.execute_workflow(
+        IndexingWorkflow.run,
+        args=[TENANT, scope, ROOT_A.replace("-", "")],
+        id=ids.index_workflow_id(TENANT, scope),
+        task_queue=TASK_QUEUE,
+    )
+    r.llm.queue(
+        tool_turn(ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"})),
+        answer("Try the steps in the guidebook."),
+        answer("Use the portal [1]."),
+    )
+    await start_conversation(r, "it-helper", thread, "how do I reset my vpn?", stored=True)
+    await replies(r, 1)
+    assert r.slack.updates()[0]["text"].startswith("Use the portal [1].\n\nSources: [1] <")
     return [await current(r, "", ids.conversation_id(TENANT, "C_GENERAL", thread))]
 
 
@@ -664,6 +686,7 @@ async def knowledge_uncited_dropped(r: Rig, stored: bool) -> list[Recorded]:
             ToolCall("tu_s", "search_knowledge", {"query": "reset your vpn password"}),
         ),
         answer("Try the steps in the guidebook."),
+        *([answer("Try the steps in the guidebook.")] if stored else []),  # the citation retry
     )
     # The search runs long enough for a progress edit and both attempts of that edit are
     # refused, so the uncited answer is posted as a new message that still names the page.
@@ -2008,6 +2031,8 @@ for _name, _fn in {
 }.items():
     for _stored, _run in _both(_fn).items():
         SCENARIOS[f"{_name}{'_stored' if _stored else '_inline'}"] = _run
+# Only the stored shape retries: a turn with its text in the signal never asks twice.
+SCENARIOS["knowledge_uncited_retry_stored"] = knowledge_uncited_retry
 
 # The nightly creator-access passes have one shape: no message or task payload rides in them.
 SCENARIOS["creator_access"] = creator_access

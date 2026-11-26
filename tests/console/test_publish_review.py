@@ -72,7 +72,7 @@ async def status_of(h, version: int = 1) -> str:
 async def replace_pending(plane, **changes) -> None:
     """The creator withdraws version 1, edits it and submits the same number again."""
     await plane.withdraw_version(TENANT, OWNER, "it-helper", 1)
-    edited = helper_block() | changes
+    edited = helper_block() | {"actions": []} | changes
     await plane.edit_draft(TENANT, OWNER, "it-helper", 1, edited)
     await plane.submit_version(TENANT, OWNER, "it-helper", 1)
 
@@ -296,7 +296,7 @@ CHANGES = {
         "agent_edit",
         lambda w: w.draft(),
         lambda w: w.plane.edit_draft(
-            TENANT, OWNER, "it-helper", 1, helper_block() | {"max_steps": 3}
+            TENANT, OWNER, "it-helper", 1, helper_block() | {"actions": [], "max_steps": 3}
         ),
     ),
     "submit": (

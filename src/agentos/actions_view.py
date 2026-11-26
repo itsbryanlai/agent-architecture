@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from agentos.config import AgentVersion, effective_actions
 from agentos.connectors.manifest import selectable_actions
+from agentos.connectors.registry import held_grant_kinds
 
 
 @dataclass(frozen=True)
@@ -27,15 +28,10 @@ class ActionSection:
     rows: list[ActionRow]
 
 
-def grant_kinds(agent: AgentVersion) -> set[str]:
-    """The kinds of grant the agent holds, in the words of a manifest's ``needs``."""
-    kinds: set[str] = set()
-    if agent.grants.notion_databases:
-        kinds.add("notion_database")
-    for grant in agent.grants.drive:
-        kinds.add(grant.kind)
-        kinds.add("drive_item")
-    return kinds
+@dataclass(frozen=True)
+class ActionHint:
+    key: str  # the action the note is about, or the service when no action of it is ticked
+    text: str
 
 
 def action_sections(agent: AgentVersion) -> list[ActionSection]:
@@ -47,13 +43,13 @@ def action_sections(agent: AgentVersion) -> list[ActionSection]:
     ]
 
 
-def action_hints(agent: AgentVersion) -> list[str]:
+def action_hints(agent: AgentVersion) -> list[ActionHint]:
     """Plain-words notes on a mismatch between the chosen actions and the grants."""
-    chosen, held = effective_actions(agent), grant_kinds(agent)
-    hints: list[str] = []
+    chosen, held = effective_actions(agent), held_grant_kinds(agent.grants)
+    hints: list[ActionHint] = []
     for service, specs in selectable_actions().items():
         hints += [
-            f"{s.label} needs {s.needs_text} granted below."
+            ActionHint(s.name, f"{s.label} needs {s.needs_text} granted below.")
             for s in specs
             if s.name in chosen and s.needs and s.needs not in held
         ]
@@ -61,7 +57,10 @@ def action_hints(agent: AgentVersion) -> list[str]:
             granted = [s.needs_text for s in specs if s.needs and s.needs in held]
             if granted:
                 hints.append(
-                    f"{granted[0][:1].upper()}{granted[0][1:]} is granted but no "
-                    f"{service} action is ticked."
+                    ActionHint(
+                        service,
+                        f"{granted[0][:1].upper()}{granted[0][1:]} is granted but no "
+                        f"{service} action is ticked.",
+                    )
                 )
     return hints

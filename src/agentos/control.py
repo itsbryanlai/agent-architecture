@@ -1013,11 +1013,12 @@ class ControlPlane:
     ) -> AgentVersionRecord:
         """Create an agent as version 1, a draft, with the actor as its creator.
 
-        A definition with no ``actions`` starts with none: nothing is on until the creator
-        chooses it (D-52).
+        A definition with no ``actions``, or a null one, starts with none: nothing is on until
+        the creator chooses it (D-52).
         """
         await self._require_role(tenant_id, actor, ADMIN, CREATOR)
-        definition = {"actions": [], **definition}
+        if definition.get("actions") is None:
+            definition = {**definition, "actions": []}
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.create_agent(
                 tenant_id, agent_id, definition, actor, conn=conn
@@ -1097,6 +1098,12 @@ class ControlPlane:
         request_id: str | None = None,
     ) -> AgentVersionRecord:
         await self._require_editor(tenant_id, actor, agent_id)
+        if definition.get("actions") is None:
+            # Only the YAML tenant file and stored versions may leave it out (D-52): an edit
+            # that drops the line would turn a chosen list into "everything the grants allow".
+            raise ConfigError(
+                "Keep the actions line: list what this agent may do, or [] for nothing."
+            )
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.replace_draft(
                 tenant_id, agent_id, version, definition, conn=conn
@@ -1118,14 +1125,12 @@ class ControlPlane:
         """Set which actions a draft may use, leaving the rest of its definition as it is."""
         await self._require_editor(tenant_id, actor, agent_id)
         async with self._uow.begin(tenant_id) as conn:
-            current = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
-            if current is None:
-                raise AgentStoreError(f"agent '{agent_id}' has no version {version}")
-            record = await self._agents.replace_draft(
+            # Read and replaced under the store's lock, so an edit made meanwhile is kept.
+            record = await self._agents.update_draft(
                 tenant_id,
                 agent_id,
                 version,
-                {**current.definition, "actions": sorted(set(actions))},
+                lambda current: {**current, "actions": sorted(set(actions))},
                 conn=conn,
             )
             await self._record(

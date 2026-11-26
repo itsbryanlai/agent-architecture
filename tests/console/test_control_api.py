@@ -201,7 +201,7 @@ async def test_creating_an_agent_makes_a_draft_listed_with_its_creator(h, api, d
 
 async def test_editing_a_draft_replaces_its_definition(h, api, draft):
     """Fails if an edit to a draft is not stored, or is not audited."""
-    edited = helper_block()
+    edited = helper_block() | {"actions": []}
     edited["name"] = "IT helper v2"
 
     put = await api.put(t("/agents/it-helper/versions/1"), json={"definition": edited})
@@ -345,7 +345,10 @@ async def test_a_wrong_state_is_409(h):
         await c.post(t("/agents/it-helper/versions/1/submit"))
         assert (await c.post(t("/agents/it-helper/versions/1/submit"))).status_code == 409
         assert (
-            await c.put(t("/agents/it-helper/versions/1"), json={"definition": helper_block()})
+            await c.put(
+                t("/agents/it-helper/versions/1"),
+                json={"definition": helper_block() | {"actions": []}},
+            )
         ).status_code == 409
         h.as_user(ROOT)
         assert (

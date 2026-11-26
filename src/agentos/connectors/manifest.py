@@ -64,7 +64,7 @@ class ToolSpec:
     # search follows the grants; the task list follows the write actions).
     label: str = ""
     service: str = ""  # the manifest's service name, shown beside its actions
-    # The kind of grant the action works on (see ``agentos.actions_view.grant_kinds``) and
+    # The kind of grant the action works on (each connector's ``grant_kinds``) and
     # how to say it, so the console can tell a creator who ticked an action that its grant
     # is missing. Empty for a tool with no grant of its own.
     needs: str = ""

@@ -537,10 +537,27 @@ class AgentVersion:
     actions: frozenset[str] | None = None
 
 
+# What a version with no ``actions`` list may use: the eight actions that existed when actions
+# became a choice (D-52). Frozen, so an action a later connector adds never reaches a legacy
+# agent without a publish.
+LEGACY_ACTIONS = frozenset(
+    {
+        "search_items",
+        "my_items",
+        "create_item",
+        "add_comment",
+        "comment_on_file",
+        "append_row",
+        "create_doc_from_template",
+        "replace_section",
+    }
+)
+
+
 def effective_actions(agent: AgentVersion) -> frozenset[str]:
-    """The actions the agent may use: its own list, or every selectable action for a version
-    that has none (D-52). Offering, enforcement, the access diff and the console read this."""
-    return selectable_action_names() if agent.actions is None else agent.actions
+    """The actions the agent may use: its own list, or ``LEGACY_ACTIONS`` for a version that
+    has none (D-52). Offering, enforcement, the access diff and the console read this."""
+    return LEGACY_ACTIONS if agent.actions is None else agent.actions
 
 
 @dataclass
@@ -943,14 +960,19 @@ def _parse_policy(
     return cls(**values)
 
 
-def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) -> AgentVersion:
+def parse_agent(
+    agent_id: str, raw: dict[str, Any], version: int | None = None, *, strict: bool = True
+) -> AgentVersion:
     """Parse and validate one agent block, from the YAML file or from the database.
 
     Both sources go through this function, so an agent loaded from the
     database is checked exactly like one read from YAML. ``version`` overrides
     the block's own ``version`` field: the database assigns version numbers, so
     a stored definition has none. A key the definition may not have, a value of the
-    wrong type and a number out of range are each an error that names where.
+    wrong type and a number out of range are each an error that names where. A write path
+    and the YAML file parse strictly: an action name no manifest knows is refused. A stored
+    version is read with ``strict=False``, which ignores such a name (a connector may have
+    been removed since it was saved) so an old version still loads.
     """
     check_agent_id(agent_id)
     where = f"agent '{agent_id}'"
@@ -994,7 +1016,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         audience=_parse_audience(where, raw.get("audience")),
         team=_parse_team(where, raw.get("team")),
         max_writes_per_turn=_parse_max_writes(where, raw.get("max_writes_per_turn")),
-        actions=_parse_actions(where, raw.get("actions")),
+        actions=_parse_actions(where, raw.get("actions"), strict),
     )
 
 
@@ -1164,13 +1186,17 @@ def channel_audience_problems(
 MAX_TEAM_LENGTH = 64
 
 
-def _parse_actions(where: str, raw: Any) -> frozenset[str] | None:
-    """The ``actions`` list (D-52), or None when the definition has none (a legacy version)."""
+def _parse_actions(where: str, raw: Any, strict: bool = True) -> frozenset[str] | None:
+    """The ``actions`` list (D-52), or None when the definition has none (a legacy version).
+
+    Not strict, a name the manifests no longer know is dropped instead of refused."""
     if raw is None:
         return None
     if not isinstance(raw, list):
         raise ConfigError(f"{where}: 'actions' must be a list of action names")
     known = selectable_action_names()
+    if not strict:
+        raw = [name for name in raw if isinstance(name, str) and name in known]
     for name in raw:
         if not isinstance(name, str) or name not in known:
             raise ConfigError(

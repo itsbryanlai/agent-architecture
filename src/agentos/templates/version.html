@@ -116,8 +116,8 @@
 {% endif %}
 
 <h2>What this agent may do</h2>
-<p class="muted">Nothing is on until it is ticked here. An action also needs the grant it works on; an admin approves this list when the version is published.</p>
 {% if editor and is_draft %}
+<p class="muted">Nothing is on until it is ticked here. An action also needs the grant it works on; an admin approves this list when the version is published.</p>
 <form method="post" action="{{ version_url }}/actions">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">
@@ -134,7 +134,7 @@
   {% for a in section.rows if a.on %}{{ a.label }}{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none</span>{% endfor %}</p>
 {% endfor %}
 {% endif %}
-{% for h in action_hints %}<p class="warn">{{ h }}</p>{% endfor %}
+{% for h in action_hints %}<p class="warn" data-hint="{{ h.key }}">{{ h.text }}</p>{% endfor %}
 
 {% if review and review.diff and review.diff.changes %}
 <h2>Changes against the published version</h2>

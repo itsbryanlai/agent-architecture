@@ -45,7 +45,7 @@ import re
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 
-from agentos.config import DRIVE_ID, DriveGrant
+from agentos.config import DRIVE_ID, DriveGrant, Grants
 from agentos.connectors import drive_errors
 from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import (
@@ -432,6 +432,20 @@ class DriveReader:
         )
 
 
+def _held_kinds(grants: Iterable[DriveGrant]) -> set[str]:
+    kinds: set[str] = set()
+    for grant in grants:
+        kinds.add(grant.kind)
+        kinds.add("drive_item")
+    return kinds
+
+
+def grant_kinds(grants: Grants) -> set[str]:
+    """The kinds of grant held for Drive, in the words of a manifest's ``needs``. The
+    connector offers a tool by this, and the console's hint reads it too."""
+    return _held_kinds(grants.drive)
+
+
 class DriveConnector:
     """Drive limited to the grants of one agent version: the comment tool, and the
     grant boundary every resolve and write goes through."""
@@ -457,28 +471,25 @@ class DriveConnector:
         return list(self._grants.values())
 
     def tools_for_llm(self) -> list[dict]:
+        held = _held_kinds(self._grants.values())
         sheets = [g for g in self._grants.values() if g.kind == "sheet"]
         templates = [g for g in self._grants.values() if g.kind == "template"]
         sections = [g for g in self._grants.values() if g.kind == "section"]
         tools = []
         for spec in self.manifest.tools.values():
-            if not spec.offer_to_llm:
+            if not spec.offer_to_llm or (spec.needs and spec.needs not in held):
+                # A tool is offered only to an agent holding the kind of grant its manifest
+                # names in ``needs``: the console's hint reads the same ``grant_kinds``.
                 continue
             if spec.name == "append_row":
-                # The append tool is offered only to an agent granted a Sheet, and its
-                # description names the granted sheets and their columns (D-48).
-                if sheets:
-                    tools.append(self._append_row_definition(spec, sheets))
+                # Its description names the granted sheets and their columns (D-48).
+                tools.append(self._append_row_definition(spec, sheets))
             elif spec.name == "create_doc_from_template":
-                # The template tool is offered only to an agent granted a template, and its
-                # description names the granted templates and their blanks (D-49).
-                if templates:
-                    tools.append(self._create_doc_definition(spec, templates))
+                # Its description names the granted templates and their blanks (D-49).
+                tools.append(self._create_doc_definition(spec, templates))
             elif spec.name == "replace_section":
-                # The section tool is offered only to an agent granted a section, and its
-                # description names the granted sections and their headings (D-50).
-                if sections:
-                    tools.append(self._replace_section_definition(spec, sections))
+                # Its description names the granted sections and their headings (D-50).
+                tools.append(self._replace_section_definition(spec, sections))
             else:
                 tools.append(spec.llm_definition())
         return tools

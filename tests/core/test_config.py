@@ -4,8 +4,10 @@ from pathlib import Path
 import pytest
 
 from agentos.config import (
+    LEGACY_ACTIONS,
     ConfigError,
     agent_definition,
+    effective_actions,
     load_agents_config,
     parse_agent,
     parse_agents_config,
@@ -291,25 +293,39 @@ def test_the_assignee_and_nudge_fields_round_trip():
 
 
 @pytest.mark.parametrize(
-    ("actions", "expected"),
+    ("actions", "strict", "refusal", "kept"),
     [
-        (["my_tasks"], "is not an action"),
-        (["no_such_action"], "is not an action"),
-        (["append_row", "append_row"], "more than once"),
-        ("append_row", "must be a list"),
-        (["create_item", "append_row"], None),
-        ([], None),
+        (["my_tasks"], True, "is not an action", None),
+        (["no_such_action"], True, "is not an action", None),
+        (["append_row", "append_row"], True, "more than once", None),
+        ("append_row", True, "must be a list", None),
+        (["create_item", "append_row"], True, None, {"create_item", "append_row"}),
+        ([], True, None, set()),
+        (["create_item", "no_such_action"], False, None, {"create_item"}),
+    ],
+    ids=[
+        "not selectable",
+        "unknown",
+        "repeated",
+        "not a list",
+        "valid",
+        "empty",
+        "stored, lenient",
     ],
 )
-def test_an_actions_list_is_checked_and_a_missing_one_is_legacy(actions, expected):
-    """Fails if an unknown, non-selectable or repeated action is accepted, a valid list is
-    refused or lost on the way to the definition, or a missing key reads as 'no actions'."""
-    if expected is not None:
-        with pytest.raises(ConfigError, match=expected):
-            parse_agent("it-helper", _helper(actions=actions), 1)
+def test_an_actions_list_is_checked_and_a_stored_one_ignores_an_unknown_name(
+    actions, strict, refusal, kept
+):
+    """Fails if an unknown, non-selectable or repeated action is accepted on a write, a valid
+    list is refused or lost on the way to the definition, a stored version with a name no
+    manifest knows stops loading, or a missing key reads as 'no actions'."""
+    if refusal is not None:
+        with pytest.raises(ConfigError, match=refusal):
+            parse_agent("it-helper", _helper(actions=actions), 1, strict=strict)
         return
-    agent = parse_agent("it-helper", _helper(actions=actions), 1)
-    assert agent.actions == frozenset(actions)
+    agent = parse_agent("it-helper", _helper(actions=actions), 1, strict=strict)
+    assert agent.actions == kept
     assert parse_agent("it-helper", agent_definition(agent), 1) == agent
     legacy = parse_agent("it-helper", _helper(), 1)
     assert legacy.actions is None and "actions" not in agent_definition(legacy)
+    assert effective_actions(legacy) == LEGACY_ACTIONS

@@ -321,6 +321,17 @@ def _tool_connector(name: str) -> str:
     return spec.connector if spec is not None and spec.connector else NOTION
 
 
+# A write the runtime starts on its own is the effect of one action the creator chose (D-52):
+# a nudge posts a Notion comment, so it needs "Comment on Notion items".
+RUNTIME_WRITE_ACTION = {"nudge": "add_comment"}
+
+
+def _spec_action(spec: TaskSpec) -> str:
+    """The action a task needs its agent to have: its tool, or the action it is the effect of."""
+    tool = _spec_tool(spec)
+    return RUNTIME_WRITE_ACTION.get(tool, tool)
+
+
 def _spec_tool(spec: TaskSpec) -> str:
     """The manifest tool a task runs: what the model called, or the kind for a task
     recorded before the spec carried it (a Notion tool is named by its kind)."""
@@ -1925,6 +1936,9 @@ class AgentActivities:
         agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
         if not agent.grants.notion_databases and not agent.grants.drive:
             return "This agent has no write access, so it has no requests to list.", True
+        if not effective_actions(agent) & WRITE_ACTIONS:
+            # Offered only with a write action chosen (D-52); a call without one is refused.
+            return "This agent isn't set up to make requests, so it has none to list.", True
         records = await self.tasks.list_for_requester(ctx.tenant_id, ctx.requester_user_id)
         team_id = self._runtime(ctx.tenant_id).config.slack_team_id
         return format_task_list(records, team_id=team_id), False
@@ -3315,6 +3329,9 @@ class AgentActivities:
         ctx = spec.ctx
         await self._gate(ctx.tenant_id, ctx.agent_id, Effect.READ)
         self._log("nudge_offer", ctx.tenant_id, ctx.agent_id)
+        if "add_comment" not in effective_actions(await self._agent(ctx.tenant_id, ctx.agent_id)):
+            # A nudge posts a Notion comment, so an agent not set up to comment offers none.
+            return False
         connector = await self._connector(ctx.tenant_id, ctx.agent_id)
         try:
             assignee = await connector.assignee_user_id(page_id)
@@ -3813,9 +3830,11 @@ class AgentActivities:
             line = agent_unavailable_text(agent.name)
         elif not (await self._audience_decision(ctx, agent)).allowed:
             line = no_longer_act_text(agent.name)
-        elif _spec_tool(spec) in SELECTABLE and _spec_tool(spec) not in effective_actions(agent):
+        elif _spec_action(spec) in SELECTABLE and _spec_action(spec) not in effective_actions(
+            agent
+        ):
             # The agent's current version no longer has this action (D-52).
-            line = action_not_chosen_text(_spec_tool(spec))
+            line = action_not_chosen_text(_spec_action(spec))
         else:
             return None
         if spec.tool_name in ("add_comment", "nudge"):

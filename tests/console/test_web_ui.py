@@ -303,7 +303,7 @@ async def test_saving_the_edit_form_replaces_the_draft_definition(h):
     """Fails if the edit form does not store the posted definition, or audits another identity."""
     await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
     owner = await h.signed_in(OWNER)
-    edited = helper_block()
+    edited = helper_block() | {"actions": []}
     edited["max_steps"] = 4
     async with using(owner):
         saved = await post(
@@ -401,7 +401,9 @@ async def test_a_bad_edit_keeps_the_draft_and_shows_the_text(h):
     c = await h.signed_in(OWNER)
     async with using(c):
         token = await csrf_token(c)
-        response = await post(c, f"{VERSION}/edit", token, definition="name: only a name\n")
+        response = await post(
+            c, f"{VERSION}/edit", token, definition="name: only a name\nactions: []\n"
+        )
         assert response.status_code == 422
         assert "only a name" in response.text and "system_prompt" in response.text
     stored = await h.agents.get_version(TENANT, "it-helper", 1)
@@ -413,7 +415,12 @@ async def test_a_wrong_state_and_a_duplicate_are_409_pages(h):
     c = await h.signed_in(OWNER)
     async with using(c):
         token = await csrf_token(c)
-        edit = await post(c, f"{VERSION}/edit", token, definition=definition_text(helper_block()))
+        edit = await post(
+            c,
+            f"{VERSION}/edit",
+            token,
+            definition=definition_text(helper_block() | {"actions": []}),
+        )
         assert edit.status_code == 409 and "needs" in edit.text
         again = await post(c, f"{VERSION}/submit", token)
         assert again.status_code == 409
@@ -721,7 +728,7 @@ async def test_the_audit_view_shows_actors_agents_approvers_and_hashes_only(h):
 
 async def test_ticking_actions_on_a_draft_saves_them_and_the_page_shows_them_checked(h):
     """Fails if the actions a creator ticks are not saved on the draft, the page does not show
-    them checked after reload, or it does not say that a ticked Sheet action has no Sheet."""
+    them checked after reload, or it does not flag a ticked Sheet action that has no Sheet."""
     await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
     c = await h.signed_in(OWNER)
     async with using(c):
@@ -734,7 +741,7 @@ async def test_ticking_actions_on_a_draft_saves_them_and_the_page_shows_them_che
     assert saved.status_code == 303
     assert 'value="create_item" checked' in page and 'value="append_row" checked' in page
     assert 'value="search_items" checked' not in page
-    assert "Add rows to a Sheet needs a Sheet granted below." in page
+    assert 'data-hint="append_row"' in page
 
 
 # --- forms: CSRF and origin ---------------------------------------------------------

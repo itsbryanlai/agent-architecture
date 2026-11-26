@@ -11,7 +11,7 @@ agents:
     system_prompt: |
       You answer general questions. Hand specialist questions to the right agent.
     max_steps: 4
-    actions: [add_comment, create_item, my_items, search_items]
+    actions: []
     specialists: [it-helper]
   it-helper:
     version: 1

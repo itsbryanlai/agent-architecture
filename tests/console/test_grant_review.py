@@ -14,8 +14,7 @@ import pytest
 
 from agentos.access_diff import WideningNotAcknowledged, diff_access
 from agentos.audience import EffectiveAudience
-from agentos.config import DriveGrant, NotionPageGrant
-from agentos.connectors.manifest import selectable_action_names
+from agentos.config import LEGACY_ACTIONS, DriveGrant, NotionPageGrant
 from agentos.connectors.notion import normalize_id
 from agentos.control_api import create_app
 from agentos.creator_access import (
@@ -252,7 +251,7 @@ def test_which_changes_widen_access(grant_change, audience, widens):
     elif grant_change == "remove_action":
         old.actions, new.actions = frozenset({"create_item"}), frozenset()
     elif grant_change == "legacy_equals_explicit_list":
-        new.actions = selectable_action_names()
+        new.actions = LEGACY_ACTIONS
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"
     elif grant_change == "remove_database":

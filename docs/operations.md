@@ -1716,9 +1716,9 @@ The row holds the item's title and link, its last known status, the listed state
 (awaiting approval, filed, watching, done, failed, cancelled), when the task last
 reported, and the thread it lives in — short metadata, never conversation text.
 
-The tool is offered only to an agent with a write grant (a Notion database), and the
-grant is checked again when the call runs: a call the model invents for an agent
-without one is a tool error and lists nothing. It takes no input and lists the asker's
+The tool is offered only to an agent with a write grant (a Notion database or a Drive
+scope) and a write action chosen (D-52), and both are checked again when the call runs:
+a call the model invents for an agent without them is a tool error and lists nothing. It takes no input and lists the asker's
 own tasks made through any agent in the workspace: the requester comes from the
 runtime, open tasks first, then newest, at most 10. A connector switch stops only that
 connector's tools, so turning Notion off does not refuse `my_tasks` (the platform's

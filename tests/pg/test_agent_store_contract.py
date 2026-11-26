@@ -115,7 +115,8 @@ async def test_new_draft_copies_the_published_version_or_a_given_one(world: Worl
 async def test_withdraw_returns_a_pending_version_to_draft_and_it_can_be_edited_again(
     world: World,
 ):
-    """Fails if a withdrawn version stays pending or cannot be edited again."""
+    """Fails if a withdrawn version stays pending or cannot be edited again, or a change applied
+    to the stored definition drops what the draft already held."""
     s, t = world.store, world.tenant
     await s.create_agent(t, "it-helper", helper_block(), EDITOR)
     await s.submit(t, "it-helper", 1, EDITOR)
@@ -123,6 +124,11 @@ async def test_withdraw_returns_a_pending_version_to_draft_and_it_can_be_edited_
     assert (await s.withdraw(t, "it-helper", 1)).status == "draft"
     again = await s.replace_draft(t, "it-helper", 1, {**helper_block(), "name": "Edited"})
     assert again.definition["name"] == "Edited"
+    changed = await s.update_draft(t, "it-helper", 1, lambda d: {**d, "actions": ["create_item"]})
+    assert (changed.definition["name"], changed.definition["actions"]) == (
+        "Edited",
+        ["create_item"],
+    )
 
 
 async def test_illegal_moves_and_edits_are_refused(world: World):
@@ -140,6 +146,8 @@ async def test_illegal_moves_and_edits_are_refused(world: World):
         await s.submit(t, "it-helper", 1, EDITOR)
     with pytest.raises(AgentStoreError):  # a pending version is not edited
         await s.replace_draft(t, "it-helper", 1, block)
+    with pytest.raises(AgentStoreError):  # nor changed in place
+        await s.update_draft(t, "it-helper", 1, lambda d: d)
     await s.publish(t, "it-helper", 1, ADMIN)
     with pytest.raises(AgentStoreError):  # a published version is not edited
         await s.replace_draft(t, "it-helper", 1, block)

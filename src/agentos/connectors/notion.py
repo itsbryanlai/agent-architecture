@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
-from agentos.config import ConfigError, NotionDatabaseGrant, NotionPageGrant
+from agentos.config import ConfigError, Grants, NotionDatabaseGrant, NotionPageGrant
 from agentos.connectors import notion_errors
 from agentos.connectors.base import ConnectorError, GrantDenied, UnknownItem, UnknownRequester
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, load_manifest
@@ -53,6 +53,12 @@ if TYPE_CHECKING:
     import httpx
 
 LLM_TOOLS = ("search_items", "my_items", "create_item", "add_comment")
+
+
+def grant_kinds(grants: Grants) -> set[str]:
+    """The kinds of grant held for Notion, in the words of a manifest's ``needs``."""
+    return {"notion_database"} if grants.notion_databases else set()
+
 
 # One Notion request may take this long. It stays under the activity timeouts, so a
 # slow Notion fails the attempt, and Temporal's retry policy decides what happens next.

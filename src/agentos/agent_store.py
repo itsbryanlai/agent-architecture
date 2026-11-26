@@ -48,7 +48,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -71,6 +73,8 @@ from agentos.config import (
 )
 from agentos.models import AuditEvent
 from agentos.stores import joined_transaction, tenant_transaction
+
+log = logging.getLogger("agentos.agent_store")
 
 IMPORT_USER = "import:yaml"
 
@@ -118,8 +122,27 @@ class AgentVersionRecord:
     definition_sha256: str | None = None  # set by submit; None while a draft
 
     def agent(self) -> AgentVersion:
-        """The definition parsed and validated like a YAML agent block."""
-        return parse_agent(self.agent_id, self.definition, self.version)
+        """The definition parsed and validated like a YAML agent block.
+
+        A stored version loads leniently: an action name the manifests no longer know is
+        ignored (and logged), so an old version never stops loading. The write paths parse
+        strictly before they store."""
+        agent = parse_agent(self.agent_id, self.definition, self.version, strict=False)
+        listed = self.definition.get("actions")
+        if (
+            isinstance(listed, list)
+            and agent.actions is not None
+            and len(listed) != len(agent.actions)
+        ):
+            log.warning(
+                "stored version lists actions no connector offers; ignored "
+                "tenant_id=%s agent_id=%s version=%s count=%s",
+                self.tenant_id,
+                self.agent_id,
+                self.version,
+                len(listed) - len(agent.actions),
+            )
+        return agent
 
 
 @dataclass(frozen=True)
@@ -196,6 +219,18 @@ class AgentStore(Protocol):
         conn: Any = None,
     ) -> AgentVersionRecord:
         """Replace a draft's definition. Any other status is refused."""
+        ...
+
+    async def update_draft(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        change: Callable[[dict[str, Any]], dict[str, Any]],
+        conn: Any = None,
+    ) -> AgentVersionRecord:
+        """Replace a draft's definition with ``change(current definition)``, the read and
+        the write under one lock, so a concurrent edit is never overwritten."""
         ...
 
     async def submit(
@@ -502,6 +537,25 @@ class PostgresAgentStore:
                 (Jsonb(stored), tenant_id, agent_id, version),
             )
             return await self._moved(db, cur, tenant_id, agent_id, version, DRAFT)
+
+    async def update_draft(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        change: Callable[[dict[str, Any]], dict[str, Any]],
+        conn: Any = None,
+    ) -> AgentVersionRecord:
+        async with joined_transaction(self._pool, tenant_id, conn) as db:
+            await self._lock(db, tenant_id)
+            current = await self._get(db, tenant_id, agent_id, version)
+            if current is None:
+                raise _no_such(agent_id, version)
+            if current.status != DRAFT:
+                raise _wrong_status(agent_id, version, current.status, DRAFT)
+            return await self.replace_draft(
+                tenant_id, agent_id, version, change(current.definition), conn=db
+            )
 
     async def submit(
         self, tenant_id: str, agent_id: str, version: int, submitted_by: str, conn: Any = None
@@ -875,6 +929,17 @@ class InMemoryAgentStore:
         if row.status != DRAFT:
             raise _wrong_status(agent_id, version, row.status, DRAFT)
         return self._set(row, definition=stored)
+
+    async def update_draft(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        version: int,
+        change: Callable[[dict[str, Any]], dict[str, Any]],
+        conn: Any = None,
+    ) -> AgentVersionRecord:
+        row = self._find(tenant_id, agent_id, version)
+        return await self.replace_draft(tenant_id, agent_id, version, change(row.definition))
 
     async def submit(
         self, tenant_id: str, agent_id: str, version: int, submitted_by: str, conn: Any = None

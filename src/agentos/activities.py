@@ -244,8 +244,13 @@ MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
 MY_TASKS_TOOL = "my_tasks"
 # The read tool that shows a granted Doc section as the replace writes it; offered exactly
-# when ``replace_section`` is (D-50, D-52).
+# when ``replace_section`` or ``suggest_edit`` is (D-50, D-52, D-54).
 READ_SECTION_TOOL = "read_section"
+# The two actions that write a Doc section: one replaces it once approved, the other suggests
+# the edit for the Doc's owner to accept (D-54). Both are a "replace_section" task; the task's
+# tool says which.
+SECTION_WRITE_TOOLS = frozenset({"replace_section", "suggest_edit"})
+SUGGEST_EDIT_TOOL = "suggest_edit"
 # The actions an agent's creator chooses (D-52), and the writes among them.
 SELECTABLE = selectable_action_names()
 WRITE_ACTIONS = frozenset(name for name in SELECTABLE if TOOLS[name].is_write)
@@ -305,6 +310,15 @@ def _item_ref(item: NotionItem) -> str:
 
 def _item_from_ref(ref: str) -> NotionItem:
     return NotionItem(**json.loads(ref))
+
+
+def _section_result(page_id: str, ref: str, suggest: bool) -> dict:
+    """The small result a section write records: the Doc's ID for a replace; for a suggested
+    edit (D-54) the Doc's ID and the suggestion's, with no suggestion when the section already
+    read as approved."""
+    if not suggest:
+        return {"page_id": ref}
+    return {"page_id": page_id, "suggestion_id": ref} if ref else {"page_id": page_id}
 
 
 def _write_ref(made: NotionItem | str) -> str:
@@ -1169,8 +1183,8 @@ class AgentActivities:
             # Only an agent with a write grant (a Notion database or a Drive scope) that is
             # offered a write action starts tasks, so only it has any to list.
             tools = tools + [TOOLS[MY_TASKS_TOOL].llm_definition()]
-        if "replace_section" not in {t["name"] for t in tools}:
-            # The section read follows the section replace, as the task list follows a write.
+        if not SECTION_WRITE_TOOLS & {t["name"] for t in tools}:
+            # The section read follows the section write, as the task list follows a write.
             tools = [t for t in tools if t["name"] != READ_SECTION_TOOL]
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
@@ -1959,11 +1973,12 @@ class AgentActivities:
         """A granted section's current view for the model: its text with each horizontal line
         as ``---`` and each table as pipe rows, wrapped as untrusted document data (D-50).
 
-        Checked here as well as where it is offered: it answers only when ``replace_section``
-        is among the agent's actions and the named section is one of the agent's grants.
+        Checked here as well as where it is offered: it answers only when ``replace_section`` or
+        ``suggest_edit`` is among the agent's actions and the named section is one of the agent's
+        grants.
         """
         agent = pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
-        if "replace_section" not in effective_actions(agent):
+        if not SECTION_WRITE_TOOLS & effective_actions(agent):
             return action_not_chosen_text("replace_section"), True
         ref = call.input.get("section")
         if not isinstance(ref, str) or not ref.strip():
@@ -1971,7 +1986,9 @@ class AgentActivities:
         connector = self._connector_for(ctx.tenant_id, agent, DRIVE)
         try:
             grant = connector.section_for(ref.strip())
-            section = await connector.read_section(grant)
+            section = await connector.read_section(
+                grant, suggest=SUGGEST_EDIT_TOOL in effective_actions(agent)
+            )
         except ConnectorError as err:
             return str(err), True
         except Exception as err:  # noqa: BLE001 - final connector errors become a result, the rest re-raise
@@ -2529,7 +2546,9 @@ class AgentActivities:
                 "marker", grant.marker
             ):
                 raise ConnectorError(SECTION_SHAPE_CHANGED_TEXT)
-            section = await connector.read_section(grant, payload["text"])
+            section = await connector.read_section(
+                grant, payload["text"], suggest=_spec_tool(spec) == SUGGEST_EDIT_TOOL
+            )
         except ConnectorError as err:
             raise _non_retryable(err) from err
         except Exception as err:
@@ -2743,7 +2762,9 @@ class AgentActivities:
             # changes a table's shape comes back to the model in plain words, before any card,
             # and the model can read the section and draft again (D-50); prepare checks again.
             try:
-                await connector.read_section(grant, text_text)
+                await connector.read_section(
+                    grant, text_text, suggest=call.name == SUGGEST_EDIT_TOOL
+                )
             except ConnectorError as err:
                 return DraftOutcome(error=str(err))
             except Exception as err:  # noqa: BLE001 - a client error answers the model, the rest retries
@@ -3073,14 +3094,21 @@ class AgentActivities:
         matches the live grant's and the Doc still has it exactly once, so a republish or a renamed
         heading since the draft refuses before this attempt writes. A task with a stored draft gets
         back the Doc's ID only: the section text is content.
+
+        A task whose tool is ``suggest_edit`` (D-54) runs the same path with the write sent as a
+        suggestion: the look is the pending suggestion holding the approved text, and the result
+        is the suggestion's ID (a small value), not the Doc's.
         """
         ctx = spec.ctx
         idem_key = f"{task_id}:replace"
+        suggest = _spec_tool(spec) == SUGGEST_EDIT_TOOL
         await self._gate_write(spec, task_id, idem_key, "page_id")
         self._log("replace_doc_section", ctx.tenant_id, ctx.agent_id)
         payload = await self._spec_payload(spec)
         page_id = payload["page_id"]
-        await self._check_method(spec, payload, task_id, page_id, idem_key, "revision")
+        await self._check_method(
+            spec, payload, task_id, page_id, idem_key, "revision_suggest" if suggest else "revision"
+        )
         # The live published version, not the turn's pinned one: a grant revoked since this
         # write was approved must stop it.
         agent = await self._agent(ctx.tenant_id, ctx.agent_id)
@@ -3093,9 +3121,17 @@ class AgentActivities:
                 await self._write_once(
                     ctx.tenant_id,
                     idem_key,
-                    find=lambda: connector.find_replaced_section(page_id, payload),
+                    find=lambda: (
+                        connector.find_suggested_section(page_id, payload)
+                        if suggest
+                        else connector.find_replaced_section(page_id, payload)
+                    ),
                     write=lambda: connector.write(
-                        "replace_section", page_id, payload, idem_key, agent_name=agent.name
+                        SUGGEST_EDIT_TOOL if suggest else "replace_section",
+                        page_id,
+                        payload,
+                        idem_key,
+                        agent_name=agent.name,
                     ),
                     to_ref=_write_ref,
                     from_ref=lambda ref: ref,
@@ -3113,7 +3149,7 @@ class AgentActivities:
             idem_key,
             page_id,
             self._write_outcome(spec),
-            {"page_id": ref},
+            _section_result(page_id, ref, suggest),
         )
         return ref
 
@@ -3309,9 +3345,11 @@ class AgentActivities:
     async def reconcile_drive_section(self, spec: TaskSpec, task_id: str) -> str | None:
         """The section-replace counterpart of ``reconcile_drive_doc`` (D-50): the Doc's ID when
         the section already holds the approved text, or None for "not seen". Reads only, one look,
-        the tool's connector. The write's shape check runs first: a draft whose heading no longer
-        matches the live grant, or a heading gone or duplicated, refuses, and the task says it could
-        not confirm."""
+        the tool's connector. For a suggested edit (D-54) the look is the pending suggestion
+        holding the approved text, and the result is its ID (an empty one when the section already
+        reads as approved: the owner accepted before the look). The write's shape check runs
+        first: a draft whose heading no longer matches the live grant, or a heading gone or
+        duplicated, refuses, and the task says it could not confirm."""
         ctx = spec.ctx
         await self._gate(
             ctx.tenant_id, ctx.agent_id, Effect.READ, _tool_connector(_spec_tool(spec))
@@ -3322,13 +3360,20 @@ class AgentActivities:
         connector = self._connector_for(ctx.tenant_id, agent, _tool_connector(_spec_tool(spec)))
         idem_key = f"{task_id}:replace"
         page_id = payload["page_id"]
+        suggest = _spec_tool(spec) == SUGGEST_EDIT_TOOL
         ref = await self.writes.result(ctx.tenant_id, idem_key)
         if ref is None:
             # The approved shape must still hold: a republish since the draft, or a heading
             # renamed, removed or duplicated, stops the look, which the task reads as "not
             # confirmed", never as "nothing written".
-            await connector.check_section_shape(page_id, payload["heading"], payload.get("marker"))
-            ref = await connector.find_replaced_section(page_id, payload)
+            await connector.check_section_shape(
+                page_id, payload["heading"], payload.get("marker"), suggestions=suggest
+            )
+            ref = await (
+                connector.find_suggested_section(page_id, payload)
+                if suggest
+                else connector.find_replaced_section(page_id, payload)
+            )
         if ref is None:
             return None
         await self._record_write(
@@ -3338,7 +3383,7 @@ class AgentActivities:
             idem_key,
             page_id,
             self._write_outcome(spec),
-            {"page_id": ref},
+            _section_result(page_id, ref, suggest),
         )
         return ref
 
@@ -4043,6 +4088,8 @@ def _card_text(spec: TaskSpec, payload: dict, db_name: str) -> str:
     if spec.tool_name == "create_doc":
         return escape_slack(f"Approve new Doc: {payload['title']}")
     if spec.tool_name == "replace_section":
+        if _spec_tool(spec) == SUGGEST_EDIT_TOOL:
+            return escape_slack(f"Approve suggested edit in {payload['item_title']}")
         return escape_slack(f"Approve section replace in {payload['item_title']}")
     if spec.tool_name == "nudge":
         return escape_slack(f"Approve nudge on {payload['item_title']}")
@@ -4249,11 +4296,13 @@ def approval_card_blocks(
         # is named beside it. The card previews the section's whole current text (before, read
         # from the Doc and spread over section blocks, never cut) and the approved replacement.
         target = f"<{shown['item_url']}|{payload['item_title']}>"
+        suggest = _spec_tool(spec) == SUGGEST_EDIT_TOOL
+        verb = "suggest an edit to" if suggest else "replace"
         head = {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*{agent_name}* wants to replace the section "
+                "text": f"*{agent_name}* wants to {verb} the section "
                 f"*{escape_slack(shown['heading'])}* in *{target}*.",
             },
         }
@@ -4267,7 +4316,11 @@ def approval_card_blocks(
                 },
             },
         ]
-        note = "Nothing is written until you click Submit."
+        note = (
+            "Nothing is suggested until you click Submit. The Doc's owner accepts or rejects it."
+            if suggest
+            else "Nothing is written until you click Submit."
+        )
     else:
         head = {
             "type": "section",

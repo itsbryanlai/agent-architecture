@@ -1388,7 +1388,7 @@ class ConversationWorkflow:
                 return ToolResult(call.id, error, is_error=True)
             # The task resolves the item and checks the grant before any card.
             payload = {"item": item.strip(), "comment": comment.strip()}
-            drafted = _drafted_text(kind, ctx)
+            drafted = _drafted_text(kind, ctx, call.name)
         else:
             title = call.input.get("title")
             details = call.input.get("details")
@@ -1410,7 +1410,7 @@ class ConversationWorkflow:
                 "details": details.strip(),
                 "database_id": agent.grants.notion_databases[0].id,
             }
-            drafted = _drafted_text(kind, ctx)
+            drafted = _drafted_text(kind, ctx, call.name)
         spec = TaskSpec(
             ctx=ctx,
             tool_name=kind,
@@ -1459,11 +1459,12 @@ class ConversationWorkflow:
             id=task_id,
             parent_close_policy=ParentClosePolicy.ABANDON,
         )
-        return ToolResult(call.id, _drafted_text(kind, ctx))
+        return ToolResult(call.id, _drafted_text(kind, ctx, call.name))
 
 
-def _drafted_text(kind: str, ctx: TurnContext) -> str:
-    """What the model is told after a write became a task waiting for approval."""
+def _drafted_text(kind: str, ctx: TurnContext, tool: str = "") -> str:
+    """What the model is told after a write became a task waiting for approval. ``tool`` is the
+    manifest tool the model called: a suggested edit (D-54) is a replace task with its own words."""
     if kind == "add_comment":
         return (
             f"Drafted the comment and sent <@{ctx.requester_user_id}> an approval card. "
@@ -1478,6 +1479,11 @@ def _drafted_text(kind: str, ctx: TurnContext) -> str:
         return (
             f"Drafted the new Doc and sent <@{ctx.requester_user_id}> an approval card. "
             "Nothing is created until they click Submit."
+        )
+    if kind == "replace_section" and tool == "suggest_edit":
+        return (
+            f"Drafted a suggested edit and sent <@{ctx.requester_user_id}> an approval card. "
+            "Nothing is suggested until they click Submit."
         )
     if kind == "replace_section":
         return (

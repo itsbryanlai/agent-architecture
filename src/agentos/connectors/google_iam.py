@@ -347,6 +347,18 @@ class DocTable:
     rows: tuple[tuple[DocCell, ...], ...]
 
 
+class DocSuggestedText(NamedTuple):
+    """One run of text a pending suggestion inserts or deletes, as the inline suggestions view
+    shows it (D-54): the IDs of the suggestions on the run (a run can carry several and counts
+    once), its text and the UTF-16 index it sits at in the Doc as it was before any suggestion.
+    An insertion's index is where its text goes in; a deletion's is where its text starts. The
+    view carries no author, so a reconcile matches on the text inside the granted section."""
+
+    ids: tuple[str, ...]
+    text: str
+    start_index: int
+
+
 @dataclass(frozen=True)
 class DocRead:
     """One ``documents.get`` of a Doc: its ``revisionId`` (the section write's lock), its
@@ -356,13 +368,21 @@ class DocRead:
     ``paragraphs`` are the body's top-level paragraphs (a table's cell paragraphs are in
     ``tables``). ``foreign`` is the UTF-16 index ranges of the body's other non-paragraph
     elements (section breaks) and inline images: a section whose content range overlaps one is
-    not plain text, so the replace refuses it (D-50)."""
+    not plain text, so the replace refuses it (D-50).
+
+    The Doc is always read as it was before any pending suggestion — inserted text left out,
+    deleted text kept, every index as it was — so a section's layout is the same with or
+    without a suggestion pending (D-54). The text pending suggestions insert is in
+    ``insertions`` and the text they delete in ``deletions``, both at the index it had before
+    any suggestion. Only a suggestion of text is listed: a style-only suggestion is not seen."""
 
     revision_id: str
     title: str
     paragraphs: tuple[DocParagraph, ...]
     foreign: tuple[tuple[int, int], ...] = ()
     tables: tuple[DocTable, ...] = ()
+    insertions: tuple[DocSuggestedText, ...] = ()
+    deletions: tuple[DocSuggestedText, ...] = ()
 
 
 class DocEdit(NamedTuple):
@@ -534,11 +554,14 @@ class GoogleAccounts(Protocol):
         blank read and the post-fill check use this instead (D-49)."""
         ...
 
-    async def read_doc(self, email: str, file_id: str) -> DocRead:
+    async def read_doc(self, email: str, file_id: str, *, suggestions: bool = False) -> DocRead:
         """One ``documents.get`` of a Doc: its revisionId, title and body paragraphs (each
         with its text, named style and UTF-16 start/end index). The section write reads the
         heading and the text under it from this, and locks the write to its revisionId
-        (D-50). A Doc that is gone or unreadable raises ``GoogleError`` with its status."""
+        (D-50). With ``suggestions`` the read asks for ``SUGGESTIONS_INLINE`` explicitly; the
+        text pending suggestions insert or delete is listed either way (``DocRead.insertions``
+        and ``deletions``, D-54). A Doc that is gone or
+        unreadable raises ``GoogleError`` with its status."""
         ...
 
     async def replace_doc_section(
@@ -552,6 +575,16 @@ class GoogleAccounts(Protocol):
         every index still holds. The revision is the lock — a Doc that moved since the read
         answers 400 (``revision_mismatch``) and nothing is written. Returns the Doc's ID
         (D-50)."""
+        ...
+
+    async def suggest_doc_section(
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
+    ) -> tuple[str, ...]:
+        """``replace_doc_section`` as a suggestion (D-54): the same requests in ONE batchUpdate
+        carrying ``writeControl`` with ``requiredRevisionId`` and ``writeMode: SUGGEST``, so
+        the Doc's text is unchanged until its owner accepts. Returns the created or updated
+        suggestion IDs. A response that saved no suggestion, or whose comment state is not
+        ``ALL_SAVED``, raises ``GoogleError`` (``refused``): nothing is done."""
         ...
 
 
@@ -1531,29 +1564,36 @@ class RealGoogleAccounts:
 
         return await asyncio.to_thread(call)
 
-    async def read_doc(self, email: str, file_id: str) -> DocRead:
+    async def read_doc(self, email: str, file_id: str, *, suggestions: bool = False) -> DocRead:
         token = await self._drive_token(email)
 
         def call() -> DocRead:
             session = self._drive_session_for_call()
             try:
+                params = {"fields": "documentId,title,revisionId,body.content"}
+                if suggestions:
+                    params["suggestionsViewMode"] = "SUGGESTIONS_INLINE"
                 response = self._send(
                     session,
                     "GET",
                     f"{DOCS}/documents/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
-                    params={"fields": "documentId,title,revisionId,body.content"},
+                    params=params,
                 )
                 self._check_drive(response)
                 body = _json_object(response)
                 try:
-                    paragraphs, foreign, tables = _doc_body(body.get("body", {}))
+                    doc_body = body.get("body", {})
+                    paragraphs, foreign, tables = _doc_body(doc_body)
+                    insertions, deletions = _doc_pending(doc_body, _original_index_of(doc_body))
                     return DocRead(
                         revision_id=str(body["revisionId"]),
                         title=str(body.get("title", "")),
                         paragraphs=paragraphs,
                         foreign=foreign,
                         tables=tables,
+                        insertions=insertions,
+                        deletions=deletions,
                     )
                 except (KeyError, TypeError) as err:
                     raise GoogleError("unavailable") from err
@@ -1566,9 +1606,26 @@ class RealGoogleAccounts:
     async def replace_doc_section(
         self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
+        await self._section_batch_update(email, file_id, required_revision_id, edits, False)
+        return file_id
+
+    async def suggest_doc_section(
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
+    ) -> tuple[str, ...]:
+        body = await self._section_batch_update(email, file_id, required_revision_id, edits, True)
+        return _suggestion_ids(body)
+
+    async def _section_batch_update(
+        self,
+        email: str,
+        file_id: str,
+        required_revision_id: str,
+        edits: list[DocEdit],
+        suggest: bool,
+    ) -> dict:
         token = await self._drive_token(email)
 
-        def call() -> str:
+        def call() -> dict:
             session = self._drive_session_for_call()
             try:
                 # Each edit inserts its new text first, so the new paragraphs take the style
@@ -1578,7 +1635,8 @@ class RealGoogleAccounts:
                 # no paragraph to inherit from, so its range is also normalised to NORMAL_TEXT
                 # with its bullets cleared. The writeControl locks the
                 # batchUpdate to the read revision: a Doc that moved answers 400
-                # FAILED_PRECONDITION and nothing is written.
+                # FAILED_PRECONDITION and nothing is written. A suggestion (D-54) sends the
+                # same requests with ``writeMode: SUGGEST``.
                 requests: list[dict] = []
                 for edit in edits:
                     if edit.insert_text:
@@ -1623,15 +1681,15 @@ class RealGoogleAccounts:
                                 }
                             }
                         )
+                write_control = {"requiredRevisionId": required_revision_id}
+                if suggest:
+                    write_control["writeMode"] = "SUGGEST"
                 response = self._send(
                     session,
                     "POST",
                     f"{DOCS}/documents/{quote(file_id, safe='')}:batchUpdate",
                     headers={"Authorization": f"Bearer {token}"},
-                    json={
-                        "requests": requests,
-                        "writeControl": {"requiredRevisionId": required_revision_id},
-                    },
+                    json={"requests": requests, "writeControl": write_control},
                 )
                 if response.status_code == 400 and _is_revision_mismatch(response):
                     raise GoogleError(
@@ -1640,13 +1698,40 @@ class RealGoogleAccounts:
                         status=400,
                     )
                 self._check_drive(response)
-                _json_object(response)
-                return file_id
+                return _json_object(response)
             finally:
                 if self._drive_session is None:
                     session.close()
 
         return await asyncio.to_thread(call)
+
+
+SUGGESTION_NOT_SAVED_TEXT = "Google did not save the suggestion."
+_SUGGESTION_ID_KEYS = (
+    "createdSuggestionIds",
+    "updatedSummarySuggestionIds",
+    "updatedSuggestionIds",
+)
+
+
+def _suggestion_ids(body: dict) -> tuple[str, ...]:
+    """The suggestion IDs a SUGGEST batchUpdate created or updated, in the order Google
+    listed them (D-54). Raises ``GoogleError`` (``refused``) unless at least one was saved and
+    every ``commentUpdateState`` Google reports is ``ALL_SAVED`` (or absent): the text may
+    commit while the suggestion fails to save, and that is not done."""
+    found: list[str] = []
+    states = [body.get("commentUpdateState")]
+    for entry in body.get("suggestionResponses") or []:
+        if not isinstance(entry, dict):
+            continue
+        states.append(entry.get("commentUpdateState"))
+        for key in _SUGGESTION_ID_KEYS:
+            for suggestion_id in entry.get(key) or []:
+                if isinstance(suggestion_id, str) and suggestion_id not in found:
+                    found.append(suggestion_id)
+    if not found or any(state not in (None, "ALL_SAVED") for state in states):
+        raise GoogleError("refused", SUGGESTION_NOT_SAVED_TEXT, status=400)
+    return tuple(found)
 
 
 def _is_revision_mismatch(response: requests.Response) -> bool:
@@ -1693,6 +1778,61 @@ def _doc_segment_texts(tabs: list) -> list[str]:
     return texts
 
 
+def _inserted(run: dict) -> bool:
+    """Whether a text run is text a pending suggestion inserts (D-54)."""
+    return bool(run.get("textRun", {}).get("suggestedInsertionIds"))
+
+
+def _body_runs(content: list):
+    """Every run of a body's paragraphs in document order, table cells included."""
+    for element in content:
+        if "paragraph" in element:
+            yield from element["paragraph"].get("elements", [])
+        elif "table" in element:
+            for row in element["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    yield from _body_runs(cell.get("content", []))
+
+
+def _original_index_of(body: dict):
+    """A function from an index of the inline suggestions view to the index the same place had
+    before any pending suggestion: the view holds the inserted text, so every index after an
+    insertion is shifted by its length (D-54)."""
+    spans = [
+        (int(run.get("startIndex", 0)), int(run["endIndex"]))
+        for run in _body_runs(body.get("content", []))
+        if _inserted(run) and "endIndex" in run
+    ]
+
+    def original(index: int) -> int:
+        return index - sum(max(0, min(end, index) - start) for start, end in spans)
+
+    return original
+
+
+def _doc_pending(
+    body: dict, original
+) -> tuple[tuple[DocSuggestedText, ...], tuple[DocSuggestedText, ...]]:
+    """The text pending suggestions insert and the text they delete, each in document order and
+    at the index it had before any suggestion (D-54). A run counts once however many suggestion
+    IDs it carries. Style-only suggestions are not listed."""
+    inserted: list[DocSuggestedText] = []
+    deleted: list[DocSuggestedText] = []
+    for run in _body_runs(body.get("content", [])):
+        text_run = run.get("textRun")
+        if text_run is None:
+            continue
+        at = original(int(run.get("startIndex", 0)))
+        content = str(text_run.get("content", ""))
+        if text_run.get("suggestedInsertionIds"):
+            ids = tuple(str(i) for i in text_run["suggestedInsertionIds"])
+            inserted.append(DocSuggestedText(ids, content, at))
+        elif text_run.get("suggestedDeletionIds"):
+            ids = tuple(str(i) for i in text_run["suggestedDeletionIds"])
+            deleted.append(DocSuggestedText(ids, content, at))
+    return tuple(inserted), tuple(deleted)
+
+
 def _doc_body(
     body: dict,
 ) -> tuple[tuple[DocParagraph, ...], tuple[tuple[int, int], ...], tuple[DocTable, ...]]:
@@ -1702,24 +1842,58 @@ def _doc_body(
     becomes a ``DocTable`` of its cells' text and ranges; any other non-paragraph element (a
     section break) contributes its index range to ``foreign``, and an inline image run
     contributes its range, so a section overlapping one is refused as not plain text (D-50). A
-    non-text run contributes no text."""
+    non-text run contributes no text.
+
+    The Doc is read as it was before any pending suggestion (D-54): the text suggestions insert
+    is left out and every index is the one it had without them. A paragraph made only of
+    inserted text is not a paragraph of the Doc; a paragraph whose closing newline is inserted
+    (a suggestion that splits it) is joined to the next, which holds the original newline and
+    its style."""
+    original = _original_index_of(body)
     paragraphs: list[DocParagraph] = []
     foreign: list[tuple[int, int]] = []
     tables: list[DocTable] = []
+    # A paragraph whose closing newline a suggestion inserts, waiting for the paragraph that
+    # holds the original one: its text, the styles of its runs, whether it is a line, its start.
+    carry: tuple[str, list[tuple[bool, bool]], bool, int] | None = None
+    carry_end = 0
+
+    def emit(text, styled, rule, named, start, end) -> None:
+        paragraphs.append(
+            DocParagraph(
+                text=text,
+                style=named,
+                start_index=start,
+                end_index=end,
+                bold=bool(styled) and all(b for b, _ in styled),
+                underline=bool(styled) and all(u for _, u in styled),
+                rule=rule,
+            )
+        )
+
     for element in body.get("content", []):
         start = int(element.get("startIndex", 0))
         end = int(element["endIndex"])
         paragraph = element.get("paragraph")
         if paragraph is None:
+            if carry is not None:
+                emit(carry[0], carry[1], carry[2], "NORMAL_TEXT", carry[3], carry_end)
+                carry = None
             if "table" in element:
-                tables.append(_doc_table(element["table"], start, end))
+                tables.append(
+                    _doc_table(element["table"], original(start), original(end), original)
+                )
             else:
-                foreign.append((start, end))
+                foreign.append((original(start), original(end)))
             continue
         text = ""
         styled: list[tuple[bool, bool]] = []
         rule = False
-        for run in paragraph.get("elements", []):
+        elements = paragraph.get("elements", [])
+        kept = [run for run in elements if not _inserted(run)]
+        if elements and not kept:
+            continue
+        for run in kept:
             if "textRun" in run:
                 content = run["textRun"].get("content", "")
                 text += content
@@ -1736,19 +1910,23 @@ def _doc_body(
             elif "horizontalRule" in run:
                 rule = True
             elif "inlineObjectElement" in run:
-                foreign.append((int(run["startIndex"]), int(run["endIndex"])))
-        named = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
-        paragraphs.append(
-            DocParagraph(
-                text=text,
-                style=named,
-                start_index=start,
-                end_index=end,
-                bold=bool(styled) and all(b for b, _ in styled),
-                underline=bool(styled) and all(u for _, u in styled),
-                rule=rule,
+                foreign.append((original(int(run["startIndex"])), original(int(run["endIndex"]))))
+        first = original(start)
+        if carry is not None:
+            text, styled, rule, first = (
+                carry[0] + text,
+                carry[1] + styled,
+                carry[2] or rule,
+                carry[3],
             )
-        )
+            carry = None
+        if len(kept) < len(elements) and not text.endswith("\n"):
+            carry, carry_end = (text, styled, rule, first), original(end)
+            continue
+        named = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+        emit(text, styled, rule, named, first, original(end))
+    if carry is not None:
+        emit(carry[0], carry[1], carry[2], "NORMAL_TEXT", carry[3], carry_end)
     return tuple(paragraphs), tuple(foreign), tuple(tables)
 
 
@@ -1765,10 +1943,12 @@ def _cell_why(content: list) -> str:
     return ""
 
 
-def _doc_table(table: dict, start: int, end: int) -> DocTable:
+def _doc_table(table: dict, start: int, end: int, original) -> DocTable:
     """A table element as rows of cells. A cell's editable range is its one paragraph's text,
     without the paragraph's final newline; a cell with several paragraphs, an inline image or
-    any other element than text is not ``plain`` and says why (D-50)."""
+    any other element than text is not ``plain`` and says why (D-50). ``start`` and ``end`` are
+    already as the Doc had them before any pending suggestion, and ``original`` maps the cells'
+    indices the same way (D-54); inserted text is not the cell's text."""
     rows: list[tuple[DocCell, ...]] = []
     for row in table.get("tableRows", []):
         cells: list[DocCell] = []
@@ -1780,17 +1960,18 @@ def _doc_table(table: dict, start: int, end: int) -> DocTable:
                 text = "".join(
                     run["textRun"].get("content", "")
                     for run in para["paragraph"].get("elements", [])
+                    if not _inserted(run)
                 )
                 cells.append(
                     DocCell(
                         text=text.removesuffix("\n"),
-                        start_index=int(para.get("startIndex", 0)),
-                        end_index=int(para["endIndex"]) - 1,
+                        start_index=original(int(para.get("startIndex", 0))),
+                        end_index=original(int(para["endIndex"]) - 1),
                     )
                 )
             else:
-                first = int(content[0].get("startIndex", 0)) if content else 0
-                last = int(content[-1]["endIndex"]) - 1 if content else 0
+                first = original(int(content[0].get("startIndex", 0))) if content else 0
+                last = original(int(content[-1]["endIndex"]) - 1) if content else 0
                 cells.append(DocCell("", first, last, plain=False, why=why))
         rows.append(tuple(cells))
     return DocTable(start, end, tuple(rows))
@@ -1806,7 +1987,7 @@ def _split_doc_paragraphs(text: str) -> list[dict]:
     return [{"text": piece + "\n", "style": "NORMAL_TEXT"} for piece in pieces]
 
 
-def _u16_slice(text: str, start: int, end: int | None = None) -> str:
+def u16_slice(text: str, start: int, end: int | None = None) -> str:
     """A substring by UTF-16 code-unit offset, the unit Google Docs indexes by."""
     units = text.encode("utf-16-le")
     if end is None:
@@ -1850,6 +2031,50 @@ def _fake_table_cells(p: dict, start: int) -> list[list[tuple[int, int]]]:
             idx += _fake_cell_footprint(text)
         cells.append(row_cells)
     return cells
+
+
+def _fake_apply_edits(paragraphs: list[dict], edits: list[DocEdit]) -> list[dict]:
+    """The paragraphs after Google's structural rules run a section write's edits in request
+    order: insert first (the new paragraphs take the style at the insertion index), then delete
+    the shifted old range (never the body's final newline), then normalise an empty part's
+    inserted range to NORMAL_TEXT and clear its bullets. A table's start index refuses an
+    insert. A refused request raises and changes nothing (D-50)."""
+    result = paragraphs
+    for edit in edits:
+        if edit.insert_text:
+            result = _fake_insert(result, edit.insert_index, edit.insert_text)
+        if edit.delete_end > edit.delete_start:
+            result = _fake_delete(result, edit.delete_start, edit.delete_end)
+        if edit.style_end > edit.style_start:
+            result = _fake_restyle(
+                result, edit.style_start, edit.style_end, clear_bullets=edit.paragraphs
+            )
+    return result
+
+
+def _fake_text_runs(paragraphs: list[dict], start: int, end: int) -> list[tuple[int, str]]:
+    """The text of ``[start, end)`` as the runs Google would split it into: one per paragraph
+    (its newline included) or table cell the range touches, each as ``(index, text)``."""
+    bounds, _, _, _ = _fake_doc_index(paragraphs)
+    runs: list[tuple[int, str]] = []
+    for p, (s, e) in zip(paragraphs, bounds):
+        if p.get("kind") == "table":
+            spans = (
+                [
+                    (text, ts, te)
+                    for row, cells in zip(p["rows"], _fake_table_cells(p, s))
+                    for text, (ts, te) in zip(row, cells)
+                ]
+                if "rows" in p
+                else []
+            )
+        else:
+            spans = [(p["text"], s, s + utf16_len(p["text"]))]
+        for text, ts, te in spans:
+            lo, hi = max(start, ts), min(end, te)
+            if lo < hi:
+                runs.append((lo, u16_slice(text, lo - ts, hi - ts)))
+    return runs
 
 
 def _fake_doc_index(paragraphs: list[dict]):
@@ -1904,7 +2129,7 @@ def _fake_edit_cell(
         raise GoogleError("refused", "A table cell takes one line here.", status=400)
     rows = [list(row) for row in paragraphs[pos]["rows"]]
     cell = rows[r][c]
-    rows[r][c] = _u16_slice(cell, 0, offset) + text + _u16_slice(cell, offset + remove)
+    rows[r][c] = u16_slice(cell, 0, offset) + text + u16_slice(cell, offset + remove)
     return [*paragraphs[:pos], {**paragraphs[pos], "rows": rows}, *paragraphs[pos + 1 :]]
 
 
@@ -1935,8 +2160,8 @@ def _fake_insert(paragraphs: list[dict], insert_index: int, insert_text: str) ->
         ]
         return paragraphs[:target] + fresh + paragraphs[target:]
     offset = insert_index - start
-    head = _u16_slice(p["text"], 0, offset)
-    tail = _u16_slice(p["text"], offset)
+    head = u16_slice(p["text"], 0, offset)
+    tail = u16_slice(p["text"], offset)
     attrs = _fake_attrs(p)
     lines = insert_text.split("\n")
     if len(lines) == 1:
@@ -2167,6 +2392,7 @@ class FakeGoogleAccounts:
             "copy": 0,
             "fill": 0,
             "replace": 0,
+            "suggest": 0,
         }
         self._hang_after_write: dict[str, list[Hang]] = {
             "create": [],
@@ -2175,6 +2401,7 @@ class FakeGoogleAccounts:
             "append": [],
             "copy": [],
             "replace": [],
+            "suggest": [],
         }
         self._visibility_delay = 0
         self._hidden_comments: dict[str, int] = {}
@@ -2236,6 +2463,12 @@ class FakeGoogleAccounts:
         self.doc_read_calls: list[tuple[str, str]] = []
         self.template_read_calls: list[tuple[str, str]] = []
         self.doc_replace_calls: list[tuple[str, str]] = []
+        # The suggestion surface (D-54): the (email, ID) of every SUGGEST batchUpdate, and
+        # whether each documents.get asked for the inline suggestions view. A pending suggestion
+        # lives in its Doc's model (``docs[id]["suggestions"]``), outside ``paragraphs``, so the
+        # plain text is unchanged until the owner accepts.
+        self.doc_suggest_calls: list[tuple[str, str]] = []
+        self.doc_read_inline: list[bool] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
         self.list_calls: list[tuple[str, str]] = []
@@ -2251,13 +2484,13 @@ class FakeGoogleAccounts:
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
         """The next ``times`` writes of ``kind`` ("create", "delete", "comment", "append",
-        "copy", "fill" or "replace") take effect and then raise, as when the response is
+        "copy", "fill", "replace" or "suggest") take effect and then raise, as when the response is
         lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
-        """The next write of ``kind`` ("create", "delete", "comment", "append", "copy" or
-        "replace") takes effect, then waits until the returned ``Hang`` is released. Another
+        """The next write of ``kind`` ("create", "delete", "comment", "append", "copy",
+        "replace" or "suggest") takes effect, then waits until the returned ``Hang`` is released. Another
         attempt meanwhile runs normally: this is how two overlap."""
         hang = Hang()
         self._hang_after_write[kind].append(hang)
@@ -2812,8 +3045,9 @@ class FakeGoogleAccounts:
         body = [s.text for s in self.drive_content.get(file_id, [])]
         return "\n".join(body + self.drive_segments.get(file_id, []))
 
-    async def read_doc(self, email: str, file_id: str) -> DocRead:
+    async def read_doc(self, email: str, file_id: str, *, suggestions: bool = False) -> DocRead:
         self.doc_read_calls.append((email, file_id))
+        self.doc_read_inline.append(suggestions)
         if file_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         if file_id not in self.drive_files:
@@ -2864,12 +3098,17 @@ class FakeGoogleAccounts:
                         ),
                     )
                 )
+        # A pending suggestion is listed as Google's inline view lists it, whichever way the
+        # read asked: its text at the index it has in the Doc without suggestions.
+        suggestions_pending = (doc or {}).get("suggestions", [])
         return DocRead(
             revision_id,
             self.drive_files[file_id].name,
             tuple(indexed),
             tuple(foreign),
             tuple(tables),
+            tuple(t for sg in suggestions_pending for t in sg["insertions"]),
+            tuple(t for sg in suggestions_pending for t in sg["deletions"]),
         )
 
     async def replace_doc_section(
@@ -2895,16 +3134,7 @@ class FakeGoogleAccounts:
         # body's final newline), then normalise an empty part's inserted range to
         # NORMAL_TEXT and clear its bullets. A table's start index refuses an insert. A refused
         # request leaves the Doc as it was.
-        result = doc["paragraphs"]
-        for edit in edits:
-            if edit.insert_text:
-                result = _fake_insert(result, edit.insert_index, edit.insert_text)
-            if edit.delete_end > edit.delete_start:
-                result = _fake_delete(result, edit.delete_start, edit.delete_end)
-            if edit.style_end > edit.style_start:
-                result = _fake_restyle(
-                    result, edit.style_start, edit.style_end, clear_bullets=edit.paragraphs
-                )
+        result = _fake_apply_edits(doc["paragraphs"], edits)
         doc["paragraphs"] = result
         # The revision is opaque, as Google's revisionId is: a write moves it to a fresh token,
         # never a number a caller could predict or compare arithmetically.
@@ -2915,6 +3145,73 @@ class FakeGoogleAccounts:
         ]
         await self._after_write("replace")
         return file_id
+
+    async def suggest_doc_section(
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
+    ) -> tuple[str, ...]:
+        self.doc_suggest_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        doc = self.docs.get(file_id)
+        if doc is None:
+            raise GoogleError("refused", "The Doc has no readable body.", status=400)
+        if required_revision_id != doc["revision_id"]:
+            raise GoogleError(
+                "revision_mismatch",
+                "The document changed since this write was drafted.",
+                status=400,
+            )
+        # The batch must be one Google would accept, so the edits run on a copy exactly as a
+        # replace runs them; the Doc's own paragraphs are never changed (the owner accepts or
+        # rejects), and a refused request leaves the Doc as it was.
+        _fake_apply_edits(doc["paragraphs"], edits)
+        suggestion_id = f"suggest.{uuid.uuid4().hex[:12]}"
+        # What the inline view shows of this suggestion: the text it inserts at its index and
+        # the text it deletes, each at the index it has in the Doc without suggestions. The
+        # edits' deletions are in the shifted indexes of the request, so they shift back.
+        doc.setdefault("suggestions", []).append(
+            {
+                "id": suggestion_id,
+                "edits": list(edits),
+                "insertions": [
+                    DocSuggestedText((suggestion_id,), edit.insert_text, edit.insert_index)
+                    for edit in reversed(edits)
+                    if edit.insert_text
+                ],
+                "deletions": [
+                    DocSuggestedText((suggestion_id,), text, at)
+                    for edit in reversed(edits)
+                    if edit.delete_end > edit.delete_start
+                    for at, text in _fake_text_runs(
+                        doc["paragraphs"],
+                        edit.delete_start - utf16_len(edit.insert_text),
+                        edit.delete_end - utf16_len(edit.insert_text),
+                    )
+                ],
+            }
+        )
+        # A suggestion moves the revision, as a direct write does.
+        doc["revision_id"] = uuid.uuid4().hex
+        self.set_drive_version(file_id, doc["revision_id"])
+        await self._after_write("suggest")
+        return (suggestion_id,)
+
+    def accept_suggestions(self, file_id: str) -> None:
+        """The Doc's owner accepting every pending suggestion: their edits become the Doc's
+        text and the revision moves (D-54)."""
+        doc = self.docs[file_id]
+        for suggestion in doc.get("suggestions", []):
+            doc["paragraphs"] = _fake_apply_edits(doc["paragraphs"], suggestion["edits"])
+        doc["suggestions"] = []
+        doc["revision_id"] = uuid.uuid4().hex
+        self.set_drive_version(file_id, doc["revision_id"])
+        self.drive_content[file_id] = [
+            DriveSection(
+                "", "".join(p["text"] for p in doc["paragraphs"] if p.get("kind") != "table")
+            )
+        ]
 
 
 def accounts_from_settings(

@@ -652,6 +652,25 @@ refused with nothing written. The replacement lands as the workspace's Drive
 account. There is no follow-up watch on a replace. The Drive connector switch and
 the writes switch stop it while off.
 
+**Drive writes (suggest an edit, D-54).** An agent whose creator chose the action
+"Suggest an edit to a section of a Doc" and that holds a granted section is offered
+`suggest_edit`: the same section grant, the same draft, the same approval card and Edit
+as the replace above, but the write is a tracked suggestion, not a change to the text.
+Share the Doc with the workspace's Drive address **as Commenter** for suggestions only
+(Editor is needed only for `replace_section`); Google itself then stops the agent
+changing text directly. The Doc's owner accepts or rejects the suggestion in the Doc
+with one click, and the requester is told so in the thread with the Doc's link. The
+suggested text is visible in the Doc to everyone with access, and Google's notification
+email carries it; the requester's card does not. The model is offered `read_section`
+when either action is chosen. If Google answers without saving a suggestion the task
+says "Google did not save the suggestion." A suggestion on a section that already reads
+as approved refuses with "The section already reads that, so there is nothing to
+suggest". A section that already holds a pending suggestion (an insertion or a deletion; a
+style-only suggestion is not seen) is refused, for a suggestion and for a replace, with
+"'<heading>' in '<doc>' already has a suggestion waiting for its owner. Ask them to accept
+or reject it first." A retry that finds the owner already accepted the suggestion is done,
+and the thread says the section already reads as approved.
+
 ## Encrypted workflow data
 
 Every payload the platform writes to Temporal (workflow inputs and results,

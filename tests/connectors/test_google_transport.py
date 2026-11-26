@@ -1560,3 +1560,172 @@ async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deploym
     assert body["writeControl"] == {"requiredRevisionId": "rev-1"}
     if not mismatch:
         assert body["requests"] == expected_requests[case]
+
+
+SAVED = {"createdSuggestionIds": ["suggest.a"], "commentUpdateState": "ALL_SAVED"}
+
+
+@pytest.mark.parametrize(
+    ("answer", "ids_or_none"),
+    [
+        ({"suggestionResponses": [SAVED]}, ("suggest.a",)),
+        (
+            {
+                "suggestionResponses": [
+                    {"createdSuggestionIds": ["suggest.a"]},
+                    {"updatedSummarySuggestionIds": ["suggest.a", "suggest.b"]},
+                ]
+            },
+            ("suggest.a", "suggest.b"),
+        ),
+        (
+            {
+                "suggestionResponses": [
+                    {
+                        "createdSuggestionIds": ["suggest.a"],
+                        "commentUpdateState": "ALL_FAILED_UNKNOWN_REASON",
+                    }
+                ]
+            },
+            None,
+        ),
+        ({"suggestionResponses": [{"commentUpdateState": "ALL_SAVED"}]}, None),
+        ({"replies": [{}]}, None),
+    ],
+    ids=["saved", "created and updated", "comment failed", "no suggestion id", "no response"],
+)
+async def test_a_suggestion_is_done_only_when_google_saved_one(deployment_key, answer, ids_or_none):
+    """Fails if a suggest batch counts as done when Google created no suggestion or did not save
+    its comment (the text may commit while the suggestion fails), or a saved suggestion's IDs
+    are not returned (D-54)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        return reply(request, 200, {"documentId": "f1", **answer})
+
+    client, _ = client_with(handler, deployment_key)
+    if ids_or_none is None:
+        with pytest.raises(GoogleError) as err:
+            await client.suggest_doc_section(EMAIL, "f1", "rev-1", [DocEdit(7, "new\n", 16, 20)])
+        assert (err.value.code, str(err.value)) == (
+            "refused",
+            "Google did not save the suggestion.",
+        )
+    else:
+        got = await client.suggest_doc_section(EMAIL, "f1", "rev-1", [DocEdit(7, "new\n", 16, 20)])
+        assert got == ids_or_none
+
+
+async def test_a_suggestion_is_sent_in_suggest_mode_locked_to_the_read_revision(deployment_key):
+    """Fails if the suggest batchUpdate is not locked to the read revision with writeMode
+    SUGGEST (D-54)."""
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        return reply(request, 200, {"suggestionResponses": [SAVED]})
+
+    client, sent = client_with(handler, deployment_key)
+
+    await client.suggest_doc_section(EMAIL, "f1", "rev-1", [DocEdit(8, "new line\n", 17, 26)])
+
+    [post] = [r for r in sent if r.method == "POST" and r.path_url.endswith(":batchUpdate")]
+    assert json.loads(post.body)["writeControl"] == {
+        "requiredRevisionId": "rev-1",
+        "writeMode": "SUGGEST",
+    }
+
+
+def _text_run(start, text, **ids):
+    return {"startIndex": start, "endIndex": start + len(text), "textRun": {"content": text, **ids}}
+
+
+def _paragraph(start, runs, style="NORMAL_TEXT"):
+    return {
+        "startIndex": start,
+        "endIndex": runs[-1]["endIndex"],
+        "paragraph": {"paragraphStyle": {"namedStyleType": style}, "elements": runs},
+    }
+
+
+# The Doc "Status / old text / Other" with "old text" replaced by "new line", as Google's inline
+# view shows the suggestion: the suggested text is in the body, so every index after it shifts.
+REPLACED_VIEW = [
+    _paragraph(1, [_text_run(1, "Status\n")], "HEADING_1"),
+    _paragraph(8, [_text_run(8, "new line\n", suggestedInsertionIds=["s.1"])]),
+    _paragraph(17, [_text_run(17, "old text\n", suggestedDeletionIds=["s.1"])]),
+    _paragraph(26, [_text_run(26, "Other\n")], "HEADING_1"),
+]
+# The Doc "Status" (its last paragraph) after a suggestion inserted "\nHello" before its newline:
+# the suggested newline ends the heading's paragraph and the original one ends the new one.
+SPLIT_VIEW = [
+    _paragraph(
+        1,
+        [_text_run(1, "Status"), _text_run(7, "\n", suggestedInsertionIds=["s.2"])],
+        "HEADING_1",
+    ),
+    _paragraph(
+        8,
+        [_text_run(8, "Hello", suggestedInsertionIds=["s.2", "s.3"]), _text_run(13, "\n")],
+        "HEADING_1",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("content", "suggestions", "view", "paragraphs", "insertions", "deletions"),
+    [
+        (
+            REPLACED_VIEW,
+            True,
+            ["SUGGESTIONS_INLINE"],
+            [("Status\n", 1, 8), ("old text\n", 8, 17), ("Other\n", 17, 23)],
+            [(("s.1",), "new line\n", 8)],
+            [(("s.1",), "old text\n", 8)],
+        ),
+        (
+            SPLIT_VIEW,
+            True,
+            ["SUGGESTIONS_INLINE"],
+            [("Status\n", 1, 8)],
+            [(("s.2",), "\n", 7), (("s.2", "s.3"), "Hello", 7)],
+            [],
+        ),
+        (
+            REPLACED_VIEW,
+            False,
+            None,
+            [("Status\n", 1, 8), ("old text\n", 8, 17), ("Other\n", 17, 23)],
+            [(("s.1",), "new line\n", 8)],
+            [(("s.1",), "old text\n", 8)],
+        ),
+    ],
+    ids=["replaced text", "split by a suggested newline", "the replace read's default request"],
+)
+async def test_a_read_shows_the_doc_as_it_was_before_its_pending_suggestions(
+    deployment_key, content, suggestions, view, paragraphs, insertions, deletions
+):
+    """Fails if the Doc read for a suggestion asks for the inline view only by default, shows
+    suggested text as the Doc's own or shifts the indexes by it, loses a suggested newline's
+    paragraph split, drops deleted text, lists a run with two suggestion IDs twice, or the
+    replace read's request changes (D-54)."""
+    doc = {"revisionId": "rev-2", "title": "Guide", "body": {"content": content}}
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        return reply(request, 200, doc)
+
+    client, sent = client_with(handler, deployment_key)
+
+    read = await client.read_doc(EMAIL, "f1", suggestions=suggestions)
+
+    [get] = [r for r in sent if r.method == "GET" and "/v1/documents/f1" in r.path_url]
+    assert parse_qs(urlsplit(get.url).query).get("suggestionsViewMode") == view
+    assert [(p.text, p.start_index, p.end_index) for p in read.paragraphs] == paragraphs
+    assert [(i.ids, i.text, i.start_index) for i in read.insertions] == insertions
+    assert [(d.ids, d.text, d.start_index) for d in read.deletions] == deletions

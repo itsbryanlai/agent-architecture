@@ -39,6 +39,12 @@ NOT_CONFIRMED_CREATE_DOC = "not_confirmed_create_doc"
 REPLACED = "replaced"
 FAILED_REPLACE_SECTION = "failed_replace_section"
 NOT_CONFIRMED_REPLACE_SECTION = "not_confirmed_replace_section"
+# The suggested-edit write's lines (D-54): a tracked change put in a granted Doc for its owner
+# to accept or reject, no watch afterwards.
+SUGGESTED = "suggested"
+SUGGEST_ALREADY_ACCEPTED = "suggest_already_accepted"
+FAILED_SUGGEST_EDIT = "failed_suggest_edit"
+NOT_CONFIRMED_SUGGEST_EDIT = "not_confirmed_suggest_edit"
 # The fixed line a card shows when a write is stopped before it runs; a policy write
 # has no card, so the line goes to the thread as it is.
 STOPPED_COMMENT = "stopped_comment"
@@ -124,6 +130,17 @@ def notice_text(
         return f"I couldn't replace the section in '{name}': {escape_slack(reason)}"
     if kind == NOT_CONFIRMED_REPLACE_SECTION:
         return f"I couldn't confirm whether the section was replaced; please check {url}"
+    if kind == SUGGESTED:
+        return (
+            f"Suggested an edit to a section of {name}. Its owner accepts or rejects "
+            f"it in the Doc ({url})."
+        )
+    if kind == SUGGEST_ALREADY_ACCEPTED:
+        return f"The section of {name} already reads as approved, so nothing is left to suggest ({url})."
+    if kind == FAILED_SUGGEST_EDIT:
+        return f"I couldn't suggest an edit in '{name}': {escape_slack(reason)}"
+    if kind == NOT_CONFIRMED_SUGGEST_EDIT:
+        return f"I couldn't confirm whether the edit was suggested; please check {url}"
     if kind == STOPPED_COMMENT:
         return reason
     if kind == NUDGED:

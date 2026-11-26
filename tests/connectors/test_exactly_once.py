@@ -2,6 +2,7 @@
 a Notion item or comment, a nudge's two effects, a Drive comment."""
 
 import asyncio
+import copy
 import dataclasses
 import json
 import uuid
@@ -896,3 +897,173 @@ async def test_a_lost_response_after_replacing_a_section_with_a_line_and_a_table
         "Keep this.\n",
     ]
     assert len(h.google.doc_replace_calls) == 1
+
+
+# --- a suggested edit (D-54) ---------------------------------------------------------------
+
+
+def suggest_spec(text: str = "The VPN is back up.") -> TaskSpec:
+    return dataclasses.replace(replace_spec(text), tool="suggest_edit")
+
+
+async def pending_suggestions(h):
+    """The text the fake Doc shows pending, inserted and deleted, as the inline view lists it."""
+    read = await h.google.read_doc(
+        "agent@x.iam.gserviceaccount.com", DRIVE_SECTION, suggestions=True
+    )
+    return [*read.insertions, *read.deletions]
+
+
+def pending_ids(runs) -> set[str]:
+    return {i for run in runs for i in run.ids}
+
+
+def status_doc(*body: dict) -> list[dict]:
+    """The VPN guide's Status section holding ``body`` and the heading after it."""
+    return [
+        {"text": "Status\n", "style": "HEADING_1"},
+        *body,
+        {"text": "Other\n", "style": "HEADING_1"},
+        {"text": "Keep this.\n", "style": "NORMAL_TEXT"},
+    ]
+
+
+LINE = {"text": "\n", "style": "NORMAL_TEXT", "rule": True}
+SUGGEST_DOCS = [
+    pytest.param(None, "The VPN is back up.", id="plain text"),
+    pytest.param(
+        status_doc(
+            {"text": "Intro.\n", "style": "NORMAL_TEXT"},
+            LINE,
+            {"kind": "table", "rows": [["Item", "Qty"], ["Pens", "2"]]},
+            {"text": "After.\n", "style": "NORMAL_TEXT"},
+        ),
+        "New intro.\n---\n| Item | Qty |\n| Pencils | 12 |\nDone.",
+        id="a line and a table",
+    ),
+    pytest.param(
+        [{"text": "Status\n", "style": "HEADING_1"}],
+        "Hello",
+        id="an empty section at the Doc's end",
+    ),
+    pytest.param(
+        status_doc(
+            {"text": "Intro.\n", "style": "NORMAL_TEXT"},
+            LINE,
+            {"text": "After.\n", "style": "NORMAL_TEXT"},
+        ),
+        "---\nAfter.",
+        id="a deletion only",
+    ),
+]
+
+
+@pytest.mark.parametrize(("paragraphs", "text"), SUGGEST_DOCS)
+async def test_a_suggestion_whose_response_was_lost_is_found_by_the_retry(
+    dharness, paragraphs, text
+):
+    """Fails if the retry of a suggested edit whose response was lost, for a section with a
+    line and a table, an empty section at the Doc's end or a deletion only, makes a second
+    suggestion, does not return the ID of the first, or the Doc's text changes."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section_doc(h)
+    if paragraphs is not None:
+        h.google.docs[DRIVE_SECTION]["paragraphs"] = copy.deepcopy(paragraphs)
+    text_before = copy.deepcopy(h.google.docs[DRIVE_SECTION]["paragraphs"])
+    task_id = ids.task_id(TENANT, "drive-suggest-lost")
+    h.google.fail_after_write("suggest")
+    with pytest.raises(GoogleError):
+        await run(h.acts.replace_doc_section, suggest_spec(text), task_id)
+
+    ref = await run(h.acts.replace_doc_section, suggest_spec(text), task_id)
+
+    assert pending_ids(await pending_suggestions(h)) == {ref}
+    assert h.google.docs[DRIVE_SECTION]["paragraphs"] == text_before
+    assert len(h.google.doc_suggest_calls) == 1
+
+
+async def test_a_retry_after_the_owner_accepted_the_suggestion_is_done_with_no_suggestion(
+    dharness,
+):
+    """Fails if the retry of a suggested edit whose suggestion the owner already accepted makes
+    a second suggestion or names a suggestion that is not there."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-suggest-accepted")
+    h.google.fail_after_write("suggest")
+    with pytest.raises(GoogleError):
+        await run(h.acts.replace_doc_section, suggest_spec(), task_id)
+    h.google.accept_suggestions(DRIVE_SECTION)
+
+    ref = await run(h.acts.replace_doc_section, suggest_spec(), task_id)
+
+    assert ref == ""
+    assert h.google.docs[DRIVE_SECTION]["paragraphs"][1]["text"] == "The VPN is back up.\n"
+    assert await pending_suggestions(h) == []
+    assert len(h.google.doc_suggest_calls) == 1
+
+
+PENDING_REFUSAL = (
+    "'Status' in 'VPN guide' already has a suggestion waiting for its owner. "
+    "Ask them to accept or reject it first."
+)
+
+
+@pytest.mark.parametrize(
+    ("paragraphs", "first", "second", "second_spec"),
+    [
+        (SUGGEST_DOCS[2].values[0], "Hello", "Bye", suggest_spec),
+        (SUGGEST_DOCS[3].values[0], "---\nAfter.", "---\nMore.", suggest_spec),
+        (SUGGEST_DOCS[2].values[0], "Hello", "Bye", replace_spec),
+    ],
+    ids=["suggest over an insertion", "suggest over a deletion", "replace over an insertion"],
+)
+async def test_a_write_over_a_section_holding_a_suggestion_is_refused(
+    dharness, paragraphs, first, second, second_spec
+):
+    """Fails if a suggested edit or a replace goes over a section that already holds a pending
+    suggestion, an insertion or a deletion, instead of refusing in plain words with nothing
+    sent."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section_doc(h)
+    h.google.docs[DRIVE_SECTION]["paragraphs"] = copy.deepcopy(paragraphs)
+    await run(
+        h.acts.replace_doc_section,
+        suggest_spec(first),
+        ids.task_id(TENANT, "drive-suggest-first"),
+    )
+
+    with pytest.raises(ApplicationError) as refused:
+        await run(
+            h.acts.replace_doc_section,
+            second_spec(second),
+            ids.task_id(TENANT, "drive-suggest-second"),
+        )
+
+    assert (refused.value.message, refused.value.non_retryable) == (PENDING_REFUSAL, True)
+    assert len(h.google.doc_suggest_calls) == 1 and h.google.doc_replace_calls == []
+
+
+async def test_a_second_suggestion_attempt_beside_a_running_one_suggests_nothing(dharness):
+    """Fails if a suggested edit attempt starting while another is mid-write makes a second
+    suggestion."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section_doc(h)
+    task_id = ids.task_id(TENANT, "drive-suggest-overlap")
+    hang = h.google.hang_after_write("suggest")
+    first = asyncio.create_task(run(h.acts.replace_doc_section, suggest_spec(), task_id))
+    await hang.reached.wait()
+
+    with pytest.raises(ApplicationError) as busy:
+        await run(h.acts.replace_doc_section, suggest_spec(), task_id)
+    assert busy.value.type == "WriteInProgress" and not busy.value.non_retryable
+    hang.release()
+    ref = await first
+
+    assert await run(h.acts.replace_doc_section, suggest_spec(), task_id) == ref
+    assert pending_ids(await pending_suggestions(h)) == {ref}
+    assert len(h.google.doc_suggest_calls) == 1

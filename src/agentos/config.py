@@ -171,6 +171,11 @@ class Settings:
     # where either setting is unset.
     google_project_id: str | None = None
     google_service_account_key: str | None = field(default=None, repr=False)
+    # The OAuth client behind "Sign in as the agent's Google account" (D-53): one client for
+    # every tenant, so an admin signs in once as a user in the customer's Workspace. The
+    # secret is never logged. Unset, the console offers only the built-in service account.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = field(default=None, repr=False)
     # The pilot allowlist for the Slack OAuth install: the Slack team IDs that may
     # install. Empty (the default) refuses every install.
     install_allowed_teams: tuple[str, ...] = ()
@@ -303,6 +308,8 @@ def load_settings() -> Settings:
         require_grant_picker=_parse_flag(env.get("AGENTOS_REQUIRE_GRANT_PICKER")),
         google_project_id=env.get("GOOGLE_PROJECT_ID") or None,
         google_service_account_key=env.get("GOOGLE_SERVICE_ACCOUNT_KEY") or None,
+        google_oauth_client_id=env.get("GOOGLE_OAUTH_CLIENT_ID") or None,
+        google_oauth_client_secret=env.get("GOOGLE_OAUTH_CLIENT_SECRET") or None,
         install_allowed_teams=_parse_install_teams(env.get("AGENTOS_INSTALL_ALLOWED_TEAMS")),
         db_pool_min=_parse_positive_int(env, "AGENTOS_DB_POOL_MIN", DEFAULT_DB_POOL_MIN),
         db_pool_max=_parse_positive_int(env, "AGENTOS_DB_POOL_MAX", DEFAULT_DB_POOL_MAX),

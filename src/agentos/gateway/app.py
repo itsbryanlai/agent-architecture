@@ -66,14 +66,21 @@ from temporalio.service import RPCError, RPCStatusCode
 from agentos import ids
 from agentos.agent_store import AgentStore, startup_agent_failure
 from agentos.audit import AuditStore
-from agentos.config import TASK_QUEUE, TENANT_ID_PATTERN, Settings, TenantsConfig, read_secret
+from agentos.config import (
+    TASK_QUEUE,
+    TENANT_ID_PATTERN,
+    ConfigError,
+    Settings,
+    TenantsConfig,
+    read_secret,
+)
 from agentos.connectors.drive import fill_markup_error
 from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.notion import normalize_id
 from agentos.content_store import ContentStore, InMemoryContentStore
-from agentos.credentials import SLACK_BOT, TenantCredentials
+from agentos.credentials import GOOGLE_USER, SLACK_BOT, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
-from agentos.drive_connections import DriveConnectionStore
+from agentos.drive_connections import USER, DriveConnectionStore
 from agentos.feedback import (
     FEEDBACK_ACTIONS,
     FEEDBACK_CALLBACK,
@@ -552,7 +559,17 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
             return
         await d.tenant_store.set_enabled(tenant, False, conn=conn)
         drive_row = None if d.drive is None else await d.drive.get(tenant, conn=conn)
+        user_token = None
         if drive_row is not None:
+            if drive_row.kind == USER:
+                # The agent's own Google user (D-53): its stored sign-in goes with the row.
+                try:
+                    user_token = await d.credentials.google_user_token(tenant)
+                except ConfigError:
+                    # Stored but not decryptable (its key is gone): the row is deleted
+                    # below and the token is only not revoked.
+                    user_token = None
+                await d.credentials.delete(tenant, GOOGLE_USER, conn=conn)
             await d.drive.delete(tenant, conn=conn)
         await d.audit.record(
             AuditEvent(
@@ -569,11 +586,22 @@ async def _uninstall(d: GatewayDeps, team_id: str | None, payload: dict, event: 
             conn=conn,
         )
         if d.google is not None:
+            # A user connection's row names the user, never an account to delete: the
+            # service account kept from before is the derived one.
             email = (
                 drive_row.service_account_email
-                if drive_row is not None
+                if drive_row is not None and drive_row.kind != USER
                 else d.google.account_email(ids.drive_account_id(tenant))
             )
+            if user_token is not None:
+                try:
+                    await d.google.revoke_user(drive_row.service_account_email, user_token)
+                except Exception as err:  # noqa: BLE001 - the uninstall stands
+                    log.warning(
+                        "tenant_id=%s google user token not revoked error_type=%s",
+                        tenant,
+                        type(err).__name__,
+                    )
             try:
                 await d.google.delete_account(email)
             except Exception as err:  # noqa: BLE001 - the uninstall stands even if Google refuses

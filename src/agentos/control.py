@@ -85,7 +85,11 @@ requester filed may then run without a card (D-43). An admin connects the tenant
 Google Drive (``connect_drive``): the deployment's Google service account creates one
 service account per tenant, and the connection row and its ``connector`` event commit
 together (``drive_connect``); ``disconnect_drive`` deletes the account at Google and the
-row (D-45). No key is stored per tenant.
+row (D-45). No key is stored per tenant. Where the customer wants the agent to be a real
+user in their Workspace, an admin signs in once as that user (``connect_drive_user``): the
+refresh token is stored encrypted as the ``google_user`` credential with the connection row
+(kind ``user``) and the same ``drive_connect`` event; switching back is ``connect_drive``,
+which removes and revokes the token and keeps the service account (D-53).
 
 Grants. The grant check (``check_version_grants``) gives an admin the full report: the live
 title and parent of each granted object, the creator's label and any mismatch, and the
@@ -114,6 +118,7 @@ decide a change (the count of admins before a demotion) are made inside the unit
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -122,6 +127,7 @@ from decimal import Decimal
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
+from psycopg.errors import UniqueViolation
 
 from agentos import ids
 from agentos.access_diff import AccessDiff, WideningNotAcknowledged, diff_access
@@ -206,14 +212,17 @@ from agentos.connectors.google_iam import (
 from agentos.connectors.manifest import low_risk_actions
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
-from agentos.credentials import CREATOR_USER_ID_PATTERN, NOTION, TenantCredentials
+from agentos.credentials import CREATOR_USER_ID_PATTERN, GOOGLE_USER, NOTION, TenantCredentials
 from agentos.crypto_keys import TenantKeyError
 from agentos.drive_connections import (
     CONNECTED,
     ERROR,
+    SERVICE_ACCOUNT,
+    USER,
     DriveConnection,
     DriveConnectionStore,
 )
+from agentos.google_signin import GoogleUserGrant
 from agentos.grant_checker import (
     GrantChecker,
     GrantCheckUnavailable,
@@ -276,6 +285,12 @@ from agentos.usage import (
     month_bounds,
     utcnow,
 )
+
+log = logging.getLogger("agentos.control")
+
+
+class _AddressTaken(Exception):
+    """The agent user's address belongs to another tenant's connection."""
 
 
 class Forbidden(Exception):
@@ -370,6 +385,7 @@ class TenantSettingsView:
     drive_items: list[DriveItem] | None = None
     drive_more: bool = False
     drive_problem: str | None = None
+    drive_reconnect: bool = False
 
 
 def _slack_problem(err: Exception) -> str:
@@ -2072,6 +2088,7 @@ class ControlPlane:
         drive_items: list[DriveItem] | None = None
         drive_more = False
         drive_problem: str | None = None
+        drive_reconnect = False
         if drive_row is not None and self._google is not None:
             # A read of Google for this view only: its outcome is shown, never stored.
             # The row's status is written by connect and disconnect; a later check
@@ -2080,6 +2097,7 @@ class ControlPlane:
                 listing = await self._google.list_shared(drive_row.service_account_email)
             except GoogleError as err:
                 drive_problem = str(err)
+                drive_reconnect = err.code == "reconnect_needed"
             else:
                 drive_items = listing.items
                 drive_more = listing.more
@@ -2105,6 +2123,7 @@ class ControlPlane:
             drive_items=drive_items,
             drive_more=drive_more,
             drive_problem=drive_problem,
+            drive_reconnect=drive_reconnect,
         )
 
     async def _fresh_config(self, tenant_id: str) -> AgentsConfig | None:
@@ -2261,6 +2280,28 @@ class ControlPlane:
             )
         return True
 
+    async def _release_user_credential(self, tenant_id: str, conn: Any) -> str | None:
+        """Delete the tenant's stored agent-user token in the caller's unit of work and
+        return it, so the caller can revoke it at Google once the change has committed.
+        None when there was none or it cannot be read."""
+        if self._credentials is None:
+            return None
+        try:
+            token = await self._credentials.google_user_token(tenant_id)
+        except ConfigError:
+            token = None
+        await self._credentials.delete(tenant_id, GOOGLE_USER, conn=conn)
+        return token
+
+    async def _revoke_user_token(self, email: str, token: str | None) -> None:
+        """Best effort: a failed revoke never blocks the change that already committed."""
+        if token is None or self._google is None:
+            return
+        try:
+            await self._google.revoke_user(email, token)
+        except Exception as err:  # noqa: BLE001 - the change stands even if Google refuses
+            log.warning("google user token not revoked error_type=%s", type(err).__name__)
+
     async def connect_drive(
         self, tenant_id: str, actor: str, request_id: str | None = None
     ) -> None:
@@ -2275,10 +2316,15 @@ class ControlPlane:
         commit in one unit of work after the call succeeds. A tenant already connected to
         the same account changes nothing and records nothing; a reconnect after an error
         records again. No key is created or stored for the tenant.
+
+        Switching back from the agent's own Google user replaces the row, deletes the
+        stored user token and revokes it at Google (best effort, after the commit); the
+        service account was kept at Google, so it is found, not created anew (D-53).
         """
         await self._require_role(tenant_id, actor, ADMIN)
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
+        released: tuple[str, str | None] | None = None
         async with self._uow.begin(tenant_id) as conn:
             email = await self._google.ensure_account(ids.drive_account_id(tenant_id))
             # Under the tenant lock: an overlapping attempt that committed first makes
@@ -2287,9 +2333,15 @@ class ControlPlane:
             if (
                 existing is not None
                 and existing.status == CONNECTED
+                and existing.kind == SERVICE_ACCOUNT
                 and existing.service_account_email == email
             ):
                 return
+            if existing is not None and existing.kind == USER:
+                released = (
+                    existing.service_account_email,
+                    await self._release_user_credential(tenant_id, conn),
+                )
             await self._drive.connect(tenant_id, email, self._clock(), conn=conn)
             await self._record(
                 "connector",
@@ -2300,6 +2352,78 @@ class ControlPlane:
                 request_id=request_id,
                 conn=conn,
             )
+        if released is not None:
+            await self._revoke_user_token(*released)
+
+    async def connect_drive_user(
+        self,
+        tenant_id: str,
+        actor: str,
+        grant: GoogleUserGrant,
+        request_id: str | None = None,
+    ) -> None:
+        """Connect Drive as the agent's own Google user (D-53). Only an admin.
+
+        The refresh token (stored encrypted as the ``google_user`` credential), the
+        connection row (kind ``user``, the user's address) and the ``connector`` event
+        (``drive_connect``, the address as target) commit in one unit of work under the
+        tenant lock. The same sign-in again (a retry after a lost response, or an
+        overlapping callback) leaves one credential and one row and records nothing again;
+        a new sign-in for the same address replaces the token and records again (it is a
+        credential change), as does a reconnect after an error. An address another tenant
+        uses is refused, also when that tenant wins a race for it, and the sign-in just
+        obtained is revoked. The service account, if one was connected, is kept at Google.
+        A replaced token is revoked after the commit, best effort.
+        """
+        await self._require_role(tenant_id, actor, ADMIN)
+        if self._drive is None or self._google is None or self._credentials is None:
+            raise ConfigError("Signing in as the agent's Google account is not set up")
+        replaced: tuple[str, str] | None = None
+        try:
+            async with self._uow.begin(tenant_id) as conn:
+                owner = await self._drive.tenant_for_user_email(grant.email)
+                if owner is not None and owner != tenant_id:
+                    raise _AddressTaken
+                existing = await self._drive.get(tenant_id, conn=conn)
+                old = None
+                if existing is not None and existing.kind == USER:
+                    try:
+                        old = await self._credentials.google_user_token(tenant_id)
+                    except ConfigError:
+                        old = None
+                same = (
+                    existing is not None
+                    and existing.kind == USER
+                    and existing.service_account_email.lower() == grant.email.lower()
+                )
+                if same and existing.status == CONNECTED and old == grant.refresh_token:
+                    return  # the same sign-in again: a retry or an overlapping callback
+                await self._credentials.store_with_current_key(
+                    tenant_id, GOOGLE_USER, grant.refresh_token, conn=conn
+                )
+                await self._drive.connect(
+                    tenant_id, grant.email, self._clock(), conn=conn, kind=USER
+                )
+                await self._record(
+                    "connector",
+                    tenant_id,
+                    actor,
+                    tool="drive_connect",
+                    target=grant.email,
+                    request_id=request_id,
+                    conn=conn,
+                )
+                if old is not None and old != grant.refresh_token:
+                    replaced = (existing.service_account_email, old)
+        except (_AddressTaken, UniqueViolation):
+            # Another organisation's address (also when it won an overlapping callback):
+            # the sign-in just obtained is not kept, so it is not left valid at Google.
+            await self._revoke_user_token(grant.email, grant.refresh_token)
+            raise ConfigError(
+                "That Google account is already the agent's account of another organisation."
+            ) from None
+        if replaced is not None:
+            await self._revoke_user_token(*replaced)
 
     async def disconnect_drive(
         self, tenant_id: str, actor: str, request_id: str | None = None
@@ -2314,17 +2438,30 @@ class ControlPlane:
         Google call and the row write, so a connect and a disconnect never interleave; the
         row's deletion and the ``connector`` event (``drive_disconnect``, the account email
         as target) commit in one unit of work.
+
+        A connection to the agent's own Google user (D-53) also removes the stored token
+        and revokes it at Google (best effort, after the commit), and deletes the service
+        account kept from before, if there is one: the row's email is the user's address,
+        never an account to delete.
         """
         await self._require_role(tenant_id, actor, ADMIN)
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
+        released: tuple[str, str | None] | None = None
         async with self._uow.begin(tenant_id) as conn:
             row = await self._drive.get(tenant_id, conn=conn)
-            email = (
-                row.service_account_email
-                if row is not None
-                else self._google.account_email(ids.drive_account_id(tenant_id))
-            )
+            if row is not None and row.kind == USER:
+                email = self._google.account_email(ids.drive_account_id(tenant_id))
+                released = (
+                    row.service_account_email,
+                    await self._release_user_credential(tenant_id, conn),
+                )
+            else:
+                email = (
+                    row.service_account_email
+                    if row is not None
+                    else self._google.account_email(ids.drive_account_id(tenant_id))
+                )
             await self._google.delete_account(email)
             if row is None:
                 return False
@@ -2338,6 +2475,8 @@ class ControlPlane:
                 request_id=request_id,
                 conn=conn,
             )
+        if released is not None:
+            await self._revoke_user_token(*released)
         return True
 
     # --- Drive grants (the picker) ----------------------------------------------------
@@ -2352,6 +2491,13 @@ class ControlPlane:
         configured = self._drive is not None and self._google is not None
         row = None if self._drive is None else await self._drive.get(tenant_id)
         return configured, row is not None
+
+    async def drive_connection_kind(self, tenant_id: str, actor: Actor) -> str | None:
+        """The tenant's Drive connection kind (``service_account`` or ``user``), or None
+        when not connected. Only an admin: Settings words a disconnect by it."""
+        await self._require_role(tenant_id, actor, ADMIN)
+        row = None if self._drive is None else await self._drive.get(tenant_id)
+        return None if row is None else row.kind
 
     async def _drive_account(self, tenant_id: str, actor: Actor) -> str:
         """The tenant's Drive account email, for a picker read."""

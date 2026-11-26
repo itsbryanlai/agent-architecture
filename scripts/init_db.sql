@@ -1,7 +1,7 @@
 -- Every table that holds a tenant's rows starts its primary key with tenant_id: the
 -- skeleton runs one tenant by configuration, but the data is already shaped for many.
 -- The two tables with no tenant (schema_migrations, audit_kinds) are shared lookups.
--- This file equals migrations 000 to 042 applied in order; a test in tests/pg checks it.
+-- This file equals migrations 000 to 043 applied in order; a test in tests/pg checks it.
 
 CREATE TABLE conversation_messages (
   tenant_id       text        NOT NULL,
@@ -1010,13 +1010,15 @@ CREATE POLICY key_insert ON tenant_payload_keys FOR INSERT
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
 -- Per-tenant connector credentials, encrypted with the tenant's payload key. Same as
--- migrations 032, 034 and 038: the kinds are 'slack_bot', 'notion' and a creator's kept
--- Notion sign-in ('notion_creator:<Slack user ID>'), and Disconnect or a consent revoke
--- removes a row, so the app role may DELETE too.
+-- migrations 032, 034, 038 and 043: the kinds are 'slack_bot', 'notion', the agent's
+-- Google user ('google_user') and a creator's kept Notion sign-in
+-- ('notion_creator:<Slack user ID>'), and Disconnect or a consent revoke removes a row,
+-- so the app role may DELETE too.
 CREATE TABLE IF NOT EXISTS tenant_credentials (
   tenant_id   text        NOT NULL,
   kind        text        NOT NULL CHECK (
-    kind IN ('slack_bot', 'notion') OR kind ~ '^notion_creator:[A-Z0-9_]{1,64}$'),
+    kind IN ('slack_bot', 'notion', 'google_user')
+    OR kind ~ '^notion_creator:[A-Z0-9_]{1,64}$'),
   ciphertext  bytea       NOT NULL,
   key_version integer     NOT NULL CHECK (key_version >= 1),
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -1238,8 +1240,10 @@ CREATE TABLE IF NOT EXISTS drive_connections (
   last_error            text,
   connected_at          timestamptz NOT NULL DEFAULT now(),
   checked_at            timestamptz,
+  kind                  text        NOT NULL DEFAULT 'service_account',
   CONSTRAINT drive_connections_error_matches_status CHECK (
-    (status = 'error') = (last_error IS NOT NULL))
+    (status = 'error') = (last_error IS NOT NULL)),
+  CONSTRAINT drive_connections_kind_check CHECK (kind IN ('service_account', 'user'))
 );
 
 REVOKE ALL ON drive_connections FROM agentos_app;
@@ -1252,6 +1256,28 @@ CREATE POLICY tenant_isolation ON drive_connections
   USING (tenant_id = current_setting('app.tenant_id', true))
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- The agent's own Google user as the Drive account (D-53). Same as migration 043: a user
+-- address belongs to one tenant, and a directory function maps it to its tenant.
+CREATE UNIQUE INDEX IF NOT EXISTS drive_connections_user_email
+  ON drive_connections (lower(service_account_email)) WHERE kind = 'user';
+
+REVOKE ALL ON drive_connections FROM agentos_directory;
+GRANT SELECT ON drive_connections TO agentos_directory;
+DROP POLICY IF EXISTS tenant_directory ON drive_connections;
+CREATE POLICY tenant_directory ON drive_connections FOR SELECT TO agentos_directory
+  USING (kind = 'user');
+
+CREATE OR REPLACE FUNCTION drive_user_tenant(account text)
+RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT d.tenant_id FROM drive_connections d
+  WHERE d.kind = 'user' AND lower(d.service_account_email) = lower(account)
+$$;
+
+ALTER FUNCTION drive_user_tenant(text) OWNER TO agentos_directory;
+REVOKE ALL ON FUNCTION drive_user_tenant(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION drive_user_tenant(text) TO agentos_app;
+
 -- Which migrations this database has had. Same as migration 000. A new install has them all.
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     text        PRIMARY KEY,   -- the number in the migration's file name
@@ -1263,5 +1289,5 @@ GRANT SELECT ON schema_migrations TO agentos_app;
 
 INSERT INTO schema_migrations (version) VALUES
   ('000'), ('001'), ('002'), ('003'), ('004'), ('005'), ('006'), ('007'), ('008'),
-  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040'), ('041'), ('042')
+  ('009'), ('010'), ('011'), ('012'), ('013'), ('014'), ('015'), ('016'), ('017'), ('018'), ('019'), ('020'), ('021'), ('022'), ('023'), ('024'), ('025'), ('026'), ('027'), ('028'), ('029'), ('030'), ('031'), ('032'), ('033'), ('034'), ('035'), ('036'), ('037'), ('038'), ('039'), ('040'), ('041'), ('042'), ('043')
 ON CONFLICT DO NOTHING;

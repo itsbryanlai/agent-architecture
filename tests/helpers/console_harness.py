@@ -131,6 +131,7 @@ class ConsoleHarness:
         creator_access=None,
         drive=None,
         google=None,
+        google_signin=None,
     ):
         self.agents = InMemoryAgentStore()
         self.members = InMemoryMemberStore()
@@ -197,6 +198,7 @@ class ConsoleHarness:
             sessions=self.sessions,
             console=self.console,
             picker=picker,
+            google_signin=google_signin,
         )
         self.base_url = console_url
         self._picker = picker

@@ -13,8 +13,14 @@ from agentos import ids
 from agentos.audit import InMemoryAuditStore
 from agentos.config import TASK_QUEUE, Settings, TenantsConfig
 from agentos.connectors.google_iam import FakeGoogleAccounts, GoogleError
-from agentos.credentials import NOTION, SLACK_BOT, InMemoryCredentialStore, TenantCredentials
-from agentos.drive_connections import InMemoryDriveConnectionStore
+from agentos.credentials import (
+    GOOGLE_USER,
+    NOTION,
+    SLACK_BOT,
+    InMemoryCredentialStore,
+    TenantCredentials,
+)
+from agentos.drive_connections import USER, InMemoryDriveConnectionStore
 from agentos.gateway.app import MAX_WEBHOOK_BODY, create_app
 from agentos.models import ApprovalDecision, ConversationRef, InboundMessage
 from agentos.slack_client import FakeSlack
@@ -283,6 +289,7 @@ async def uninstall_gateway(agents, temporal, secret):
         "oauth only",
         "drive delete fails",
         "no drive row",
+        "user connection",
     ],
     ids=[
         "app-uninstalled",
@@ -293,6 +300,7 @@ async def uninstall_gateway(agents, temporal, secret):
         "oauth-only",
         "drive-delete-fails",
         "no-drive-row",
+        "user-connection",
     ],
 )
 async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
@@ -300,7 +308,9 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
     Notion token deleted or its Drive account and row kept, a repeat or out-of-order event
     audits again, a late retry of a processed event disables a reinstalled tenant or deletes
     its fresh token, an unknown team or a user-token-only revocation is acted on, a
-    refused Google delete blocks the uninstall, or an account with no Drive row is kept."""
+    refused Google delete blocks the uninstall, an account with no Drive row is kept, or an
+    agent user connection leaves its stored sign-in, skips its revoke or deletes its address
+    as a service account."""
     client, store, credential_store, audit, credentials, drive, google = uninstall_gateway
     uninstall = {"type": "app_uninstalled"}
     revoked_bot = {"type": "tokens_revoked", "tokens": {"oauth": [], "bot": [UNINSTALL_TOKEN]}}
@@ -317,6 +327,7 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         "oauth only": [(TEAM, "EvU1", revoked_oauth)],
         "drive delete fails": [(TEAM, "EvU1", uninstall)],
         "no drive row": [(TEAM, "EvU1", uninstall)],
+        "user connection": [(TEAM, "EvU1", uninstall)],
     }[case]
     if case == "drive delete fails":
         google.fail_next_delete(GoogleError("unavailable"))
@@ -324,6 +335,13 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
         # The account exists at Google with no row naming it: the uninstall still
         # deletes it, by the derived ID.
         await drive.delete(TENANT)
+    if case == "user connection":
+        # The agent signed in as its own Google user: the row names that address, and the
+        # service account kept from before is still at Google.
+        await drive.connect(
+            TENANT, "it-helper@acme.test", datetime(2026, 1, 2, tzinfo=UTC), kind=USER
+        )
+        await credentials.store_with_current_key(TENANT, GOOGLE_USER, "1//agent-user-refresh")
     for team, event_id, event in payloads:
         payload = {"type": "event_callback", "team_id": team, "event_id": event_id, "event": event}
         assert post_event(client, secret, payload).status_code == 200
@@ -384,3 +402,7 @@ async def test_uninstall_events(uninstall_gateway, secret, temporal, case):
     )
     assert recorded.agent_id is None
     assert UNINSTALL_TOKEN not in repr(recorded)
+    if case == "user connection":
+        assert await credential_store.get(TENANT, GOOGLE_USER) is None
+        assert google.revoke_calls == [("it-helper@acme.test", "1//agent-user-refresh")]
+        assert google.delete_calls == [google.account_email(ids.drive_account_id(TENANT))]

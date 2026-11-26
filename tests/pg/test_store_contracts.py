@@ -45,6 +45,8 @@ from agentos.creator_access import (
 from agentos.drive_connections import (
     CONNECTED,
     ERROR,
+    SERVICE_ACCOUNT,
+    USER,
     InMemoryDriveConnectionStore,
     PostgresDriveConnectionStore,
 )
@@ -782,6 +784,38 @@ async def test_a_drive_connection_reads_back_its_account_and_last_check_per_tena
     assert await drive_connections.delete(tenant) is True
     assert await drive_connections.delete(tenant) is False
     assert await drive_connections.get(tenant) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["plain connect", "any letter case", "service account address", "replaced", "deleted"],
+)
+async def test_a_user_connection_is_found_by_its_address_only_while_it_is_one(
+    drive_connections, tenant: str, other_tenant: str, case: str
+):
+    """Fails if a connect without a kind is not a service account, a user connection is not
+    found by its address in any letter case, a service account's address is found as a user's,
+    or a replaced or deleted user connection is still found."""
+    at = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
+    service = "ag-abcdefghijklmnopqrstuvwx@test-project.iam.gserviceaccount.com"
+    agent = f"it-helper-{tenant}@acme.test"  # one address per tenant: the database is shared
+    if case == "plain connect":
+        await drive_connections.connect(tenant, service, at)
+        assert (await drive_connections.get(tenant)).kind == SERVICE_ACCOUNT
+    elif case == "service account address":
+        await drive_connections.connect(other_tenant, service, at)
+        assert await drive_connections.tenant_for_user_email(service) is None
+    else:
+        await drive_connections.connect(tenant, agent.title(), at, kind=USER)
+        if case == "any letter case":
+            assert (await drive_connections.get(tenant)).kind == USER
+            assert await drive_connections.tenant_for_user_email(agent.upper()) == tenant
+        elif case == "replaced":
+            await drive_connections.connect(tenant, service, at)
+            assert await drive_connections.tenant_for_user_email(agent) is None
+        else:
+            assert await drive_connections.delete(tenant) is True
+            assert await drive_connections.tenant_for_user_email(agent) is None
 
 
 # --- test sets ---------------------------------------------------------------------

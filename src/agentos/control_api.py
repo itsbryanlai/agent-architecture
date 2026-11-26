@@ -49,6 +49,12 @@ from agentos.agent_store import AgentNotFound
 from agentos.config import ConfigError, Settings, TenantsConfig, load_settings
 from agentos.control import ControlPlane
 from agentos.control_errors import STATUS_BY_ERROR
+from agentos.google_signin import (
+    GOOGLE_CALLBACK_PATH,
+    GoogleSignIn,
+    HttpGoogleOAuth,
+    google_signin_from_settings,
+)
 from agentos.grant_checker import GrantProblems
 from agentos.notion_picker import (
     NOTION_CALLBACK_PATH,
@@ -235,6 +241,7 @@ class ControlDeps:
     console: Console | None = None
     picker: Picker | None = None
     install: Installer | None = None
+    google_signin: GoogleSignIn | None = None
 
 
 def create_app(
@@ -247,13 +254,14 @@ def create_app(
     console: Console | None = None,
     picker: Picker | None = None,
     install: Installer | None = None,
+    google_signin: GoogleSignIn | None = None,
 ) -> FastAPI:
     """Build the API. Tests pass fakes; the real process fills ``deps`` on startup.
 
     With a ``console`` the app also serves the web pages, and ``identity`` should be
     ``SlackSession()``. The Host and Origin allowlists then include the console URL.
     """
-    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker, install)
+    deps = ControlDeps(plane, as_source(tenants), sessions, console, picker, install, google_signin)
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.deps = deps
     allowed_hosts = {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
@@ -315,6 +323,7 @@ def create_app(
         arrives_from_slack = console is not None and request.url.path in (
             CALLBACK_PATH,
             NOTION_CALLBACK_PATH,
+            GOOGLE_CALLBACK_PATH,
             INSTALL_CALLBACK_PATH,
         )
         if (
@@ -700,7 +709,7 @@ async def _real_lifespan(app: FastAPI):
         start_key_refresh,
         tenant_key_material,
     )
-    from agentos.drive_connections import PostgresDriveConnectionStore
+    from agentos.drive_connections import PostgresDriveConnectionStore, user_refresh_tokens
     from agentos.grant_checker import NotionGrantChecker
     from agentos.grant_picks import PostgresGrantPickStore
     from agentos.members import PostgresMemberStore
@@ -741,11 +750,16 @@ async def _real_lifespan(app: FastAPI):
         # stops start-up with a plain message, never at the first click.
         try:
             google = accounts_from_settings(
-                settings.google_project_id, settings.google_service_account_key
+                settings.google_project_id,
+                settings.google_service_account_key,
+                settings.google_oauth_client_id,
+                settings.google_oauth_client_secret,
             )
         except GoogleError as err:
             raise SystemExit(str(err)) from err
         drive = None if google is None else PostgresDriveConnectionStore(pool)
+        if google is not None:
+            google.use_user_tokens(user_refresh_tokens(drive, credentials))
         apis: dict[str, tuple[str, RealNotionAPI]] = {}
 
         async def notion_for(tenant_id: str) -> RealNotionAPI:
@@ -899,6 +913,17 @@ def build_process_app(
     picker = (
         None if picker_config is None else Picker(picker_config, HttpNotionOAuth(picker_config))
     )
+    try:
+        google_config = google_signin_from_settings(
+            settings.google_oauth_client_id, settings.google_oauth_client_secret
+        )
+    except ConfigError as err:
+        raise SystemExit(str(err)) from err
+    google_signin = (
+        None
+        if google_config is None
+        else GoogleSignIn(google_config, HttpGoogleOAuth(google_config))
+    )
     return create_app(
         None,
         None,
@@ -907,6 +932,7 @@ def build_process_app(
         port=port,
         console=Console(sign_in, slack),
         picker=picker,
+        google_signin=google_signin,
     )
 
 

@@ -1560,6 +1560,39 @@ async def drive_suggest_edit(r: Rig) -> list[Recorded]:
     ]
 
 
+async def drive_read_label(r: Rig) -> list[Recorded]:
+    """A slow Drive read (read_section) shows the placeholder "Reading Google Drive…", the
+    label named by the tool's connector, then the turn answers."""
+    thread = thread_ts(326)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: (
+            d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+            d.update(actions=["suggest_edit"]),
+        ),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 27, tzinfo=UTC)
+    )
+    add_section_doc(r.google)
+    r.llm.queue(
+        tool_turn(ToolCall("tu_rl", "read_section", {"section": DRIVE_SECTION})),
+        answer("The VPN is down."),
+    )
+    read_hang = r.google.hang_next_doc_read()
+    await start_conversation(r, "it-helper", thread, "what does the VPN guide say?", stored=True)
+    await read_hang.reached.wait()
+    await r.env.sleep(PROGRESS_AFTER)
+    await eventually(
+        lambda: [u for u in r.slack.updates() if u["text"] == "Reading Google Drive…"], timeout=30
+    )
+    read_hang.release()
+    await replies(r, 2)
+    assert [u["text"] for u in r.slack.updates()] == ["Reading Google Drive…", "The VPN is down."]
+    return [await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread))]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -2128,6 +2161,8 @@ SCENARIOS["drive_create_doc"] = drive_create_doc
 SCENARIOS["drive_replace_section"] = drive_replace_section
 # A Drive suggested-edit task is new too: one shape (the stored draft), no legacy inline history.
 SCENARIOS["drive_suggest_edit"] = drive_suggest_edit
+# A slow Drive read names its connector in the placeholder: new, one shape (stored).
+SCENARIOS["drive_read_label"] = drive_read_label
 
 
 # --- files --------------------------------------------------------------------------------

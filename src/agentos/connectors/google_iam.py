@@ -36,7 +36,7 @@ NORMAL_TEXT; a Doc that moved since the read answers 400 ``revision_mismatch``.
 The fake keeps the accounts and what is shared with each, and carries the failure
 injections in one place: ``fail_after_write`` (the response is lost after the effect),
 ``hang_after_write`` (a second attempt overlaps the first), ``delay_visibility`` (a
-comment or appended row stays out of the next searches), ``hang_next_sheet_read``,
+comment or appended row stays out of the next searches), ``hang_next_sheet_read``, ``hang_next_doc_read``,
 ``fail_next_list``, ``fail_next_delete``, and the Drive tree's ``fail_next_get``/
 ``fail_next_export``/``fail_next_children`` and the lasting ``fail_get_for``/
 ``fail_export_for``/``fail_children_for``.
@@ -2529,6 +2529,7 @@ class FakeGoogleAccounts:
         self._hidden_metadata: dict[int, int] = {}
         self._hidden_copies: dict[str, int] = {}
         self._sheet_read_hangs: list[Hang] = []
+        self._doc_read_hangs: list[Hang] = []
         self._list_error: Exception | None = None
         self._delete_error: Exception | None = None
         # The Drive tree the read surface serves: metadata by ID, a folder's child IDs,
@@ -2628,6 +2629,13 @@ class FakeGoogleAccounts:
         Sheets read does. Other reads run normally."""
         hang = Hang()
         self._sheet_read_hangs.append(hang)
+        return hang
+
+    def hang_next_doc_read(self) -> Hang:
+        """The next ``read_doc`` waits until the returned ``Hang`` is released, as a slow Docs
+        read does. Other reads run normally."""
+        hang = Hang()
+        self._doc_read_hangs.append(hang)
         return hang
 
     @staticmethod
@@ -3173,6 +3181,8 @@ class FakeGoogleAccounts:
     async def read_doc(self, email: str, file_id: str, *, suggestions: bool = False) -> DocRead:
         self.doc_read_calls.append((email, file_id))
         self.doc_read_inline.append(suggestions)
+        if self._doc_read_hangs:
+            await self._doc_read_hangs.pop(0).wait()
         if file_id in self.drive_refused:
             raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
         if file_id not in self.drive_files:

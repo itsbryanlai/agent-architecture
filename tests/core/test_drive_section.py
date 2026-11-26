@@ -9,6 +9,7 @@ from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.activities import approval_card_blocks
+from agentos.audit import canonical_sha256
 from agentos.config import TASK_QUEUE
 from agentos.connectors.drive import (
     DOC_MOVED_TEXT,
@@ -17,6 +18,7 @@ from agentos.connectors.drive import (
     heading_matches,
     section_bounds,
 )
+from agentos.connectors.google_iam import DocEdit
 from agentos.models import (
     ApprovalDecision,
     EditRequest,
@@ -65,7 +67,9 @@ async def grant_section(h) -> int:
     return record.version
 
 
-async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEADING) -> object:
+async def start_replace_task(
+    h, text: str = NEW_TEXT, heading: str = SECTION_HEADING, tool: str = "replace_section"
+) -> object:
     """A section-replace task as a turn starts it now: the draft stored, the spec a reference.
 
     The draft carries the resolved section (before text, read revision and content range) as
@@ -90,9 +94,7 @@ async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEA
             "item_url": DOC_LINK,
         },
     )
-    spec = TaskSpec(
-        ctx(), "replace_section", {}, NONCE, tool="replace_section", draft_ref=task_id, revision=1
-    )
+    spec = TaskSpec(ctx(), "replace_section", {}, NONCE, tool=tool, draft_ref=task_id, revision=1)
     return await h.client.start_workflow(TaskWorkflow.run, spec, id=task_id, task_queue=TASK_QUEUE)
 
 
@@ -424,8 +426,9 @@ SHAPED_VIEW = (
         (["replace_section"], DRIVE_SECTION, SHAPED_VIEW),
         (["comment_on_file"], DRIVE_SECTION, "This agent isn't set up to replace a section"),
         (["replace_section"], "drive-nope-0001", "not been granted a section"),
+        (["suggest_edit"], DRIVE_SECTION, SHAPED_VIEW),
     ],
-    ids=["chosen and granted", "replace not chosen", "section not granted"],
+    ids=["chosen and granted", "replace not chosen", "section not granted", "suggest alone"],
 )
 async def test_the_section_read_shows_the_view_only_with_the_replace_action_and_the_grant(
     dharness, chosen, section, expected
@@ -502,3 +505,123 @@ async def test_a_draft_that_breaks_the_sections_lines_or_tables_is_refused_befor
     assert problem in json.dumps(h.llm.calls[1]["messages"])
     assert len(cards(h)) == 1
     assert h.google.doc_replace_calls == []
+
+
+# --- a suggested edit (D-54) -------------------------------------------------------------
+
+
+async def test_an_approved_suggestion_leaves_the_text_and_stores_one_pending_suggestion(dharness):
+    """Fails if an approved suggested edit changes the Doc's text, makes no suggestion or more
+    than one, loses the suggestion ID from the task's result, or tells the thread the section
+    was replaced instead of suggested with the Doc link."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section(h)
+    reader = DriveReader(h.google, "agent@x.iam.gserviceaccount.com")
+    plain_before = [p.text for p in (await reader.read_doc(DRIVE_SECTION)).paragraphs]
+    handle = await start_replace_task(h, tool="suggest_edit")
+    await wait_state(handle, "awaiting_approval")
+
+    await handle.signal(TaskWorkflow.decision, ApprovalDecision(NONCE, ALICE, True))
+
+    assert await handle.result() == "done"
+    live = await reader.read_doc(DRIVE_SECTION, suggestions=True)
+    [pending] = live.insertions
+    assert pending.text == NEW_TEXT + "\n"
+    assert [p.text for p in live.paragraphs] == plain_before
+    assert len(h.google.doc_suggest_calls) == 1 and h.google.doc_replace_calls == []
+    [told] = thread_posts(h, "Suggested an edit")
+    assert told["text"] == (
+        f"Suggested an edit to a section of VPN guide. Its owner accepts or rejects it in the Doc ({DOC_LINK})."
+    )
+    [_, write] = [e for e in h.audit.events if e.task_id == handle.id]
+    assert (write.kind, write.tool, write.outcome) == ("write", "suggest_edit", "ok")
+    assert write.output_sha256 == canonical_sha256(
+        {"page_id": DRIVE_SECTION, "suggestion_id": pending.ids[0]}
+    )
+
+
+async def test_a_suggest_edit_call_drafts_a_suggestion_card_and_tells_the_model_nothing_is_suggested(
+    dharness,
+):
+    """Fails if a suggested edit's card says it replaces the section or that something is
+    written, or the model is not told nothing is suggested until the requester clicks Submit."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section(h)
+    h.llm.queue(
+        LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall("tu_1", "suggest_edit", {"section": DRIVE_SECTION, "text": NEW_TEXT})
+            ],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(text="Drafted.", tool_calls=[], stop_reason="end_turn"),
+    )
+    await start_stored_conversation(h, "Ev1", "suggest a VPN status edit")
+    [card] = await eventually(lambda: cards(h))
+
+    text = json.dumps(card["blocks"], ensure_ascii=False)
+    assert (
+        f"wants to suggest an edit to the section *{SECTION_HEADING}* in *<{DOC_LINK}|VPN guide>*"
+        in text
+    )
+    assert "*Before*" in text and "The VPN is down." in text and NEW_TEXT in text
+    assert "Nothing is suggested until you click Submit." in text
+    told_model = json.dumps(h.llm.calls[1]["messages"])
+    assert (
+        f"Drafted a suggested edit and sent <@{ALICE}> an approval card. "
+        "Nothing is suggested until they click Submit."
+    ) in told_model
+
+
+# The section as the fake serves it: "Status", 7 units, then "The VPN is down.\n" at [7, 24).
+INSERT_PENDING = [DocEdit(7, "Extra.\n", 0, 0)]
+DELETE_PENDING = [DocEdit(0, "", 7, 24)]
+SECTION_TEXT = "The VPN is down.\nSteps\nRestart the router."
+
+
+@pytest.mark.parametrize(
+    ("tool", "text", "pending", "problem"),
+    [
+        ("suggest_edit", SECTION_TEXT, None, "The section already reads that, so there is nothing"),
+        (
+            "suggest_edit",
+            NEW_TEXT,
+            INSERT_PENDING,
+            "already has a suggestion waiting for its owner",
+        ),
+        ("replace_section", NEW_TEXT, DELETE_PENDING, "already has a suggestion waiting"),
+    ],
+    ids=["suggestion equal to the section", "suggest over an insertion", "replace over a deletion"],
+)
+async def test_a_draft_that_changes_nothing_or_meets_a_pending_suggestion_is_refused_before_any_card(
+    dharness, tool, text, pending, problem
+):
+    """Fails if a draft equal to the section, or one over a section holding a pending
+    suggestion (suggest or replace), posts a card instead of telling the model in plain words."""
+    h = dharness
+    await republish(
+        h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit", "replace_section"])
+    )
+    await grant_section(h)
+    if pending:
+        read = await h.google.read_doc("agent@x.iam.gserviceaccount.com", DRIVE_SECTION)
+        await h.google.suggest_doc_section(
+            "agent@x.iam.gserviceaccount.com", DRIVE_SECTION, read.revision_id, pending
+        )
+    h.llm.queue(
+        LLMResponse(
+            text=None,
+            tool_calls=[ToolCall("tu_1", tool, {"section": DRIVE_SECTION, "text": text})],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(text="Cannot.", tool_calls=[], stop_reason="end_turn"),
+    )
+
+    await start_stored_conversation(h, "Ev1", "update the VPN status section")
+
+    await eventually(lambda: [u for u in h.slack.updates() if "Cannot." in u["text"]], timeout=20)
+    assert problem in json.dumps(h.llm.calls[1]["messages"])
+    assert cards(h) == []

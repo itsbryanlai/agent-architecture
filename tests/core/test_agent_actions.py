@@ -50,6 +50,8 @@ async def publish(h, actions, with_sheet=False, with_section=False):
         (["append_row"], True, False, {"append_row", "my_tasks"}),
         (["search_items", "my_items"], False, False, {"search_items", "my_items"}),
         (["replace_section"], False, True, {"replace_section", "read_section", "my_tasks"}),
+        (["suggest_edit"], False, True, {"suggest_edit", "read_section", "my_tasks"}),
+        (["suggest_edit"], False, False, set()),
         (["append_row"], True, True, {"append_row", "my_tasks"}),
     ],
     ids=[
@@ -59,6 +61,8 @@ async def publish(h, actions, with_sheet=False, with_section=False):
         "write with its grant",
         "reads only",
         "section write brings its read",
+        "suggest alone brings its read",
+        "suggest without its grant",
         "section granted but its action not chosen",
     ],
 )

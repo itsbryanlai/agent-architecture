@@ -1512,6 +1512,54 @@ async def drive_replace_section(r: Rig) -> list[Recorded]:
     ]
 
 
+async def drive_suggest_edit(r: Rig) -> list[Recorded]:
+    """A Drive suggested-edit task (D-54): the model drafts suggest_edit on a granted Doc
+    section, the requester approves the card, and the edit is put in the Doc as one pending
+    suggestion at the read revision, the Doc's text unchanged."""
+    thread = thread_ts(325)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: (
+            d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+            d.update(actions=["suggest_edit"]),
+        ),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 26, tzinfo=UTC)
+    )
+    add_section_doc(r.google)
+    r.llm.queue(
+        tool_turn(
+            ToolCall(
+                "tu_dse",
+                "suggest_edit",
+                {"section": DRIVE_SECTION, "text": "The VPN is back up."},
+            )
+        ),
+        answer("Sent you a card."),
+    )
+    await start_conversation(r, "it-helper", thread, "suggest a VPN status edit", stored=True)
+    cards = await eventually(lambda: [p for p in r.slack.posts() if p["blocks"]], timeout=30)
+    actions = next(b for b in cards[0]["blocks"] if b["type"] == "actions")
+    value = json.loads(actions["elements"][0]["value"])
+    handle = r.client.get_workflow_handle(value["task_id"])
+    await wait_state(handle, "awaiting_approval")
+    await approve(handle, value["nonce"])
+    assert await handle.result() == "done"
+    paras = r.google.docs[DRIVE_SECTION]["paragraphs"]
+    assert paras[1]["text"] == "The VPN is down.\n"
+    assert len(r.google.doc_suggest_calls) == 1
+    assert any(
+        p["thread_ts"] and "Suggested an edit to a section of VPN guide" in p["text"]
+        for p in r.slack.posts()
+    )
+    return [
+        await current(r, "", handle.id),
+        await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
+    ]
+
+
 def _slack_update_error() -> SlackApiError:
     """A chat.update refusal as the SDK raises it: Slack's error code in the response."""
     return SlackApiError(
@@ -2078,6 +2126,8 @@ SCENARIOS["drive_append"] = drive_append
 SCENARIOS["drive_create_doc"] = drive_create_doc
 # A Drive section-replace task is new: one shape (the stored draft), no legacy inline history.
 SCENARIOS["drive_replace_section"] = drive_replace_section
+# A Drive suggested-edit task is new too: one shape (the stored draft), no legacy inline history.
+SCENARIOS["drive_suggest_edit"] = drive_suggest_edit
 
 
 # --- files --------------------------------------------------------------------------------

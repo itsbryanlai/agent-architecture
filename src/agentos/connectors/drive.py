@@ -30,6 +30,9 @@ the idempotency lock — a retry after a lost response, or a Doc someone else mo
 revision mismatch, then the section's text is compared with the approved text: equal means the
 earlier attempt landed, different refuses with nothing written. The write refuses when the
 draft's heading no longer matches the live grant's, or the heading is gone or duplicated.
+The fifth is ``suggest_edit`` (D-54): the same write sent as a suggestion for the Doc's owner to
+accept, done only when Google saved a suggestion, and found again after a lost response by the
+pending suggestion holding the approved text.
 ``resolve_item`` walks a file's parents up to
 a granted root — the same walk the search re-check makes — so a file inside a granted
 folder or shared drive resolves, and one moved out of it does not; the granted root is
@@ -63,6 +66,7 @@ from agentos.connectors.google_iam import (
     HeaderAt,
     SheetMetadata,
     SheetTab,
+    u16_slice,
     utf16_len,
 )
 from agentos.connectors.manifest import MANIFEST_DIR, Manifest, ToolSpec, load_manifest
@@ -115,6 +119,17 @@ SECTION_SHAPE_CHANGED_TEXT = (
 # The refusal when the Doc moved since the read revision and the section's text is not the
 # approved text: nothing is written, the requester is told to draft again (D-50).
 DOC_MOVED_TEXT = "The document changed since you approved; I'll draft it again"
+# The refusal when the section already reads as approved, so a suggestion would change nothing (D-54).
+NOTHING_TO_SUGGEST_TEXT = "The section already reads that, so there is nothing to suggest"
+# The refusal when the granted section already holds a suggestion nobody has accepted or
+# rejected: a write over it would mix with it, so the requester is told to ask the owner (D-54).
+SECTION_PENDING_TEXT = (
+    "'{heading}' in '{doc}' already has a suggestion waiting for its owner. "
+    "Ask them to accept or reject it first."
+)
+# What a suggested edit's write returns when the section already reads as approved (the owner
+# accepted the suggestion before a retry looked): done, with no suggestion to point to (D-54).
+ALREADY_ACCEPTED_REF = ""
 # The longest current section text a replace drafts: a longer section is refused at draft so
 # the card never previews a body it cannot show whole (D-50).
 MAX_SECTION_BEFORE = 5000
@@ -674,6 +689,76 @@ def section_edits(doc: DocRead, layout: SectionLayout, text: str, heading: str) 
     return [edit for _, edit in found]
 
 
+def original_text(doc: DocRead, start: int, end: int) -> str:
+    """The Doc's text over the UTF-16 range ``[start, end)``, as it was before any pending
+    suggestion: the paragraphs' and table cells' text the range touches, in order (D-54)."""
+    pieces: list[tuple[int, str]] = []
+    for p in doc.paragraphs:
+        lo, hi = max(start, p.start_index), min(end, p.end_index)
+        if lo < hi:
+            pieces.append((lo, u16_slice(p.text, lo - p.start_index, hi - p.start_index)))
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row:
+                lo, hi = max(start, cell.start_index), min(end, cell.end_index)
+                if cell.plain and lo < hi:
+                    pieces.append(
+                        (lo, u16_slice(cell.text, lo - cell.start_index, hi - cell.start_index))
+                    )
+    return "".join(text for _, text in sorted(pieces))
+
+
+def section_pending(doc: DocRead, layout: SectionLayout) -> bool:
+    """Whether the section holds a pending suggestion: text a suggestion inserts at an index
+    inside it (one before it too, where a heading that is the Doc's last paragraph takes its
+    new text) or text one deletes that overlaps it (D-54). A suggestion that only changes style
+    is not seen."""
+    if any(layout.start - 1 <= run.start_index <= layout.end for run in doc.insertions):
+        return True
+    return any(
+        run.start_index < layout.end and run.start_index + utf16_len(run.text) > layout.start
+        for run in doc.deletions
+    )
+
+
+def match_pending_edits(doc: DocRead, edits: list[DocEdit]) -> tuple[str, ...] | None:
+    """The IDs of the pending suggestions that are these edits, or None when any part of the
+    write is not pending (D-54). Matched against what the write sent: each insertion by its text
+    at its planned index, each deletion by the Doc's text over its planned range, which the
+    pending deletions must cover exactly. A delete's range is in the request's shifted indices,
+    so it shifts back by the text its edit inserts. Text a run carries once counts once however
+    many suggestion IDs it has; the view has no author, so this is the whole proof."""
+    inserted: dict[int, tuple[str, list[str]]] = {}
+    for run in doc.insertions:
+        text, ids = inserted.get(run.start_index, ("", []))
+        inserted[run.start_index] = (text + run.text, ids + [i for i in run.ids if i not in ids])
+    found: list[str] = []
+    planned = 0
+    for edit in edits:
+        if edit.insert_text:
+            planned += 1
+            hit = inserted.get(edit.insert_index)
+            if hit is None or hit[0] != edit.insert_text:
+                return None
+            found += [i for i in hit[1] if i not in found]
+        if edit.delete_end > edit.delete_start:
+            planned += 1
+            shift = utf16_len(edit.insert_text)
+            start, end = edit.delete_start - shift, edit.delete_end - shift
+            runs = sorted(
+                (
+                    run
+                    for run in doc.deletions
+                    if start <= run.start_index and run.start_index + utf16_len(run.text) <= end
+                ),
+                key=lambda run: run.start_index,
+            )
+            if "".join(run.text for run in runs) != original_text(doc, start, end):
+                return None
+            found += [i for run in runs for i in run.ids if i not in found]
+    return tuple(found) if planned else None
+
+
 def sheet_marker(idem_key: str) -> str:
     """The developer metadata value marking an appended row: the whole digest of its key."""
     return hashlib.sha256(idem_key.encode()).hexdigest()
@@ -823,13 +908,20 @@ class DriveReader:
     async def fill_doc(self, file_id: str, replacements: list[tuple[str, str]]) -> None:
         return await self._google.fill_doc(self._email, file_id, replacements)
 
-    async def read_doc(self, file_id: str) -> DocRead:
-        return await self._google.read_doc(self._email, file_id)
+    async def read_doc(self, file_id: str, *, suggestions: bool = False) -> DocRead:
+        return await self._google.read_doc(self._email, file_id, suggestions=suggestions)
 
     async def replace_doc_section(
         self, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
         return await self._google.replace_doc_section(
+            self._email, file_id, required_revision_id, edits
+        )
+
+    async def suggest_doc_section(
+        self, file_id: str, required_revision_id: str, edits: list[DocEdit]
+    ) -> tuple[str, ...]:
+        return await self._google.suggest_doc_section(
             self._email, file_id, required_revision_id, edits
         )
 
@@ -889,8 +981,8 @@ class DriveConnector:
             elif spec.name == "create_doc_from_template":
                 # Its description names the granted templates and their blanks (D-49).
                 tools.append(self._create_doc_definition(spec, templates))
-            elif spec.name == "replace_section":
-                # Its description names the granted sections and their headings (D-50).
+            elif spec.name in ("replace_section", "suggest_edit"):
+                # Its description names the granted sections and their headings (D-50, D-54).
                 tools.append(self._replace_section_definition(spec, sections))
             else:
                 tools.append(spec.llm_definition())
@@ -1227,17 +1319,22 @@ class DriveConnector:
                 raise ConnectorError(DOC_FILL_INCOMPLETE_TEXT)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
-    async def read_section(self, grant: DriveGrant, text: str | None = None) -> dict:
+    async def read_section(
+        self, grant: DriveGrant, text: str | None = None, *, suggest: bool = False
+    ) -> dict:
         """The section's current text and the Doc's read revision, for the draft and the card
         (D-50): a ``documents.get`` of the granted Doc, the marker line found exactly once in
         its recorded style, the text under it (the card's "before", with each horizontal line
         as ``---`` and each table as pipe rows) and the content range the write replaces. The
         section must hold only text, lines and tables and its current text be within the draft
-        bound; with ``text``, the new text must keep the section's lines and tables. Anything
-        else refuses here in plain words before any card. The revisionId is the lock the write
+        bound; with ``text``, the new text must keep the section's lines and tables, and the
+        section must hold no pending suggestion (D-54). Anything else refuses here in plain words
+        before any card. With ``suggest`` (a suggested edit, or the model reading to write one)
+        the Doc is read in the inline suggestions view, and a ``text`` the section already reads
+        refuses: there is nothing to suggest. The revisionId is the lock the write
         names; the before text is frozen into the draft so what was approved is what runs. The
         link is the Doc's webViewLink."""
-        doc = await self._reader.read_doc(grant.doc_id)
+        doc = await self._reader.read_doc(grant.doc_id, suggestions=suggest)
         index = locate_marker(doc, grant.heading, grant.marker)
         if error := section_plain_error(doc, grant.heading, index):
             raise ConnectorError(error)
@@ -1250,7 +1347,12 @@ class DriveConnector:
                 )
             )
         if text is not None:
-            section_edits(doc, layout, text, grant.heading)
+            if section_pending(doc, layout):
+                raise ConnectorError(
+                    SECTION_PENDING_TEXT.format(heading=grant.heading, doc=doc.title)
+                )
+            if not section_edits(doc, layout, text, grant.heading) and suggest:
+                raise ConnectorError(NOTHING_TO_SUGGEST_TEXT)
         file = await self._reader.get_file(grant.doc_id)
         return {
             "revision_id": doc.revision_id,
@@ -1260,7 +1362,7 @@ class DriveConnector:
         }
 
     async def check_section_shape(
-        self, doc_id: str, heading: str, marker: str | None = None
+        self, doc_id: str, heading: str, marker: str | None = None, *, suggestions: bool = False
     ) -> DocRead:
         """The write's shape check without the write (D-50), run before the write and before
         reconcile looks: the approved heading and marker style must still be the live grant's
@@ -1268,13 +1370,13 @@ class DriveConnector:
         in that style (a renamed, removed, duplicated or restyled line refuses in plain
         words), and the section must hold only text, lines and tables (an image refuses).
         ``marker`` is None for a draft made before styles were recorded. Returns the Doc read
-        for the check."""
+        for the check; with ``suggestions`` it is the inline suggestions view (D-54)."""
         grant = self._grants.get(doc_id)
         if grant is None or grant.kind != "section":
             raise GrantDenied("This agent has not been granted that Doc section to replace.")
         if grant.heading != heading or (marker is not None and grant.marker != marker):
             raise ConnectorError(SECTION_SHAPE_CHANGED_TEXT)
-        doc = await self._reader.read_doc(doc_id)
+        doc = await self._reader.read_doc(doc_id, suggestions=suggestions)
         index = locate_marker(doc, heading, grant.marker)
         if error := section_plain_error(doc, heading, index):
             raise ConnectorError(error)
@@ -1313,6 +1415,10 @@ class DriveConnector:
         edits = section_edits(doc, layout, payload["text"], payload["heading"])
         if not edits:
             return doc_id
+        if section_pending(doc, layout):
+            raise ConnectorError(
+                SECTION_PENDING_TEXT.format(heading=payload["heading"], doc=doc.title)
+            )
         try:
             return await self._reader.replace_doc_section(doc_id, payload["revision_id"], edits)
         except GoogleError as err:
@@ -1325,6 +1431,69 @@ class DriveConnector:
                 wanted = section_replacement_view(layout, payload["text"], payload["heading"])
                 if wanted is not None and section_view(layout) == wanted:
                     return doc_id
+            raise ConnectorError(DOC_MOVED_TEXT) from err
+
+    async def find_suggested_section(self, doc_id: str, payload: dict) -> str | None:
+        """The suggestion IDs (joined by a comma) of the suggestion an earlier attempt made,
+        ``ALREADY_ACCEPTED_REF`` when the section already reads as approved, or None for "not
+        seen" (D-54): the look-before-write and reconcile lookup of a suggested edit. The shape
+        check runs first, as the write's does. The Doc is read in the inline suggestions view,
+        which is the Doc as it was before any suggestion, so the edits the approved text makes
+        are the ones the write sent; the pending suggestions must be exactly those edits'
+        insertions and deletions (``match_pending_edits``). The view carries no author, so the
+        proof is the text inside the granted section. No edits left to make means the section
+        reads as approved: the owner accepted before this look."""
+        grant = self._grants.get(doc_id)
+        if grant is None or grant.kind != "section":
+            return None
+        doc = await self.check_section_shape(
+            doc_id, payload["heading"], payload.get("marker"), suggestions=True
+        )
+        layout = section_layout(doc, locate_marker(doc, payload["heading"], grant.marker))
+        try:
+            edits = section_edits(doc, layout, payload["text"], payload["heading"])
+        except ConnectorError:
+            return None
+        if not edits:
+            return ALREADY_ACCEPTED_REF
+        found = match_pending_edits(doc, edits)
+        return ",".join(found) if found else None
+
+    async def suggest_section(self, doc_id: str, payload: dict, idem_key: str) -> str:
+        """Suggest the approved section text as a tracked change, as the tenant's account
+        (D-54): ``replace_section``'s checks and edits, sent with ``writeMode: SUGGEST`` so the
+        Doc's text stays as it is until its owner accepts. The Doc is read in the inline
+        suggestions view; a section that already reads as approved is done with no suggestion
+        (``ALREADY_ACCEPTED_REF``), and one holding a suggestion that is not this write's refuses
+        in plain words. The revision is the lock as in D-50; a retry after a lost response gets
+        a revision mismatch and the Doc is read again — the pending suggestions being the
+        write's edits means the earlier attempt landed (done, with its ID), none refuses with
+        nothing written. Returns the suggestion IDs, joined by a comma."""
+        grant = self._grants[doc_id]
+        doc = await self.check_section_shape(
+            doc_id, payload["heading"], payload.get("marker"), suggestions=True
+        )
+        layout = section_layout(doc, locate_marker(doc, payload["heading"], grant.marker))
+        edits = section_edits(doc, layout, payload["text"], payload["heading"])
+        if not edits:
+            return ALREADY_ACCEPTED_REF
+        if section_pending(doc, layout):
+            found = match_pending_edits(doc, edits)
+            if found:
+                return ",".join(found)
+            raise ConnectorError(
+                SECTION_PENDING_TEXT.format(heading=payload["heading"], doc=doc.title)
+            )
+        try:
+            return ",".join(
+                await self._reader.suggest_doc_section(doc_id, payload["revision_id"], edits)
+            )
+        except GoogleError as err:
+            if err.code != "revision_mismatch":
+                raise
+            found_ref = await self.find_suggested_section(doc_id, payload)
+            if found_ref is not None:
+                return found_ref
             raise ConnectorError(DOC_MOVED_TEXT) from err
 
     async def find_write(self, kind: str, target: str, idem_key: str) -> NotionItem | str | None:
@@ -1356,6 +1525,8 @@ class DriveConnector:
             return await self.create_doc(target, payload, idem_key)
         if kind == "replace_section":
             return await self.replace_section(target, payload, idem_key)
+        if kind == "suggest_edit":
+            return await self.suggest_section(target, payload, idem_key)
         raise ConnectorError(f"Unknown write kind '{kind}'.")
 
     def bulk_priority(self) -> AbstractContextManager[None]:

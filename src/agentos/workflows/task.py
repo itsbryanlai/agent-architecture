@@ -1089,13 +1089,19 @@ class TaskWorkflow:
         (a permanent refusal, the thread carries the reason); a retry after a lost response finds
         the section already holding the approved text. When the retries run out and the look
         cannot confirm, the task says so and points to the Doc, never that nothing was written.
+
+        A task whose tool is ``suggest_edit`` (D-54) runs the same steps and says "suggested"
+        where this one says "replaced": the activities read the tool, so only the lines differ.
+        A task made before the tool existed never has that tool, so its commands are unchanged.
         """
         self._state = "executing"
         await self._record()
+        suggest = spec.tool == "suggest_edit"
         payload = {} if self._refs else spec.payload
         title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        done_ref = None
         try:
-            await self._act_write(AgentActivities.replace_doc_section, spec, task_id)
+            done_ref = await self._act_write(AgentActivities.replace_doc_section, spec, task_id)
         except ActivityError as err:
             if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
                 return await self._stop_for_tenant_disabled(spec, task_id)
@@ -1112,7 +1118,9 @@ class TaskWorkflow:
                         AgentActivities.update_card, spec, task_id, card_ts, "Not confirmed"
                     )
                     await self._notice(
-                        task_notices.NOT_CONFIRMED_REPLACE_SECTION,
+                        task_notices.NOT_CONFIRMED_SUGGEST_EDIT
+                        if suggest
+                        else task_notices.NOT_CONFIRMED_REPLACE_SECTION,
                         f"{task_id}:failed",
                         task_id,
                         url=item_url,
@@ -1120,13 +1128,16 @@ class TaskWorkflow:
                     self._state = "failed"
                     await self._record()
                     return self._state
+                done_ref = found
             else:
                 reason = _reason(err)
                 await self._try(
                     AgentActivities.update_card, spec, task_id, card_ts, f"Failed: {reason}"
                 )
                 await self._notice(
-                    task_notices.FAILED_REPLACE_SECTION,
+                    task_notices.FAILED_SUGGEST_EDIT
+                    if suggest
+                    else task_notices.FAILED_REPLACE_SECTION,
                     f"{task_id}:failed",
                     task_id,
                     subject=title,
@@ -1135,9 +1146,22 @@ class TaskWorkflow:
                 self._state = "failed"
                 await self._record()
                 return self._state
-        await self._try(AgentActivities.update_card, spec, task_id, card_ts, "Replaced")
+        # A suggested edit whose section already read as approved (the owner accepted the
+        # suggestion before a retry looked) has no suggestion to point to: it says so (D-54).
+        accepted = suggest and done_ref == ""
+        await self._try(
+            AgentActivities.update_card,
+            spec,
+            task_id,
+            card_ts,
+            "Suggested" if suggest and not accepted else "Replaced" if not suggest else "Accepted",
+        )
         await self._notice(
-            task_notices.REPLACED,
+            task_notices.SUGGEST_ALREADY_ACCEPTED
+            if accepted
+            else task_notices.SUGGESTED
+            if suggest
+            else task_notices.REPLACED,
             f"{task_id}:replaced",
             task_id,
             subject=title,

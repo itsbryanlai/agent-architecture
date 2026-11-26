@@ -3,12 +3,14 @@ lock, the moved-Doc and republish refusals, the draft validation and the edit (D
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
 from agentos.activities import approval_card_blocks
+from agentos.approval_policy import NO_APPROVAL
 from agentos.audit import canonical_sha256
 from agentos.config import TASK_QUEUE
 from agentos.connectors.drive import (
@@ -27,6 +29,7 @@ from agentos.models import (
     ToolCall,
     TurnContext,
 )
+from agentos.switches import AGENT
 from agentos.workflows.task import TaskWorkflow
 from tests.conftest import ALICE, TENANT, eventually
 from tests.helpers.agents import republish
@@ -68,7 +71,10 @@ async def grant_section(h) -> int:
 
 
 async def start_replace_task(
-    h, text: str = NEW_TEXT, heading: str = SECTION_HEADING, tool: str = "replace_section"
+    h,
+    text: str = NEW_TEXT,
+    heading: str = SECTION_HEADING,
+    tool: str = "replace_section",
 ) -> object:
     """A section-replace task as a turn starts it now: the draft stored, the spec a reference.
 
@@ -539,6 +545,127 @@ async def test_an_approved_suggestion_leaves_the_text_and_stores_one_pending_sug
     assert write.output_sha256 == canonical_sha256(
         {"page_id": DRIVE_SECTION, "suggestion_id": pending.ids[0]}
     )
+
+
+@pytest.mark.parametrize("policy", [NO_APPROVAL, None], ids=["policy-none", "default"])
+async def test_a_suggestion_runs_without_a_card_only_when_the_admin_turned_approval_off(
+    dharness, policy
+):
+    """Fails if policy none still shows a card, or the default policy skips it."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section(h)
+    if policy is not None:
+        await h.acts.policies.set(TENANT, "suggest_edit", policy)
+    handle = await start_replace_task(h, tool="suggest_edit")
+
+    if policy is None:
+        await wait_state(handle, "awaiting_approval")
+        assert len(cards(h)) == 1
+        assert h.google.doc_suggest_calls == []
+        return
+    assert await handle.result() == "done"
+    assert cards(h) == []
+    assert len(h.google.doc_suggest_calls) == 1
+    [told] = thread_posts(h, "without an approval card")
+    assert told["text"] == (
+        "Suggested an edit to a section of VPN guide without an approval card, as your admin "
+        f"set. Its owner accepts or rejects it in the Doc ({DOC_LINK})."
+    )
+    [write] = [e for e in h.audit.events if e.task_id == handle.id]
+    assert (write.kind, write.tool, write.outcome, write.approver_user_id) == (
+        "write",
+        "suggest_edit",
+        "policy",
+        None,
+    )
+
+
+NO_CARD_DOC = f"({DOC_LINK})"
+NO_CARD_DONE = (
+    "Suggested an edit to a section of VPN guide without an approval card, as your admin "
+    f"set. Its owner accepts or rejects it in the Doc {NO_CARD_DOC}."
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "state", "line", "suggestions"),
+    [
+        ("agent off", "cancelled", "IT helper is turned off by an admin. Nothing was changed.", 0),
+        (
+            "doc moved",
+            "failed",
+            (
+                "I couldn't suggest an edit in 'VPN guide': The document changed after the "
+                "suggestion was drafted. Ask again to draft it from the current text."
+            ),
+            0,
+        ),
+        ("response lost", "done", NO_CARD_DONE, 1),
+        (
+            "accepted meanwhile",
+            "done",
+            f"The section of VPN guide already reads as approved, so nothing is left to suggest {NO_CARD_DOC}.",
+            0,
+        ),
+        ("attempt overlaps", "done", NO_CARD_DONE, 1),
+    ],
+    ids=["agent-off", "doc-moved", "response-lost", "accepted-meanwhile", "attempt-overlaps"],
+)
+async def test_a_suggestion_with_no_card_ends_as_its_write_does(
+    dharness, case, state, line, suggestions
+):
+    """Fails if a no-card suggestion writes after a stop, doubles one or misreports it."""
+    h = dharness
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["suggest_edit"]))
+    await grant_section(h)
+    await h.acts.policies.set(TENANT, "suggest_edit", NO_APPROVAL)
+    if case in ("agent off", "doc moved"):
+        # The change lands while the task reads the policy: after the turn's check and the
+        # draft's read, before the write.
+        read_policy = h.acts.policies.get
+
+        async def get_then_change(tenant_id, tool):
+            policy = await read_policy(tenant_id, tool)
+            if case == "agent off":
+                await h.switches.switch_off(
+                    TENANT, AGENT, "it-helper", "U_ADMIN", datetime.now(UTC)
+                )
+            else:
+                h.google.set_doc_revision(DRIVE_SECTION, "9")
+                h.google.docs[DRIVE_SECTION]["paragraphs"][1]["text"] = "Someone else's text.\n"
+            return policy
+
+        h.acts.policies.get = get_then_change
+    if case == "response lost":
+        h.google.fail_after_write("suggest")
+    if case == "accepted meanwhile":
+        h.google.fail_after_write("suggest")
+        first = h.google.suggest_doc_section
+
+        async def suggest_then_accept(*args):
+            try:
+                return await first(*args)
+            finally:
+                h.google.accept_suggestions(DRIVE_SECTION)
+
+        h.google.suggest_doc_section = suggest_then_accept
+    hang = h.google.hang_after_write("suggest") if case == "attempt overlaps" else None
+
+    handle = await start_replace_task(h, tool="suggest_edit")
+    if hang is not None:
+        await hang.reached.wait()
+        hang.release()
+
+    assert await handle.result() == state
+    assert cards(h) == []
+    # Settle point: the task has ended, so its one thread line is posted.
+    [told] = [p for p in h.slack.posts() if p["thread_ts"]]
+    assert told["text"] == line
+    live = await DriveReader(h.google, "agent@x.iam.gserviceaccount.com").read_doc(
+        DRIVE_SECTION, suggestions=True
+    )
+    assert len(live.insertions) == suggestions
 
 
 async def test_a_suggest_edit_call_drafts_a_suggestion_card_and_tells_the_model_nothing_is_suggested(

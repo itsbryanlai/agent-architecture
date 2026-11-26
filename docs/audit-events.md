@@ -272,12 +272,12 @@ connector event.
 Written by the console's settings page (the control plane), in the same transaction as the
 change. Admin only. Setting what is already in force changes nothing and records
 nothing; a refused change (an unpublished agent, a channel outside its agent's audience,
-an action that is not low-risk, an unknown policy) records nothing.
+an action that is not low-risk, such as a section replace, an unknown policy) records nothing.
 
 | Kind | Written when | Requester / identity | Agent / version | tool | target | outcome | Event key |
 |---|---|---|---|---|---|---|---|
 | `tenant_settings` | The default agent or the channel routing changes | the admin / `user:<admin>` | none | `routing` | `default=<agent or ->; <channel>-><agent>,...`, cut at 300 characters | `ok` | Control key |
-| `policy_change` | The tenant's approval policy for a low-risk action changes (D-43) | the admin / `user:<admin>` | none | the action's name (`add_comment`) | the new policy: `none` or `requester_approval` | `ok` | Control key |
+| `policy_change` | The tenant's approval policy for a low-risk action changes (D-43) | the admin / `user:<admin>` | none | the action's name (`add_comment`, `suggest_edit`) | the new policy: `none` or `requester_approval` | `ok` | Control key |
 
 ## Access review
 

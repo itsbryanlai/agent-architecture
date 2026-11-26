@@ -71,20 +71,20 @@
 </form>
 
 <h2>Approvals</h2>
-<p class="muted">Every write asks the requester to approve before it runs. Here you can turn approval off for a low-risk action — a comment on an item the requester filed. It then runs without a card, and the thread line says no approval was needed; a comment on anyone else's item, and every other write, still shows its card. The default is requester approval, and each change is recorded in the audit log.</p>
+<p class="muted">Every write asks the requester to approve before it runs. Here you can turn approval off for a low-risk action — a comment on an item the requester filed, or a suggested edit to a section of a Doc, which the Doc's owner still accepts or rejects. It then runs without a card, and the thread line says no approval was needed; a comment on anyone else's item, and every other write, still shows its card. The default is requester approval, and each change is recorded in the audit log.</p>
 <table>
   <tr><th>Action</th><th>Approval</th></tr>
-  {% for action, policy in view.approvals.items() %}
+  {% for action, entry in view.approvals.items() %}
   <tr>
-    <td><code>{{ action }}</code></td>
+    <td>{{ entry.label }}</td>
     <td>
       <form method="post" action="{{ base }}/settings/approvals">
         <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
         <input type="hidden" name="request_id" value="{{ new_token() }}">
         <input type="hidden" name="action" value="{{ action }}">
         <select name="policy">
-          <option value="requester_approval"{% if policy == "requester_approval" %} selected{% endif %}>Requester approval</option>
-          <option value="none"{% if policy == "none" %} selected{% endif %}>No approval</option>
+          <option value="requester_approval"{% if entry.policy == "requester_approval" %} selected{% endif %}>Requester approval</option>
+          <option value="none"{% if entry.policy == "none" %} selected{% endif %}>No approval</option>
         </select>
         <button type="submit">Save</button>
       </form>

@@ -55,6 +55,7 @@ with workflow.unsafe.imports_passed_through():
     from agentos.activities import AgentActivities
     from agentos.agent_health import agent_unavailable_text
     from agentos.config import AgentVersion
+    from agentos.connectors.drive import DOC_MOVED_TEXT
     from agentos.connectors.manifest import TOOLS
     from agentos.connectors.notion import normalize_id
     from agentos.models import (
@@ -112,6 +113,9 @@ NUDGE_PATCH = "nudge"
 # Histories recorded before the approval policy existed never ask it: every comment
 # shows its card, as it did then.
 APPROVAL_POLICY_PATCH = "approval-policy"
+# Histories recorded before a suggested edit could be relaxed never ask: every suggestion
+# shows its card, as it did then.
+SUGGEST_APPROVAL_POLICY_PATCH = "suggest-approval-policy"
 UNCHECKED_CARD_TEXT = "I couldn't confirm you can still make this request; nothing was changed."
 # One look per call: this workflow owns the retries, with a timer between.
 RECONCILE_RETRY = RetryPolicy(maximum_attempts=1)
@@ -487,6 +491,15 @@ class TaskWorkflow:
         ):
             self._spec = dataclasses.replace(self._spec, under_policy=True)
             return await self._run_comment_under_policy(self._spec, task_id, agent.name)
+        # A suggested edit may run without a card too (D-43, D-54): the Doc's owner still
+        # accepts or rejects it. Histories recorded before this never ask.
+        if (
+            spec.tool == "suggest_edit"
+            and workflow.patched(SUGGEST_APPROVAL_POLICY_PATCH)
+            and await self._act(AgentActivities.suggest_approval_policy, self._spec)
+        ):
+            self._spec = dataclasses.replace(self._spec, under_policy=True)
+            return await self._run_suggest_under_policy(self._spec, task_id, agent.name)
         card_ts: str = await self._act(AgentActivities.post_approval_card, self._spec, task_id)
         self._state = "awaiting_approval"
         await self._record()
@@ -1249,6 +1262,95 @@ class TaskWorkflow:
         await self._notice(
             task_notices.COMMENTED_NO_APPROVAL,
             f"{task_id}:commented",
+            task_id,
+            subject=title,
+            url=item_url,
+        )
+        self._state = "done"
+        await self._record()
+        return self._state
+
+    async def _run_suggest_under_policy(self, spec: TaskSpec, task_id: str, agent_name: str) -> str:
+        """Suggest the edit the tenant's policy allows, without a card (D-43, D-54).
+
+        The same exactly-once suggest write as an approved one, with no approval row and
+        outcome 'policy', behind the same pre-write re-check. There is no card to update,
+        so a refusal or a failure says so in the thread. Nothing to watch afterwards.
+        """
+        try:
+            stopped = await self._act(AgentActivities.check_before_write, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            # The check could not be completed: fail closed, nothing is written.
+            stopped = UNCHECKED_CARD_TEXT
+        if stopped is not None:
+            await self._notice(
+                task_notices.STOPPED_COMMENT, f"{task_id}:failed", task_id, reason=stopped
+            )
+            self._state = "cancelled"
+            await self._record()
+            return self._state
+        self._state = "executing"
+        await self._record()
+        payload = {} if self._refs else spec.payload
+        title, item_url = payload.get("item_title", ""), payload.get("item_url", "")
+        done_ref = None
+        try:
+            done_ref = await self._act_write(AgentActivities.replace_doc_section, spec, task_id)
+        except ActivityError as err:
+            if workflow.patched(TENANT_DISABLED_PATCH) and is_tenant_disabled(err):
+                return await self._stop_for_tenant_disabled(spec, task_id)
+            stopped_text = None
+            if _is_agent_off(err):
+                stopped_text = agent_off_text(agent_name)
+            elif workflow.patched(AGENT_UNAVAILABLE_PATCH) and _is_agent_unavailable(err):
+                stopped_text = agent_unavailable_text(agent_name)
+            if stopped_text is not None:
+                await self._notice(
+                    task_notices.FAILED_SUGGEST_EDIT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=stopped_text,
+                )
+                self._state = "cancelled"
+                await self._record()
+                return self._state
+            if workflow.patched(RECONCILE_PATCH) and not _is_permanent(err):
+                done_ref = await self._reconcile(
+                    AgentActivities.reconcile_drive_section, spec, task_id
+                )
+                if done_ref is None:
+                    await self._notice(
+                        task_notices.NOT_CONFIRMED_SUGGEST_EDIT,
+                        f"{task_id}:failed",
+                        task_id,
+                        url=item_url,
+                    )
+                    self._state = "failed"
+                    await self._record()
+                    return self._state
+            else:
+                reason = _reason(err)
+                # "since you approved" is wrong with no card: say what happened instead.
+                if DOC_MOVED_TEXT in reason:
+                    reason = task_notices.DOC_MOVED_NO_APPROVAL_TEXT
+                await self._notice(
+                    task_notices.FAILED_SUGGEST_EDIT,
+                    f"{task_id}:failed",
+                    task_id,
+                    subject=title,
+                    reason=reason,
+                )
+                self._state = "failed"
+                await self._record()
+                return self._state
+        await self._notice(
+            task_notices.SUGGEST_ALREADY_ACCEPTED
+            if done_ref == ""
+            else task_notices.SUGGESTED_NO_APPROVAL,
+            f"{task_id}:replaced",
             task_id,
             subject=title,
             url=item_url,

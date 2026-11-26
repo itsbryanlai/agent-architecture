@@ -16,9 +16,9 @@
 # input_schema: the model's input is checked against it before anything runs; a missing,
 #   unexpected or wrongly typed field becomes an error the model reads and can correct.
 # offer_to_llm: false keeps a tool for runtime use only; the model cannot call it.
-# low_risk: true marks a comment action an admin may let run without the requester's
-#   approval (D-43), on an item the requester filed. Loading refuses the flag on any
-#   create, append or replace; the default policy still asks for approval.
+# low_risk: true marks a comment action (or a Drive suggested edit) an admin may let run
+#   without the requester's approval (D-43), a comment on an item the requester filed.
+#   Loading refuses the flag on any create, append or replace; the default policy still asks for approval.
 # service / label / needs / needs_text (D-52): an agent's creator chooses which actions it
 #   may use. A tool offered to the model with a label is one of those choices, listed under
 #   the manifest's service; needs names the kind of grant it works on (notion_database,

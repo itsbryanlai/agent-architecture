@@ -3,7 +3,7 @@
 Calling a tool is generic; what makes a tool safe for an agent that does work
 is its risk class, whether it is scoped to the requester, how a write avoids
 duplicates, and whether an admin may let it run without the requester's
-approval (``low_risk``, a comment action only). That metadata lives in a YAML
+approval (``low_risk``, a comment or a suggested edit only). That metadata lives in a YAML
 manifest per connector.
 
 The runtime reads it. ``screen`` classifies a call the model made: a read tool runs at
@@ -40,6 +40,11 @@ WRITE_KINDS = {
     "revision": "replace_section",
     "revision_suggest": "replace_section",
 }
+
+# The idempotency methods of the actions an admin may relax (D-43): a comment, and a
+# suggested edit the Doc's owner still accepts or rejects (D-54). Never a create, an
+# append or a replace.
+LOW_RISK_METHODS = frozenset({"marker_text", "revision_suggest"})
 
 
 class RiskClass(str, Enum):
@@ -108,11 +113,10 @@ def load_manifest(path: str | Path) -> Manifest:
         risk = RiskClass(spec["risk"])
         low_risk = bool(spec.get("low_risk", False))
         if low_risk and (
-            risk is RiskClass.READ
-            or WRITE_KINDS.get(spec.get("idempotency") or "") != "add_comment"
+            risk is RiskClass.READ or (spec.get("idempotency") or "") not in LOW_RISK_METHODS
         ):
             raise ValueError(
-                f"tool '{name}': low_risk may only mark a comment action, "
+                f"tool '{name}': low_risk may only mark a comment or a suggested edit, "
                 "never a create, append or replace"
             )
         tools[name] = ToolSpec(

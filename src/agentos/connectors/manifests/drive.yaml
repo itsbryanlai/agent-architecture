@@ -5,7 +5,8 @@
 # and preview shape here; comment is the first (D-47), append a row the second (D-48),
 # create a Doc from a template the third (D-49), replace a marked section the fourth
 # (D-50), suggest an edit to a section the fifth (D-54). A Drive write always asks the
-# requester's approval: no tool carries low_risk (maintainer, 2026-11-21 / 2026-11-19).
+# requester's approval, except a suggested edit, which carries low_risk: an admin may turn
+# approval off for it, because the Doc's owner still accepts or rejects it (D-43, D-54).
 connector: drive
 service: Google Drive
 tools:
@@ -111,10 +112,12 @@ tools:
     needs_text: a section
     risk: write_reversible
     idempotency: revision_suggest
+    low_risk: true
     description: >-
       Draft a suggested edit for one headed section of one of the agent's granted Google Docs.
-      Nothing is suggested until the requester approves the draft in Slack; the Doc's text then
-      stays as it is until its owner accepts the suggestion in the Doc. The section is
+      Nothing is suggested until the requester approves the draft in Slack, unless an admin
+      turned approval off for suggestions; the Doc's text then stays as it is until its owner
+      accepts the suggestion in the Doc. The section is
       everything under the named heading up to the next heading of the same or higher level;
       the heading itself is kept. Call read_section first and keep what it shows: each line
       holding exactly --- is a horizontal line and each run of | a | b | rows is a table, and

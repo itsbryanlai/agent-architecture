@@ -1516,7 +1516,17 @@ async def drive_suggest_edit(r: Rig) -> list[Recorded]:
     """A Drive suggested-edit task (D-54): the model drafts suggest_edit on a granted Doc
     section, the requester approves the card, and the edit is put in the Doc as one pending
     suggestion at the read revision, the Doc's text unchanged."""
-    thread = thread_ts(325)
+    return await _drive_suggest_edit_with_card(r, 325)
+
+
+async def drive_suggest_edit_default_policy(r: Rig) -> list[Recorded]:
+    """The same task recorded by code that asks the approval policy (D-43): the policy is the
+    default, so the question is answered 'no' and the card shows as before."""
+    return await _drive_suggest_edit_with_card(r, 327)
+
+
+async def _drive_suggest_edit_with_card(r: Rig, thread_number: int) -> list[Recorded]:
+    thread = thread_ts(thread_number)
     await republish(
         r.acts.agents,
         "it-helper",
@@ -1556,6 +1566,48 @@ async def drive_suggest_edit(r: Rig) -> list[Recorded]:
     )
     return [
         await current(r, "", handle.id),
+        await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
+    ]
+
+
+async def drive_suggest_edit_policy(r: Rig) -> list[Recorded]:
+    """A Drive suggested edit under the admin's policy (D-43, D-54): approval is turned off for
+    suggest_edit, so the task puts the suggestion in the Doc at once, with no card."""
+    thread = thread_ts(326)
+    await republish(
+        r.acts.agents,
+        "it-helper",
+        lambda d: (
+            d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+            d.update(actions=["suggest_edit"]),
+        ),
+    )
+    await r.drive_connections.connect(
+        TENANT, drive_account_email(r.google), datetime(2026, 11, 26, tzinfo=UTC)
+    )
+    add_section_doc(r.google)
+    await r.acts.policies.set(TENANT, "suggest_edit", NO_APPROVAL)
+    r.llm.queue(
+        tool_turn(
+            ToolCall(
+                "tu_dsp",
+                "suggest_edit",
+                {"section": DRIVE_SECTION, "text": "The VPN is back up."},
+            )
+        ),
+        answer("Suggested it."),
+    )
+    await start_conversation(r, "it-helper", thread, "suggest a VPN status edit", stored=True)
+    await eventually(
+        lambda: [
+            p for p in r.slack.posts() if p["thread_ts"] and "without an approval card" in p["text"]
+        ],
+        timeout=30,
+    )
+    assert len(r.google.doc_suggest_calls) == 1
+    write = next(e for e in r.acts.audit.events if e.kind == "write" and e.outcome == "policy")
+    return [
+        await current(r, "", write.task_id),
         await current(r, "conversation", ids.conversation_id(TENANT, "C_GENERAL", thread)),
     ]
 
@@ -2161,6 +2213,10 @@ SCENARIOS["drive_create_doc"] = drive_create_doc
 SCENARIOS["drive_replace_section"] = drive_replace_section
 # A Drive suggested-edit task is new too: one shape (the stored draft), no legacy inline history.
 SCENARIOS["drive_suggest_edit"] = drive_suggest_edit
+# The same task under the admin's no-approval policy (D-43): no card, the suggestion at once.
+SCENARIOS["drive_suggest_edit_policy"] = drive_suggest_edit_policy
+# The carded shape recorded after the policy question existed: its history holds the marker.
+SCENARIOS["drive_suggest_edit_default_policy"] = drive_suggest_edit_default_policy
 # A slow Drive read names its connector in the placeholder: new, one shape (stored).
 SCENARIOS["drive_read_label"] = drive_read_label
 

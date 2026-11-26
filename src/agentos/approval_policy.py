@@ -1,7 +1,7 @@
 """The tenant's approval policy per low-risk action (D-43).
 
-An admin may turn requester approval off for a low-risk action — today a Notion
-comment on an item the requester filed. The policy is one row per tenant and
+An admin may turn requester approval off for a low-risk action — a Notion
+comment on an item the requester filed, or a suggested edit to a Doc section. The policy is one row per tenant and
 action: ``requester_approval`` (the default) or ``none``. An action with no row,
 like an action no manifest marks low-risk, reads as the default, so a tenant
 that never touches the setting keeps asking for approval on every write.

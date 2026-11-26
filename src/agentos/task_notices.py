@@ -42,6 +42,12 @@ NOT_CONFIRMED_REPLACE_SECTION = "not_confirmed_replace_section"
 # The suggested-edit write's lines (D-54): a tracked change put in a granted Doc for its owner
 # to accept or reject, no watch afterwards.
 SUGGESTED = "suggested"
+SUGGESTED_NO_APPROVAL = "suggested_no_approval"
+# The moved-Doc line for a suggestion that ran with no card (nobody approved a draft).
+DOC_MOVED_NO_APPROVAL_TEXT = (
+    "The document changed after the suggestion was drafted. "
+    "Ask again to draft it from the current text."
+)
 SUGGEST_ALREADY_ACCEPTED = "suggest_already_accepted"
 FAILED_SUGGEST_EDIT = "failed_suggest_edit"
 NOT_CONFIRMED_SUGGEST_EDIT = "not_confirmed_suggest_edit"
@@ -134,6 +140,11 @@ def notice_text(
         return (
             f"Suggested an edit to a section of {name}. Its owner accepts or rejects "
             f"it in the Doc ({url})."
+        )
+    if kind == SUGGESTED_NO_APPROVAL:
+        return (
+            f"Suggested an edit to a section of {name} without an approval card, as your "
+            f"admin set. Its owner accepts or rejects it in the Doc ({url})."
         )
     if kind == SUGGEST_ALREADY_ACCEPTED:
         return f"The section of {name} already reads as approved, so nothing is left to suggest ({url})."

@@ -555,6 +555,7 @@ class AgentActivities:
             self.replace_doc_section,
             self.reconcile_drive_section,
             self.comment_approval_policy,
+            self.suggest_approval_policy,
             self.apply_edit,
             self.post_task_notice,
             self.watch_notion_item,
@@ -2590,6 +2591,23 @@ class AgentActivities:
             return False
         record = await self.tasks.get(ctx.tenant_id, creator_task)
         return record is not None and record.requester_user_id == ctx.requester_user_id
+
+    @activity.defn(name="suggest_approval_policy")
+    async def suggest_approval_policy(self, spec: TaskSpec) -> bool:
+        """Whether this suggested edit may run without the requester's approval card (D-43, D-54).
+
+        True only when the manifest marks the task's tool low-risk and the tenant's policy
+        for that tool (``suggest_edit``, not the task kind ``replace_section``) is 'none'.
+        The Doc's owner still accepts or rejects the suggestion, so nothing else is asked:
+        the grant, the shape checks and the revision lock all apply to the write itself.
+        """
+        ctx = spec.ctx
+        self._log("suggest_approval_policy", ctx.tenant_id, ctx.agent_id)
+        tool_name = _spec_tool(spec)
+        tool = TOOLS.get(tool_name)
+        if tool is None or not tool.low_risk or tool_name != SUGGEST_EDIT_TOOL:
+            return False
+        return await self.policies.get(ctx.tenant_id, tool_name) == NO_APPROVAL
 
     @activity.defn(name="draft_task")
     async def draft_task(

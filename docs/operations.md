@@ -714,7 +714,8 @@ the writes switch stop it while off.
 **Drive writes (suggest an edit, D-54).** An agent whose creator chose the action
 "Suggest an edit to a section of a Doc" and that holds a granted section is offered
 `suggest_edit`: the same section grant, the same draft, the same approval card and Edit
-as the replace above, but the write is a tracked suggestion, not a change to the text.
+as the replace above (unless an admin turned approval off for suggestions: see
+[Approval policy](#approval-policy-low-risk-actions)), but the write is a tracked suggestion, not a change to the text.
 Share the Doc with the workspace's Drive address **as Commenter** for suggestions only
 (Editor is needed only for `replace_section`); Google itself then stops the agent
 changing text directly. The Doc's owner accepts or rejects the suggestion in the Doc
@@ -1832,12 +1833,12 @@ wires the Postgres store (`tasks=PostgresTaskStore(pool)`); the row-level securi
 grants are the same shape as the other tenant tables (SELECT, INSERT, UPDATE for the
 app role).
 
-## Approval policy (low-risk comments)
+## Approval policy (low-risk actions)
 
 Every write asks the requester to approve before it runs, unless an admin turned
 approval off for that low-risk action (D-43). The manifest's `low_risk` flag marks
-which actions may be relaxed — today only Notion's `add_comment`; loading refuses
-the flag on any create, append or replace. The policy is one row per tenant and
+which actions may be relaxed — today Notion's `add_comment` and Drive's `suggest_edit`;
+loading refuses the flag on any create, append or replace. The policy is one row per tenant and
 action in `approval_policies` (migration 040): `requester_approval` (the default,
 also for an action with no row) or `none`. An admin changes it in the **Approvals**
 section of the settings page, audited as `policy_change`; the worker reads it on
@@ -1855,6 +1856,13 @@ says why, audited `write` with `error`). In every other case — the default pol
 item the requester did not file, an item with no creating task, any create, the
 nudge's comment — the card shows as before. The new workflow commands sit behind
 the `approval-policy` patch marker; tasks recorded before it keep showing the card.
+
+A suggested edit to a Doc section (`suggest_edit`, D-54) is the second low-risk action.
+With its policy `none` the task puts the suggestion in the Doc at once, with no card and
+no condition on who filed anything: the Doc grant, the shape checks, the
+pending-suggestion refusal and the revision lock still apply, and the Doc's owner still
+accepts or rejects it. The thread says it was suggested without an approval card, as the
+admin set; the audit outcome is `policy`. The marker is `suggest-approval-policy`.
 
 ## Nudge the assignee
 
@@ -2037,10 +2045,11 @@ process on its next directory refresh, with no restart.
   `tenant_settings`. A tenant with no default agent sees a "not set up" banner with the
   steps left (create an agent, publish it, choose it here).
 - **Approvals.** Each low-risk action the manifests declare (today `add_comment`, a
-  comment on an item the requester filed) with a switch: requester approval (the
-  default) or no approval. With no approval, the comment runs without a card on the
-  requester's own item; every other write still shows its card. Audited as
-  `policy_change`; see [Approval policy](#approval-policy-low-risk-comments).
+  comment on an item the requester filed, and `suggest_edit`, a suggested edit to a
+  Doc section) with a switch: requester approval (the default) or no approval. With no
+  approval, the comment runs without a card on the requester's own item and the
+  suggestion goes into the Doc at once; every other write still shows its card. Audited as
+  `policy_change`; see [Approval policy](#approval-policy-low-risk-actions).
 - **Agent health.** Each published agent's status (available / unavailable), the reason
   and when the worker last checked it, read from `agent_health`; an agent no check has
   recorded shows "never checked". Read-only: fix the grant in Notion or the agent's

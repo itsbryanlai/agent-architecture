@@ -209,7 +209,7 @@ from agentos.connectors.google_iam import (
     GoogleError,
     problem_text,
 )
-from agentos.connectors.manifest import low_risk_actions
+from agentos.connectors.manifest import TOOLS, low_risk_actions
 from agentos.connectors.notion import normalize_id
 from agentos.creator_access import AccessRow, CreatorAccessStore, InMemoryCreatorAccessStore
 from agentos.credentials import CREATOR_USER_ID_PATTERN, GOOGLE_USER, NOTION, TenantCredentials
@@ -345,6 +345,14 @@ class PausedChannel:
     problem: str | None = None
 
 
+@dataclass(frozen=True)
+class ApprovalEntry:
+    """One low-risk action on the Approvals list: the manifest's label and the tenant's policy."""
+
+    label: str
+    policy: str
+
+
 @dataclass
 class TenantSettingsView:
     """What the admin settings page shows: routing, the Notion connection, the webhook token.
@@ -355,7 +363,8 @@ class TenantSettingsView:
     event. ``notion_env_var`` names the environment variable in use when no credential
     is connected; None when Notion is connected or the tenant has no token at all.
     ``health`` holds the worker's last check of each published agent, by agent ID.
-    ``approvals`` holds the tenant's approval policy for each low-risk action (D-43).
+    ``approvals`` holds, for each low-risk action by name, its manifest label and the tenant's
+    approval policy (D-43).
     ``drive_configured`` is False on a deployment without the Google settings; ``drive``
     is the tenant's connection row as stored (None when never connected), ``drive_items``
     what its account can see now (None when the live list failed or was not run),
@@ -379,7 +388,7 @@ class TenantSettingsView:
     # The tenant's health rows by agent ID; an agent with no row was never checked.
     health: dict[str, AgentHealth] = field(default_factory=dict)
     # The approval policy of each low-risk action, by action name.
-    approvals: dict[str, str] = field(default_factory=dict)
+    approvals: dict[str, ApprovalEntry] = field(default_factory=dict)
     drive_configured: bool = False
     drive: DriveConnection | None = None
     drive_items: list[DriveItem] | None = None
@@ -2081,7 +2090,10 @@ class ControlPlane:
             else {h.agent_id: h for h in await self._health.list(tenant_id)}
         )
         approvals = {
-            action: await self._policies.get(tenant_id, action) for action in low_risk_actions()
+            action: ApprovalEntry(
+                TOOLS[action].label or action, await self._policies.get(tenant_id, action)
+            )
+            for action in low_risk_actions()
         }
         drive_configured = self._drive is not None and self._google is not None
         drive_row = None if self._drive is None else await self._drive.get(tenant_id)
@@ -2198,7 +2210,7 @@ class ControlPlane:
     ) -> None:
         """Set the tenant's approval policy for one low-risk action. Only an admin.
 
-        The action must be one the manifests mark low-risk (a comment action), and
+        The action must be one the manifests mark low-risk (a comment or a suggested edit), and
         the policy one of the two the store holds. Setting what is already in force
         changes nothing and records nothing; a real change and its ``policy_change``
         event commit in one unit of work, with the admin's identity.

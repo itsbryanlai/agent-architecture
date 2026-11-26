@@ -11,6 +11,8 @@ from agentos.connectors.manifest import load_manifest
     [
         ("write_reversible", "marker_text", True, True),
         ("write_reversible", "marker_text", False, False),
+        ("write_reversible", "revision_suggest", True, True),
+        ("write_irreversible", "revision", True, "refused"),
         ("write_irreversible", "marker_property", True, "refused"),
         ("write_reversible", "marker_property", True, "refused"),
         ("write_irreversible", "append_text", True, "refused"),
@@ -21,6 +23,8 @@ from agentos.connectors.manifest import load_manifest
     ids=[
         "comment",
         "comment-default",
+        "suggest",
+        "replace-section",
         "create",
         "create-reversible",
         "append",
@@ -32,8 +36,7 @@ from agentos.connectors.manifest import load_manifest
 def test_the_low_risk_flag_is_accepted_only_on_a_comment_action(
     tmp_path, risk, idempotency, flag, expected
 ):
-    """Fails if loading accepts low_risk on a create, append, replace or read, refuses it on a
-    comment, or reads a missing flag as anything but false."""
+    """Fails if low_risk is accepted on a create, append or replace, or refused on a suggestion."""
     spec = {"risk": risk, "description": "An action."}
     if idempotency is not None:
         spec["idempotency"] = idempotency

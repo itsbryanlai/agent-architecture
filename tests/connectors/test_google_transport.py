@@ -1311,24 +1311,83 @@ async def test_read_doc_returns_the_revision_title_and_paragraphs(deployment_key
     assert "revisionId" in get.path_url
 
 
+async def test_read_doc_parses_marker_styles_horizontal_lines_and_tables(deployment_key):
+    """Fails if documents.get is not read into bold and underlined lines, a horizontal line (its
+    own paragraph), a table's cells with their text ranges, and a non-text element as foreign
+    — the shapes a section write locates its marker, lines and cells by (D-50)."""
+
+    def run(text: str, **style) -> dict:
+        return {"textRun": {"content": text, "textStyle": style}}
+
+    def paragraph(start: int, end: int, *elements: dict) -> dict:
+        return {"startIndex": start, "endIndex": end, "paragraph": {"elements": list(elements)}}
+
+    cell = {
+        "startIndex": 21,
+        "endIndex": 25,
+        "content": [paragraph(22, 25, run("Ab\n"))],
+    }
+    content = [
+        {"endIndex": 1, "sectionBreak": {}},
+        paragraph(1, 8, run("Status", bold=True), run("\n")),
+        paragraph(8, 12, run("Due\n", underline=True, bold=False)),
+        paragraph(12, 14, {"startIndex": 12, "endIndex": 13, "horizontalRule": {}}, run("\n")),
+        {
+            "startIndex": 14,
+            "endIndex": 25,
+            "table": {"tableRows": [{"tableCells": [cell]}]},
+        },
+    ]
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v1/documents/f1"):
+            return reply(
+                request,
+                200,
+                {"title": "Guide", "revisionId": "rev-1", "body": {"content": content}},
+            )
+        return reply(request, 404, {})
+
+    client, _ = client_with(handler, deployment_key)
+    doc = await client.read_doc(EMAIL, "f1")
+
+    assert [(p.text, p.bold, p.underline, p.rule) for p in doc.paragraphs] == [
+        ("Status\n", True, False, False),
+        ("Due\n", False, True, False),
+        ("\n", False, False, True),
+    ]
+    assert doc.foreign == ((0, 1),)
+    [table] = doc.tables
+    assert [[(c.text, c.start_index, c.end_index) for c in row] for row in table.rows] == [
+        [("Ab", 22, 24)]
+    ]
+
+
 @pytest.mark.parametrize(
     "case",
-    ["writes", "insert-only", "normalize", "status mismatch", "reason-only mismatch"],
-    ids=["writes", "insert-only", "normalize", "status-mismatch", "reason-only"],
+    ["writes", "insert-only", "normalize", "two edits", "status mismatch", "reason-only mismatch"],
+    ids=["writes", "insert-only", "normalize", "two-edits", "status-mismatch", "reason-only"],
 )
 async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deployment_key, case):
     """Fails if the section replace is not one Docs batchUpdate carrying writeControl with the
     read revision and the tenant's token, inserting the new text first then deleting the
-    shifted old range (insert-only when nothing is deleted, NORMAL_TEXT style and bullets
-    cleared over the inserted range for an empty section), or a 400 failedPrecondition — by
+    shifted old range for each edit in the order given (insert-only when nothing is deleted,
+    NORMAL_TEXT style, bullets, bold and underline cleared over the inserted range for an
+    empty part), or a 400 failedPrecondition — by
     status or by reason alone — is not a revision_mismatch GoogleError (D-50)."""
     # insert_index, insert_text, delete_start, delete_end, style_start, style_end
     plans = {
-        "writes": (7, "new line\n", 16, 25, 0, 0),
-        "insert-only": (7, "new line\n", 7, 7, 0, 0),
-        "normalize": (7, "new line\n", 0, 0, 7, 16),
-        "status mismatch": (7, "new line\n", 16, 25, 0, 0),
-        "reason-only mismatch": (7, "new line\n", 16, 25, 0, 0),
+        "writes": [(7, "new line\n", 16, 25, 0, 0)],
+        "insert-only": [(7, "new line\n", 7, 7, 0, 0)],
+        "normalize": [(7, "new line\n", 0, 0, 7, 16)],
+        "status mismatch": [(7, "new line\n", 16, 25, 0, 0)],
+        "reason-only mismatch": [(7, "new line\n", 16, 25, 0, 0)],
+        # A part after a table cell edit, last in the Doc first (a cell's text is replaced in
+        # place: insert, then delete the shifted range).
+        "two edits": [(40, "Done.\n", 46, 52, 0, 0), (20, "Pencils", 27, 31, 0, 0)],
     }
     expected_requests = {
         "writes": [
@@ -1336,6 +1395,12 @@ async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deploym
             {"deleteContentRange": {"range": {"startIndex": 16, "endIndex": 25}}},
         ],
         "insert-only": [{"insertText": {"location": {"index": 7}, "text": "new line\n"}}],
+        "two edits": [
+            {"insertText": {"location": {"index": 40}, "text": "Done.\n"}},
+            {"deleteContentRange": {"range": {"startIndex": 46, "endIndex": 52}}},
+            {"insertText": {"location": {"index": 20}, "text": "Pencils"}},
+            {"deleteContentRange": {"range": {"startIndex": 27, "endIndex": 31}}},
+        ],
         "normalize": [
             {"insertText": {"location": {"index": 7}, "text": "new line\n"}},
             {
@@ -1346,6 +1411,13 @@ async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deploym
                 }
             },
             {"deleteParagraphBullets": {"range": {"startIndex": 7, "endIndex": 16}}},
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": 7, "endIndex": 16},
+                    "textStyle": {"bold": False, "underline": False},
+                    "fields": "bold,underline",
+                }
+            },
         ],
     }
     mismatch = case in ("status mismatch", "reason-only mismatch")
@@ -1376,10 +1448,10 @@ async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deploym
     client, sent = client_with(handler, deployment_key)
     if mismatch:
         with pytest.raises(GoogleError) as err:
-            await client.replace_doc_section(EMAIL, "f1", "rev-1", *plans[case])
+            await client.replace_doc_section(EMAIL, "f1", "rev-1", plans[case])
         assert err.value.code == "revision_mismatch"
     else:
-        assert await client.replace_doc_section(EMAIL, "f1", "rev-1", *plans[case]) == "f1"
+        assert await client.replace_doc_section(EMAIL, "f1", "rev-1", plans[case]) == "f1"
 
     [post] = [
         r for r in sent if r.method == "POST" and r.path_url == "/v1/documents/f1:batchUpdate"

@@ -187,9 +187,9 @@ from agentos.connectors.drive import (
     SHARED_DRIVE_FOLDER_TEXT,
     DriveReader,
     heading_duplicated_text,
-    heading_level,
     heading_matches,
     heading_missing_text,
+    marker_signature,
     section_plain_error,
     template_blank_names,
 )
@@ -1157,9 +1157,9 @@ class ControlPlane:
         # together — the hash the admin reviews covers them.
         columns = await self._sheet_columns(tenant_id, agent_id, version)
         template_reads = await self._template_reads(tenant_id, agent_id, version)
-        await self._section_reads(tenant_id, agent_id, version)
+        markers = await self._section_reads(tenant_id, agent_id, version)
         async with self._uow.begin(tenant_id) as conn:
-            if columns is not None or template_reads is not None:
+            if columns is not None or template_reads is not None or markers is not None:
                 fresh = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
                 if fresh is not None and fresh.status == "draft":
                     definition = agent_definition(fresh.agent())
@@ -1170,6 +1170,9 @@ class ControlPlane:
                     for entry in drive_block.get("templates", []):
                         if template_reads is not None and entry["id"] in template_reads:
                             entry.update(template_reads[entry["id"]])
+                    for entry in drive_block.get("sections", []):
+                        if markers is not None and entry["id"] in markers:
+                            entry["marker"] = markers[entry["id"]]
                     await self._agents.replace_draft(
                         tenant_id, agent_id, version, definition, conn=conn
                     )
@@ -1292,26 +1295,32 @@ class ControlPlane:
             reads[grant.id] = {"blanks": names, "drive_id": folder.drive_id}
         return reads
 
-    async def _section_reads(self, tenant_id: str, agent_id: str, version: int) -> None:
+    async def _section_reads(
+        self, tenant_id: str, agent_id: str, version: int
+    ) -> dict[str, str] | None:
         """Check each granted section's heading exists exactly once in its Doc and the section
-        is plain paragraphs (D-50), reading the Doc's metadata (``files.get``) and its body
-        (``documents.get``). The creator names the heading; submit verifies it so the admin
-        reviews a section the agent can actually replace. Refuses when Drive is not set up or
-        connected, the Doc is not an untrashed Google Doc, the heading is missing or appears more
-        than once, or the section holds a table or image. Nothing is merged: the heading is the
-        creator's, frozen as typed (stripped of surrounding whitespace at parse)."""
+        holds only text, horizontal lines and tables (D-50), reading the Doc's metadata
+        (``files.get``) and its body (``documents.get``). The creator names the heading; submit
+        verifies it so the admin reviews a section the agent can actually replace, and records
+        the style signature of the line that carries it (a heading style, or a normal line
+        wholly bold, underlined or in capitals) by section ID, so a line that later changes
+        style no longer marks the section. Refuses when Drive is not set up or connected, the
+        Doc is not an untrashed Google Doc, the heading is missing or appears more than once, or
+        the section holds an image. The heading is the creator's, frozen as typed (stripped of
+        surrounding whitespace at parse). None when there is nothing to read."""
         record = await self._agents.get_version(tenant_id, agent_id, version)
         if record is None or record.status != "draft":
-            return
+            return None
         sections = [g for g in record.agent().grants.drive if g.kind == "section"]
         if not sections:
-            return
+            return None
         if self._drive is None or self._google is None:
             raise ConfigError("Google Drive is not set up on this deployment")
         row = await self._drive.get(tenant_id)
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
         reader = DriveReader(self._google, row.service_account_email)
+        markers: dict[str, str] = {}
         for grant in sections:
             try:
                 file = await reader.get_file(grant.doc_id)
@@ -1330,6 +1339,8 @@ class ControlPlane:
                 raise ConfigError(heading_duplicated_text(grant.heading, grant.name))
             if error := section_plain_error(doc, grant.heading, matches[0]):
                 raise ConfigError(error)
+            markers[grant.id] = marker_signature(doc.paragraphs[matches[0]]) or ""
+        return markers
 
     async def _check_template_folders(self, tenant_id: str, agent: AgentVersion) -> None:
         """Refuse a publish whose template destination folder is not in a shared drive (D-49).
@@ -2400,7 +2411,7 @@ class ControlPlane:
         doc = await self._google.read_doc(row.service_account_email, file_id)
         names: list[str] = []
         for p in doc.paragraphs:
-            if heading_level(p.style) is not None:
+            if marker_signature(p) is not None:
                 name = p.text.strip()
                 if name and name not in names:
                     names.append(name)

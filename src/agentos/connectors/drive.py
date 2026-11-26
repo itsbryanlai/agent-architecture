@@ -44,6 +44,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 
 from agentos.config import DRIVE_ID, DriveGrant, Grants
 from agentos.connectors import drive_errors
@@ -51,8 +52,10 @@ from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied,
 from agentos.connectors.google_iam import (
     MIME_DOC,
     MIME_FOLDER,
+    DocEdit,
     DocParagraph,
     DocRead,
+    DocTable,
     DriveComment,
     DriveFile,
     DriveSection,
@@ -110,11 +113,28 @@ DOC_MOVED_TEXT = "The document changed since you approved; I'll draft it again"
 # The longest current section text a replace drafts: a longer section is refused at draft so
 # the card never previews a body it cannot show whole (D-50).
 MAX_SECTION_BEFORE = 5000
-# The refusal for a section that is not plain paragraphs: a table, an inline image or any
-# other non-paragraph element under the heading. The replace only writes plain text (D-50).
+# The refusal for a section holding something the replace cannot write: an inline image, a
+# page or section break, or a table cell of several lines. Text, horizontal lines and table
+# cells are written; the rest is left to the owner (D-50).
 SECTION_NOT_PLAIN_TEXT = (
-    "I can only replace a section made of plain paragraphs; "
-    "'{doc}' has a table or image under '{heading}'"
+    "I can only replace a section made of text, lines and tables; "
+    "'{doc}' has an image or other content under '{heading}' that I can't edit"
+)
+# The refusal for a section holding a paragraph that reads like a divider or a table row: the
+# model's view of a section marks lines with --- and tables with pipe rows, so such text would
+# make the view ambiguous. Refused at submit and at read, never guessed at (D-50).
+SECTION_AMBIGUOUS_TEXT = (
+    "'{doc}' has a line that reads like a divider or table row under '{heading}'"
+)
+# The refusal for new text that does not keep the section's horizontal lines: the Docs API
+# cannot insert one, so each existing line stays and the model writes --- where it is (D-50).
+SECTION_RULES_TEXT = "Keep the {count} horizontal {lines} in '{heading}': write --- where {each} is"
+# The refusal for new text that does not keep a table's rows and columns (D-50).
+SECTION_TABLE_TEXT = "Keep the table in '{heading}' at {rows} rows and {columns} columns"
+# The refusal for new text under a heading that sits right before a table with no line of
+# text between them: Google refuses text at a table's first index (D-50).
+SECTION_BEFORE_TABLE_TEXT = (
+    "I can't add text right above the table in '{heading}'; ask the owner to add a line there"
 )
 # The refusal for a section whose current text is longer than the draft bound (D-50).
 SECTION_TOO_LONG_TEXT = (
@@ -152,6 +172,16 @@ def heading_duplicated_text(heading: str, doc_name: str) -> str:
     )
 
 
+def heading_style_changed_text(heading: str, doc_name: str) -> str:
+    """The plain words for a marker line that is still in the Doc but no longer looks as it
+    did when the agent was published (its heading style, bold, underline or capitals changed):
+    the creator republishes (D-50)."""
+    return (
+        f"The line '{heading}' in {doc_name} changed style since this agent was published; "
+        "ask the creator to republish"
+    )
+
+
 def heading_level(style: str) -> int | None:
     """A paragraph style's heading level: ``HEADING_1``..``HEADING_6`` as 1..6, ``TITLE``
     and ``SUBTITLE`` as 0 (the highest), and None for a non-heading (``NORMAL_TEXT``). A
@@ -166,59 +196,316 @@ def heading_level(style: str) -> int | None:
     return None
 
 
-def heading_matches(paragraphs: tuple[DocParagraph, ...], heading: str) -> list[int]:
-    """The indices of the heading paragraphs whose text is ``heading`` (trimmed): a section
-    needs exactly one (D-50)."""
-    name = heading.strip()
-    return [
-        i
-        for i, p in enumerate(paragraphs)
-        if heading_level(p.style) is not None and p.text.strip() == name
+def marker_signature(p: DocParagraph) -> str | None:
+    """The style signature of a line that can mark a section, or None when the line cannot:
+    a heading style is its own signature (``HEADING_2``); a normal line is a marker when its
+    whole text is bold, underlined or in capitals, and its signature names which
+    (``NORMAL_TEXT:bold+caps``). The grant freezes it at submit, so a line that later changes
+    style no longer marks the section (D-50)."""
+    if p.rule:
+        return None
+    if heading_level(p.style) is not None:
+        return p.style
+    flags = [
+        name for name, on in (("bold", p.bold), ("underline", p.underline), ("caps", p.caps)) if on
     ]
+    return "NORMAL_TEXT:" + "+".join(flags) if flags else None
 
 
-def section_bounds(
-    paragraphs: tuple[DocParagraph, ...], heading_index: int
-) -> tuple[int, int, str]:
-    """The content range of the section under the heading at ``heading_index``: the UTF-16
-    start (the heading's end) and end (the next heading of the same or higher level, or the
-    body's end), and the text under the heading, trimmed. The heading itself is kept (D-50)."""
-    level = heading_level(paragraphs[heading_index].style)
-    start = paragraphs[heading_index].end_index
-    end = start
-    parts: list[str] = []
-    for p in paragraphs[heading_index + 1 :]:
+def heading_matches(
+    paragraphs: tuple[DocParagraph, ...], heading: str, marker: str | None = None
+) -> list[int]:
+    """The indices of the marker lines whose text is ``heading`` (trimmed): a section needs
+    exactly one (D-50). ``marker`` is the grant's recorded style signature: None accepts a line
+    of any marker style (the submit-time look), a signature only that style, and "" (a grant
+    published before signatures) only a heading style."""
+    name = heading.strip()
+    found: list[int] = []
+    for i, p in enumerate(paragraphs):
+        signature = marker_signature(p)
+        if signature is None or p.text.strip() != name:
+            continue
+        if marker == "" and heading_level(p.style) is None:
+            continue
+        if marker and signature != marker:
+            continue
+        found.append(i)
+    return found
+
+
+def locate_marker(doc: DocRead, heading: str, marker: str) -> int:
+    """The index of the one line that marks the section, or a ``ConnectorError`` in plain
+    words: the heading missing, more than once, or still there in another style (D-50)."""
+    matches = heading_matches(doc.paragraphs, heading, marker)
+    if not matches:
+        if marker and heading_matches(doc.paragraphs, heading):
+            raise ConnectorError(heading_style_changed_text(heading, doc.title))
+        raise ConnectorError(heading_missing_text(heading, doc.title))
+    if len(matches) > 1:
+        raise ConnectorError(heading_duplicated_text(heading, doc.title))
+    return matches[0]
+
+
+RULE = "rule"
+TABLE = "table"
+# The line a horizontal line is written as in the section text the model reads and writes.
+RULE_LINE = "---"
+
+
+@dataclass(frozen=True)
+class SectionPart:
+    """A run of text paragraphs of a section between its horizontal lines and tables: the
+    UTF-16 range ``[start, end)`` they fill and their text (each paragraph ends in a newline)."""
+
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class SectionSep:
+    """A horizontal line or a table of a section, kept in place by a write (D-50)."""
+
+    kind: str
+    start: int
+    end: int
+    table: DocTable | None = None
+
+
+@dataclass(frozen=True)
+class SectionLayout:
+    """A section as the write sees it: the content range under the marker line and its parts
+    and separators in order, ``len(parts) == len(seps) + 1``. A write replaces each part's
+    text and each table cell's text in place and never touches a separator's structure (D-50)."""
+
+    start: int
+    end: int
+    parts: tuple[SectionPart, ...]
+    seps: tuple[SectionSep, ...]
+
+
+def section_layout(doc: DocRead, marker_index: int) -> SectionLayout:
+    """The layout of the section under the marker line at ``marker_index`` (D-50): the content
+    starts at the line's end and runs to the next line of the same signature, or for a heading
+    to the next heading of the same or a higher level, or to the body's end. Horizontal lines
+    and tables inside it split the text into parts."""
+    paragraphs = doc.paragraphs
+    marker = paragraphs[marker_index]
+    signature = marker_signature(marker)
+    level = heading_level(marker.style)
+    start = marker.end_index
+    end = paragraphs[-1].end_index
+    boundary = len(paragraphs)
+    for j in range(marker_index + 1, len(paragraphs)):
+        p = paragraphs[j]
         nxt = heading_level(p.style)
-        if nxt is not None and level is not None and nxt <= level:
+        stops = (
+            (nxt is not None and nxt <= level)
+            if level is not None
+            else (marker_signature(p) == signature)
+        )
+        if stops:
+            end, boundary = p.start_index, j
             break
-        end = p.end_index
-        parts.append(p.text)
-    return start, end, "".join(parts).strip()
+    elements: list[tuple[int, DocParagraph | DocTable]] = [
+        (p.start_index, p) for p in paragraphs[marker_index + 1 : boundary]
+    ]
+    elements += [
+        (t.start_index, t) for t in doc.tables if t.start_index >= start and t.end_index <= end
+    ]
+    elements.sort(key=lambda e: e[0])
+    parts: list[SectionPart] = []
+    seps: list[SectionSep] = []
+    part_start, text = start, ""
+    for at, element in elements:
+        if isinstance(element, DocTable):
+            sep = SectionSep(TABLE, element.start_index, element.end_index, element)
+        elif element.rule:
+            sep = SectionSep(RULE, element.start_index, element.end_index)
+        else:
+            text += element.text
+            continue
+        parts.append(SectionPart(part_start, at, text))
+        seps.append(sep)
+        part_start, text = sep.end, ""
+    parts.append(SectionPart(part_start, end, text))
+    return SectionLayout(start, end, tuple(parts), tuple(seps))
 
 
-def section_span(paragraphs: tuple[DocParagraph, ...], heading_index: int) -> tuple[int, int]:
-    """The full index span under the heading at ``heading_index``: from the heading's end to
-    the next heading of the same or higher level's start (or the body's end). Unlike the
-    content range, it includes any non-paragraph element between the last content paragraph
-    and the next heading, so a trailing table or image is refused too (D-50)."""
-    level = heading_level(paragraphs[heading_index].style)
-    start = paragraphs[heading_index].end_index
-    for p in paragraphs[heading_index + 1 :]:
-        nxt = heading_level(p.style)
-        if nxt is not None and level is not None and nxt <= level:
-            return start, p.start_index
-    return start, paragraphs[-1].end_index
+def _escape_cell(text: str) -> str:
+    return text.replace("|", "\\|")
 
 
-def section_plain_error(doc: DocRead, heading: str, heading_index: int) -> str | None:
-    """The refusal for a section that is not plain paragraphs, or None: a table, an inline
-    image or any other non-paragraph element whose index range falls inside the section's
-    full span under the heading. The replace writes plain text only, so such a section is
-    refused at submit, at draft and at the write (D-50)."""
-    start, end = section_span(doc.paragraphs, heading_index)
-    if any(fs < end and fe > start for fs, fe in doc.foreign):
+def _table_lines(rows: list[list[str]] | tuple[tuple[str, ...], ...]) -> str:
+    """A table as pipe rows, one line per row, as the model reads and writes it (D-50)."""
+    return "".join("| " + " | ".join(_escape_cell(c) for c in row) + " |\n" for row in rows)
+
+
+def _sep_text(sep: SectionSep) -> str:
+    if sep.kind == RULE:
+        return RULE_LINE + "\n"
+    assert sep.table is not None
+    return _table_lines([[cell.text.strip() for cell in row] for row in sep.table.rows])
+
+
+def section_view(layout: SectionLayout) -> str:
+    """The section's text as the model reads and writes it, trimmed: its paragraphs, each
+    horizontal line as a line holding exactly ``---``, each table as pipe rows
+    (``| a | b |``) (D-50)."""
+    chunks: list[str] = []
+    for i, part in enumerate(layout.parts):
+        chunks.append(part.text)
+        if i < len(layout.seps):
+            chunks.append(_sep_text(layout.seps[i]))
+    return "".join(chunks).strip()
+
+
+def section_bounds(doc: DocRead, marker_index: int) -> tuple[int, int, str]:
+    """The content range of the section under the marker line at ``marker_index`` (its UTF-16
+    start and end) and its text as ``section_view`` gives it (D-50)."""
+    layout = section_layout(doc, marker_index)
+    return layout.start, layout.end, section_view(layout)
+
+
+def section_plain_error(doc: DocRead, heading: str, marker_index: int) -> str | None:
+    """The refusal for a section holding something the replace cannot write, or None: an
+    inline image or any other element that is not text, a horizontal line or a table, a
+    table cell of several lines, or a paragraph that reads like a divider (``---``) or a table
+    row (starts with ``|``), which would make the model's view ambiguous (D-50). Such a section is refused at submit, at draft and at
+    the write."""
+    layout = section_layout(doc, marker_index)
+    refused = any(fs < layout.end and fe > layout.start for fs, fe in doc.foreign) or any(
+        not cell.plain or len(row) != len(sep.table.rows[0])
+        for sep in layout.seps
+        if sep.table is not None
+        for row in sep.table.rows
+        for cell in row
+    )
+    if refused:
         return SECTION_NOT_PLAIN_TEXT.format(doc=doc.title, heading=heading)
+    for part in layout.parts:
+        for line in part.text.split("\n"):
+            if line.strip() == RULE_LINE or line.strip().startswith("|"):
+                return SECTION_AMBIGUOUS_TEXT.format(doc=doc.title, heading=heading)
     return None
+
+
+_PIPE_SPLIT = re.compile(r"(?<!\\)\|")
+
+
+def _is_table_row(line: str) -> bool:
+    line = line.strip()
+    return len(line) >= 2 and line.startswith("|") and line.endswith("|")
+
+
+def _table_row(line: str) -> tuple[str, ...]:
+    return tuple(cell.strip().replace("\\|", "|") for cell in _PIPE_SPLIT.split(line.strip()[1:-1]))
+
+
+@dataclass(frozen=True)
+class SectionText:
+    """New section text split along an existing layout: the text of each part (each line ends
+    in a newline) and the horizontal lines and tables (as rows of cell text) between them."""
+
+    parts: tuple[str, ...]
+    seps: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]
+
+
+def parse_section_text(text: str, layout: SectionLayout, heading: str) -> SectionText:
+    """The new text split at its ``---`` lines and pipe-row tables, checked to keep the
+    section's horizontal lines and tables as they are: the same lines in the same places, the
+    same tables at the same rows and columns. A section without lines (or tables) takes a
+    ``---`` line (or a pipe row) as ordinary text. A text that does not keep them is refused in
+    plain words, before the card (D-50)."""
+    has_rules = any(sep.kind == RULE for sep in layout.seps)
+    has_tables = any(sep.kind == TABLE for sep in layout.seps)
+    lines = text.split("\n")
+    parts: list[list[str]] = [[]]
+    seps: list[tuple[str, tuple[tuple[str, ...], ...]]] = []
+    i = 0
+    while i < len(lines):
+        if has_rules and lines[i].strip() == RULE_LINE:
+            seps.append((RULE, ()))
+            parts.append([])
+            i += 1
+        elif has_tables and _is_table_row(lines[i]):
+            rows: list[tuple[str, ...]] = []
+            while i < len(lines) and _is_table_row(lines[i]):
+                rows.append(_table_row(lines[i]))
+                i += 1
+            seps.append((TABLE, tuple(rows)))
+            parts.append([])
+        else:
+            parts[-1].append(lines[i])
+            i += 1
+    parsed = SectionText(tuple("".join(f"{ln}\n" for ln in part) for part in parts), tuple(seps))
+    _check_section_text(parsed, layout, heading)
+    return parsed
+
+
+def _check_section_text(parsed: SectionText, layout: SectionLayout, heading: str) -> None:
+    old_kinds = [sep.kind for sep in layout.seps]
+    new_kinds = [kind for kind, _ in parsed.seps]
+    rules = old_kinds.count(RULE)
+    old_tables = [sep.table for sep in layout.seps if sep.table is not None]
+    if old_kinds != new_kinds and (
+        new_kinds.count(RULE) != rules or new_kinds.count(TABLE) == len(old_tables)
+    ):
+        raise ConnectorError(
+            SECTION_RULES_TEXT.format(
+                count=rules,
+                lines="line" if rules == 1 else "lines",
+                heading=heading,
+                each="it" if rules == 1 else "each one",
+            )
+        )
+    new_tables = [rows for kind, rows in parsed.seps if kind == TABLE]
+    shapes_match = len(new_tables) == len(old_tables) and all(
+        len(rows) == len(old.rows) and all(len(row) == len(old.rows[0]) for row in rows)
+        for rows, old in zip(new_tables, old_tables)
+    )
+    if not shapes_match:
+        first = old_tables[0]
+        for rows, old in zip(new_tables, old_tables):
+            first = old
+            if len(rows) != len(old.rows) or any(len(row) != len(old.rows[0]) for row in rows):
+                break
+        raise ConnectorError(
+            SECTION_TABLE_TEXT.format(
+                heading=heading, rows=len(first.rows), columns=len(first.rows[0])
+            )
+        )
+
+
+def section_card_text(text: str) -> str:
+    """Section text as the approval card shows it: each ``---`` line as a ``———`` row and
+    each run of pipe rows as a small grid of ``│``-separated cells (D-50)."""
+    shown: list[str] = []
+    for line in text.split("\n"):
+        if line.strip() == RULE_LINE:
+            shown.append("———")
+        elif _is_table_row(line):
+            shown.append("│ " + " │ ".join(_table_row(line)) + " │")
+        else:
+            shown.append(line)
+    return "\n".join(shown)
+
+
+def section_replacement_view(layout: SectionLayout, text: str, heading: str) -> str | None:
+    """What ``section_view`` reads once ``text`` is written over the section, or None when
+    ``text`` does not fit the layout. The write's look-before-write and its reconcile compare
+    it with the live view: equal means an earlier attempt landed (D-50)."""
+    try:
+        parsed = parse_section_text(text, layout, heading)
+    except ConnectorError:
+        return None
+    chunks: list[str] = []
+    for i, part in enumerate(parsed.parts):
+        chunks.append(part)
+        if i < len(parsed.seps):
+            kind, rows = parsed.seps[i]
+            chunks.append(RULE_LINE + "\n" if kind == RULE else _table_lines(rows))
+    return "".join(chunks).strip()
 
 
 def section_control_char_error(text: str) -> str | None:
@@ -264,6 +551,53 @@ def section_write_plan(
     insert_text = text + "\n"
     length = utf16_len(insert_text)
     return start, insert_text, start + length, end + length, 0, 0
+
+
+def section_edits(doc: DocRead, layout: SectionLayout, text: str, heading: str) -> list[DocEdit]:
+    """The edits that write ``text`` over the section, last in the Doc first so every index
+    still holds (D-50): each part whose text changed is replaced between the lines and tables
+    around it (``section_write_plan``), each table cell whose text changed is deleted and
+    refilled in place. Unchanged parts and cells are not touched. Refuses, in plain words,
+    text that does not keep the section's lines and tables, or that adds text right above a
+    table (Google refuses text at a table's first index)."""
+    parsed = parse_section_text(text, layout, heading)
+    body_end = doc.paragraphs[-1].end_index
+    found: list[tuple[int, DocEdit]] = []
+    for i, (part, new) in enumerate(zip(layout.parts, parsed.parts)):
+        if new == part.text:
+            continue
+        if not new:
+            end = part.end - 1 if part.end == body_end else part.end
+            if end > part.start:
+                found.append((part.start, (0, "", part.start, end, 0, 0)))
+            continue
+        if part.start == part.end and i < len(layout.seps) and layout.seps[i].kind == TABLE:
+            raise ConnectorError(SECTION_BEFORE_TABLE_TEXT.format(heading=heading))
+        found.append((part.start, section_write_plan(doc, part.start, part.end, new[:-1])))
+    for sep, (_, rows) in zip(
+        (sep for sep in layout.seps if sep.table is not None),
+        (entry for entry in parsed.seps if entry[0] == TABLE),
+    ):
+        for old_row, new_row in zip(sep.table.rows, rows):
+            for cell, new_text in zip(old_row, new_row):
+                if new_text == cell.text.strip():
+                    continue
+                shift = utf16_len(new_text)
+                found.append(
+                    (
+                        cell.start_index,
+                        (
+                            cell.start_index,
+                            new_text,
+                            cell.start_index + shift,
+                            cell.end_index + shift,
+                            0,
+                            0,
+                        ),
+                    )
+                )
+    found.sort(key=lambda entry: entry[0], reverse=True)
+    return [edit for _, edit in found]
 
 
 def sheet_marker(idem_key: str) -> str:
@@ -409,26 +743,10 @@ class DriveReader:
         return await self._google.read_doc(self._email, file_id)
 
     async def replace_doc_section(
-        self,
-        file_id: str,
-        required_revision_id: str,
-        insert_index: int,
-        insert_text: str,
-        delete_start: int,
-        delete_end: int,
-        style_start: int = 0,
-        style_end: int = 0,
+        self, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
         return await self._google.replace_doc_section(
-            self._email,
-            file_id,
-            required_revision_id,
-            insert_index,
-            insert_text,
-            delete_start,
-            delete_end,
-            style_start,
-            style_end,
+            self._email, file_id, required_revision_id, edits
         )
 
 
@@ -811,102 +1129,105 @@ class DriveConnector:
             await self._reader.fill_doc(copy.id, replacements)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
-    async def read_section(self, grant: DriveGrant) -> dict:
+    async def read_section(self, grant: DriveGrant, text: str | None = None) -> dict:
         """The section's current text and the Doc's read revision, for the draft and the card
-        (D-50): a ``documents.get`` of the granted Doc, the heading found exactly once, the
-        text under it (the card's "before") and the content range the write replaces. The
-        section must be plain paragraphs and its current text within the draft bound, so a
-        table, an image or an over-long section refuses here in plain words before any card.
-        The revisionId is the lock the write names; the range and the before text are frozen
-        into the draft so what was approved is what runs. The link is the Doc's webViewLink."""
+        (D-50): a ``documents.get`` of the granted Doc, the marker line found exactly once in
+        its recorded style, the text under it (the card's "before", with each horizontal line
+        as ``---`` and each table as pipe rows) and the content range the write replaces. The
+        section must hold only text, lines and tables and its current text be within the draft
+        bound; with ``text``, the new text must keep the section's lines and tables. Anything
+        else refuses here in plain words before any card. The revisionId is the lock the write
+        names; the before text is frozen into the draft so what was approved is what runs. The
+        link is the Doc's webViewLink."""
         doc = await self._reader.read_doc(grant.doc_id)
-        matches = heading_matches(doc.paragraphs, grant.heading)
-        if not matches:
-            raise ConnectorError(heading_missing_text(grant.heading, doc.title))
-        if len(matches) > 1:
-            raise ConnectorError(heading_duplicated_text(grant.heading, doc.title))
-        start, end, before = section_bounds(doc.paragraphs, matches[0])
-        if error := section_plain_error(doc, grant.heading, matches[0]):
+        index = locate_marker(doc, grant.heading, grant.marker)
+        if error := section_plain_error(doc, grant.heading, index):
             raise ConnectorError(error)
+        layout = section_layout(doc, index)
+        before = section_view(layout)
         if len(before) > MAX_SECTION_BEFORE:
             raise ConnectorError(
                 SECTION_TOO_LONG_TEXT.format(
                     heading=grant.heading, doc=doc.title, limit=MAX_SECTION_BEFORE
                 )
             )
+        if text is not None:
+            section_edits(doc, layout, text, grant.heading)
         file = await self._reader.get_file(grant.doc_id)
         return {
             "revision_id": doc.revision_id,
             "before": before,
-            "content_start": start,
-            "content_end": end,
+            "content_start": layout.start,
+            "content_end": layout.end,
             "item_title": doc.title,
             "item_url": file.web_view_link or f"https://drive.google.com/file/d/{grant.doc_id}",
         }
 
-    async def check_section_shape(self, doc_id: str, heading: str) -> DocRead:
+    async def check_section_shape(
+        self, doc_id: str, heading: str, marker: str | None = None
+    ) -> DocRead:
         """The write's shape check without the write (D-50), run before the write and before
-        reconcile looks: the approved heading must still be the live grant's (a republish
-        since the draft refuses), the Doc must still have that heading exactly once (a
-        renamed, removed or duplicated heading refuses in plain words), and the section must
-        be plain paragraphs (a table or image refuses). Returns the Doc read for the check."""
+        reconcile looks: the approved heading and marker style must still be the live grant's
+        (a republish since the draft refuses), the Doc must still have that line exactly once
+        in that style (a renamed, removed, duplicated or restyled line refuses in plain
+        words), and the section must hold only text, lines and tables (an image refuses).
+        ``marker`` is None for a draft made before styles were recorded. Returns the Doc read
+        for the check."""
         grant = self._grants.get(doc_id)
         if grant is None or grant.kind != "section":
             raise GrantDenied("This agent has not been granted that Doc section to replace.")
-        if grant.heading != heading:
+        if grant.heading != heading or (marker is not None and grant.marker != marker):
             raise ConnectorError(SECTION_SHAPE_CHANGED_TEXT)
         doc = await self._reader.read_doc(doc_id)
-        matches = heading_matches(doc.paragraphs, heading)
-        if not matches:
-            raise ConnectorError(heading_missing_text(heading, doc.title))
-        if len(matches) > 1:
-            raise ConnectorError(heading_duplicated_text(heading, doc.title))
-        if error := section_plain_error(doc, heading, matches[0]):
+        index = locate_marker(doc, heading, grant.marker)
+        if error := section_plain_error(doc, heading, index):
             raise ConnectorError(error)
         return doc
 
     async def find_replaced_section(self, doc_id: str, payload: dict) -> str | None:
         """Whether the section already holds the approved text (D-50): the revision write's
         look-before-write and reconcile lookup. The shape check runs first, as reconcile's
-        does (a republish, a heading gone or duplicated, or a table or image refuses). The Doc
-        is read and the section's current text compared with the approved text — equal means
-        an earlier attempt landed (the revision is the lock, so no marker is needed);
-        different means not seen."""
+        does (a republish, a heading gone, duplicated or restyled, or an image refuses). The
+        Doc is read and the section's current text compared with the approved text as it would
+        read once written (lines and tables included) — equal means an earlier attempt landed
+        (the revision is the lock, so no marker is needed); different means not seen."""
         grant = self._grants.get(doc_id)
         if grant is None or grant.kind != "section":
             return None
-        doc = await self.check_section_shape(doc_id, payload["heading"])
-        matches = heading_matches(doc.paragraphs, payload["heading"])
-        if len(matches) != 1:
-            return None
-        _, _, before = section_bounds(doc.paragraphs, matches[0])
-        return doc_id if before == payload["text"].strip() else None
+        doc = await self.check_section_shape(doc_id, payload["heading"], payload.get("marker"))
+        layout = section_layout(doc, locate_marker(doc, payload["heading"], grant.marker))
+        wanted = section_replacement_view(layout, payload["text"], payload["heading"])
+        return doc_id if wanted is not None and section_view(layout) == wanted else None
 
     async def replace_section(self, doc_id: str, payload: dict, idem_key: str) -> str:
-        """Replace the approved section's content as the tenant's account, keeping the heading
-        (D-50). The approved shape is the written shape: the draft's heading must still be the
-        live grant's, the Doc must still have it exactly once, and the section must be plain
-        paragraphs. The batchUpdate carries ``writeControl.requiredRevisionId`` = the stored
-        read revision and inserts the new text first at the section's first content paragraph,
-        then deletes the shifted old range (``section_write_plan``), so the new paragraphs keep
-        the NORMAL style and the body's final newline is never deleted. The revision is the
-        lock: a retry after a lost response, or a Doc someone else moved, gets a revision
-        mismatch; the Doc is then read and the section's text compared with the approved text —
-        equal means the earlier attempt landed (done), different refuses with nothing written."""
-        doc = await self.check_section_shape(doc_id, payload["heading"])
-        plan = section_write_plan(
-            doc, payload["content_start"], payload["content_end"], payload["text"]
-        )
+        """Replace the approved section's content as the tenant's account, keeping the marker
+        line, its horizontal lines and its tables' shape (D-50). The approved shape is the
+        written shape: the draft's heading and style must still be the live grant's, the Doc
+        must still have the line exactly once, and the section must hold only text, lines and
+        tables. The batchUpdate carries ``writeControl.requiredRevisionId`` = the stored read
+        revision and, last part of the Doc first, replaces each part between the lines and each
+        changed table cell in place (``section_edits``), so the new paragraphs keep the NORMAL
+        style and the body's final newline is never deleted. The revision is the lock: a retry
+        after a lost response, or a Doc someone else moved, gets a revision mismatch; the Doc
+        is then read and the section's text compared with the approved text — equal means the
+        earlier attempt landed (done), different refuses with nothing written."""
+        grant = self._grants[doc_id]
+        doc = await self.check_section_shape(doc_id, payload["heading"], payload.get("marker"))
+        layout = section_layout(doc, locate_marker(doc, payload["heading"], grant.marker))
+        edits = section_edits(doc, layout, payload["text"], payload["heading"])
+        if not edits:
+            return doc_id
         try:
-            return await self._reader.replace_doc_section(doc_id, payload["revision_id"], *plan)
+            return await self._reader.replace_doc_section(doc_id, payload["revision_id"], edits)
         except GoogleError as err:
             if err.code != "revision_mismatch":
                 raise
             doc = await self._reader.read_doc(doc_id)
-            matches = heading_matches(doc.paragraphs, payload["heading"])
+            matches = heading_matches(doc.paragraphs, payload["heading"], grant.marker)
             if len(matches) == 1:
-                _, _, before = section_bounds(doc.paragraphs, matches[0])
-                if before == payload["text"].strip():
+                layout = section_layout(doc, matches[0])
+                wanted = section_replacement_view(layout, payload["text"], payload["heading"])
+                if wanted is not None and section_view(layout) == wanted:
                     return doc_id
             raise ConnectorError(DOC_MOVED_TEXT) from err
 

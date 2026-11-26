@@ -31,15 +31,16 @@ def section_definition() -> dict:
         "heading exists once",
         "missing heading",
         "duplicated heading",
-        "table under heading",
+        "image under heading",
+        "divider-like line under heading",
         "not connected",
     ],
-    ids=["ok", "missing", "duplicated", "table", "not-connected"],
+    ids=["ok", "missing", "duplicated", "image", "divider-like", "not-connected"],
 )
 async def test_submit_checks_the_section_heading_exists_exactly_once(case):
     """Fails if submit does not read the Doc and accept a heading present exactly once in a
     plain-paragraph section, or accepts a heading the Doc lacks or has twice, a section holding
-    a table, or an unconnected Drive."""
+    an image or a line the model's --- and pipe-row view would misread, or an unconnected Drive."""
     h, _drive, google = section_harness()
     await h.seed_members()
     if case != "not connected":
@@ -51,8 +52,14 @@ async def test_submit_checks_the_section_heading_exists_exactly_once(case):
         google.docs[DRIVE_SECTION]["paragraphs"].append(
             {"text": f"{SECTION_HEADING}\n", "style": "HEADING_1"}
         )
-    elif case == "table under heading":
-        google.docs[DRIVE_SECTION]["paragraphs"].insert(2, {"kind": "table", "size": 5})
+    elif case == "divider-like line under heading":
+        google.docs[DRIVE_SECTION]["paragraphs"].insert(
+            2, {"text": "---\n", "style": "NORMAL_TEXT"}
+        )
+    elif case == "image under heading":
+        google.docs[DRIVE_SECTION]["paragraphs"].insert(
+            2, {"text": "Caption.\n", "style": "NORMAL_TEXT", "image": True}
+        )
     await h.plane.add_agent(TENANT, OWNER, "it-helper", section_definition())
 
     if case == "not connected":
@@ -75,7 +82,33 @@ async def test_submit_checks_the_section_heading_exists_exactly_once(case):
     needles = {
         "missing heading": "I can't find the heading",
         "duplicated heading": "appears more than once",
-        "table under heading": "plain paragraphs",
+        "image under heading": "text, lines and tables",
+        "divider-like line under heading": "reads like a divider or table row",
     }
     assert needles[case] in str(err.value)
     assert (await h.agents.get_version(TENANT, "it-helper", 1)).status == "draft"
+
+
+@pytest.mark.parametrize(
+    ("first_line", "recorded"),
+    [
+        ({"text": "Status\n", "style": "HEADING_1"}, "HEADING_1"),
+        ({"text": "Status\n", "style": "NORMAL_TEXT", "bold": True}, "NORMAL_TEXT:bold"),
+    ],
+    ids=["heading", "bold line"],
+)
+async def test_submit_records_the_style_of_the_line_that_marks_the_section(first_line, recorded):
+    """Fails if submit does not freeze the marker line's style signature into the definition, so
+    a line later restyled would still mark the section, or a bold line is not accepted."""
+    h, _drive, google = section_harness()
+    await h.seed_members()
+    await h.plane.connect_drive(TENANT, ROOT)
+    add_section_doc(google)
+    google.docs[DRIVE_SECTION]["paragraphs"][0] = first_line
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", section_definition())
+
+    await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    [section] = record.agent().grants.drive
+    assert section.marker == recorded

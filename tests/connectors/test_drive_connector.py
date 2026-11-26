@@ -197,12 +197,14 @@ def test_a_name_two_grants_share_is_refused_so_the_model_uses_the_id(kind, case,
 SECTION_DOC = "drive-section-0001"
 
 
-def section_conn(paragraphs: list[dict]):
+def section_conn(paragraphs: list[dict], heading: str = "Status", marker: str = ""):
     """A connector granted the VPN guide's Status section, and the Doc as Google serves it."""
     google = FakeGoogleAccounts()
     google.add_drive_folder(FOLDER, "Team folder")
     google.add_drive_doc(SECTION_DOC, "VPN guide", paragraphs, FOLDER)
-    grant = DriveGrant(SECTION_DOC, "VPN guide", "section", doc_id=SECTION_DOC, heading="Status")
+    grant = DriveGrant(
+        SECTION_DOC, "VPN guide", "section", doc_id=SECTION_DOC, heading=heading, marker=marker
+    )
     return DriveConnector(DriveReader(google, EMAIL), [grant]), google, grant
 
 
@@ -218,7 +220,6 @@ def _p(text: str, style: str = "NORMAL_TEXT") -> dict:
         "heading last",
         "lower-level heading",
         "style stays NORMAL_TEXT",
-        "table refusal",
         "image refusal",
     ],
 )
@@ -227,7 +228,7 @@ async def test_the_section_write_inserts_first_and_keeps_the_text_plain(case):
     range keeping the heading and the body's final newline (a section ending at the body end,
     an empty section, a heading that is the Doc's last paragraph, a section spanning a
     lower-level heading), if the new paragraphs do not stay NORMAL_TEXT, or if a section
-    holding a table or an inline image is accepted instead of refused as not plain paragraphs."""
+    holding an inline image is accepted instead of refused as not editable."""
     cases = {
         "last section": (
             [_p("Status\n", "HEADING_1"), _p("Old text.\n")],
@@ -276,17 +277,6 @@ async def test_the_section_write_inserts_first_and_keeps_the_text_plain(case):
                 ("Other\n", "HEADING_1"),
             ],
         ),
-        "table refusal": (
-            [
-                _p("Status\n", "HEADING_1"),
-                _p("Intro.\n"),
-                {"kind": "table", "size": 5},
-                _p("More.\n"),
-                _p("Other\n", "HEADING_1"),
-            ],
-            "New text.",
-            None,
-        ),
         "image refusal": (
             [
                 _p("Status\n", "HEADING_1"),
@@ -303,7 +293,7 @@ async def test_the_section_write_inserts_first_and_keeps_the_text_plain(case):
     if expected is None:
         with pytest.raises(ConnectorError) as err:
             await conn.read_section(grant)
-        assert "plain paragraphs" in str(err.value)
+        assert "text, lines and tables" in str(err.value)
         assert google.doc_replace_calls == []
         return
 
@@ -342,4 +332,154 @@ async def test_a_moved_doc_whose_section_already_holds_the_approved_text_is_done
     assert await conn.replace_section(SECTION_DOC, payload, "idem") == SECTION_DOC
     assert google.docs[SECTION_DOC]["revision_id"] == "moved-9"
     assert google.docs[SECTION_DOC]["paragraphs"][1]["text"] == "New text.\n"
-    assert len(google.doc_replace_calls) == 1
+    assert google.doc_replace_calls == []
+
+
+def _bold(text: str) -> dict:
+    return {"text": text, "style": "NORMAL_TEXT", "bold": True}
+
+
+def _rule() -> dict:
+    return {"text": "\n", "style": "NORMAL_TEXT", "rule": True}
+
+
+def _table(*rows: list[str]) -> dict:
+    return {"kind": "table", "rows": [list(row) for row in rows]}
+
+
+def _shape(google) -> list:
+    """The Doc's body as a reader sees it: text lines, ``---`` for a line, a table's rows."""
+    return [
+        p["rows"] if p.get("kind") == "table" else "---" if p.get("rule") else p["text"]
+        for p in google.docs[SECTION_DOC]["paragraphs"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("paragraphs", "heading", "marker", "outcome"),
+    [
+        (
+            [_p("Status\n", "HEADING_1"), _p("A.\n"), _p("Other\n", "HEADING_1"), _p("B.\n")],
+            "Status",
+            "HEADING_1",
+            "A.",
+        ),
+        (
+            [_bold("Status\n"), _p("A.\n"), _p("Big\n", "HEADING_1"), _bold("Next\n"), _p("B.\n")],
+            "Status",
+            "NORMAL_TEXT:bold",
+            "A.\nBig",
+        ),
+        (
+            [
+                {"text": "Status\n", "style": "NORMAL_TEXT", "underline": True},
+                _p("A.\n"),
+                {"text": "Next\n", "style": "NORMAL_TEXT", "underline": True},
+            ],
+            "Status",
+            "NORMAL_TEXT:underline",
+            "A.",
+        ),
+        (
+            [_p("STATUS\n"), _p("a line\n"), _p("NEXT\n"), _p("b line\n")],
+            "STATUS",
+            "NORMAL_TEXT:caps",
+            "a line",
+        ),
+        ([_p("Status\n"), _p("A.\n")], "Status", "", "can't find the heading"),
+        ([_bold("Status\n"), _p("A.\n")], "Status", "", "can't find the heading"),
+        ([_bold("Status\n"), _p("A.\n")], "Status", "HEADING_1", "changed style"),
+    ],
+    ids=["heading", "bold", "underline", "caps", "plain line", "legacy grant", "restyled"],
+)
+async def test_a_section_starts_at_the_marker_style_the_grant_recorded(
+    paragraphs, heading, marker, outcome
+):
+    """Fails if a section starts at a line that is not in the style recorded at submit (a plain
+    line, a bold line under a heading-only legacy grant), runs past the next line of the same
+    style, or a line restyled since publishing is silently treated as missing."""
+    conn, _, grant = section_conn(paragraphs, heading, marker)
+
+    if outcome in ("can't find the heading", "changed style"):
+        with pytest.raises(ConnectorError, match=outcome):
+            await conn.read_section(grant)
+    else:
+        assert (await conn.read_section(grant))["before"] == outcome
+
+
+@pytest.mark.parametrize(
+    ("text", "after"),
+    [
+        (
+            "New intro.\n---\nNew outro.",
+            ["Status\n", "New intro.\n", "---", "New outro.\n", "Other\n"],
+        ),
+        ("---\nOnly outro.", ["Status\n", "---", "Only outro.\n", "Other\n"]),
+        ("New intro.\n---\n---\nNew outro.", "Keep the 1 horizontal line in 'Status'"),
+        ("Just text.", "Keep the 1 horizontal line in 'Status'"),
+    ],
+    ids=["both parts", "first part emptied", "a line added", "the line dropped"],
+)
+async def test_a_section_keeps_its_horizontal_lines_and_replaces_the_text_between(text, after):
+    """Fails if a write recreates, moves or drops a horizontal line, writes text that does not
+    carry the section's lines before the card, or leaves a part between two lines unwritten."""
+    paragraphs = [
+        _p("Status\n", "HEADING_1"),
+        _p("Intro.\n"),
+        _rule(),
+        _p("Outro.\n"),
+        _p("Other\n", "HEADING_1"),
+    ]
+    conn, google, grant = section_conn(paragraphs, marker="HEADING_1")
+
+    if isinstance(after, str):
+        with pytest.raises(ConnectorError, match=after):
+            await conn.read_section(grant, text)
+        assert google.doc_replace_calls == []
+        return
+
+    section = await conn.read_section(grant, text)
+    assert section["before"] == "Intro.\n---\nOutro."
+    payload = {"heading": "Status", "text": text, "revision_id": section["revision_id"]}
+    await conn.replace_section(SECTION_DOC, payload, "idem")
+    assert _shape(google) == after
+
+
+@pytest.mark.parametrize(
+    ("text", "rows"),
+    [
+        (
+            "Intro.\n| Item | Qty |\n| Pencils | 12 |\nDone.",
+            [["Item", "Qty"], ["Pencils", "12"]],
+        ),
+        ("Intro.\n| Item | Qty |\n| Pens | 2 |\n| Ink | 1 |\nAfter.", None),
+        ("Intro.\n| Item | Qty |\nAfter.", None),
+    ],
+    ids=["cells changed", "row added", "row removed"],
+)
+async def test_a_table_is_edited_cell_by_cell_and_never_reshaped(text, rows):
+    """Fails if a table's cells are written at shifted positions (a longer cell moving the next
+    one), a table that gains or loses a row is written, or the refusal does not name the rows
+    and columns to keep."""
+    paragraphs = [
+        _p("Status\n", "HEADING_1"),
+        _p("Intro.\n"),
+        _table(["Item", "Qty"], ["Pens", "2"]),
+        _p("After.\n"),
+        _p("Other\n", "HEADING_1"),
+    ]
+    conn, google, grant = section_conn(paragraphs, marker="HEADING_1")
+
+    if rows is None:
+        with pytest.raises(
+            ConnectorError, match="Keep the table in 'Status' at 2 rows and 2 columns"
+        ):
+            await conn.read_section(grant, text)
+        assert google.doc_replace_calls == []
+        return
+
+    section = await conn.read_section(grant, text)
+    assert section["before"] == "Intro.\n| Item | Qty |\n| Pens | 2 |\nAfter."
+    payload = {"heading": "Status", "text": text, "revision_id": section["revision_id"]}
+    await conn.replace_section(SECTION_DOC, payload, "idem")
+    assert _shape(google) == ["Status\n", "Intro.\n", rows, "Done.\n", "Other\n"]

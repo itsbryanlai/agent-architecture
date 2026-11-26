@@ -749,9 +749,9 @@ async def grant_section_doc(h):
     add_section_doc(h.google)
 
 
-def replace_spec() -> TaskSpec:
+def replace_spec(text: str = "The VPN is back up.") -> TaskSpec:
     from agentos.connectors.drive import heading_matches, section_bounds
-    from agentos.connectors.google_iam import DocParagraph, utf16_len
+    from agentos.connectors.google_iam import DocParagraph, DocRead, utf16_len
 
     paragraphs = []
     idx = 0
@@ -759,16 +759,15 @@ def replace_spec() -> TaskSpec:
         end = idx + utf16_len(p["text"])
         paragraphs.append(DocParagraph(p["text"], p["style"], idx, end))
         idx = end
-    start, end, _ = section_bounds(
-        tuple(paragraphs), heading_matches(tuple(paragraphs), SECTION_HEADING)[0]
-    )
+    doc = DocRead("1", "VPN guide", tuple(paragraphs))
+    start, end, _ = section_bounds(doc, heading_matches(doc.paragraphs, SECTION_HEADING)[0])
     ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
     payload = {
         "page_id": DRIVE_SECTION,
         "section_id": DRIVE_SECTION,
         "doc_id": DRIVE_SECTION,
         "heading": SECTION_HEADING,
-        "text": "The VPN is back up.",
+        "text": text,
         "before": SECTION_BEFORE,
         "revision_id": "1",
         "content_start": start,
@@ -816,4 +815,45 @@ async def test_a_second_drive_replace_attempt_beside_a_running_one_writes_nothin
     assert await run(h.acts.replace_doc_section, replace_spec(), task_id) == ref
     paras = h.google.docs[DRIVE_SECTION]["paragraphs"]
     assert paras[1]["text"] == "The VPN is back up.\n"
+    assert len(h.google.doc_replace_calls) == 1
+
+
+async def test_a_lost_response_after_replacing_a_section_with_a_line_and_a_table_writes_once(
+    dharness,
+):
+    """Fails if the retry of a section replace holding a horizontal line and a table, whose
+    response was lost, writes a second time, or the Doc does not read as approved: the line
+    kept, the table's cells changed in place, the text between them replaced."""
+    h = dharness
+    await grant_section_doc(h)
+    h.google.docs[DRIVE_SECTION]["paragraphs"] = [
+        {"text": "Status\n", "style": "HEADING_1"},
+        {"text": "Intro.\n", "style": "NORMAL_TEXT"},
+        {"text": "\n", "style": "NORMAL_TEXT", "rule": True},
+        {"kind": "table", "rows": [["Item", "Qty"], ["Pens", "2"]]},
+        {"text": "After.\n", "style": "NORMAL_TEXT"},
+        {"text": "Other\n", "style": "HEADING_1"},
+        {"text": "Keep this.\n", "style": "NORMAL_TEXT"},
+    ]
+    text = "New intro.\n---\n| Item | Qty |\n| Pencils | 12 |\nDone."
+    task_id = ids.task_id(TENANT, "drive-replace-shapes")
+    h.google.fail_after_write("replace")
+    with pytest.raises(GoogleError):
+        await run(h.acts.replace_doc_section, replace_spec(text), task_id)
+
+    await run(h.acts.replace_doc_section, replace_spec(text), task_id)
+
+    body = [
+        p["rows"] if p.get("kind") == "table" else "---" if p.get("rule") else p["text"]
+        for p in h.google.docs[DRIVE_SECTION]["paragraphs"]
+    ]
+    assert body == [
+        "Status\n",
+        "New intro.\n",
+        "---",
+        [["Item", "Qty"], ["Pencils", "12"]],
+        "Done.\n",
+        "Other\n",
+        "Keep this.\n",
+    ]
     assert len(h.google.doc_replace_calls) == 1

@@ -246,6 +246,43 @@ class SheetTab:
     sheet_id: int
     header: tuple[str, ...]
     data_rows: int
+    header_row: int = 1
+    first_column: str = "A"
+
+
+# A Sheet's header is the first row, within this many rows from the top, with at least two
+# non-empty cells (D-48).
+HEADER_SCAN_ROWS = 20
+HEADER_MIN_CELLS = 2
+
+
+@dataclass(frozen=True)
+class HeaderAt:
+    """Where a grant recorded its header: the 1-based row, the A1 letter of its first
+    column and how many columns it spans (0 reads the row to its last non-empty cell, as a
+    legacy grant without a recorded place does)."""
+
+    row: int = 1
+    first_column: str = "A"
+    width: int = 0
+
+
+def column_letter(index: int) -> str:
+    """The A1 letter of a zero-based column index (0 is A, 26 is AA)."""
+    letters = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        letters = chr(ord("A") + rest) + letters
+    return letters
+
+
+def column_index(letter: str) -> int:
+    """The zero-based index of an A1 column letter (A is 0, AA is 26)."""
+    index = 0
+    for char in letter.upper():
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
 
 
 @dataclass(frozen=True)
@@ -402,13 +439,22 @@ class GoogleAccounts(Protocol):
         ...
 
     async def read_sheet(
-        self, email: str, file_id: str, tab: str, header_only: bool = False
+        self,
+        email: str,
+        file_id: str,
+        tab: str,
+        header_only: bool = False,
+        header_at: HeaderAt | None = None,
     ) -> SheetTab:
         """One tab's numeric sheet ID, header row and count of data rows, read from the
         spreadsheet's grid data (one ``spreadsheets.get`` asking ``ranges`` for the granted
-        tab alone; ``header_only`` asks for row 1 only, so ``data_rows`` counts that row).
-        A tab the Sheet does not have raises ``GoogleError`` (a 400), so the caller refuses
-        rather than appends blind."""
+        tab alone). ``header_only`` asks for the header alone: for the recorded place
+        ``header_at`` (just that row's span) or, with none, the tab's first 20 rows, where
+        the header is the first row with two or more non-empty cells; ``data_rows`` then
+        counts only what was read. Without ``header_only`` the whole tab is read and the
+        header is taken from ``header_at`` (row 1, column A when none). A tab the Sheet
+        does not have raises ``GoogleError`` (a 400), so the caller refuses rather than
+        appends blind."""
         ...
 
     async def list_sheet_tabs(self, email: str, file_id: str) -> list[str]:
@@ -432,12 +478,16 @@ class GoogleAccounts(Protocol):
         row_index: int,
         key: str,
         value: str,
+        first_column: str = "A",
     ) -> str:
         """Append ``row`` and mark it with developer metadata in ONE atomic batchUpdate
         (``appendCells`` then ``createDeveloperMetadata`` on the appended row), so a lost
         response never leaves an unmarked row. A text cell is sent as ``stringValue`` and
         lands literally (never parsed into a formula or another type); a number as
-        ``numberValue``. Returns the created metadata's ID."""
+        ``numberValue``. The row is padded with empty cells up to ``first_column`` (the
+        column the grant's header starts in), so its values land under the header's columns;
+        the row lands after the last row with data anywhere in the tab. Returns the created
+        metadata's ID."""
         ...
 
     async def copy_file(
@@ -464,6 +514,13 @@ class GoogleAccounts(Protocol):
         sentinel to its value — so a value containing another blank's placeholder lands
         literally (D-49). A string no longer present is a no-op, so a retry fills only what
         is left."""
+        ...
+
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        """The text of every part of a Doc that can hold a ``{{blank}}``: one
+        ``documents.get`` of every tab's body, headers, footers and footnotes, joined with
+        newlines. The plain-text export leaves headers and footers out, so the template
+        blank read and the post-fill check use this instead (D-49)."""
         ...
 
     async def read_doc(self, email: str, file_id: str) -> DocRead:
@@ -1125,7 +1182,12 @@ class RealGoogleAccounts:
     # row is appended as the account the Sheet is shared with, never the deployment's.
 
     async def read_sheet(
-        self, email: str, file_id: str, tab: str, header_only: bool = False
+        self,
+        email: str,
+        file_id: str,
+        tab: str,
+        header_only: bool = False,
+        header_at: HeaderAt | None = None,
     ) -> SheetTab:
         token = await self._drive_token(email)
 
@@ -1138,7 +1200,7 @@ class RealGoogleAccounts:
                     f"{SHEETS}/spreadsheets/{quote(file_id, safe='')}",
                     headers={"Authorization": f"Bearer {token}"},
                     params={
-                        "ranges": _tab_range(tab, header_only),
+                        "ranges": _tab_range(tab, header_only, header_at),
                         "fields": "sheets(properties(sheetId,title),data.rowData.values.formattedValue)",
                     },
                 )
@@ -1150,7 +1212,7 @@ class RealGoogleAccounts:
                         if props["title"] != tab:
                             continue
                         rows = (sheet.get("data") or [{}])[0].get("rowData", [])
-                        return _sheet_tab(int(props["sheetId"]), rows)
+                        return _sheet_tab(int(props["sheetId"]), rows, header_only, header_at)
                 except (KeyError, TypeError, IndexError, ValueError) as err:
                     raise GoogleError("unavailable") from err
                 raise GoogleError("refused", f"The Sheet has no tab named '{tab}'.", status=400)
@@ -1242,6 +1304,7 @@ class RealGoogleAccounts:
         row_index: int,
         key: str,
         value: str,
+        first_column: str = "A",
     ) -> str:
         token = await self._drive_token(email)
 
@@ -1265,7 +1328,8 @@ class RealGoogleAccounts:
                                     "sheetId": sheet_id,
                                     "rows": [
                                         {
-                                            "values": [
+                                            "values": [{}] * column_index(first_column)
+                                            + [
                                                 {"userEnteredValue": {"numberValue": v}}
                                                 if isinstance(v, (int, float))
                                                 else {"userEnteredValue": {"stringValue": v}}
@@ -1401,7 +1465,11 @@ class RealGoogleAccounts:
                 # One replaceAllText per replacement, in order, literal text (no markup
                 # interpretation): the create write's two passes — blank forms to sentinels,
                 # sentinels to values. A string no longer present is a no-op, so a retry
-                # fills only what is left.
+                # fills only what is left. ``replaceAllText`` takes no segment or header
+                # setting: its reference says only "all instances of text matching a
+                # criteria" and, without ``tabsCriteria``, every tab. Whether that reaches
+                # headers and footers is not stated there, so the create write reads every
+                # segment after the fill and refuses while a blank is left.
                 response = self._send(
                     session,
                     "POST",
@@ -1421,6 +1489,31 @@ class RealGoogleAccounts:
                 )
                 self._check_drive(response)
                 _json_object(response)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        token = await self._drive_token(email)
+
+        def call() -> str:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "GET",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"includeTabsContent": "true", "fields": "tabs"},
+                )
+                self._check_drive(response)
+                body = _json_object(response)
+                try:
+                    return "\n".join(_doc_segment_texts(body.get("tabs", [])))
+                except (KeyError, TypeError, AttributeError) as err:
+                    raise GoogleError("unavailable") from err
             finally:
                 if self._drive_session is None:
                     session.close()
@@ -1549,6 +1642,39 @@ def _is_revision_mismatch(response: requests.Response) -> bool:
     except (ValueError, KeyError, TypeError):
         pass
     return _drive_reason(response) == "failedPrecondition"
+
+
+def _structural_text(content: list) -> str:
+    """The text of a list of structural elements: paragraph runs joined within a paragraph,
+    table cells and tables of contents walked, one line per paragraph."""
+    lines: list[str] = []
+    for element in content:
+        if "paragraph" in element:
+            runs = element["paragraph"].get("elements", [])
+            lines.append(
+                "".join(r.get("textRun", {}).get("content", "") for r in runs).rstrip("\n")
+            )
+        elif "table" in element:
+            for row in element["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    lines.append(_structural_text(cell.get("content", [])))
+        elif "tableOfContents" in element:
+            lines.append(_structural_text(element["tableOfContents"].get("content", [])))
+    return "\n".join(lines)
+
+
+def _doc_segment_texts(tabs: list) -> list[str]:
+    """The text of the body, every header, every footer and every footnote of each tab
+    (child tabs included), each as one string."""
+    texts: list[str] = []
+    for tab in tabs:
+        doc_tab = tab.get("documentTab", {})
+        texts.append(_structural_text(doc_tab.get("body", {}).get("content", [])))
+        for key in ("headers", "footers", "footnotes"):
+            for segment in doc_tab.get(key, {}).values():
+                texts.append(_structural_text(segment.get("content", [])))
+        texts.extend(_doc_segment_texts(tab.get("childTabs", [])))
+    return texts
 
 
 def _doc_body(
@@ -1866,26 +1992,82 @@ def _trim_trailing_empty(values: list[str]) -> list[str]:
     return values[:end]
 
 
-def _tab_range(tab: str, header_only: bool) -> str:
-    """The A1 range of the granted tab — row 1 alone for a header check. The tab name is
-    quoted (it may hold spaces) and its own single quotes doubled, as A1 notation asks."""
+def _tab_range(tab: str, header_only: bool, header_at: HeaderAt | None = None) -> str:
+    """The A1 range of the granted tab. A header check asks for the header alone: the
+    recorded row's span (``C3:F3``), or the tab's first 20 rows when no place is recorded
+    yet (submit's scan). The tab name is quoted (it may hold spaces) and its own single
+    quotes doubled, as A1 notation asks."""
     quoted = "'" + tab.replace("'", "''") + "'"
-    return f"{quoted}!1:1" if header_only else quoted
+    if not header_only:
+        return quoted
+    if header_at is None:
+        return f"{quoted}!1:{HEADER_SCAN_ROWS}"
+    if header_at.width:
+        last = column_letter(column_index(header_at.first_column) + header_at.width - 1)
+        return f"{quoted}!{header_at.first_column}{header_at.row}:{last}{header_at.row}"
+    if header_at.first_column == "A":
+        return f"{quoted}!{header_at.row}:{header_at.row}"
+    return f"{quoted}!{header_at.first_column}{header_at.row}:{header_at.row}"
 
 
-def _sheet_tab(sheet_id: int, rows: list[dict]) -> SheetTab:
-    """The tab's header (first row, trailing empty cells trimmed) and its count of data
-    rows: the index after the last row holding any value, where ``appendCells`` appends."""
+def _sheet_tab(
+    sheet_id: int,
+    rows: list[dict],
+    header_only: bool = False,
+    header_at: HeaderAt | None = None,
+) -> SheetTab:
+    """The tab's header and its count of data rows: the index after the last row holding
+    any value, where ``appendCells`` appends. ``rows`` are the cells Google served for the
+    asked range."""
     grid = [
         [(cell or {}).get("formattedValue", "") for cell in (row.get("values") or [])]
         for row in rows
     ]
-    header = tuple(_trim_trailing_empty(grid[0])) if grid else ()
+    return sheet_tab_from_grid(sheet_id, grid, header_only, header_at)
+
+
+def find_header(grid: list[list[str]]) -> tuple[int, int, list[str]] | None:
+    """The header of a grid's first 20 rows: its 1-based row, the zero-based index of its
+    first column and its cells from the first to the last non-empty one (a blank inside
+    is kept, for the caller to refuse). None when no row has two non-empty cells."""
+    for number, row in enumerate(grid[:HEADER_SCAN_ROWS], start=1):
+        filled = [i for i, value in enumerate(row) if str(value).strip()]
+        if len(filled) >= HEADER_MIN_CELLS:
+            return number, filled[0], list(row[filled[0] : filled[-1] + 1])
+    return None
+
+
+def sheet_tab_from_grid(
+    sheet_id: int,
+    grid: list[list[str]],
+    header_only: bool,
+    header_at: HeaderAt | None,
+) -> SheetTab:
+    """The one place both the real client and the fake turn served cells into a SheetTab.
+
+    ``grid`` starts where the asked range starts: the tab's top-left for a scan or a whole
+    tab read, the recorded span's first cell for a header-only read of a recorded place."""
     data_rows = 0
     for i, row in enumerate(grid):
         if any(value != "" for value in row):
             data_rows = i + 1
-    return SheetTab(sheet_id, header, data_rows)
+    if header_only and header_at is None:
+        found = find_header(grid)
+        if found is None:
+            return SheetTab(sheet_id, (), data_rows)
+        row_number, first, cells = found
+        return SheetTab(sheet_id, tuple(cells), data_rows, row_number, column_letter(first))
+    place = header_at or HeaderAt()
+    first = column_index(place.first_column)
+    if header_only:
+        cells = grid[0] if grid else []
+    else:
+        cells = grid[place.row - 1][first:] if len(grid) >= place.row else []
+    if place.width:
+        cells = cells[: place.width]
+    return SheetTab(
+        sheet_id, tuple(_trim_trailing_empty(cells)), data_rows, place.row, place.first_column
+    )
 
 
 def _picker_item(file: dict) -> DriveItem:
@@ -1965,6 +2147,12 @@ class FakeGoogleAccounts:
         self.drive_files: dict[str, DriveFile] = {}
         self.drive_children: dict[str, list[str]] = {}
         self.drive_content: dict[str, list[DriveSection]] = {}
+        # The text of a Doc's headers and footers, which the plain-text export leaves out:
+        # the structural read returns it, a copy carries it and the fill replaces in it.
+        self.drive_segments: dict[str, list[str]] = {}
+        # False models a fill that does not reach headers and footers, so the post-fill
+        # check has something to catch.
+        self.fill_reaches_segments = True
         self.drive_refused: set[str] = set()
         # The comments each file carries, as Google returns them (id, content, author).
         # ``comment_calls`` and ``comment_list_calls`` record the (email, file ID) of every
@@ -2002,6 +2190,7 @@ class FakeGoogleAccounts:
         # index refuses an insert). The replace failure injections live in ``_after_write``.
         self.docs: dict[str, dict] = {}
         self.doc_read_calls: list[tuple[str, str]] = []
+        self.template_read_calls: list[tuple[str, str]] = []
         self.doc_replace_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
@@ -2148,6 +2337,10 @@ class FakeGoogleAccounts:
     def set_drive_content(self, file_id: str, sections: list[DriveSection]) -> None:
         self.drive_content[file_id] = list(sections)
 
+    def set_drive_segments(self, file_id: str, texts: list[str]) -> None:
+        """A Doc's header and footer texts, as ``documents.get`` returns them."""
+        self.drive_segments[file_id] = list(texts)
+
     def trash_drive_file(self, file_id: str) -> None:
         self.drive_files[file_id] = replace(self.drive_files[file_id], trashed=True)
 
@@ -2187,6 +2380,10 @@ class FakeGoogleAccounts:
             "rows": [list(header), *[list(r) for r in rows]],
         }
         return sheet_id
+
+    def set_sheet_rows(self, file_id: str, tab: str, rows: list[list[str]]) -> None:
+        """Replace a tab's whole grid, so a header can sit below a title or right of column A."""
+        self.sheets[file_id][tab]["rows"] = [list(r) for r in rows]
 
     def set_sheet_header(self, file_id: str, tab: str, header: list[str]) -> None:
         """Replace a tab's header row, as a creator editing the Sheet's columns would."""
@@ -2368,7 +2565,12 @@ class FakeGoogleAccounts:
         return comment_id
 
     async def read_sheet(
-        self, email: str, file_id: str, tab: str, header_only: bool = False
+        self,
+        email: str,
+        file_id: str,
+        tab: str,
+        header_only: bool = False,
+        header_at: HeaderAt | None = None,
     ) -> SheetTab:
         self.sheet_read_calls.append((email, file_id))
         if self._sheet_read_hangs:
@@ -2380,14 +2582,16 @@ class FakeGoogleAccounts:
         state = self.sheets.get(file_id, {}).get(tab)
         if state is None:
             raise GoogleError("refused", f"The Sheet has no tab named '{tab}'.", status=400)
-        # Google answers a ranges read with the asked rows alone: row 1 for a header check.
-        rows = state["rows"][:1] if header_only else state["rows"]
-        header = tuple(_trim_trailing_empty(rows[0])) if rows else ()
-        data_rows = 0
-        for i, row in enumerate(rows):
-            if any(value != "" for value in row):
-                data_rows = i + 1
-        return SheetTab(state["sheet_id"], header, data_rows)
+        # Google answers a ranges read with the asked cells alone: the first 20 rows for a
+        # scan, the recorded row's span from its first cell for a check of a recorded place.
+        grid = state["rows"]
+        if header_only and header_at is None:
+            grid = grid[:HEADER_SCAN_ROWS]
+        elif header_only:
+            first = column_index(header_at.first_column)
+            row = grid[header_at.row - 1] if len(grid) >= header_at.row else []
+            grid = [row[first:]]
+        return sheet_tab_from_grid(state["sheet_id"], grid, header_only, header_at)
 
     async def list_sheet_tabs(self, email: str, file_id: str) -> list[str]:
         if file_id in self.drive_refused:
@@ -2428,6 +2632,7 @@ class FakeGoogleAccounts:
         row_index: int,
         key: str,
         value: str,
+        first_column: str = "A",
     ) -> str:
         self.append_calls.append((email, file_id))
         if file_id in self.drive_refused:
@@ -2441,6 +2646,7 @@ class FakeGoogleAccounts:
         if tab is None:
             raise GoogleError("refused", "The Sheet has no tab with that ID.", status=400)
         rows = self.sheets[file_id][tab]["rows"]
+        row = [""] * column_index(first_column) + list(row)
         # appendCells adds after the last row with data, inserting rows if necessary — it
         # never overwrites a data row, whatever index the read before the write computed.
         end = 0
@@ -2504,6 +2710,7 @@ class FakeGoogleAccounts:
         )
         self.drive_files[new_id] = copied
         self.drive_content[new_id] = list(self.drive_content.get(template_id, []))
+        self.drive_segments[new_id] = list(self.drive_segments.get(template_id, []))
         self.drive_children.setdefault(folder_id, []).append(new_id)
         # The marker lands with the copy, as the one files.copy request carries it.
         self.drive_app_properties.setdefault(new_id, {})[key] = value
@@ -2544,7 +2751,22 @@ class FakeGoogleAccounts:
                 text = text.replace(old, new)
             filled.append(DriveSection(section.heading, text))
         self.drive_content[file_id] = filled
+        segments = []
+        for text in self.drive_segments.get(file_id, []):
+            for old, new in replacements if self.fill_reaches_segments else []:
+                text = text.replace(old, new)
+            segments.append(text)
+        self.drive_segments[file_id] = segments
         await self._after_write("fill")
+
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        self.template_read_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        body = [s.text for s in self.drive_content.get(file_id, [])]
+        return "\n".join(body + self.drive_segments.get(file_id, []))
 
     async def read_doc(self, email: str, file_id: str) -> DocRead:
         self.doc_read_calls.append((email, file_id))

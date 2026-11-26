@@ -50,7 +50,6 @@ from agentos.config import DRIVE_ID, DriveGrant, Grants
 from agentos.connectors import drive_errors
 from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import (
-    MIME_DOC,
     MIME_FOLDER,
     DocEdit,
     DocParagraph,
@@ -61,6 +60,7 @@ from agentos.connectors.google_iam import (
     DriveSection,
     GoogleAccounts,
     GoogleError,
+    HeaderAt,
     SheetMetadata,
     SheetTab,
     utf16_len,
@@ -92,6 +92,11 @@ DOC_APP_PROPERTY_KEY = "agentos_write"
 DOC_SHAPE_CHANGED_TEXT = (
     "The template's blanks or folder changed since this agent was published; "
     "ask the creator to republish"
+)
+# The refusal when a blank is still in the copy after the fill (a header, a footer or a
+# footnote the replacement did not reach): the Doc is not reported as done.
+DOC_FILL_INCOMPLETE_TEXT = (
+    "The new Doc still has a blank the fill could not replace; it was not reported as done"
 )
 # The refusal when the destination folder sits in no shared drive: the same plain words
 # the publish refuses with, so a folder moved to My Drive reads the same everywhere.
@@ -691,6 +696,9 @@ class DriveReader:
     async def export_file(self, file_id: str, mime_type: str) -> list[DriveSection]:
         return await self._google.export_file(self._email, file_id, mime_type)
 
+    async def read_template_text(self, file_id: str) -> str:
+        return await self._google.read_template_text(self._email, file_id)
+
     async def get_drive(self, drive_id: str) -> DriveFile:
         return await self._google.get_drive(self._email, drive_id)
 
@@ -703,8 +711,14 @@ class DriveReader:
     async def create_comment(self, file_id: str, content: str) -> str:
         return await self._google.create_comment(self._email, file_id, content)
 
-    async def read_sheet(self, file_id: str, tab: str, header_only: bool = False) -> SheetTab:
-        return await self._google.read_sheet(self._email, file_id, tab, header_only)
+    async def read_sheet(
+        self,
+        file_id: str,
+        tab: str,
+        header_only: bool = False,
+        header_at: HeaderAt | None = None,
+    ) -> SheetTab:
+        return await self._google.read_sheet(self._email, file_id, tab, header_only, header_at)
 
     async def search_sheet_metadata(
         self, file_id: str, key: str, value: str
@@ -719,9 +733,10 @@ class DriveReader:
         row_index: int,
         key: str,
         value: str,
+        first_column: str = "A",
     ) -> str:
         return await self._google.append_sheet_row(
-            self._email, file_id, sheet_id, row, row_index, key, value
+            self._email, file_id, sheet_id, row, row_index, key, value, first_column
         )
 
     async def copy_file(
@@ -941,8 +956,16 @@ class DriveConnector:
     async def read_checked_sheet(self, grant: DriveGrant, *, header_only: bool = False) -> SheetTab:
         """The tab as it is now, refusing when its header no longer matches the columns the
         definition froze at publish (D-48). The write reads this just before appending; a
-        draft reads only row 1 (``header_only``), the header alone."""
-        sheet = await self._reader.read_sheet(grant.id, grant.tab, header_only=header_only)
+        draft reads only the header's span (``header_only``), the header alone. The header is
+        read where the grant recorded it (row 1, column A for a legacy grant)."""
+        at = (
+            HeaderAt(grant.header_row, grant.first_column or "A", len(grant.columns))
+            if grant.header_row
+            else HeaderAt()
+        )
+        sheet = await self._reader.read_sheet(
+            grant.id, grant.tab, header_only=header_only, header_at=at
+        )
         if tuple(sheet.header) != grant.columns:
             raise ConnectorError(HEADER_CHANGED_TEXT)
         return sheet
@@ -1062,6 +1085,7 @@ class DriveConnector:
             sheet.data_rows,
             SHEET_METADATA_KEY,
             sheet_marker(idem_key),
+            grant.first_column or "A",
         )
 
     async def _find_copy(self, grant: DriveGrant, idem_key: str) -> DriveFile | None:
@@ -1085,8 +1109,7 @@ class DriveConnector:
         copy = await self._find_copy(grant, idem_key)
         if copy is None:
             return None
-        sections = await self._reader.export_file(copy.id, MIME_DOC)
-        text = "\n".join(section.text for section in sections)
+        text = await self._reader.read_template_text(copy.id)
         if any(fill_sentinel(blank) in text for blank in grant.blanks):
             return None
         if set(template_blank_names(text)) & set(grant.blanks):
@@ -1117,8 +1140,7 @@ class DriveConnector:
                 DOC_APP_PROPERTY_KEY,
                 doc_marker(idem_key),
             )
-        sections = await self._reader.export_file(copy.id, MIME_DOC)
-        forms = template_blank_forms("\n".join(section.text for section in sections))
+        forms = template_blank_forms(await self._reader.read_template_text(copy.id))
         replacements: list[tuple[str, str]] = []
         for blank in payload["blanks"]:
             for form in forms.get(blank, ()):
@@ -1127,6 +1149,13 @@ class DriveConnector:
             replacements.append((fill_sentinel(blank), payload["values"].get(blank, "")))
         if replacements:
             await self._reader.fill_doc(copy.id, replacements)
+            # The fill is proved, not assumed: no blank's form or sentinel may remain in the
+            # body, a header, a footer or a footnote.
+            left = await self._reader.read_template_text(copy.id)
+            if any(fill_sentinel(blank) in left for blank in payload["blanks"]) or set(
+                template_blank_names(left)
+            ) & set(payload["blanks"]):
+                raise ConnectorError(DOC_FILL_INCOMPLETE_TEXT)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
     async def read_section(self, grant: DriveGrant, text: str | None = None) -> dict:

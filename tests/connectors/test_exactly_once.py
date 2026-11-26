@@ -543,14 +543,27 @@ async def test_a_second_drive_comment_attempt_beside_a_running_one_writes_nothin
 # --- a Drive sheet append (D-48) -------------------------------------------------------
 
 
-async def grant_append_sheet(h):
-    """Publish it-helper with the Roster sheet grant and serve its Q1 tab from the fake."""
+async def grant_append_sheet(h, at_c3: bool = False) -> list[str]:
+    """Publish it-helper with the Roster sheet grant and serve its Q1 tab from the fake:
+    the header in row 1 from column A, or (``at_c3``) under a title from column C. Returns
+    the row a bob append writes, as the new row of the tab."""
+    grant = sheet_grant_block()
+    if at_c3:
+        grant = {**grant, "header_row": 3, "first_column": "C"}
     await republish(
         h.agent_store,
         "it-helper",
-        lambda d: d["grants"].setdefault("drive", {}).update(sheets=[sheet_grant_block()]),
+        lambda d: d["grants"].setdefault("drive", {}).update(sheets=[grant]),
     )
     add_roster_sheet(h.google)
+    if not at_c3:
+        return ["bob", "people"]
+    h.google.set_sheet_rows(
+        DRIVE_SHEET,
+        SHEET_TAB,
+        [["Q1 roster"], [], ["", "", *SHEET_COLUMNS], ["", "", "alice", "engineer"]],
+    )
+    return ["", "", "bob", "people"]
 
 
 def append_spec() -> TaskSpec:
@@ -567,10 +580,12 @@ def append_spec() -> TaskSpec:
     return TaskSpec(ctx, "append_row", payload, NONCE, tool="append_row")
 
 
-async def test_a_drive_append_whose_response_was_lost_is_found_by_the_retry(dharness):
-    """Fails if the retry of a Drive append whose response was lost appends the row a second time."""
+@pytest.mark.parametrize("at_c3", [False, True], ids=["header-at-a1", "header-at-c3"])
+async def test_a_drive_append_whose_response_was_lost_is_found_by_the_retry(dharness, at_c3):
+    """Fails if the retry of a Drive append whose response was lost appends the row a second
+    time, or a header that starts at column C gets its values in the wrong columns."""
     h = dharness
-    await grant_append_sheet(h)
+    landed = await grant_append_sheet(h, at_c3)
     task_id = ids.task_id(TENANT, "drive-append-lost")
     h.google.fail_after_write("append")
     with pytest.raises(GoogleError):
@@ -579,14 +594,15 @@ async def test_a_drive_append_whose_response_was_lost_is_found_by_the_retry(dhar
     await run(h.acts.append_sheet_row, append_spec(), task_id)
 
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
-    assert len(rows) == 3 and rows[-1] == ["bob", "people"]
+    assert len(rows) == (5 if at_c3 else 3) and rows[-1] == landed
     assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
 
 
-async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing(dharness):
+@pytest.mark.parametrize("at_c3", [False, True], ids=["header-at-a1", "header-at-c3"])
+async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing(dharness, at_c3):
     """Fails if a Drive append attempt starting while another is mid-write appends a second row."""
     h = dharness
-    await grant_append_sheet(h)
+    await grant_append_sheet(h, at_c3)
     task_id = ids.task_id(TENANT, "drive-append-overlap")
     hang = h.google.hang_after_write("append")
     first = asyncio.create_task(run(h.acts.append_sheet_row, append_spec(), task_id))
@@ -600,7 +616,7 @@ async def test_a_second_drive_append_attempt_beside_a_running_one_writes_nothing
 
     assert await run(h.acts.append_sheet_row, append_spec(), task_id) == metadata_id
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
-    assert len(rows) == 3
+    assert len(rows) == (5 if at_c3 else 3)
     assert len(h.google.sheet_metadata[DRIVE_SHEET]) == 1
 
 
@@ -734,6 +750,43 @@ async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_th
     assert h.google.drive_content[new_id][0].text == "Dear Bob,\nYou are hired as engineer."
     assert len(h.google.copy_calls) == 1
     assert len(h.google.fill_calls) == 1
+
+
+async def test_a_blank_in_a_header_is_filled_and_a_lost_fill_response_still_makes_one_doc(
+    dharness,
+):
+    """Fails if a header blank is left in the new Doc, or the retry of a create whose fill
+    response was lost copies a second Doc or fills again."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_segments(DRIVE_TEMPLATE, ["Offer for {{name}}"])
+    task_id = ids.task_id(TENANT, "drive-create-header")
+    h.google.fail_after_write("fill")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_segments[new_id] == ["Offer for Bob"]
+    assert len(h.google.copy_calls) == 1
+    assert len(h.google.fill_calls) == 1
+
+
+async def test_a_create_whose_fill_leaves_a_header_blank_is_not_reported_done(dharness):
+    """Fails if a create whose fill did not reach a header blank returns the Doc as done."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_segments(DRIVE_TEMPLATE, ["Offer for {{name}}"])
+    h.google.fill_reaches_segments = False
+    task_id = ids.task_id(TENANT, "drive-create-header-left")
+
+    with pytest.raises(ApplicationError, match="still has a blank"):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_segments[new_id] == ["Offer for {{name}}"]
+    assert len(h.google.copy_calls) == 1
 
 
 # --- a Drive section replace (D-50) ------------------------------------------------------

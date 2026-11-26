@@ -281,3 +281,46 @@ async def test_an_edited_append_row_writes_the_edited_values_after_a_fresh_appro
 
     rows = h.google.sheets[DRIVE_SHEET][SHEET_TAB]["rows"]
     assert rows[-1] == expected
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["header-in-place", "header-moved"])
+async def test_the_header_is_checked_where_the_grant_recorded_it(dharness, moved):
+    """Fails if a grant recorded at C3 is checked against row 1, so a Sheet whose header is
+    still at C3 is refused, or one whose header moved down a row is still drafted."""
+    h = dharness
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: (
+            d["grants"]
+            .setdefault("drive", {})
+            .update(sheets=[{**sheet_grant_block(), "header_row": 3, "first_column": "C"}])
+        ),
+    )
+    add_roster_sheet(h.google)
+    title, blank = ["Q1 roster"], []
+    header = ["", "", "name", "role"]
+    grid = [title, blank, header, ["", "", "alice", "engineer"]]
+    h.google.set_sheet_rows(
+        DRIVE_SHEET, SHEET_TAB, [title, blank, blank, header] if moved else grid
+    )
+    h.llm.queue(
+        LLMResponse(
+            text=None,
+            tool_calls=[ToolCall("tu_1", "append_row", {"sheet": DRIVE_SHEET, "row": dict(ROW)})],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(text="Done.", tool_calls=[], stop_reason="end_turn"),
+    )
+
+    await start_stored_conversation(h, "Ev1", "add bob to the roster")
+
+    async def settled():
+        return len(h.llm.calls) >= 2 if moved else bool(cards(h))
+
+    await eventually(settled, timeout=20)
+    if moved:
+        assert HEADER_CHANGED_TEXT in json.dumps(h.llm.calls[1]["messages"])
+        assert cards(h) == []
+    else:
+        assert len(cards(h)) == 1

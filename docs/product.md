@@ -57,6 +57,7 @@ There are three product shapes in this space. **v1 is shape 2 with a shape-1 fro
 - Slack only (one Slack app installed per workspace, which is one tenant).
 - A front-door assistant plus agents built by approved creators.
 - Read connectors: Notion and Google Drive (knowledge).
+- Google Drive connects with one admin click (the organisation's own built-in Google address, shared files with it), or, for a Workspace customer who needs a real user, as the agent's own Google account: the customer creates the user, their Workspace admin allows our app, and an admin signs in once as that user on Settings (D-53).
 - **Write actions in two systems, with approval:** add an item to a Notion database (such as a request tracker) or comment on one, followed by durable follow-up until its status reaches done; and in Google Drive, comment on a file, append a row to a granted Sheet, create a Doc from a template, replace a marked section of a granted Doc, or suggest an edit to one for its owner to accept or reject.
 - Admin console: connectors, creator roles, approval policy, audit log, usage and cost.
 - Multi-tenant SaaS.

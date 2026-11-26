@@ -168,12 +168,33 @@
 {% elif view.drive is none %}
 <p class="muted">Not connected. Connecting creates this organisation's own Google account in the deployment's project. Share the folders and files your agents should use with its address — that is the whole setup.</p>
 {{ post_button(base ~ "/settings/drive/connect", ctx.csrf, "Connect Google Drive", {"request_id": new_token()}) }}
+{% if google_signin_enabled %}
+<p class="muted">Or have the agent be a user in your own Google Workspace (for example <code>it-helper@yourcompany.com</code>). Your Workspace admin creates that user and allows this app first.</p>
+{{ post_button(base ~ "/settings/drive/google/start", ctx.csrf, "Sign in as the agent's Google account") }}
+<p class="muted">Sign in as the agent's account, not as yourself.</p>
+{% endif %}
+{% else %}
+{% if view.drive.kind == "user" %}
+<p>The agent signs in to Google as the Workspace user: <code id="drive-address">{{ view.drive.service_account_email }}</code></p>
 {% else %}
 <p>Share the folders and files your agents should use with: <code id="drive-address">{{ view.drive.service_account_email }}</code></p>
+{% endif %}
 <div class="actions"><button type="button" data-copy="drive-address">Copy address</button></div>
 <p class="muted">Anything shared with this address is available to every agent creator in this workspace; an admin approves each agent before it reads it.</p>
 <p class="muted">Connected {{ view.drive.connected_at | stamp }}. Status: {{ view.drive.status }}{% if view.drive.checked_at %} (last checked {{ view.drive.checked_at | stamp }}){% endif %}.</p>
 {% if view.drive_problem %}<p class="error">{{ view.drive_problem }}</p>{% endif %}
+{% if view.drive.kind == "user" %}
+{% if google_signin_enabled %}
+{{ post_button(base ~ "/settings/drive/google/start", ctx.csrf, "Sign in again as the agent's Google account" if view.drive_reconnect else "Sign in as a different Google account") }}
+<p class="muted">Sign in as the agent's account, not as yourself.</p>
+{% endif %}
+{{ post_button(base ~ "/settings/drive/connect", ctx.csrf, "Switch back to the built-in address", {"request_id": new_token()}) }}
+<p class="muted">Switching back signs the agent out of this Google account and uses the built-in address again. Share the same files with the new address: the grants stay.</p>
+{% elif google_signin_enabled %}
+<p class="muted">To have the agent be a user in your own Google Workspace instead, create that user (for example <code>it-helper@yourcompany.com</code>), allow this app in your Workspace admin console, then sign in once as that user. Share the same files with the new address: the grants stay.</p>
+{{ post_button(base ~ "/settings/drive/google/start", ctx.csrf, "Sign in as the agent's Google account") }}
+<p class="muted">Sign in as the agent's account, not as yourself.</p>
+{% endif %}
 {% if view.drive_items is not none %}
 {% if view.drive_items %}
 <table>
@@ -188,7 +209,11 @@
 {% if view.drive_more %}<p class="muted">Showing the first 100 items shared with this address.</p>{% endif %}
 {% endif %}
 {{ post_button(base ~ "/settings/drive/disconnect", ctx.csrf, "Disconnect", {"request_id": new_token()}) }}
+{% if view.drive.kind == "user" %}
+<p class="muted">Disconnect signs the agent out of its Google account and removes this connection. Files shared with the address keep their sharing until their owners remove it.</p>
+{% else %}
 <p class="muted">Disconnect deletes the account at Google and removes this connection. Files shared with the address keep their sharing until their owners remove it.</p>
+{% endif %}
 {% endif %}
 <script src="/static/console.js" defer></script>
 {% endblock %}

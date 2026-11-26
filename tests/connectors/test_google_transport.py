@@ -4,9 +4,11 @@ error types: one adapter answers the deployment credential refresh and the API c
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 import requests
 from cryptography.hazmat.primitives import serialization
@@ -34,7 +36,13 @@ from agentos.connectors.google_iam import (
     SheetMetadata,
     SheetTab,
 )
+from agentos.credentials import GOOGLE_USER, InMemoryCredentialStore, TenantCredentials
+from agentos.drive_connections import USER, InMemoryDriveConnectionStore, user_refresh_tokens
+from agentos.google_signin import GoogleSignInConfig, HttpGoogleOAuth
+from tests.conftest import GLOBEX, TENANT
 from tests.helpers.console_harness import Clock
+from tests.helpers.google_oauth import CLIENT_ID
+from tests.helpers.keys import RefreshableKeyStore
 
 PROJECT = "test-project"
 ACCOUNT_ID = "ag-abcdefghijklmnopqrstuvwx"
@@ -1729,3 +1737,213 @@ async def test_a_read_shows_the_doc_as_it_was_before_its_pending_suggestions(
     assert [(p.text, p.start_index, p.end_index) for p in read.paragraphs] == paragraphs
     assert [(i.ids, i.text, i.start_index) for i in read.insertions] == insertions
     assert [(d.ids, d.text, d.start_index) for d in read.deletions] == deletions
+
+
+# --- the agent's own Google user (D-53) ------------------------------------------------
+
+USER_EMAIL = "it-helper@acme.test"
+USER_REFRESH = "1//refresh-token"
+
+
+def user_client_with(handler, deployment_key, clock, *, oauth=True, stored=None):
+    """A client whose Drive calls and the OAuth token endpoint share one mocked adapter.
+    ``stored`` maps an agent user's address to its stored refresh token (a dict the test may
+    change, as a disconnect does); any address missing from it has no connection."""
+    adapter = MockAdapter(handler)
+    drive_session = requests.Session()
+    drive_session.mount("https://", adapter)
+    client = RealGoogleAccounts(
+        PROJECT,
+        deployment_key,
+        session=requests.Session(),  # never used: a user's token is not minted through IAM
+        drive_session=drive_session,
+        clock=clock,
+        oauth_client_id="oauth-client" if oauth else None,
+        oauth_client_secret="oauth-secret" if oauth else None,
+    )
+    tokens = {USER_EMAIL: USER_REFRESH} if stored is None else stored
+
+    async def refresh_token_for(email: str) -> str | None:
+        return tokens.get(email)
+
+    client.use_user_tokens(refresh_token_for)
+    return client, adapter.sent
+
+
+@pytest.mark.parametrize(
+    "case", ["mints and caches", "sign-in lost", "no oauth client"], ids=["caches", "lost", "unset"]
+)
+async def test_an_agent_users_token_is_traded_from_its_refresh_token_until_google_refuses_it(
+    case, deployment_key
+):
+    """Fails if the user's access token is not traded at Google's token endpoint with its
+    refresh token and the OAuth client, is traded again before it expires or not again after,
+    a revoked sign-in (invalid_grant) is not a final reconnect_needed error, or a process with
+    no OAuth client asks the admin to sign in again instead of naming the deployment."""
+    clock = Clock()
+    clock.now = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
+
+    def handler(request):
+        if request.url.startswith(TOKEN_URI):
+            if case == "sign-in lost":
+                return reply(request, 400, {"error": "invalid_grant"})
+            return reply(request, 200, {"access_token": "user-access", "expires_in": 3600})
+        return reply(request, 200, {"files": [], "drives": []})
+
+    client, sent = user_client_with(handler, deployment_key, clock, oauth=case != "no oauth client")
+    if case != "mints and caches":
+        code, text = {
+            "sign-in lost": (
+                "reconnect_needed",
+                (
+                    "The agent's Google account needs to sign in again: an admin can do it on "
+                    "Settings."
+                ),
+            ),
+            "no oauth client": (
+                "not_configured",
+                (
+                    "Signing in as the agent's Google account is not set up on this deployment: "
+                    "ask whoever runs it to set the Google sign-in."
+                ),
+            ),
+        }[case]
+        with pytest.raises(GoogleError) as err:
+            await client.list_shared(USER_EMAIL)
+        assert err.value.code == code and str(err.value) == text
+        assert drive_errors.is_final(err.value) and not drive_errors.is_gone(err.value)
+        return
+    await client.list_shared(USER_EMAIL)
+    clock.advance(minutes=58)
+    await client.list_shared(USER_EMAIL)
+    mints = [r for r in sent if r.url.startswith(TOKEN_URI)]
+    assert len(mints) == 1
+    assert parse_qs(mints[0].body) == {
+        "grant_type": ["refresh_token"],
+        "refresh_token": [USER_REFRESH],
+        "client_id": ["oauth-client"],
+        "client_secret": ["oauth-secret"],
+    }
+    clock.advance(minutes=2)
+    await client.list_shared(USER_EMAIL)
+    assert len([r for r in sent if r.url.startswith(TOKEN_URI)]) == 2
+
+
+async def test_a_drive_read_for_an_agent_user_carries_the_users_token_not_an_iam_one(
+    deployment_key,
+):
+    """Fails if a Drive read for an agent user sends a token minted through IAM instead of
+    the one traded from the user's refresh token."""
+
+    def handler(request):
+        if request.url.startswith(TOKEN_URI):
+            return reply(request, 200, {"access_token": "user-access", "expires_in": 3600})
+        if request.path_url == MINT_PATH:
+            return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        return reply(request, 200, {"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "parents": []})
+
+    clock = Clock()
+    clock.now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    client, sent = user_client_with(handler, deployment_key, clock)
+    await DriveReader(client, USER_EMAIL).get_file("f1")
+    gets = [r for r in sent if r.path_url.startswith("/drive/v3/files/f1")]
+    assert [r.headers["Authorization"] for r in gets] == ["Bearer user-access"]
+    assert [r for r in sent if r.path_url == MINT_PATH] == []
+
+
+@pytest.mark.parametrize("change", ["disconnect", "new sign-in"], ids=["disconnect", "new-sign-in"])
+async def test_a_reader_built_before_a_change_of_connection_follows_it_on_its_next_call(
+    change, deployment_key
+):
+    """Fails if a reader built before a disconnect still reads with the access token cached
+    from the old sign-in (or falls through to impersonating a service account), or after a
+    new sign-in still sends the token minted from the old refresh token."""
+
+    def handler(request):
+        if request.url.startswith(TOKEN_URI):
+            refresh = parse_qs(request.body)["refresh_token"][0]
+            return reply(request, 200, {"access_token": f"access-{refresh}", "expires_in": 3600})
+        if request.path_url == MINT_PATH:
+            return reply(request, 200, {"accessToken": "tenant-token", "expireTime": EXPIRES})
+        return reply(request, 200, {"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "parents": []})
+
+    clock = Clock()
+    clock.now = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
+    stored = {USER_EMAIL: USER_REFRESH}
+    client, sent = user_client_with(handler, deployment_key, clock, stored=stored)
+    reader = DriveReader(client, USER_EMAIL)
+    await reader.get_file("f1")  # the access token is now cached
+    if change == "disconnect":
+        del stored[USER_EMAIL]
+        with pytest.raises(GoogleError) as err:
+            await reader.get_file("f1")
+        assert err.value.code == "reconnect_needed"
+    else:
+        stored[USER_EMAIL] = "1//renewed"
+        await reader.get_file("f1")
+    gets = [r for r in sent if r.path_url.startswith("/drive/v3/files/f1")]
+    expected = [f"Bearer access-{USER_REFRESH}"] + (
+        [] if change == "disconnect" else ["Bearer access-1//renewed"]
+    )
+    assert [r.headers["Authorization"] for r in gets] == expected
+    assert [r for r in sent if r.path_url == MINT_PATH] == []
+
+
+async def test_two_tenants_agent_users_each_read_with_their_own_stored_token(deployment_key):
+    """Fails if an address resolves to another tenant's refresh token, so one tenant's agent
+    user reads Drive with the other's sign-in, through the real store, credentials and client."""
+    keys = RefreshableKeyStore(
+        {(TENANT, 1): secrets.token_bytes(32), (GLOBEX, 1): secrets.token_bytes(32)}
+    )
+    await keys.refresh()
+    credentials = TenantCredentials(InMemoryCredentialStore(), keys)
+    drive = InMemoryDriveConnectionStore()
+    at = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
+    people = {TENANT: ("it-helper@acme.test", "1//acme"), GLOBEX: ("bot@globex.test", "1//globex")}
+    for tenant, (email, refresh) in people.items():
+        await drive.connect(tenant, email, at, kind=USER)
+        await credentials.store_with_current_key(tenant, GOOGLE_USER, refresh)
+
+    def handler(request):
+        if request.url.startswith(TOKEN_URI):
+            refresh = parse_qs(request.body)["refresh_token"][0]
+            return reply(request, 200, {"access_token": f"access-{refresh}", "expires_in": 3600})
+        return reply(request, 200, {"id": "f1", "name": "Doc", "mimeType": MIME_DOC, "parents": []})
+
+    clock = Clock()
+    clock.now = at
+    client, sent = user_client_with(handler, deployment_key, clock)
+    client.use_user_tokens(user_refresh_tokens(drive, credentials))
+    for email, _ in people.values():
+        await DriveReader(client, email).get_file("f1")
+    gets = [r for r in sent if r.path_url.startswith("/drive/v3/files/f1")]
+    assert [r.headers["Authorization"] for r in gets] == [
+        "Bearer access-1//acme",
+        "Bearer access-1//globex",
+    ]
+
+
+@pytest.mark.parametrize("outcome", ["revoked", "refused", "unreachable"])
+async def test_a_refresh_token_is_revoked_at_googles_endpoint_and_a_failure_never_raises(
+    outcome, caplog
+):
+    """Fails if revoking a sign-in does not post the token to Google's revoke endpoint, a
+    refusal or a lost connection raises into the caller, or the token reaches the log."""
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        if outcome == "unreachable":
+            raise httpx.ConnectError("down", request=request)
+        return httpx.Response(200 if outcome == "revoked" else 400, json={})
+
+    oauth = HttpGoogleOAuth(
+        GoogleSignInConfig(CLIENT_ID, "google-secret"), httpx.MockTransport(handler)
+    )
+    with caplog.at_level("WARNING"):
+        await oauth.revoke_user("1//secret-refresh")
+    assert [(r.url.path, parse_qs(r.content.decode())) for r in seen] == [
+        ("/revoke", {"token": ["1//secret-refresh"]})
+    ]
+    assert "1//secret-refresh" not in caplog.text
+    assert bool(caplog.text) == (outcome != "revoked")

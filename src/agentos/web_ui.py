@@ -48,6 +48,15 @@ from agentos.connectors.notion import normalize_id
 from agentos.control import ControlPlane, DriveLocation, Forbidden, Principal
 from agentos.control_errors import REFUSALS, page_status, status_of
 from agentos.crypto_keys import TenantKeyError
+from agentos.google_signin import (
+    GOOGLE_CALLBACK_PATH,
+    NOT_WORKSPACE,
+    GoogleSignInError,
+    NotWorkspaceAccount,
+)
+from agentos.google_signin import (
+    authorize_url as google_authorize_url,
+)
 from agentos.grant_checker import GrantCheckUnavailable, GrantProblems
 from agentos.grant_picks import GrantNotPicked
 from agentos.members import ADMIN, CREATOR, ROLES
@@ -139,7 +148,12 @@ NOTICES = {
     "notion-connected": "Notion connected.",
     "notion-disconnected": "Notion disconnected.",
     "drive-connected": "Google Drive connected. Share folders and files with the address on this page.",
+    "drive-user-connected": "Google Drive connected as the agent's Google account. Share folders "
+    "and files with the address on this page; files shared with the built-in address need "
+    "sharing again with this one.",
     "drive-disconnected": "Google Drive disconnected. The organisation's account was deleted at Google.",
+    "drive-user-disconnected": "Google Drive disconnected. The agent's Google account was signed "
+    "out; its sign-in was revoked at Google and the built-in account, if there was one, deleted.",
     "drive-picked": "Google Drive grants added to the draft.",
     "drive-removed": "Google Drive grant removed from the draft.",
     "actions-saved": "Actions saved.",
@@ -384,6 +398,7 @@ class WebUI:
         self.route("POST", version + "/test-run", self.run_tests)
         self.route("POST", agent + "/test-cases", self.case_from_feedback)
         app.add_route(NOTION_CALLBACK_PATH, self.notion_callback, methods=["GET"])
+        app.add_route(GOOGLE_CALLBACK_PATH, self.google_callback, methods=["GET"])
         self.route("POST", version + "/{action}", self.move_version)
         self.route("GET", base + "/members", self.members)
         self.route("POST", base + "/members", self.add_member)
@@ -403,6 +418,7 @@ class WebUI:
         self.route("POST", base + "/settings/notion/start", self.notion_connect_start)
         self.route("POST", base + "/settings/notion/disconnect", self.notion_disconnect)
         self.route("POST", base + "/settings/drive/connect", self.drive_connect)
+        self.route("POST", base + "/settings/drive/google/start", self.google_connect_start)
         self.route("POST", base + "/settings/drive/disconnect", self.drive_disconnect)
         self.route("POST", base + "/settings/webhook/reveal", self.webhook_reveal)
         self.route("POST", base + "/settings/webhook/confirm", self.webhook_confirm)
@@ -1827,6 +1843,7 @@ class WebUI:
             ctx=ctx,
             view=view,
             picker_enabled=self.deps.picker is not None,
+            google_signin_enabled=self.deps.google_signin is not None,
             webhook_token=webhook_token,
             error=error,
             notice=notice,
@@ -1972,8 +1989,81 @@ class WebUI:
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.base(ctx) + "/settings?done=drive-connected")
 
+    async def google_connect_start(self, request: Request, ctx: Ctx) -> Response:
+        """Begin the sign-in as the agent's Google account: the picker's state mechanism,
+        bound to this admin's console session and tenant."""
+        signin = self.deps.google_signin
+        if signin is None:
+            return _message(
+                "Not available",
+                "Signing in as the agent's Google account is not set up on this console.",
+                404,
+                ctx,
+            )
+        await ctx.plane.require_settings_admin(ctx.tenant_id, ctx.principal)
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        token = parsed[1] if parsed else ""
+        flow = Flow(ctx.tenant_id, ctx.user_id, session_hash(token), "", 0, purpose="google")
+        state = signin.sessions.begin(flow, ctx.now)
+        return _redirect(google_authorize_url(signin.config, self.deps.console.sign_in, state))
+
+    async def google_callback(self, request: Request) -> Response:
+        """Google sent the browser back from the sign-in. The state must be one this
+        session began; the account must be a Workspace user."""
+        signin = self.deps.google_signin
+        session = await self.session_of(request)
+        if signin is None or session is None:
+            return _redirect("/login")
+        now = self.deps.console.clock()
+        parsed = read_session_cookie(request.cookies.get(SESSION_COOKIE))
+        flow = signin.sessions.finish(request.query_params.get("state", ""), now)
+        mine = (
+            flow is not None
+            and parsed is not None
+            and flow.session_hash == session_hash(parsed[1])
+            and flow.tenant_id == session.tenant_id
+            and flow.user_id == session.user_id
+        )
+        if not mine or flow is None:
+            return _message("Could not sign in", "That Google sign-in is not valid.", 400)
+        back = f"/ui/{quote(flow.tenant_id, safe='')}/settings"
+        query = request.query_params
+        code = query.get("code", "")
+        if query.get("error") or not code or len(code) > 1024:
+            return _redirect(back)
+        try:
+            grant = await signin.oauth.connect_user(
+                code, signin.config.redirect_uri(self.deps.console.sign_in)
+            )
+        except NotWorkspaceAccount:
+            return _message("Not a Workspace account", NOT_WORKSPACE, 422, back=back)
+        except GoogleSignInError as err:
+            log.warning("google sign-in failed tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Google unavailable",
+                "Couldn't sign in with Google just now. Nothing was changed; try again.",
+                page_status(502),
+                back=back,
+            )
+        try:
+            await self.deps.plane.connect_drive_user(flow.tenant_id, flow.user_id, grant)
+        except Forbidden as err:
+            return _message("Not allowed", str(err), 403, back=back)
+        except ConfigError as err:
+            return _message("Not possible now", str(err), 409, back=back)
+        except TenantKeyError as err:
+            log.warning("google connect refused tenant_id=%s: %s", flow.tenant_id, err)
+            return _message(
+                "Not available",
+                "This organisation's encryption key is not available yet. Try again in a moment.",
+                503,
+                back=back,
+            )
+        return _redirect(back + "?done=drive-user-connected")
+
     async def drive_disconnect(self, request: Request, ctx: Ctx) -> Response:
         try:
+            kind = await ctx.plane.drive_connection_kind(ctx.tenant_id, ctx.user_id)
             changed = await ctx.plane.disconnect_drive(
                 ctx.tenant_id, ctx.user_id, request_id=_form_request_id(ctx)
             )
@@ -1987,7 +2077,8 @@ class WebUI:
             return await self.settings_page(
                 request, ctx, 409, "Nothing is stored to disconnect: Google Drive is not connected."
             )
-        return _redirect(self.base(ctx) + "/settings?done=drive-disconnected")
+        done = "drive-user-disconnected" if kind == "user" else "drive-disconnected"
+        return _redirect(self.base(ctx) + f"/settings?done={done}")
 
     async def webhook_reveal(self, request: Request, ctx: Ctx) -> Response:
         try:

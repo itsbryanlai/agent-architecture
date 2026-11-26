@@ -61,7 +61,7 @@ from agentos.crypto_keys import (
     start_key_refresh,
     startup_key_failure,
 )
-from agentos.drive_connections import PostgresDriveConnectionStore
+from agentos.drive_connections import PostgresDriveConnectionStore, user_refresh_tokens
 from agentos.grant_picks import PostgresGrantPickStore
 from agentos.knowledge.drive_indexing import DriveIndexActivities
 from agentos.knowledge.embedder import Embedder, OpenAICompatibleEmbedder
@@ -297,11 +297,17 @@ async def main() -> None:
         # fails at start-up, never at the first read, like the console's connect.
         try:
             google = accounts_from_settings(
-                settings.google_project_id, settings.google_service_account_key
+                settings.google_project_id,
+                settings.google_service_account_key,
+                settings.google_oauth_client_id,
+                settings.google_oauth_client_secret,
             )
         except GoogleError as err:
             raise SystemExit(str(err)) from err
         drive_connections = PostgresDriveConnectionStore(pool)
+        if google is not None:
+            # An agent user's Drive reads trade its stored refresh token (D-53).
+            google.use_user_tokens(user_refresh_tokens(drive_connections, credentials))
         price_failure = startup_price_failure(
             prices,
             settings.prices_path,

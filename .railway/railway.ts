@@ -127,6 +127,9 @@ export default defineRailway(() => {
       // Drive (D-45): the worker mints the tenant accounts' tokens with this.
       GOOGLE_PROJECT_ID: "${{shared.GOOGLE_PROJECT_ID}}",
       GOOGLE_SERVICE_ACCOUNT_KEY: "${{shared.GOOGLE_SERVICE_ACCOUNT_KEY}}",
+      // Optional (D-53): trades an agent user's stored sign-in for a Drive token.
+      GOOGLE_OAUTH_CLIENT_ID: "${{shared.GOOGLE_OAUTH_CLIENT_ID}}",
+      GOOGLE_OAUTH_CLIENT_SECRET: "${{shared.GOOGLE_OAUTH_CLIENT_SECRET}}",
     },
   });
 
@@ -200,6 +203,9 @@ export default defineRailway(() => {
       // Drive (D-45): Connect Google Drive creates the tenant's account with this.
       GOOGLE_PROJECT_ID: "${{shared.GOOGLE_PROJECT_ID}}",
       GOOGLE_SERVICE_ACCOUNT_KEY: "${{shared.GOOGLE_SERVICE_ACCOUNT_KEY}}",
+      // Optional (D-53): "Sign in as the agent's Google account" on Settings.
+      GOOGLE_OAUTH_CLIENT_ID: "${{shared.GOOGLE_OAUTH_CLIENT_ID}}",
+      GOOGLE_OAUTH_CLIENT_SECRET: "${{shared.GOOGLE_OAUTH_CLIENT_SECRET}}",
     },
   });
 

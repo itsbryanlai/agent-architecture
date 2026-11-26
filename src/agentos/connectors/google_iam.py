@@ -46,10 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
+import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import NamedTuple, Protocol
@@ -63,12 +65,21 @@ from google.oauth2 import service_account
 from agentos.connectors.notion import Hang
 from agentos.usage import utcnow
 
+log = logging.getLogger("agentos.google_iam")
+
 IAM = "https://iam.googleapis.com/v1"
 IAM_CREDENTIALS = "https://iamcredentials.googleapis.com/v1"
 DRIVE = "https://www.googleapis.com/drive/v3"
 SHEETS = "https://sheets.googleapis.com/v4"
 DOCS = "https://docs.googleapis.com/v1"
 CLOUD_PLATFORM = "https://www.googleapis.com/auth/cloud-platform"
+# The agent's own Google user (D-53): its stored refresh token is traded here for an access
+# token, and revoked here when the connection is replaced or removed.
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+OAUTH_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+# The deployment-created accounts end like this; any other address is an agent user, whose
+# connection (row and credential) is read on every call.
+SERVICE_ACCOUNT_SUFFIX = ".iam.gserviceaccount.com"
 
 # Google's native mime types. Only Docs, Sheets and Slides export to text; a folder is
 # walked, and anything else is skipped and counted by the indexer.
@@ -104,6 +115,10 @@ PROBLEM_TEXT = {
     "unavailable": "Google could not be reached. Try again.",
     "recently_deleted": "Google is still removing this workspace's previous Drive account; "
     "try Connect again in a few minutes.",
+    "reconnect_needed": "The agent's Google account needs to sign in again: an admin can do it "
+    "on Settings.",
+    "not_configured": "Signing in as the agent's Google account is not set up on this "
+    "deployment: ask whoever runs it to set the Google sign-in.",
 }
 # A Drive refusal is the tenant account's access, not the deployment account's role.
 DRIVE_REFUSED_TEXT = (
@@ -424,6 +439,12 @@ class GoogleAccounts(Protocol):
         still deletes the old account. False when it is already gone at Google (404)."""
         ...
 
+    async def revoke_user(self, email: str, refresh_token: str) -> None:
+        """Revoke the agent user's refresh token at Google and forget the access token
+        minted from it. Best effort: a refusal or a lost connection is logged by code
+        and never raised, because the caller's change must stand."""
+        ...
+
     async def list_shared(self, email: str) -> DriveListing:
         """The first 100 files shared with the account and shared drives it is a member
         of, and whether more are shared."""
@@ -644,6 +665,8 @@ class RealGoogleAccounts:
         session: AuthorizedSession | None = None,
         drive_session: requests.Session | None = None,
         clock: Callable[[], datetime] = utcnow,
+        oauth_client_id: str | None = None,
+        oauth_client_secret: str | None = None,
     ):
         try:
             info = json.loads(service_account_key)
@@ -661,12 +684,22 @@ class RealGoogleAccounts:
         self._drive_session = drive_session
         self._clock = clock
         self._tokens: dict[str, tuple[str, datetime]] = {}
+        # The agent user's refresh token for an email (D-53), None for a service account.
+        # Set once the stores exist; unset, every email is a service account.
+        self._oauth_client = (oauth_client_id, oauth_client_secret)
+        self._user_refresh_token: Callable[[str], Awaitable[str | None]] | None = None
         # The deployment session and the token cache are shared: the IAM calls (create,
         # delete, mint) serialize on this lock. Drive pages never take it.
         self._iam_lock = asyncio.Lock()
 
     def account_email(self, account_id: str) -> str:
         return f"{account_id}@{self._project}.iam.gserviceaccount.com"
+
+    def use_user_tokens(self, refresh_token_for: Callable[[str], Awaitable[str | None]]) -> None:
+        """Give the client the lookup of an agent user's refresh token by its email: the
+        token the tenant stored when an admin signed in as that user, None for an email
+        that is a service account."""
+        self._user_refresh_token = refresh_token_for
 
     def _send(
         self,
@@ -766,11 +799,29 @@ class RealGoogleAccounts:
             self._tokens.pop(email, None)
             return gone
 
-    def _token_for(self, email: str) -> str:
-        now = self._clock()
-        cached = self._tokens.get(email)
-        if cached is not None and cached[1] - TOKEN_MARGIN > now:
+    def _cached_token(self, key: str) -> str | None:
+        cached = self._tokens.get(key)
+        if cached is not None and cached[1] - TOKEN_MARGIN > self._clock():
             return cached[0]
+        return None
+
+    @staticmethod
+    def _token_key(email: str, refresh_token: str | None) -> str:
+        """The cache key: the address, plus a hash of the refresh token for an agent user,
+        so a replaced sign-in never serves the access token minted from the old one."""
+        if refresh_token is None:
+            return email
+        return f"{email}\n{hashlib.sha256(refresh_token.encode()).hexdigest()}"
+
+    def _token_for(self, email: str, refresh_token: str | None = None) -> str:
+        """A Drive access token for the account: minted for the service account, or
+        traded from the agent user's refresh token."""
+        key = self._token_key(email, refresh_token)
+        cached = self._cached_token(key)
+        if cached is not None:
+            return cached
+        if refresh_token is not None:
+            return self._mint_user_token(key, refresh_token)
         response = self._request(
             "POST",
             f"{IAM_CREDENTIALS}/projects/-/serviceAccounts/{email}:generateAccessToken",
@@ -786,9 +837,66 @@ class RealGoogleAccounts:
         self._tokens[email] = (token, expires)
         return token
 
+    def _mint_user_token(self, key: str, refresh_token: str) -> str:
+        client_id, client_secret = self._oauth_client
+        if not client_id or not client_secret:
+            # This process has no OAuth client: a deployment fault, not a lost sign-in.
+            raise GoogleError("not_configured", status=401)
+        session = self._drive_session_for_call()
+        try:
+            response = self._send(
+                session,
+                "POST",
+                OAUTH_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+            )
+        finally:
+            if self._drive_session is None:
+                session.close()
+        if response.status_code >= 400:
+            try:
+                reason = _json_object(response).get("error")
+            except GoogleError:
+                reason = None
+            if reason == "invalid_grant":
+                # Revoked, expired or the user removed: only a new sign-in helps, so the
+                # error is final (a 401 is never retried).
+                raise GoogleError("reconnect_needed", status=401)
+            raise GoogleError(_code_for(response.status_code))
+        try:
+            body = _json_object(response)
+            token = body["access_token"]
+            expires = self._clock() + timedelta(seconds=int(body["expires_in"]))
+        except (KeyError, ValueError, TypeError) as err:
+            raise GoogleError("unavailable") from err
+        self._tokens[key] = (token, expires)
+        return token
+
+    async def revoke_user(self, email: str, refresh_token: str) -> None:
+        def call() -> None:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session, "POST", OAUTH_REVOKE_URL, data={"token": refresh_token}
+                )
+                if response.status_code >= 400:
+                    log.warning("google user token not revoked status=%s", response.status_code)
+            except GoogleError as err:
+                log.warning("google user token not revoked code=%s", err.code)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        self._tokens.pop(self._token_key(email, refresh_token), None)
+        await asyncio.to_thread(call)
+
     async def list_shared(self, email: str) -> DriveListing:
-        async with self._iam_lock:
-            token = await asyncio.to_thread(self._token_for, email)
+        token = await self._drive_token(email)
 
         def call() -> DriveListing:
             session = self._drive_session if self._drive_session is not None else requests.Session()
@@ -869,6 +977,16 @@ class RealGoogleAccounts:
     # them for retry; a 404/403 is the tenant account's lost access to the file.
 
     async def _drive_token(self, email: str) -> str:
+        if self._user_refresh_token is not None and not email.endswith(SERVICE_ACCOUNT_SUFFIX):
+            # An agent user (D-53): the connection (row and credential) gates every token,
+            # before the cache, so a disconnect or a switch in any process takes effect on
+            # this process's next call, even for a reader built earlier. A row with no
+            # credential never falls through to impersonating a service account. The read
+            # is a store read, outside the IAM lock.
+            refresh = await self._user_refresh_token(email)
+            if refresh is None:
+                raise GoogleError("reconnect_needed", status=401)
+            return await asyncio.to_thread(self._token_for, email, refresh)
         async with self._iam_lock:
             return await asyncio.to_thread(self._token_for, email)
 
@@ -2384,6 +2502,8 @@ class FakeGoogleAccounts:
         self.created: list[str] = []
         self.create_calls: list[str] = []
         self.delete_calls: list[str] = []
+        # The (email, refresh token) of every revoke of an agent user's sign-in (D-53).
+        self.revoke_calls: list[tuple[str, str]] = []
         self._fail_after_write = {
             "create": 0,
             "delete": 0,
@@ -2393,6 +2513,7 @@ class FakeGoogleAccounts:
             "fill": 0,
             "replace": 0,
             "suggest": 0,
+            "revoke": 0,
         }
         self._hang_after_write: dict[str, list[Hang]] = {
             "create": [],
@@ -2484,8 +2605,8 @@ class FakeGoogleAccounts:
 
     def fail_after_write(self, kind: str = "create", times: int = 1) -> None:
         """The next ``times`` writes of ``kind`` ("create", "delete", "comment", "append",
-        "copy", "fill", "replace" or "suggest") take effect and then raise, as when the response is
-        lost."""
+        "copy", "fill", "replace", "suggest" or "revoke") take effect and then raise, as
+        when the response is lost."""
         self._fail_after_write[kind] = times
 
     def hang_after_write(self, kind: str = "create") -> Hang:
@@ -2548,6 +2669,10 @@ class FakeGoogleAccounts:
         del self.accounts[account_id]
         await self._after_write("delete")
         return True
+
+    async def revoke_user(self, email: str, refresh_token: str) -> None:
+        self.revoke_calls.append((email, refresh_token))
+        await self._after_write("revoke")
 
     async def _after_write(self, kind: str) -> None:
         if self._fail_after_write[kind]:
@@ -3215,11 +3340,21 @@ class FakeGoogleAccounts:
 
 
 def accounts_from_settings(
-    project_id: str | None, service_account_key: str | None
+    project_id: str | None,
+    service_account_key: str | None,
+    oauth_client_id: str | None = None,
+    oauth_client_secret: str | None = None,
 ) -> RealGoogleAccounts | None:
     """The deployment's Google client, or None when either setting is unset: Drive is
     then not set up on this deployment. A malformed key raises ``GoogleError`` here,
-    at start-up, never at the first click."""
+    at start-up, never at the first click. The OAuth client (D-53) lets the client trade
+    an agent user's refresh token for an access token; without it only service accounts
+    work."""
     if not project_id or not service_account_key:
         return None
-    return RealGoogleAccounts(project_id, service_account_key)
+    return RealGoogleAccounts(
+        project_id,
+        service_account_key,
+        oauth_client_id=oauth_client_id,
+        oauth_client_secret=oauth_client_secret,
+    )

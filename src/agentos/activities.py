@@ -100,7 +100,13 @@ from agentos.audience_pauses import InMemoryPauseStore, PauseStore
 from agentos.audit import AuditStore, agent_identity, canonical_sha256
 from agentos.budgets import SPEND_UNKNOWN, BudgetGuard, stop_text, unpriced_stop_text
 from agentos.budgets import STOP_REASON as BUDGET_STOP_REASON
-from agentos.config import AGENT_ID_PATTERN, AgentVersion, Settings, embed_max_distance
+from agentos.config import (
+    AGENT_ID_PATTERN,
+    AgentVersion,
+    Settings,
+    effective_actions,
+    embed_max_distance,
+)
 from agentos.connectors.base import Connector, ConnectorError, Entry
 from agentos.connectors.drive import (
     SECTION_SHAPE_CHANGED_TEXT,
@@ -112,9 +118,11 @@ from agentos.connectors.google_iam import GoogleAccounts
 from agentos.connectors.manifest import (
     MANIFEST_DIR,
     TOOLS,
+    action_label,
     load_manifest,
     require_idempotency,
     screen,
+    selectable_action_names,
 )
 from agentos.connectors.notion import normalize_id, nudge_comment_text
 from agentos.connectors.registry import connector_for, error_classes
@@ -233,6 +241,9 @@ log = logging.getLogger("agentos.activities")
 MAX_LISTED_ITEMS = 20
 HAND_OFF_TOOL = "hand_off"
 MY_TASKS_TOOL = "my_tasks"
+# The actions an agent's creator chooses (D-52), and the writes among them.
+SELECTABLE = selectable_action_names()
+WRITE_ACTIONS = frozenset(name for name in SELECTABLE if TOOLS[name].is_write)
 # Immutable versions (published, superseded) are kept per (tenant, agent, version). A
 # worker holds the versions its running turns use, and few of them; drafts are read fresh.
 VERSION_CACHE_SIZE = 256
@@ -1113,14 +1124,19 @@ class AgentActivities:
             if stopped is not None:
                 return stopped
         messages = prepare_for_model(await self.history.load_window(ctx.tenant_id, conversation_id))
+        # An action is offered only when the agent's creator chose it (D-52) and the grant it
+        # needs is there; a version with no ``actions`` list offers what its grants allow.
+        actions = effective_actions(agent)
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
         if agent.grants.drive:
             # The Drive tools join only an agent that was granted Drive folders or files;
             # the grant check before a write reads the same grants.
             tools = tools + self._connector_for(ctx.tenant_id, agent, DRIVE).tools_for_llm()
-        if agent.grants.notion_databases or agent.grants.drive:
-            # Only an agent with a write grant (a Notion database or a Drive scope) starts
-            # tasks, so only it has any to list.
+        tools = [t for t in tools if t["name"] in actions or t["name"] not in SELECTABLE]
+        offers_write = any(t["name"] in WRITE_ACTIONS for t in tools)
+        if (agent.grants.notion_databases or agent.grants.drive) and offers_write:
+            # Only an agent with a write grant (a Notion database or a Drive scope) that is
+            # offered a write action starts tasks, so only it has any to list.
             tools = tools + [TOOLS[MY_TASKS_TOOL].llm_definition()]
         # Every agent has the Notion read tools, whose output is page text people wrote.
         system = f"{agent.system_prompt}\n\n{ITEM_RULES}"
@@ -1240,6 +1256,7 @@ class AgentActivities:
         """
         self._log("call_model", ctx.tenant_id, ctx.agent_id)
         refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        agent = await self._pinned(ctx)
         step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
         if step is None:
             resp = await self._model_response(ctx, conversation_id, refusal)
@@ -1257,7 +1274,7 @@ class AgentActivities:
                 )
         return StepResult(
             stop_reason=step.stop_reason,
-            tool_calls=[_call_ref(block) for block in uses],
+            tool_calls=[_call_ref(block, effective_actions(agent)) for block in uses],
             has_text=_has_text(step),
         )
 
@@ -1705,6 +1722,11 @@ class AgentActivities:
         elif refusal is not None:
             # A connector switch: the refusal names the connector the tool reads through.
             text, is_error = str(refusal), True
+        elif call.name in SELECTABLE and call.name not in effective_actions(
+            pinned if pinned is not None else await self._agent(ctx.tenant_id, ctx.agent_id)
+        ):
+            # An action its creator did not choose (D-52): no connector is called.
+            text, is_error = action_not_chosen_text(call.name), True
         elif call.name == "search_knowledge":
             text, is_error, citations = await self._search_knowledge(
                 ctx, call, first_marker, pinned
@@ -3719,6 +3741,9 @@ class AgentActivities:
             line = agent_unavailable_text(agent.name)
         elif not (await self._audience_decision(ctx, agent)).allowed:
             line = no_longer_act_text(agent.name)
+        elif _spec_tool(spec) in SELECTABLE and _spec_tool(spec) not in effective_actions(agent):
+            # The agent's current version no longer has this action (D-52).
+            line = action_not_chosen_text(_spec_tool(spec))
         else:
             return None
         if spec.tool_name in ("add_comment", "nudge"):
@@ -3807,10 +3832,22 @@ def _has_text(step: StoredStep) -> bool:
     return any(b.get("type") == "text" and str(b.get("text", "")).strip() for b in step.content)
 
 
-def _call_ref(block: dict) -> ToolCallRef:
-    """What the workflow may know about a tool call: never its input, only values derived from it."""
+def action_not_chosen_text(tool: str) -> str:
+    """What the model reads when it calls an action its agent was not set up for (D-52)."""
+    label = action_label(tool)
+    return f"This agent isn't set up to {label[:1].lower()}{label[1:]}."
+
+
+def _call_ref(block: dict, actions: frozenset[str] | None = None) -> ToolCallRef:
+    """What the workflow may know about a tool call: never its input, only values derived from it.
+
+    ``actions`` are the agent's effective actions: a call to an action outside them carries
+    the problem the model reads, so it is refused like input that does not fit (D-52).
+    """
     name, tool_input = block.get("name", ""), block.get("input")
     kind, problem = screen(name, tool_input)
+    if actions is not None and name in SELECTABLE and name not in actions:
+        problem = action_not_chosen_text(name)
     target = tool_input.get("agent") if isinstance(tool_input, dict) else None
     return ToolCallRef(
         id=block["id"],

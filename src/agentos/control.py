@@ -180,6 +180,7 @@ from agentos.config import (
     TenantsConfig,
     agent_definition,
     channel_audience_problems,
+    effective_actions,
     read_secret,
 )
 from agentos.connectors.drive import (
@@ -1010,8 +1011,13 @@ class ControlPlane:
         definition: dict[str, Any],
         request_id: str | None = None,
     ) -> AgentVersionRecord:
-        """Create an agent as version 1, a draft, with the actor as its creator."""
+        """Create an agent as version 1, a draft, with the actor as its creator.
+
+        A definition with no ``actions`` starts with none: nothing is on until the creator
+        chooses it (D-52).
+        """
         await self._require_role(tenant_id, actor, ADMIN, CREATOR)
+        definition = {"actions": [], **definition}
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.create_agent(
                 tenant_id, agent_id, definition, actor, conn=conn
@@ -1063,6 +1069,19 @@ class ControlPlane:
                 await self._test_sets.copy_cases(
                     tenant_id, agent_id, source, record.version, conn=conn
                 )
+            if record.agent().actions is None:
+                # A copy of a version that predates actions: it gets the explicit list of what
+                # that version offers, so editing never drops an ability silently (D-52).
+                record = await self._agents.replace_draft(
+                    tenant_id,
+                    agent_id,
+                    record.version,
+                    {
+                        **record.definition,
+                        "actions": sorted(effective_actions(record.agent())),
+                    },
+                    conn=conn,
+                )
             await self._record(
                 "agent_draft", tenant_id, actor, version=record, request_id=request_id, conn=conn
             )
@@ -1081,6 +1100,33 @@ class ControlPlane:
         async with self._uow.begin(tenant_id) as conn:
             record = await self._agents.replace_draft(
                 tenant_id, agent_id, version, definition, conn=conn
+            )
+            await self._record(
+                "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn
+            )
+        return record
+
+    async def set_draft_actions(
+        self,
+        tenant_id: str,
+        actor: str,
+        agent_id: str,
+        version: int,
+        actions: list[str],
+        request_id: str | None = None,
+    ) -> AgentVersionRecord:
+        """Set which actions a draft may use, leaving the rest of its definition as it is."""
+        await self._require_editor(tenant_id, actor, agent_id)
+        async with self._uow.begin(tenant_id) as conn:
+            current = await self._agents.get_version(tenant_id, agent_id, version, conn=conn)
+            if current is None:
+                raise AgentStoreError(f"agent '{agent_id}' has no version {version}")
+            record = await self._agents.replace_draft(
+                tenant_id,
+                agent_id,
+                version,
+                {**current.definition, "actions": sorted(set(actions))},
+                conn=conn,
             )
             await self._record(
                 "agent_edit", tenant_id, actor, version=record, request_id=request_id, conn=conn

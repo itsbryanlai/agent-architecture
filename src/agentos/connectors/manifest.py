@@ -59,6 +59,16 @@ class ToolSpec:
     # action may carry it; loading refuses the flag on anything else.
     low_risk: bool = False
     connector: str = ""  # the manifest's connector; empty for a spec built outside one
+    # Set on an action an agent's creator may switch on or off (D-52): a short phrase that
+    # completes "This agent may ...". A tool with no label is never a choice (a knowledge
+    # search follows the grants; the task list follows the write actions).
+    label: str = ""
+    service: str = ""  # the manifest's service name, shown beside its actions
+    # The kind of grant the action works on (see ``agentos.actions_view.grant_kinds``) and
+    # how to say it, so the console can tell a creator who ticked an action that its grant
+    # is missing. Empty for a tool with no grant of its own.
+    needs: str = ""
+    needs_text: str = ""
 
     @property
     def is_write(self) -> bool:
@@ -113,6 +123,10 @@ def load_manifest(path: str | Path) -> Manifest:
             offer_to_llm=bool(spec.get("offer_to_llm", True)),
             low_risk=low_risk,
             connector=connector,
+            label=str(spec.get("label", "")).strip(),
+            needs=str(spec.get("needs", "")).strip(),
+            needs_text=str(spec.get("needs_text", "")).strip(),
+            service=str(raw.get("service", "")).strip(),
         )
     return Manifest(connector=connector, tools=tools)
 
@@ -191,6 +205,30 @@ def screen(name: str, tool_input: object) -> tuple[str, str]:
 def low_risk_actions() -> list[str]:
     """The actions an admin may turn requester approval off for (D-43), by name."""
     return sorted(name for name, spec in TOOLS.items() if spec.low_risk)
+
+
+def selectable_actions() -> dict[str, list[ToolSpec]]:
+    """The actions an agent's creator chooses from (D-52), by service name, from the manifests.
+
+    An action is a tool offered to the model that carries a ``label``. A new connector's
+    manifest adds its rows here and nowhere else.
+    """
+    found: dict[str, list[ToolSpec]] = {}
+    for spec in TOOLS.values():
+        if spec.offer_to_llm and spec.label:
+            found.setdefault(spec.service or spec.connector, []).append(spec)
+    return found
+
+
+def selectable_action_names() -> frozenset[str]:
+    """Every selectable action's tool name."""
+    return frozenset(s.name for specs in selectable_actions().values() for s in specs)
+
+
+def action_label(name: str) -> str:
+    """The phrase for a selectable action, or the tool name for any other."""
+    spec = TOOLS.get(name)
+    return spec.label if spec is not None and spec.label else name
 
 
 def require_idempotency(method: str) -> None:

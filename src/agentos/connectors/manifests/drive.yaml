@@ -7,8 +7,12 @@
 # (D-50). A Drive write always asks the requester's approval: no tool carries low_risk
 # (maintainer, 2026-11-21 / 2026-11-19).
 connector: drive
+service: Google Drive
 tools:
   comment_on_file:
+    label: Comment on Drive files
+    needs: drive_item
+    needs_text: a Drive folder or file
     risk: write_reversible
     idempotency: marker_text
     description: >-
@@ -26,6 +30,9 @@ tools:
       required: [file, comment]
 
   append_row:
+    label: Add rows to a Sheet
+    needs: sheet
+    needs_text: a Sheet
     risk: write_irreversible
     idempotency: developer_metadata
     description: >-
@@ -46,6 +53,9 @@ tools:
       required: [sheet, row]
 
   create_doc_from_template:
+    label: Create Docs from a template
+    needs: template
+    needs_text: a template
     risk: write_irreversible
     idempotency: app_properties
     description: >-
@@ -70,6 +80,9 @@ tools:
       required: [template, title, values]
 
   replace_section:
+    label: Replace a section of a Doc
+    needs: section
+    needs_text: a section
     risk: write_irreversible
     idempotency: revision
     description: >-

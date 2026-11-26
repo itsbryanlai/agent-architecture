@@ -27,6 +27,8 @@ from typing import Any
 
 import yaml
 
+from agentos.connectors.manifest import selectable_action_names
+
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_QWEN_MODEL = "qwen3.7-plus"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
@@ -528,6 +530,17 @@ class AgentVersion:
     # How many writes (each an approval card) one model reply may start; the rest of its
     # write calls get an error result.
     max_writes_per_turn: int = DEFAULT_MAX_WRITES_PER_TURN
+    # The actions (manifest tools of a service) the agent may use (D-52). None means the
+    # definition has no ``actions`` key: a version written before actions were a choice,
+    # which offers every action its grants allow. Published versions never change, so such
+    # a version keeps this. ``effective_actions`` is the one reading of it.
+    actions: frozenset[str] | None = None
+
+
+def effective_actions(agent: AgentVersion) -> frozenset[str]:
+    """The actions the agent may use: its own list, or every selectable action for a version
+    that has none (D-52). Offering, enforcement, the access diff and the console read this."""
+    return selectable_action_names() if agent.actions is None else agent.actions
 
 
 @dataclass
@@ -623,6 +636,7 @@ _AGENT_KEYS = frozenset(
         "specialists",
         "audience",
         "team",
+        "actions",
     }
 )
 _GRANT_KEYS = frozenset({"notion", "drive"})
@@ -980,6 +994,7 @@ def parse_agent(agent_id: str, raw: dict[str, Any], version: int | None = None) 
         audience=_parse_audience(where, raw.get("audience")),
         team=_parse_team(where, raw.get("team")),
         max_writes_per_turn=_parse_max_writes(where, raw.get("max_writes_per_turn")),
+        actions=_parse_actions(where, raw.get("actions")),
     )
 
 
@@ -1032,6 +1047,8 @@ def agent_definition(agent: AgentVersion) -> dict[str, Any]:
     }
     if agent.audience is not None:
         definition["audience"] = _audience_definition(agent.audience)
+    if agent.actions is not None:
+        definition["actions"] = sorted(agent.actions)
     if agent.grants.drive:
         definition["grants"]["drive"] = {
             f"{kind}s": [_drive_grant_entry(g) for g in agent.grants.drive if g.kind == kind]
@@ -1145,6 +1162,24 @@ def channel_audience_problems(
 
 
 MAX_TEAM_LENGTH = 64
+
+
+def _parse_actions(where: str, raw: Any) -> frozenset[str] | None:
+    """The ``actions`` list (D-52), or None when the definition has none (a legacy version)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: 'actions' must be a list of action names")
+    known = selectable_action_names()
+    for name in raw:
+        if not isinstance(name, str) or name not in known:
+            raise ConfigError(
+                f"{where}: {name!r} is not an action an agent can be given "
+                f"(choose from: {', '.join(sorted(known))})"
+            )
+    if len(set(raw)) != len(raw):
+        raise ConfigError(f"{where}: 'actions' lists an action more than once")
+    return frozenset(raw)
 
 
 def _parse_max_writes(where: str, raw: Any) -> int:

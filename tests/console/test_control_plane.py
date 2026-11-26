@@ -10,6 +10,7 @@ from agentos.agent_store import (
     InMemoryAgentStore,
 )
 from agentos.audit import InMemoryAuditStore, canonical_sha256
+from agentos.connectors.manifest import selectable_action_names
 from agentos.control import ControlPlane, Forbidden
 from agentos.credentials import InMemoryCredentialStore, TenantCredentials
 from agentos.grant_checker import NotionGrantChecker
@@ -170,6 +171,7 @@ async def test_draft_edit_submit_and_withdraw_are_for_the_agents_creator_or_an_a
         await plane.submit_version(TENANT, actor, "it-helper", 1)
         await plane.withdraw_version(TENANT, actor, "it-helper", 1)
         await plane.new_draft(TENANT, actor, "it-helper", from_version=1)
+        await plane.set_draft_actions(TENANT, actor, "it-helper", 1, ["create_item"])
 
     if allowed:
         await attempt()
@@ -178,6 +180,7 @@ async def test_draft_edit_submit_and_withdraw_are_for_the_agents_creator_or_an_a
         await refused(plane.edit_draft(TENANT, actor, "it-helper", 1, changed))
         await refused(plane.submit_version(TENANT, actor, "it-helper", 1))
         await refused(plane.new_draft(TENANT, actor, "it-helper", from_version=1))
+        await refused(plane.set_draft_actions(TENANT, actor, "it-helper", 1, ["create_item"]))
         assert [v.status for v in await agents.versions(TENANT, "it-helper")] == ["draft"]
 
 
@@ -355,7 +358,7 @@ async def lifecycle():
     """Every control-plane action once, in order: the audit store, the definition used, and
     the ``(kind, events it wrote)`` of each step."""
     plane, _, _, audit = await make_plane()
-    definition = helper_block()
+    definition = {"actions": [], **helper_block()}  # a new agent starts with no actions
     steps = [
         ("agent_create", plane.add_agent(TENANT, OWNER, "it-helper", definition)),
         ("agent_submit", plane.submit_version(TENANT, OWNER, "it-helper", 1)),
@@ -439,3 +442,28 @@ async def test_a_refused_or_failed_action_writes_no_event():
     with pytest.raises(AgentStoreError):
         await plane.submit_version(TENANT, ROOT, "nope", 1)
     assert audit.events == []
+
+
+@pytest.mark.parametrize(
+    ("published", "expected"),
+    [
+        (None, []),
+        ({}, sorted(selectable_action_names())),
+        ({"actions": ["search_items"]}, ["search_items"]),
+    ],
+    ids=["a new agent", "a draft of a legacy version", "a draft of a version with actions"],
+)
+async def test_a_draft_starts_with_the_actions_its_source_offers(published, expected):
+    """Fails if a new agent starts with any action on, or a draft copied from a version written
+    before actions existed starts with fewer than that version offered (an edit would then drop
+    an ability silently), or a copy changes a list the version already has."""
+    plane, agents, *_ = await make_plane()
+    if published is None:
+        record = await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    else:
+        first = await agents.create_agent(TENANT, "it-helper", helper_block() | published, OWNER)
+        await agents.submit(TENANT, "it-helper", first.version, OWNER)
+        await agents.publish(TENANT, "it-helper", first.version, ROOT)
+        record = await plane.new_draft(TENANT, OWNER, "it-helper")
+
+    assert record.definition["actions"] == expected

@@ -719,6 +719,24 @@ async def test_the_audit_view_shows_actors_agents_approvers_and_hashes_only(h):
     assert helper_block()["system_prompt"] not in page
 
 
+async def test_ticking_actions_on_a_draft_saves_them_and_the_page_shows_them_checked(h):
+    """Fails if the actions a creator ticks are not saved on the draft, the page does not show
+    them checked after reload, or it does not say that a ticked Sheet action has no Sheet."""
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    c = await h.signed_in(OWNER)
+    async with using(c):
+        token = await csrf_token(c)
+        saved = await post(
+            c, f"{VERSION}/actions", token, action=["create_item", "append_row"], request_id="r1"
+        )
+        page = (await c.get(VERSION)).text
+
+    assert saved.status_code == 303
+    assert 'value="create_item" checked' in page and 'value="append_row" checked' in page
+    assert 'value="search_items" checked' not in page
+    assert "Add rows to a Sheet needs a Sheet granted below." in page
+
+
 # --- forms: CSRF and origin ---------------------------------------------------------
 
 
@@ -737,6 +755,7 @@ FORM_ROUTES = [
     ("settings/webhook/clear", {}),
     ("agents/it-helper/versions/1/test-cases", {"question": "q"}),
     ("agents/it-helper/versions/1/test-run", {}),
+    ("agents/it-helper/versions/1/actions", {"action": "create_item"}),
     ("agents/it-helper/versions/1/drive/pick/choose", {"pick_0": "yes"}),
     ("agents/it-helper/versions/1/drive/remove", {"grant_id": "drive-folder-0001"}),
     ("agents/it-helper/test-cases", {"conversation_id": "c1", "question_seq": "1"}),

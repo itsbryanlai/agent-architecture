@@ -288,3 +288,28 @@ def test_the_assignee_and_nudge_fields_round_trip():
     assert (grant.assignee_prop, grant.assignee_prop_id) == ("Assignee", "asg1")
     assert (agent.follow_up.nudge, agent.follow_up.max_nudges) == (False, 5)
     assert parse_agent("it-helper", agent_definition(agent), 1) == agent
+
+
+@pytest.mark.parametrize(
+    ("actions", "expected"),
+    [
+        (["my_tasks"], "is not an action"),
+        (["no_such_action"], "is not an action"),
+        (["append_row", "append_row"], "more than once"),
+        ("append_row", "must be a list"),
+        (["create_item", "append_row"], None),
+        ([], None),
+    ],
+)
+def test_an_actions_list_is_checked_and_a_missing_one_is_legacy(actions, expected):
+    """Fails if an unknown, non-selectable or repeated action is accepted, a valid list is
+    refused or lost on the way to the definition, or a missing key reads as 'no actions'."""
+    if expected is not None:
+        with pytest.raises(ConfigError, match=expected):
+            parse_agent("it-helper", _helper(actions=actions), 1)
+        return
+    agent = parse_agent("it-helper", _helper(actions=actions), 1)
+    assert agent.actions == frozenset(actions)
+    assert parse_agent("it-helper", agent_definition(agent), 1) == agent
+    legacy = parse_agent("it-helper", _helper(), 1)
+    assert legacy.actions is None and "actions" not in agent_definition(legacy)

@@ -37,6 +37,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from agentos import ids
 from agentos.access_diff import WideningNotAcknowledged
+from agentos.actions_view import action_hints, action_sections
 from agentos.agent_feedback import FEEDBACK_DAYS
 from agentos.agent_store import PENDING, AgentNotFound, VersionChanged
 from agentos.audience import AudienceError, AudienceNotConfirmed
@@ -105,6 +106,7 @@ description: What this agent is for.
 system_prompt: |
   You are a helpful agent.
 max_steps: 8
+actions: []
 grants:
   notion:
     databases: []
@@ -140,6 +142,7 @@ NOTICES = {
     "drive-disconnected": "Google Drive disconnected. The organisation's account was deleted at Google.",
     "drive-picked": "Google Drive grants added to the draft.",
     "drive-removed": "Google Drive grant removed from the draft.",
+    "actions-saved": "Actions saved.",
     "webhook-confirmed": "Webhook token confirmed. Signed events are accepted.",
     "webhook-cleared": "Webhook token cleared. A new handshake is accepted.",
     "case-added": "Test case added to the draft. Choose its expected behaviour.",
@@ -360,6 +363,7 @@ class WebUI:
         self.route("POST", agent + "/drafts", self.new_draft)
         self.route("GET", version, self.version)
         self.route("POST", version + "/edit", self.edit_draft)
+        self.route("POST", version + "/actions", self.set_actions)
         self.route("POST", version + "/check-grants", self.check_grants)
         self.route("POST", version + "/pick/start", self.pick_start)
         self.route("GET", version + "/pick", self.pick_page)
@@ -924,6 +928,8 @@ class WebUI:
             review=review,
             grant_rows=grant_rows(record.agent(), review, creator_access),
             drive_grants=record.agent().grants.drive,
+            action_sections=action_sections(record.agent()),
+            action_hints=action_hints(record.agent()),
             drive_configured=drive_configured,
             drive_connected=drive_connected,
             widens=bool(review and review.diff and review.diff.widens),
@@ -969,6 +975,24 @@ class WebUI:
 
             return await self.failure(request, ctx, err, rerender=again)
         return _redirect(self.version_url(ctx, agent_id, version, "saved"))
+
+    async def set_actions(self, request: Request, ctx: Ctx, agent_id: str, version: int):
+        try:
+            await ctx.plane.set_draft_actions(
+                ctx.tenant_id,
+                ctx.user_id,
+                agent_id,
+                version,
+                ctx.getlist("action"),
+                request_id=_form_request_id(ctx),
+            )
+        except REFUSALS as err:
+
+            async def again(status: int, message: str) -> Response:
+                return await self.version_page(request, ctx, agent_id, version, status, message)
+
+            return await self.failure(request, ctx, err, rerender=again)
+        return _redirect(self.version_url(ctx, agent_id, version, "actions-saved"))
 
     # --- test sets --------------------------------------------------------------------
 

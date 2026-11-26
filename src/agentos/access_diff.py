@@ -16,7 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from agentos.audience import EffectiveAudience
-from agentos.config import AgentVersion, Grants
+from agentos.config import AgentVersion, Grants, effective_actions
+from agentos.connectors.manifest import selectable_actions
 from agentos.connectors.notion import normalize_id
 
 
@@ -100,7 +101,7 @@ def diff_access(
     baseline = old is not None and old_audience is not None
     if old is None or old_audience is None:
         # Nothing published: everything the version grants and every place it answers is new.
-        old = replace(new, grants=Grants())
+        old = replace(new, grants=Grants(), actions=frozenset())
         old_audience = EffectiveAudience(True, (), False, (), False)
     changes: list[AccessChange] = []
     before, after = _grants(old), _grants(new)
@@ -120,6 +121,16 @@ def diff_access(
     for nid, (kind, label, _) in before.items():
         if nid not in after:
             changes.append(AccessChange("removed", f"{kind} grant '{label}' ({nid})", False))
+
+    # Compared as effective actions, so a legacy version and an explicit list equal to what
+    # it offered show no change (D-52).
+    old_actions, new_actions = effective_actions(old), effective_actions(new)
+    for service, specs in selectable_actions().items():
+        for spec in specs:
+            if spec.name in new_actions and spec.name not in old_actions:
+                changes.append(AccessChange("added", f"action {service}: {spec.label}", True))
+            elif spec.name in old_actions and spec.name not in new_actions:
+                changes.append(AccessChange("removed", f"action {service}: {spec.label}", False))
 
     for channel in sorted(set(new_audience.channels) - set(old_audience.channels)):
         changes.append(AccessChange("added", f"channel {channel}", True))

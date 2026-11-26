@@ -15,6 +15,7 @@ import pytest
 from agentos.access_diff import WideningNotAcknowledged, diff_access
 from agentos.audience import EffectiveAudience
 from agentos.config import DriveGrant, NotionPageGrant
+from agentos.connectors.manifest import selectable_action_names
 from agentos.connectors.notion import normalize_id
 from agentos.control_api import create_app
 from agentos.creator_access import (
@@ -168,6 +169,9 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
         ("none", replace(BASE, dm_user_groups=("S123",)), True),
         ("none", replace(BASE, guests=True), True),
         ("none", replace(BASE, any_unmapped_channel=True), True),
+        ("add_action", BASE, True),
+        ("remove_action", BASE, False),
+        ("legacy_equals_explicit_list", BASE, False),
         ("remove_database", BASE, False),
         ("relabel", BASE, False),
         ("none", replace(BASE, channels=()), False),
@@ -177,8 +181,9 @@ BASE = EffectiveAudience(True, ("C111",), False, (), False)
 def test_which_changes_widen_access(grant_change, audience, widens):
     """Fails if a new grant (a Drive folder, sheet, template or section included), other
     properties (a sheet's tab, a template's folder or a section's heading included), a new
-    channel, wider direct messages or guests do not count as widening, or if a removal, a
-    relabel or no change does."""
+    channel, wider direct messages or guests, or a newly chosen action, do not count as
+    widening, or if a removal, a removed action, a relabel, no change, or a legacy version
+    against an explicit list equal to what it offered does."""
     old = parse_agents_config(agents_dict()).agents["it-helper"]
     new = copy.deepcopy(old)
     if grant_change == "add_page":
@@ -242,6 +247,12 @@ def test_which_changes_widen_access(grant_change, audience, widens):
                 DRIVE_SECTION, "VPN guide", "section", doc_id=DRIVE_SECTION, heading="Overview"
             )
         )
+    elif grant_change == "add_action":
+        old.actions, new.actions = frozenset(), frozenset({"create_item"})
+    elif grant_change == "remove_action":
+        old.actions, new.actions = frozenset({"create_item"}), frozenset()
+    elif grant_change == "legacy_equals_explicit_list":
+        new.actions = selectable_action_names()
     elif grant_change == "other_properties":
         new.grants.notion_databases[0].status_prop_id = "other-status"
     elif grant_change == "remove_database":

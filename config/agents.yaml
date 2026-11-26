@@ -8,6 +8,7 @@ agents:
       You help employees with IT requests. Answer from the IT requests database and cite page links.
       When someone wants something done, use create_item; it will ask them to approve.
     max_steps: 6
+    actions: [add_comment, create_item, my_items, search_items]
     grants:
       notion:
         databases:

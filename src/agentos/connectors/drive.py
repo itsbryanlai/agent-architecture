@@ -57,6 +57,7 @@ from agentos.connectors.google_iam import (
     DriveSection,
     GoogleAccounts,
     GoogleError,
+    HeaderAt,
     SheetMetadata,
     SheetTab,
     utf16_len,
@@ -376,8 +377,14 @@ class DriveReader:
     async def create_comment(self, file_id: str, content: str) -> str:
         return await self._google.create_comment(self._email, file_id, content)
 
-    async def read_sheet(self, file_id: str, tab: str, header_only: bool = False) -> SheetTab:
-        return await self._google.read_sheet(self._email, file_id, tab, header_only)
+    async def read_sheet(
+        self,
+        file_id: str,
+        tab: str,
+        header_only: bool = False,
+        header_at: HeaderAt | None = None,
+    ) -> SheetTab:
+        return await self._google.read_sheet(self._email, file_id, tab, header_only, header_at)
 
     async def search_sheet_metadata(
         self, file_id: str, key: str, value: str
@@ -392,9 +399,10 @@ class DriveReader:
         row_index: int,
         key: str,
         value: str,
+        first_column: str = "A",
     ) -> str:
         return await self._google.append_sheet_row(
-            self._email, file_id, sheet_id, row, row_index, key, value
+            self._email, file_id, sheet_id, row, row_index, key, value, first_column
         )
 
     async def copy_file(
@@ -630,8 +638,16 @@ class DriveConnector:
     async def read_checked_sheet(self, grant: DriveGrant, *, header_only: bool = False) -> SheetTab:
         """The tab as it is now, refusing when its header no longer matches the columns the
         definition froze at publish (D-48). The write reads this just before appending; a
-        draft reads only row 1 (``header_only``), the header alone."""
-        sheet = await self._reader.read_sheet(grant.id, grant.tab, header_only=header_only)
+        draft reads only the header's span (``header_only``), the header alone. The header is
+        read where the grant recorded it (row 1, column A for a legacy grant)."""
+        at = (
+            HeaderAt(grant.header_row, grant.first_column or "A", len(grant.columns))
+            if grant.header_row
+            else HeaderAt()
+        )
+        sheet = await self._reader.read_sheet(
+            grant.id, grant.tab, header_only=header_only, header_at=at
+        )
         if tuple(sheet.header) != grant.columns:
             raise ConnectorError(HEADER_CHANGED_TEXT)
         return sheet
@@ -751,6 +767,7 @@ class DriveConnector:
             sheet.data_rows,
             SHEET_METADATA_KEY,
             sheet_marker(idem_key),
+            grant.first_column or "A",
         )
 
     async def _find_copy(self, grant: DriveGrant, idem_key: str) -> DriveFile | None:

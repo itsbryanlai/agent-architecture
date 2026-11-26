@@ -1166,7 +1166,7 @@ class ControlPlane:
                     drive_block = definition.get("grants", {}).get("drive", {})
                     for entry in drive_block.get("sheets", []):
                         if columns is not None and entry["id"] in columns:
-                            entry["columns"] = columns[entry["id"]]
+                            entry.update(columns[entry["id"]])
                     for entry in drive_block.get("templates", []):
                         if template_reads is not None and entry["id"] in template_reads:
                             entry.update(template_reads[entry["id"]])
@@ -1181,9 +1181,11 @@ class ControlPlane:
 
     async def _sheet_columns(
         self, tenant_id: str, agent_id: str, version: int
-    ) -> dict[str, list[str]] | None:
-        """Each granted sheet's live header row by sheet ID, or None when there is nothing
-        to read (no sheet grant, or not a draft).
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each granted sheet's live header by sheet ID — its columns and where they start
+        (``header_row``, ``first_column``) — or None when there is nothing to read (no sheet
+        grant, or not a draft). The header is the first row in the tab's first 20 rows with
+        two or more non-empty cells, wherever it starts (D-48).
 
         Refuses when Drive is not set up or connected, or a sheet's header cannot be read,
         does not fit the card and the Edit form, or repeats a column name (D-48). The write
@@ -1202,7 +1204,7 @@ class ControlPlane:
         if row is None:
             raise ConfigError("Google Drive is not connected for this organisation")
         reader = DriveReader(self._google, row.service_account_email)
-        columns: dict[str, list[str]] = {}
+        columns: dict[str, dict[str, Any]] = {}
         for grant in sheets:
             try:
                 tab = await reader.read_sheet(grant.id, grant.tab, header_only=True)
@@ -1217,7 +1219,8 @@ class ControlPlane:
                 )
             if any(not name.strip() for name in header):
                 raise ConfigError(
-                    f"the header row of sheet '{grant.name}' has an empty column name"
+                    f"The header row of '{grant.tab}' in '{grant.name}' has an empty column; "
+                    "give every column a name"
                 )
             duplicates = [name for i, name in enumerate(header) if name in header[:i]]
             if duplicates:
@@ -1232,7 +1235,11 @@ class ControlPlane:
                     f"a column name of sheet '{grant.name}' is longer than "
                     f"{MAX_COLUMN_NAME} characters"
                 )
-            columns[grant.id] = header
+            columns[grant.id] = {
+                "columns": header,
+                "header_row": tab.header_row,
+                "first_column": tab.first_column,
+            }
         return columns
 
     async def _template_reads(

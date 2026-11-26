@@ -29,6 +29,7 @@ import copy
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from agentos.models import LLMResponse, ToolCall, Usage
@@ -377,12 +378,17 @@ def _openai_usage(resp) -> Usage:
 class ScriptedLLMClient:
     """Test fake: returns queued responses in order and records every call.
 
-    A queued exception instance is raised instead of returned.
+    A queued exception instance is raised instead of returned. ``run_after`` runs a hook
+    once the nth call has returned, to change the world between two calls of one turn.
     """
 
     def __init__(self, responses: list[LLMResponse | Exception] | None = None):
         self.responses: list[LLMResponse | Exception] = list(responses or [])
         self.calls: list[dict] = []
+        self._after: dict[int, Callable[[], Awaitable[None]]] = {}
+
+    def run_after(self, call_number: int, hook: Callable[[], Awaitable[None]]) -> None:
+        self._after[call_number] = hook
 
     def queue(self, *responses: LLMResponse | Exception) -> None:
         self.responses.extend(responses)
@@ -394,6 +400,9 @@ class ScriptedLLMClient:
         if not self.responses:
             raise RuntimeError("ScriptedLLMClient has no more responses queued")
         item = self.responses.pop(0)
+        hook = self._after.pop(len(self.calls), None)
+        if hook is not None:
+            await hook()
         if isinstance(item, Exception):
             raise item
         return item

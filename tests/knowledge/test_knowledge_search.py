@@ -2,12 +2,15 @@
 
 import logging
 import re
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 from temporalio.client import ScheduleOverlapPolicy, WorkflowExecutionStatus
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
+from agentos.budgets import BudgetGuard
 from agentos.config import parse_agents_config
 from agentos.connectors.notion import text_block
 from agentos.index_knowledge import apply_schedules
@@ -16,6 +19,7 @@ from agentos.models import (
     Citation,
     InboundMessage,
 )
+from agentos.switches import AGENT
 from agentos.workflows.conversation import ConversationWorkflow
 from tests.conftest import (
     ALICE,
@@ -43,7 +47,10 @@ from tests.helpers.knowledge import (
     tool_turn,
     turn_ctx,
 )
+from tests.helpers.llm_errors import StatusError
 from tests.helpers.replay_support import suggest_continue_as_new_after
+
+SWITCHED_AT = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
 
 
 async def test_search_tool_offered_only_with_page_grants(kharness):
@@ -281,6 +288,52 @@ async def test_an_answer_that_searched_but_cited_nothing_is_asked_once_more(
 
     assert h.slack.updates()[0]["text"].startswith(shown)
     assert len(h.llm.calls) == model_calls
+
+
+@pytest.mark.parametrize(
+    ("retry", "before_retry"),
+    [
+        (tool_turn(call("tu_2", "reset your vpn password")), None),
+        (StatusError(400), None),
+        (None, "budget"),
+        (None, "off"),
+    ],
+    ids=[
+        "the retry returns only a tool call",
+        "the retry fails with a client error",
+        "the retry hits the budget stop",
+        "the retry hits the switch-off",
+    ],
+)
+async def test_a_retry_that_gives_no_answer_keeps_the_first_answer(kharness, retry, before_retry):
+    """Fails if a retry that fails, is refused or has no text replaces the first answer."""
+    h = kharness
+    await index_both(h)
+    h.acts.budgets = BudgetGuard(h.budgets, h.usage_store, ttl_seconds=0)
+
+    async def refuse_the_agent():
+        if before_retry == "budget":
+            await h.budgets.set_budget(TENANT, "it-helper", Decimal(0), "root")
+        else:
+            await h.switches.switch_off(TENANT, AGENT, "it-helper", "U_ADMIN", SWITCHED_AT)
+
+    h.llm.queue(tool_turn(call("tu_1", "reset your vpn password")), answer("Try the guidebook."))
+    if retry is not None:
+        h.llm.queue(retry)
+    else:
+        h.llm.run_after(2, refuse_the_agent)
+    await converse_stored(h, "it-helper", "1700000000.000330", "how do I reset my VPN password?")
+    await eventually(lambda: len(h.slack.updates()) >= 1)
+    # A later turn's reply is the settle point: nothing else was posted for the first.
+    h.llm.queue(answer("sentinel"))
+    await converse_stored(h, "plain", "1700000000.000331", "hello")
+    await eventually(lambda: len(h.slack.updates()) >= 2)
+
+    title, url = (await h.knowledge.page_meta(TENANT, [SCOPE_A], [plain(ROOT_A)]))[plain(ROOT_A)]
+    assert [u["text"] for u in h.slack.updates()] == [
+        f"Try the guidebook.\n\nSearched: <{url}|{title}>",
+        "sentinel",
+    ]
 
 
 async def test_the_retry_is_shown_the_first_answer_and_the_instruction_but_history_keeps_neither(

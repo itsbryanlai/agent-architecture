@@ -78,7 +78,12 @@ from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from agentos import ids
-    from agentos.activities import HAND_OFF_TOOL, MY_TASKS_TOOL, AgentActivities
+    from agentos.activities import (
+        FIXED_STOP_REASONS,
+        HAND_OFF_TOOL,
+        MY_TASKS_TOOL,
+        AgentActivities,
+    )
     from agentos.audience import (
         UNAVAILABLE,
         AudienceDecision,
@@ -586,16 +591,29 @@ class ConversationWorkflow:
                         ctx, state, conv_id, key, cut_off, step, agent.max_steps
                     ):
                         # The answer drew on the searched pages without citing one: ask
-                        # once more. The second answer is final whatever it contains.
+                        # once more. The second answer is final when it has text. A retry
+                        # that fails, is refused (budget, spend unknown, switched off) or has
+                        # no text keeps the first answer, which is shown as it was.
                         state.cite_retried = True
                         first_key, key = key, f"{key}:cite"
-                        outcome = await workflow.execute_activity_method(
-                            AgentActivities.retry_model_for_citations,
-                            args=[ctx, conv_id, first_key, key],
-                            start_to_close_timeout=LLM_TIMEOUT,
-                            retry_policy=RETRY,
-                        )
-                        cut_off = outcome.stop_reason == MAX_TOKENS_STOP
+                        try:
+                            second: StepResult | None = await workflow.execute_activity_method(
+                                AgentActivities.retry_model_for_citations,
+                                args=[ctx, conv_id, first_key, key],
+                                start_to_close_timeout=LLM_TIMEOUT,
+                                retry_policy=RETRY,
+                            )
+                        except ActivityError:
+                            second = None
+                        if (
+                            second is None
+                            or second.stop_reason in FIXED_STOP_REASONS
+                            or not second.has_text
+                        ):
+                            key = first_key
+                        else:
+                            outcome = second
+                            cut_off = outcome.stop_reason == MAX_TOKENS_STOP
                     await self._reply_stored(
                         ctx, state, placeholder_ts, key, cut_off and outcome.has_text
                     )

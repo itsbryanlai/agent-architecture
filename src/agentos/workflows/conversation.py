@@ -90,6 +90,7 @@ with workflow.unsafe.imports_passed_through():
         decision_text,
     )
     from agentos.config import AgentVersion
+    from agentos.connectors.manifest import TOOLS
     from agentos.knowledge.search import SEARCH_RESULTS
     from agentos.models import (
         CUT_SHORT,
@@ -179,6 +180,8 @@ PATCH_MY_TASKS = "my-tasks"
 PATCH_MY_TASKS_ONCE = "my-tasks-once-per-turn"
 # One more model call when a turn that searched answered without citing a passage.
 PATCH_CITATION_RETRY = "citation-retry"
+# A read's placeholder names the tool's connector service; before, every read said Notion.
+PATCH_READ_LABEL = "read-label-connector"
 EMPTY_MESSAGE_REPLY = "What would you like to ask?"
 
 _T = TypeVar("_T")
@@ -192,6 +195,8 @@ PROGRESS_GAP = timedelta(seconds=3)
 # the runtime already knows, never from the model or a tool's input.
 SEARCHING_SOURCES = "Searching the knowledge sources…"
 READING_NOTION = "Reading Notion…"
+READING = "Reading {service}…"
+READING_ANY = "Reading…"
 DRAFTING_REQUEST = "Drafting the request…"
 HANDING_OVER = "Handing over to {agent}…"
 CHECKING_REQUESTS = "Checking your requests…"
@@ -203,13 +208,15 @@ def progress_label(
     *,
     source_titles: list[str] | None = None,
     agent_name: str = "",
+    service: str | None = None,
 ) -> str | None:
     """The placeholder text while ``name`` runs, or None for a tool with no label.
 
     ``source_titles`` are the agent's granted knowledge pages, ``agent_name`` the specialist a
-    hand-off names. Each is escaped for Slack mrkdwn here, once, at the point of use. A Notion
-    read shows the fixed "Reading Notion…": the runtime never knows the page title before the
-    read returns, and the label must not wait on it.
+    hand-off names. Each is escaped for Slack mrkdwn here, once, at the point of use. A read
+    names the tool's connector service (the manifest's ``service``), "Reading…" when it has
+    none; ``service=None`` is the label before connectors were named, "Reading Notion…". The
+    runtime never knows the page title before a read returns, and the label must not wait on it.
     """
     if name == "search_knowledge":
         titles = source_titles or []
@@ -221,7 +228,9 @@ def progress_label(
     if name == MY_TASKS_TOOL:
         return CHECKING_REQUESTS
     if kind == READ_KIND:
-        return READING_NOTION
+        if service is None:
+            return READING_NOTION
+        return READING.format(service=escape_slack(service)) if service else READING_ANY
     if kind in EDITABLE_FIELDS:
         return DRAFTING_REQUEST
     return None
@@ -1226,8 +1235,15 @@ class ConversationWorkflow:
                 )
             return ToolResult(call.id, HAND_OFF_EXTRA, is_error=True)
         kind = self._kind(call)
+        service = None
+        if kind == READ_KIND and workflow.patched(PATCH_READ_LABEL):
+            spec = TOOLS.get(call.name)
+            service = spec.service if spec is not None else ""
         label = progress_label(
-            call.name, kind, source_titles=[g.name for g in agent.grants.notion_pages]
+            call.name,
+            kind,
+            source_titles=[g.name for g in agent.grants.notion_pages],
+            service=service,
         )
         return await self._with_progress(
             ctx, state, label, self._run_call(ctx, state, agent, conv_id, call, kind, first_marker)

@@ -358,11 +358,13 @@ When a workspace removes the app, Slack sends `app_uninstalled` (and
 `tokens_revoked` for its bot tokens). The gateway handles both for the
 workspace's tenant, taken from the signed event's `team_id`: in one unit of
 work it **disables the tenant**, **deletes its `slack_bot` credential** and
-its Drive connection row, and records one `uninstall` audit event (the event
+its Drive connection row (and, for a connection to the agent's own Google
+user, its `google_user` credential, revoked at Google best effort), and
+records one `uninstall` audit event (the event
 type in `tool`, the team ID in `target`, never a token). The tenant's Google
 service account is deleted at Google under the same tenant lock, best effort:
 a refusal is logged with the tenant ID and never blocks the uninstall, and the
-delete is tried even when no Drive row is stored (D-45). The
+delete is tried even when no Drive row is stored (D-45, D-53). The
 **Notion credential is kept**, with the rest of
 the tenant's data, under normal retention. A retry of an event already
 handled changes nothing, even after a reinstall (its audit key is checked
@@ -393,11 +395,13 @@ effect without reinstalling the app into each workspace. The uninstall flow
 needs migration `037` (the `uninstall` audit kind); a new install gets it
 from `scripts/init_db.sql`.
 
-## Google Drive (one service account per tenant)
+## Google Drive (a service account per tenant, or the agent as a Workspace user)
 
 Drive connects with one Google service account per tenant, created
 automatically in the deployment's Google Cloud project when an admin clicks
-**Connect Google Drive** on the settings page (D-45). Whatever that account
+**Connect Google Drive** on the settings page (D-45), or, for a customer who
+needs the agent to be a real user in their Workspace, as that user (D-53,
+below). Whatever that account
 can see is the tenant's: isolation is by identity, there is no sharer-matching
 rule. The customer's whole setup is that one click plus sharing folders and
 files with the account's address — no Google Cloud console steps, no keys to
@@ -430,6 +434,58 @@ With either variable unset, Drive is simply not set up on that deployment:
 the settings page says so and offers no button. A malformed key stops the
 console or gateway at start-up with a plain message.
 
+**The agent as a user in the customer's Workspace (D-53).** A customer who
+needs the agent to be a real user (`it-helper@customer.com`: no shared drive,
+external sharing blocked, a robot author name) connects Drive that way instead
+of with the built-in account. Two settings, shared variables like the others,
+turn the button on for every tenant at once:
+
+- `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` — one OAuth client
+  for all tenants. Set on the console and the worker; unset, the settings page
+  offers only the built-in account. A worker without them cannot trade a
+  stored sign-in: its Drive reads for an agent user fail with "Signing in as
+  the agent's Google account is not set up on this deployment"
+  (`not_configured`), not with a request to sign in again. The secret is never logged and never
+  appears in a repr. Set only one of the two and the console stops at start-up
+  with a plain message.
+
+Google Cloud setup (once per deployment, in the same project):
+
+1. Enable the **Google Drive API** (and the Sheets and Docs APIs) on the
+   project, as above.
+2. On the OAuth consent screen choose **Internal** (the hosting company's own
+   Google organisation) and add the scopes `openid`, `email` and
+   `https://www.googleapis.com/auth/drive`. Moving to **External** later is a
+   change of settings, not of code, but the Drive scope is restricted: Google
+   verifies the app and requires a security assessment before an External
+   client may serve other organisations.
+3. Create an OAuth client of type **Web application** and add the redirect URI
+   `<AGENTOS_CONSOLE_URL>/auth/google/callback`. Put its ID and secret in the
+   two shared variables.
+
+The customer's side is two steps of their own: their Workspace admin creates
+the Google user and allows our app (client ID above) in the Admin console's
+API controls, then a console admin presses **Sign in as the agent's Google
+account** on Settings and signs in once as that user, not as themselves. An
+account with no Workspace (a personal Gmail) is refused: "Sign in with an
+account in your organisation's Google Workspace. Without Workspace, keep the
+agent's built-in Google address." The user's refresh token is stored encrypted
+per tenant (the `google_user` credential, migration `043`); the connection
+row's kind is `user` and its email column holds the user's address. A user
+address belongs to one tenant (a second tenant's attempt is refused in plain
+words and its sign-in revoked). Reconnecting as the same address replaces the
+stored token, records a `drive_connect` event again and revokes the old token.
+The connection gates every call: a disconnect or switch takes effect on the
+next Drive call in every process. Files shared with the built-in address must be
+shared again with the user's address; grants are file IDs and survive. If
+Google stops accepting the sign-in (the user was removed or the token
+revoked) the settings page says "The agent's Google account needs to sign in
+again: an admin can do it on Settings." and offers the sign-in button again;
+reads are not retried meanwhile. **Switch back to the built-in address**
+deletes and revokes the stored sign-in and uses the service account kept at
+Google; **Disconnect** removes the connection, the stored sign-in (revoked,
+best effort) and that service account.
+
 **Limits.** A project holds about **100 service accounts by default** — one
 per connected tenant. Raise the quota on request to Google, or add projects,
 before the product outgrows it; the account ID is deterministic from the
@@ -438,7 +494,9 @@ lists at most the **first 100 items** shared with the address (files and
 shared drives together) and says so when more are shared. Service accounts
 created after 2025-04-15 cannot own Drive files: create-from-template (D-49)
 works only in Workspace shared drives. Disconnect deletes
-the account at Google and the row; files shared with the address keep their
+the account at Google and the row (for the agent as a Workspace user: the row,
+the stored sign-in revoked at Google, and the service account kept from
+before, if any); files shared with the address keep their
 sharing until their owners remove it. A reconnect right after a disconnect
 can be refused with "Google is still removing this workspace's previous
 Drive account; try Connect again in a few minutes" — Google's IAM API is
@@ -494,7 +552,8 @@ Commenter or above on the file (or its folder / shared drive); a view-only
 share is refused and the task reports it could not comment. The Drive
 connector switch and the writes switch (Console → Switches) stop the write
 while off. The minted token now carries the full `drive` scope (reads
-included); no re-consent is needed — the accounts are service accounts.
+included); no re-consent is needed for the service accounts (the agent as a
+Workspace user signs in with the `drive` scope from the start).
 
 **Drive writes (append a row, D-48).** An agent granted a Sheet is offered
 `append_row`: it drafts a row for one named tab of that Sheet, and nothing is
@@ -1298,6 +1357,7 @@ reference syntax; `POSTGRES_PASSWORD` references the shared
 | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` | console | secrets; sign-in needs both, plus `AGENTOS_CONSOLE_URL` |
 | `AGENTOS_CONSOLE_URL` | console | `https://${{RAILWAY_PUBLIC_DOMAIN}}`: the exact public base URL; the Host and Origin allowlists are built from it |
 | `NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET` | console | secrets, optional (the grant picker) |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | console, worker | secrets, optional, both or neither (sign in as the agent's Google account, D-53; the worker trades the stored sign-in with them) |
 | `OLLAMA_MODELS` | ollama | `/data/models` |
 | `RAILWAY_RUN_UID` | temporal | `0`: the only service that runs as root (see below) |
 

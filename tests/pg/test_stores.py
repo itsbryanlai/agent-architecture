@@ -13,6 +13,8 @@ import pytest
 from psycopg import errors
 
 from agentos.audience_pauses import PostgresPauseStore
+from agentos.credentials import PostgresCredentialStore
+from agentos.drive_connections import SERVICE_ACCOUNT, USER, PostgresDriveConnectionStore
 from agentos.knowledge.store import PostgresKnowledgeStore
 from agentos.models import AuditEvent
 from agentos.sessions import PostgresSessionStore
@@ -140,3 +142,41 @@ async def test_a_switch_for_an_agent_needs_a_target_and_a_pause_needs_a_known_re
         await PostgresSwitchStore(pool).switch_off(tenant, "agent", "", "u", NOW)
     with pytest.raises(errors.CheckViolation):
         await PostgresPauseStore(pool).open_pause(tenant, "aa", "C1", "someone_asked", NOW)
+
+
+@pytest.mark.parametrize("case", ["legacy row", "unknown kind", "same address, two tenants"])
+async def test_the_drive_connections_kind_column_defaults_and_refuses(
+    pool, tenant: str, other_tenant: str, case: str
+):
+    """Fails if a row inserted without a kind (as every row before migration 043) reads as
+    anything but a service account, the database accepts a kind outside the two, or two
+    tenants may both connect the same agent user."""
+    store = PostgresDriveConnectionStore(pool)
+    at = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)
+    if case == "legacy row":
+        async with tenant_transaction(pool, tenant) as conn:
+            await conn.execute(
+                "INSERT INTO drive_connections "
+                "(tenant_id, service_account_email, status, connected_at) "
+                "VALUES (%s, 'ag-x@test-project.iam.gserviceaccount.com', 'connected', now())",
+                (tenant,),
+            )
+        assert (await store.get(tenant)).kind == SERVICE_ACCOUNT
+    elif case == "unknown kind":
+        await store.connect(tenant, "a@acme.test", at)
+        with pytest.raises(errors.CheckViolation):
+            async with tenant_transaction(pool, tenant) as conn:
+                await conn.execute("UPDATE drive_connections SET kind = 'robot'")
+    else:
+        await store.connect(tenant, "shared-user@acme.test", at, kind=USER)
+        with pytest.raises(errors.UniqueViolation):
+            await store.connect(other_tenant, "SHARED-user@acme.test", at, kind=USER)
+
+
+@pytest.mark.parametrize("kind", ["google-user", "googleuser", "notion_creator:lower"])
+async def test_the_database_refuses_a_credential_kind_the_code_does_not_store(
+    pool, tenant: str, kind: str
+):
+    """Fails if migration 043 widened the credential kind check beyond the one new kind."""
+    with pytest.raises(errors.CheckViolation):
+        await PostgresCredentialStore(pool).put(tenant, kind, b"\x01x", 1)

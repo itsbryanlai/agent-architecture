@@ -42,6 +42,8 @@ from agentos.tenants import require_tenant_secret
 
 SLACK_BOT = "slack_bot"
 NOTION = "notion"
+# The agent's own Google user (D-53): the OAuth refresh token an admin signed in with.
+GOOGLE_USER = "google_user"
 NOTION_CREATOR_PREFIX = "notion_creator:"
 # The user-ID class of the kind CHECK (migration 038): a Slack user ID, upper-case
 # letters, digits and underscores, 1 to 64 of them. The store boundary refuses an ID
@@ -212,7 +214,7 @@ class TenantCredentials:
 
         The rows themselves stay; the next resolve reads them and decrypts again.
         """
-        for kind in (SLACK_BOT, NOTION):
+        for kind in (SLACK_BOT, NOTION, GOOGLE_USER):
             self._cache.pop((tenant_id, kind), None)
         for key in [
             k for k in self._cache if k[0] == tenant_id and k[1].startswith(NOTION_CREATOR_PREFIX)
@@ -245,6 +247,12 @@ class TenantCredentials:
     async def notion_connected(self, tenant_id: str) -> bool:
         """Whether the tenant has a stored Notion credential. Reads no token value."""
         return await self._store.get(tenant_id, NOTION) is not None
+
+    async def google_user_token(self, tenant_id: str) -> str | None:
+        """The agent's Google user refresh token, or None when the tenant uses the
+        deployment-created service account. A row that cannot be decrypted raises
+        ``ConfigError`` naming the tenant and key version, never a value."""
+        return await self._resolve_kind(tenant_id, GOOGLE_USER)
 
     async def creator_notion_token(self, tenant_id: str, user_id: str) -> str | None:
         """The creator's kept Notion sign-in, or None when they never consented.

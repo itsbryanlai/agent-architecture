@@ -36,7 +36,7 @@ def sheet_definition() -> dict:
 def serve_sheet(google: FakeGoogleAccounts, header: list[str]) -> None:
     google.add_drive_folder(FOLDER, "Team folder")
     google.add_drive_file(DRIVE_SHEET, "Roster", MIME_SHEET, FOLDER, [])
-    google.add_sheet_tab(DRIVE_SHEET, SHEET_TAB, header, [["alice", "engineer"]])
+    google.add_sheet_tab(DRIVE_SHEET, SHEET_TAB, header, [["alice", "engineer"]] if header else [])
 
 
 @pytest.mark.parametrize(
@@ -102,3 +102,38 @@ async def test_submit_reads_the_sheets_header_once_and_stores_the_columns(case):
         record = await h.agents.get_version(TENANT, "it-helper", 1)
         assert record.status == "draft"
         assert record.agent().grants.drive[0].columns == ()
+
+
+@pytest.mark.parametrize(
+    ("grid", "expected"),
+    [
+        ([["name", "role"], ["alice", "eng"]], (("name", "role"), 1, "A")),
+        (
+            [["Q1 roster"], [], ["", "", "name", "role", "team"], ["", "", "alice"]],
+            (("name", "role", "team"), 3, "C"),
+        ),
+        ([["", "name", "", "role"]], "has an empty column; give every column a name"),
+        ([["only title"], [], ["", "one"]], "has no header row"),
+        ([[] for _ in range(20)] + [["name", "role"]], "has no header row"),
+    ],
+    ids=["row-one", "title-above-column-c", "inner-blank", "single-cells", "beyond-row-20"],
+)
+async def test_submit_finds_the_header_wherever_it_starts_and_records_where(grid, expected):
+    """Fails if submit misses a header below a title or right of column A, accepts a header
+    with an empty column, looks past the first 20 rows, or forgets where the header starts."""
+    h, _drive, google = sheet_harness()
+    await h.seed_members()
+    await h.plane.connect_drive(TENANT, ROOT)
+    serve_sheet(google, [])
+    google.set_sheet_rows(DRIVE_SHEET, SHEET_TAB, grid)
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", sheet_definition())
+
+    if isinstance(expected, str):
+        with pytest.raises(ConfigError) as err:
+            await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+        assert expected in str(err.value)
+        return
+    await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    [sheet] = record.agent().grants.drive
+    assert (sheet.columns, sheet.header_row, sheet.first_column) == expected

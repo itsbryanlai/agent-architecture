@@ -416,7 +416,9 @@ class DriveGrant:
 
     A ``sheet`` is a file the agent may also append a row to: ``tab`` names the tab and
     ``columns`` is its header row, read once when the version is submitted and frozen
-    into the definition. The write refuses when the live header no longer matches.
+    into the definition, with ``header_row`` (1-based) and ``first_column`` (A1 letter)
+    where that header starts; a legacy grant without them means row 1, column A. The
+    write refuses when the live header at that place no longer matches.
 
     A ``template`` is a granted Doc the agent may copy into a new Doc: ``id`` is the
     template's file ID, ``folder_id`` the shared-drive folder new Docs land in,
@@ -443,6 +445,8 @@ class DriveGrant:
     kind: str = "folder"
     tab: str = ""
     columns: tuple[str, ...] = ()
+    header_row: int = 0
+    first_column: str = ""
     folder_id: str = ""
     blanks: tuple[str, ...] = ()
     drive_id: str = ""
@@ -662,7 +666,8 @@ _DATABASE_KEYS = frozenset({"id", "name", "properties", "property_ids"})
 _PAGE_KEYS = frozenset({"id", "name"})
 _DRIVE_KEYS = frozenset({"folders", "files", "shared_drives", "sheets", "templates", "sections"})
 _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
-_DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns"})
+_DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns", "header_row", "first_column"})
+_COLUMN_LETTER = re.compile(r"[A-Z]{1,3}")
 _DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks", "drive_id"})
 _DRIVE_SECTION_KEYS = frozenset({"id", "name", "doc_id", "heading"})
 DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template", "section")
@@ -838,12 +843,22 @@ def _parse_drive_sheet(agent_id: str, raw: dict[str, Any], index: int = 0) -> Dr
         if any(len(c) > MAX_COLUMN_NAME for c in columns_raw):
             raise ConfigError(f"{where}: a column name may be at most {MAX_COLUMN_NAME} characters")
         columns = tuple(columns_raw)
+    header_row = raw.get("header_row", 0)
+    if isinstance(header_row, bool) or not isinstance(header_row, int) or header_row < 0:
+        raise ConfigError(f"{where}: 'header_row' must be a row number")
+    first_column = raw.get("first_column", "")
+    if not isinstance(first_column, str) or (
+        first_column and not _COLUMN_LETTER.fullmatch(first_column)
+    ):
+        raise ConfigError(f"{where}: 'first_column' must be a column letter such as C")
     return DriveGrant(
         id=grant_id,
         name=_text(where, "name", _require(raw, "name", where)),
         kind="sheet",
         tab=_text(where, "tab", _require(raw, "tab", where)),
         columns=columns,
+        header_row=header_row,
+        first_column=first_column,
     )
 
 
@@ -1085,6 +1100,10 @@ def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
         entry["tab"] = grant.tab
         if grant.columns:
             entry["columns"] = list(grant.columns)
+        if grant.header_row:
+            entry["header_row"] = grant.header_row
+        if grant.first_column:
+            entry["first_column"] = grant.first_column
     if grant.kind == "template":
         entry["folder_id"] = grant.folder_id
         if grant.blanks:

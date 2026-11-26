@@ -28,6 +28,7 @@ from agentos.connectors.google_iam import (
     DriveFile,
     DriveSection,
     GoogleError,
+    HeaderAt,
     RealGoogleAccounts,
     SheetMetadata,
     SheetTab,
@@ -867,10 +868,14 @@ async def test_comments_create_and_list_page_with_the_tenant_token_and_map_refus
 # --- the Sheet append write surface (D-48) -----------------------------------------------
 
 
-async def test_append_sends_one_atomic_batchupdate_with_the_row_and_its_metadata(deployment_key):
+@pytest.mark.parametrize(("first_column", "padding"), [("A", 0), ("C", 2)], ids=["a", "c"])
+async def test_append_sends_one_atomic_batchupdate_with_the_row_and_its_metadata(
+    deployment_key, first_column, padding
+):
     """Fails if the append is not one batchUpdate carrying appendCells and
     createDeveloperMetadata on the appended row, with the tenant's token, or the created
-    metadata's ID is not returned."""
+    metadata's ID is not returned, or a header starting in column C gets no empty cells
+    before the row's values."""
 
     def handler(request):
         minted = _mint(request)
@@ -891,7 +896,7 @@ async def test_append_sends_one_atomic_batchupdate_with_the_row_and_its_metadata
 
     client, sent = client_with(handler, deployment_key)
     made = await client.append_sheet_row(
-        EMAIL, "f1", 42, ["bob", "people"], 2, "agentos-write", "hash"
+        EMAIL, "f1", 42, ["bob", "people"], 2, "agentos-write", "hash", first_column
     )
 
     assert made == "7"
@@ -906,7 +911,8 @@ async def test_append_sends_one_atomic_batchupdate_with_the_row_and_its_metadata
             "sheetId": 42,
             "rows": [
                 {
-                    "values": [
+                    "values": [{}] * padding
+                    + [
                         {"userEnteredValue": {"stringValue": "bob"}},
                         {"userEnteredValue": {"stringValue": "people"}},
                     ]
@@ -979,12 +985,15 @@ async def test_metadata_search_posts_the_key_and_value_and_maps_matches(deployme
 
 
 @pytest.mark.parametrize(
-    "case", ["tab", "header only", "missing tab"], ids=["tab", "header-only", "missing-tab"]
+    "case",
+    ["tab", "header only", "recorded place", "missing tab"],
+    ids=["tab", "header-only", "recorded-place", "missing-tab"],
 )
 async def test_read_sheet_returns_the_tabs_id_header_and_data_row_count(deployment_key, case):
     """Fails if the header read asks for every tab instead of the granted one (ranges), asks
-    for more than row 1 on a header check, drops the tab's ID, header or data-row count, or a
-    missing tab reads as anything but a refusal."""
+    for more than the first 20 rows on a scan or more than the recorded span on a check,
+    drops the tab's ID, header or data-row count, or a missing tab reads as anything but a
+    refusal."""
     header_row = {"values": [{"formattedValue": "name"}, {"formattedValue": "role"}]}
     data_row = {"values": [{"formattedValue": "alice"}, {"formattedValue": "eng"}]}
 
@@ -995,7 +1004,7 @@ async def test_read_sheet_returns_the_tabs_id_header_and_data_row_count(deployme
         if request.path_url.startswith("/v4/spreadsheets/f1"):
             query = parse_qs(urlsplit(request.path_url).query)
             # Google answers a ranges read with the asked rows alone.
-            rows = [header_row] if query.get("ranges") == ["'Q1'!1:1"] else [header_row, data_row]
+            rows = [header_row] if query.get("ranges") == ["'Q1'!C3:D3"] else [header_row, data_row]
             return reply(
                 request,
                 200,
@@ -1015,8 +1024,13 @@ async def test_read_sheet_returns_the_tabs_id_header_and_data_row_count(deployme
         assert await client.read_sheet(EMAIL, "f1", "Q1") == SheetTab(42, ("name", "role"), 2)
     elif case == "header only":
         assert await client.read_sheet(EMAIL, "f1", "Q1", header_only=True) == SheetTab(
-            42, ("name", "role"), 1
+            42, ("name", "role"), 2
         )
+    elif case == "recorded place":
+        at = HeaderAt(3, "C", 2)
+        assert await client.read_sheet(
+            EMAIL, "f1", "Q1", header_only=True, header_at=at
+        ) == SheetTab(42, ("name", "role"), 1, 3, "C")
     else:
         with pytest.raises(GoogleError) as err:
             await client.read_sheet(EMAIL, "f1", "Q9")
@@ -1028,7 +1042,9 @@ async def test_read_sheet_returns_the_tabs_id_header_and_data_row_count(deployme
     if case == "tab":
         assert query["ranges"] == ["'Q1'"]
     elif case == "header only":
-        assert query["ranges"] == ["'Q1'!1:1"]
+        assert query["ranges"] == ["'Q1'!1:20"]
+    elif case == "recorded place":
+        assert query["ranges"] == ["'Q1'!C3:D3"]
     else:
         assert query["ranges"] == ["'Q9'"]
 

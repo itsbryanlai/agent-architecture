@@ -364,7 +364,7 @@ async def test_the_submit_view_shows_the_latest_run_and_warns_when_missing_or_st
         await seed_run(h, record.definition_sha256)
     if state == "stale":
         await h.plane.withdraw_version(TENANT, OWNER, "it-helper", 1)
-        block = helper_block()
+        block = helper_block() | {"actions": []}
         block["system_prompt"] = "Edited after the run."
         await h.plane.edit_draft(TENANT, OWNER, "it-helper", 1, block)
         await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)

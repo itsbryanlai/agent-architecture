@@ -115,6 +115,27 @@
   {% endif %}
 {% endif %}
 
+<h2>What this agent may do</h2>
+{% if editor and is_draft %}
+<p class="muted">Nothing is on until it is ticked here. An action also needs the grant it works on; an admin approves this list when the version is published.</p>
+<form method="post" action="{{ version_url }}/actions">
+  <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
+  <input type="hidden" name="request_id" value="{{ new_token() }}">
+  {% for section in action_sections %}
+  <fieldset><legend>{{ section.service }}</legend>
+    {% for a in section.rows %}<div><label><input type="checkbox" name="action" value="{{ a.name }}"{% if a.on %} checked{% endif %}> {{ a.label }}</label></div>{% endfor %}
+  </fieldset>
+  {% endfor %}
+  <p><button type="submit">Save actions</button></p>
+</form>
+{% else %}
+{% for section in action_sections %}
+<p><strong>{{ section.service }}</strong>:
+  {% for a in section.rows if a.on %}{{ a.label }}{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none</span>{% endfor %}</p>
+{% endfor %}
+{% endif %}
+{% for h in action_hints %}<p class="warn" data-hint="{{ h.key }}">{{ h.text }}</p>{% endfor %}
+
 {% if review and review.diff and review.diff.changes %}
 <h2>Changes against the published version</h2>
 {% if not review.diff.baseline %}<p class="muted">Nothing is published yet, so all of it is new.</p>{% endif %}

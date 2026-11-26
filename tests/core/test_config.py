@@ -4,8 +4,10 @@ from pathlib import Path
 import pytest
 
 from agentos.config import (
+    LEGACY_ACTIONS,
     ConfigError,
     agent_definition,
+    effective_actions,
     load_agents_config,
     parse_agent,
     parse_agents_config,
@@ -288,3 +290,42 @@ def test_the_assignee_and_nudge_fields_round_trip():
     assert (grant.assignee_prop, grant.assignee_prop_id) == ("Assignee", "asg1")
     assert (agent.follow_up.nudge, agent.follow_up.max_nudges) == (False, 5)
     assert parse_agent("it-helper", agent_definition(agent), 1) == agent
+
+
+@pytest.mark.parametrize(
+    ("actions", "strict", "refusal", "kept"),
+    [
+        (["my_tasks"], True, "is not an action", None),
+        (["no_such_action"], True, "is not an action", None),
+        (["append_row", "append_row"], True, "more than once", None),
+        ("append_row", True, "must be a list", None),
+        (["create_item", "append_row"], True, None, {"create_item", "append_row"}),
+        ([], True, None, set()),
+        (["create_item", "no_such_action"], False, None, {"create_item"}),
+    ],
+    ids=[
+        "not selectable",
+        "unknown",
+        "repeated",
+        "not a list",
+        "valid",
+        "empty",
+        "stored, lenient",
+    ],
+)
+def test_an_actions_list_is_checked_and_a_stored_one_ignores_an_unknown_name(
+    actions, strict, refusal, kept
+):
+    """Fails if an unknown, non-selectable or repeated action is accepted on a write, a valid
+    list is refused or lost on the way to the definition, a stored version with a name no
+    manifest knows stops loading, or a missing key reads as 'no actions'."""
+    if refusal is not None:
+        with pytest.raises(ConfigError, match=refusal):
+            parse_agent("it-helper", _helper(actions=actions), 1, strict=strict)
+        return
+    agent = parse_agent("it-helper", _helper(actions=actions), 1, strict=strict)
+    assert agent.actions == kept
+    assert parse_agent("it-helper", agent_definition(agent), 1) == agent
+    legacy = parse_agent("it-helper", _helper(), 1)
+    assert legacy.actions is None and "actions" not in agent_definition(legacy)
+    assert effective_actions(legacy) == LEGACY_ACTIONS

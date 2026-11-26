@@ -109,19 +109,33 @@ async def await_nudge_card(h):
 
 
 @pytest.mark.parametrize(
-    "mapped,assignee,policy,offered",
+    "mapped,assignee,policy,actions,offered",
     [
-        (False, None, {}, True),
-        (True, None, {}, True),
-        (True, CAROL_NOTION, {}, True),
-        (True, ALICE_NOTION, {}, False),
-        (True, BOB_NOTION, {"nudge": False}, False),
-        (True, BOB_NOTION, {"max_nudges": 0}, False),
+        (False, None, {}, None, True),
+        (True, None, {}, None, True),
+        (True, CAROL_NOTION, {}, None, True),
+        (True, ALICE_NOTION, {}, None, False),
+        (True, BOB_NOTION, {"nudge": False}, None, False),
+        (True, BOB_NOTION, {"max_nudges": 0}, None, False),
+        (True, BOB_NOTION, {}, ["create_item"], False),
+        (True, BOB_NOTION, {}, ["create_item", "add_comment"], True),
     ],
-    ids=["no-property", "empty", "not-in-slack", "assignee-is-requester", "nudge-off", "max-zero"],
+    ids=[
+        "no-property",
+        "empty",
+        "not-in-slack",
+        "assignee-is-requester",
+        "nudge-off",
+        "max-zero",
+        "no-comment-action",
+        "comment-action",
+    ],
 )
-async def test_the_stale_offer_follows_the_fallbacks(harness, mapped, assignee, policy, offered):
-    """Fails if the stale notice offers a nudge against a decided fallback, or hides a valid offer."""
+async def test_the_stale_offer_follows_the_fallbacks(
+    harness, mapped, assignee, policy, actions, offered
+):
+    """Fails if the stale notice offers a nudge against a decided fallback (an agent not set up
+    to comment on Notion items included), or hides a valid offer."""
     h = harness
     if mapped:
         h.notion.set_schema(DB_ID, ASSIGNEE_SCHEMA)
@@ -129,6 +143,8 @@ async def test_the_stale_offer_follows_the_fallbacks(harness, mapped, assignee, 
         def change(definition):
             with_assignee(definition)
             definition["follow_up"].update(policy)
+            if actions is not None:
+                definition["actions"] = actions
 
         await republish(h.agent_store, "it-helper", change)
     if assignee == CAROL_NOTION:
@@ -329,6 +345,22 @@ async def test_agent_off_before_the_nudge_writes_cancels_both(nh):
     assert h.slack.updates()[-1]["text"] == (
         "IT helper is turned off by an admin. Nothing was changed."
     )
+
+
+async def test_a_nudge_stops_when_a_new_version_dropped_the_comment_action(nh):
+    """Fails if an approved nudge still comments or DMs after the agent was republished
+    without "Comment on Notion items", or the card does not say so."""
+    h = nh
+    handle, _ = await stale_item(h)
+    child, nonce = await click_nudge(h, handle)
+    await republish(h.agent_store, "it-helper", lambda d: d.update(actions=["search_items"]))
+
+    await child.signal(TaskWorkflow.decision, ApprovalDecision(nonce, ALICE, True))
+
+    assert await child.result() == "cancelled"
+    assert h.notion.count("create_comment") == 0
+    assert dm_posts(h) == []
+    assert h.slack.updates()[-1]["text"] == "This agent isn't set up to comment on Notion items."
 
 
 async def test_a_failed_dm_reports_commented_and_never_recomments(nh):

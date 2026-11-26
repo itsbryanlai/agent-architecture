@@ -10,6 +10,7 @@ from agentos.agent_store import (
     InMemoryAgentStore,
 )
 from agentos.audit import InMemoryAuditStore, canonical_sha256
+from agentos.config import LEGACY_ACTIONS, ConfigError
 from agentos.control import ControlPlane, Forbidden
 from agentos.credentials import InMemoryCredentialStore, TenantCredentials
 from agentos.grant_checker import NotionGrantChecker
@@ -163,13 +164,14 @@ async def test_draft_edit_submit_and_withdraw_are_for_the_agents_creator_or_an_a
 ):
     plane, agents, *_ = await make_plane()
     await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
-    changed = {**helper_block(), "name": "Renamed"}
+    changed = {**helper_block(), "actions": [], "name": "Renamed"}
 
     async def attempt():
         await plane.edit_draft(TENANT, actor, "it-helper", 1, changed)
         await plane.submit_version(TENANT, actor, "it-helper", 1)
         await plane.withdraw_version(TENANT, actor, "it-helper", 1)
         await plane.new_draft(TENANT, actor, "it-helper", from_version=1)
+        await plane.set_draft_actions(TENANT, actor, "it-helper", 1, ["create_item"])
 
     if allowed:
         await attempt()
@@ -178,6 +180,7 @@ async def test_draft_edit_submit_and_withdraw_are_for_the_agents_creator_or_an_a
         await refused(plane.edit_draft(TENANT, actor, "it-helper", 1, changed))
         await refused(plane.submit_version(TENANT, actor, "it-helper", 1))
         await refused(plane.new_draft(TENANT, actor, "it-helper", from_version=1))
+        await refused(plane.set_draft_actions(TENANT, actor, "it-helper", 1, ["create_item"]))
         assert [v.status for v in await agents.versions(TENANT, "it-helper")] == ["draft"]
 
 
@@ -234,7 +237,9 @@ async def test_rollback_is_a_new_draft_from_the_old_version_then_submit_and_publ
     await plane.submit_version(TENANT, OWNER, "it-helper", 1)
     await plane.publish_version(TENANT, ROOT, "it-helper", 1)
     v2 = await plane.new_draft(TENANT, OWNER, "it-helper")
-    await plane.edit_draft(TENANT, OWNER, "it-helper", v2.version, {**helper_block(), "name": "V2"})
+    await plane.edit_draft(
+        TENANT, OWNER, "it-helper", v2.version, {**helper_block(), "actions": [], "name": "V2"}
+    )
     await plane.submit_version(TENANT, OWNER, "it-helper", 2)
     await plane.publish_version(TENANT, ROOT, "it-helper", 2)
     assert (await agents.published(TENANT, "it-helper")).name == "V2"
@@ -355,7 +360,7 @@ async def lifecycle():
     """Every control-plane action once, in order: the audit store, the definition used, and
     the ``(kind, events it wrote)`` of each step."""
     plane, _, _, audit = await make_plane()
-    definition = helper_block()
+    definition = {"actions": [], **helper_block()}  # a new agent starts with no actions
     steps = [
         ("agent_create", plane.add_agent(TENANT, OWNER, "it-helper", definition)),
         ("agent_submit", plane.submit_version(TENANT, OWNER, "it-helper", 1)),
@@ -439,3 +444,58 @@ async def test_a_refused_or_failed_action_writes_no_event():
     with pytest.raises(AgentStoreError):
         await plane.submit_version(TENANT, ROOT, "nope", 1)
     assert audit.events == []
+
+
+@pytest.mark.parametrize(
+    ("published", "extra", "expected"),
+    [
+        (None, {}, []),
+        (None, {"actions": None}, []),
+        ({}, {}, sorted(LEGACY_ACTIONS)),
+        ({"actions": ["search_items"]}, {}, ["search_items"]),
+    ],
+    ids=[
+        "a new agent",
+        "a new agent with a null actions line",
+        "a draft of a legacy version",
+        "a draft of a version with actions",
+    ],
+)
+async def test_a_draft_starts_with_the_actions_its_source_offers(published, extra, expected):
+    """Fails if a new agent (with the line left out or null) starts with any action on, or a draft
+    copied from a version written before actions existed starts with fewer than that version
+    offered (an edit would then drop an ability silently), or a copy changes a list the
+    version already has."""
+    plane, agents, *_ = await make_plane()
+    if published is None:
+        record = await plane.add_agent(TENANT, OWNER, "it-helper", helper_block() | extra)
+    else:
+        first = await agents.create_agent(TENANT, "it-helper", helper_block() | published, OWNER)
+        await agents.submit(TENANT, "it-helper", first.version, OWNER)
+        await agents.publish(TENANT, "it-helper", first.version, ROOT)
+        record = await plane.new_draft(TENANT, OWNER, "it-helper")
+
+    assert record.definition["actions"] == expected
+
+
+@pytest.mark.parametrize(
+    ("change", "refused"),
+    [
+        ({}, True),
+        ({"actions": None}, True),
+        ({"actions": []}, False),
+    ],
+    ids=["line left out", "line null", "line stated"],
+)
+async def test_an_edit_of_a_draft_must_state_its_actions(change, refused):
+    """Fails if a console or API edit may drop the actions line, which would turn a chosen list
+    into every action the grants allow, or if an edit that states it is refused."""
+    plane, *_ = await make_plane()
+    await plane.add_agent(TENANT, OWNER, "it-helper", helper_block())
+    edit = plane.edit_draft(TENANT, OWNER, "it-helper", 1, helper_block() | change)
+
+    if refused:
+        with pytest.raises(ConfigError, match="Keep the actions line"):
+            await edit
+    else:
+        assert (await edit).definition["actions"] == []

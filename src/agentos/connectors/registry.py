@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 
-from agentos.config import AgentVersion
-from agentos.connectors import drive_errors, notion_errors
+from agentos.config import AgentVersion, Grants
+from agentos.connectors import drive, drive_errors, notion, notion_errors
 from agentos.connectors.base import Connector, ConnectorErrors
 from agentos.connectors.drive import DriveConnector
 from agentos.connectors.notion import NotionConnector
@@ -30,6 +30,10 @@ def _drive(runtime: TenantRuntime, agent: AgentVersion) -> Connector:
 
 
 _FACTORIES: dict[str, ConnectorFactory] = {"notion": _notion, "drive": _drive}
+_GRANT_KINDS: dict[str, Callable[[Grants], set[str]]] = {
+    "notion": notion.grant_kinds,
+    "drive": drive.grant_kinds,
+}
 _ERRORS: dict[str, ConnectorErrors] = {"notion": notion_errors, "drive": drive_errors}
 
 
@@ -41,3 +45,12 @@ def connector_for(name: str, runtime: TenantRuntime, agent: AgentVersion) -> Con
 def error_classes() -> Iterator[ConnectorErrors]:
     """Every registered connector's error table, for an error whose source is unknown."""
     return iter(_ERRORS.values())
+
+
+def held_grant_kinds(grants: Grants) -> set[str]:
+    """The kinds of grant ``grants`` holds, across every connector, in the words of a
+    manifest's ``needs``. Each connector says its own; a new one registers its function."""
+    kinds: set[str] = set()
+    for held in _GRANT_KINDS.values():
+        kinds |= held(grants)
+    return kinds

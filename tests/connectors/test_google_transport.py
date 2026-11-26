@@ -1257,6 +1257,65 @@ async def test_fill_sends_one_batchupdate_of_ordered_literal_replacements(deploy
     }
 
 
+async def test_read_template_text_returns_every_tab_segment_with_the_tenants_token(
+    deployment_key,
+):
+    """Fails if the structural read leaves out a header, a footer, a footnote, a table cell
+    or a child tab, or reads the Doc without the tenant's token and the tabs flag."""
+
+    def para(text):
+        return {"paragraph": {"elements": [{"textRun": {"content": text}}]}}
+
+    def handler(request):
+        minted = _mint(request)
+        if minted is not None:
+            return minted
+        if request.path_url.startswith("/v1/documents/f1"):
+            return reply(
+                request,
+                200,
+                {
+                    "tabs": [
+                        {
+                            "documentTab": {
+                                "body": {
+                                    "content": [
+                                        para("Dear {{na"),
+                                        {
+                                            "table": {
+                                                "tableRows": [
+                                                    {
+                                                        "tableCells": [
+                                                            {"content": [para("{{role}}\n")]}
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    ]
+                                },
+                                "headers": {"h1": {"content": [para("Client {{client}}\n")]}},
+                                "footers": {"f1": {"content": [para("Ref {{ref}}\n")]}},
+                                "footnotes": {"n1": {"content": [para("See {{note}}\n")]}},
+                            },
+                            "childTabs": [
+                                {"documentTab": {"body": {"content": [para("{{child}}\n")]}}}
+                            ],
+                        }
+                    ]
+                },
+            )
+        return reply(request, 404, {})
+
+    client, sent = client_with(handler, deployment_key)
+    text = await client.read_template_text(EMAIL, "f1")
+
+    assert text == "Dear {{na\n{{role}}\nClient {{client}}\nRef {{ref}}\nSee {{note}}\n{{child}}"
+    [get] = [r for r in sent if r.path_url.startswith("/v1/documents/f1")]
+    assert get.headers["Authorization"] == "Bearer tenant-token"
+    assert parse_qs(urlsplit(get.path_url).query)["includeTabsContent"] == ["true"]
+
+
 async def test_read_doc_returns_the_revision_title_and_paragraphs(deployment_key):
     """Fails if documents.get does not return the revisionId, title and body paragraphs (each
     with its text, named style and UTF-16 indices) with the tenant's token, asking for the

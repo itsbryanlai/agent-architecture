@@ -599,7 +599,10 @@ switch and the writes switch stop it while off.
 Google Doc, and nothing is written until the requester approves the card in Slack
 — a replace always asks, never low-risk. The section is a **heading** the creator
 names: everything under that heading up to the next heading of the same or higher
-level (a deeper heading is part of the section); the heading itself is kept. To
+level (a deeper heading is part of the section); the heading itself is kept. The line
+can also be a normal line whose whole text is bold or underlined (capitals alone mark
+nothing); its section then ends at the next line in that style or one with more styles
+(bold and underlined after a bold line), or at any heading. To
 grant it, the creator shares the Doc with the workspace's Drive address **as
 Editor** (Viewer is enough for reading, but replacing writes the body), picks the
 Doc and chooses its heading from a one-read list of the Doc's headings (or types
@@ -607,15 +610,18 @@ it) — the definition editor can also add it directly as `grants.drive.sections
 with the Doc's file ID, a label, the same Doc ID as `doc_id` (it must equal the ID)
 and the heading (`{id, name, doc_id, heading}`). A Doc already granted as a read
 file shows a plain message: a Doc is granted once across kinds. The Doc is granted
-as for reads: it is indexed and citable like any file. The section must be **plain
-paragraphs only** — a table, an inline image or any other non-paragraph element
-under the heading refuses it. When the version is submitted, the platform reads the
+as for reads: it is indexed and citable like any file. The section may hold text,
+horizontal lines and tables; an inline image or any other element under the heading
+refuses it, and so does a line whose text is exactly `---` or starts with `|` (it would
+read like a divider or table row to the model). When the version is submitted, the platform reads the
 Doc's metadata and body and checks the heading exists exactly once and the section
-is plain paragraphs: a missing heading refuses with "I can't find the heading
-'<name>' in <doc>; ask the creator to update the agent", a duplicated one with "The
-heading '<name>' appears more than once in <doc>; ask the creator to update the
-agent", and a table or image with "I can only replace a section made of plain
-paragraphs; '<doc>' has a table or image under '<heading>'". The version page shows
+holds only text, lines and tables: a missing heading refuses with "I can't find the
+heading '<name>' in <doc>; ask the creator to update the agent", a duplicated one with
+"The heading '<name>' appears more than once in <doc>; ask the creator to update the
+agent", an image with "I can only replace a section made of text, lines and tables;
+'<doc>' has an image or other content under '<heading>' that I can't edit", and a divider-
+or table-like line with "'<doc>' has a line that reads like a divider or table row under
+'<heading>'". The version page shows
 the heading. The card previews the Doc (name and link), the section's heading, the
 whole current text (before, spread over section blocks, never cut) and the
 replacement (after); Edit changes the new text and needs a fresh approval, keeping
@@ -624,13 +630,18 @@ to 2000 characters); a character Google Docs strips (a control character other t
 newline and tab, or a private-use code point) is refused at draft and edit. The
 section's current text is bounded too: over 5,000 characters refuses the draft in
 plain words. The model sees the granted sections and their headings in the tool's
-description; a name two granted sections share is refused, and the model must use
+description, and is offered a second tool, `read_section`, exactly when it is offered
+the replace: it returns the section's current text with each horizontal line as a line
+holding `---` and each table as pipe rows (`| a | b |`), and the replacement must keep
+the same lines and the same tables at the same rows and columns (only cell text
+changes). A replacement that does not is sent back to the model in plain words before
+any card, so it can read the section and draft again; a name two granted sections share is refused, and the model must use
 the section's ID. The write is one Docs `batchUpdate` locked to the revision read at
 the draft (`writeControl.requiredRevisionId`): it inserts the new text first at the
 section's first content paragraph (so the new paragraphs keep its NORMAL style),
-then deletes the shifted old range; an empty section normalises the inserted range
-to NORMAL_TEXT, and a section ending at the body end keeps the body's final
-newline. If the Doc moved since the read — a collaborator
+then deletes the shifted old range; every inserted range has bold and underline
+switched off, an empty section also normalises it to NORMAL_TEXT, and a part ending
+at the body end or right before a table keeps its final newline. If the Doc moved since the read — a collaborator
 edited it, or a retry follows a lost response — the revision no longer holds and
 nothing is written; the platform reads the section and compares it with the
 approved text: equal means the earlier attempt landed (done), different refuses

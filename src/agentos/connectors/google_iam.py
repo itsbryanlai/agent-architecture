@@ -52,7 +52,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import NamedTuple, Protocol
 from urllib.parse import quote
 
 import requests
@@ -301,29 +301,85 @@ class DocParagraph:
     """One paragraph of a Doc as the section write needs it: its text (ending in a
     newline), its named style (``HEADING_1``..``HEADING_6``, ``TITLE``, ``SUBTITLE`` or
     ``NORMAL_TEXT``) and its ``startIndex``/``endIndex`` in the document body, as Google
-    reports them (UTF-16 code-unit offsets). The section write locates a heading and the
-    paragraphs under it by these (D-50)."""
+    reports them (UTF-16 code-unit offsets). The section write locates a marker line and the
+    paragraphs under it by these (D-50).
+
+    ``bold`` and ``underline`` say every non-blank text run of the paragraph carries that
+    style, and ``rule`` that the paragraph is a horizontal line (Google gives it a
+    ``horizontalRule`` element). A normal line that is wholly bold, underlined or in capitals
+    can mark a section as a heading style does."""
 
     text: str
     style: str
     start_index: int
     end_index: int
+    bold: bool = False
+    underline: bool = False
+    rule: bool = False
+
+    @property
+    def caps(self) -> bool:
+        """Whether the line's letters are all capitals (it has at least one letter)."""
+        return self.text.strip().isupper()
+
+
+@dataclass(frozen=True)
+class DocCell:
+    """One cell of a table: its text (a single paragraph, without its final newline) and the
+    UTF-16 range ``[start_index, end_index)`` of that text, which a cell write deletes and
+    refills. ``plain`` is False for a cell holding several paragraphs or anything but text,
+    which the section write does not edit; ``why`` names what it holds ("an image", "several
+    paragraphs", "other content") (D-50)."""
+
+    text: str
+    start_index: int
+    end_index: int
+    plain: bool = True
+    why: str = ""
+
+
+@dataclass(frozen=True)
+class DocTable:
+    """One table of the body: its UTF-16 range and its rows of cells (D-50)."""
+
+    start_index: int
+    end_index: int
+    rows: tuple[tuple[DocCell, ...], ...]
 
 
 @dataclass(frozen=True)
 class DocRead:
     """One ``documents.get`` of a Doc: its ``revisionId`` (the section write's lock), its
-    title and its body's paragraphs. References and small values plus the section text the
-    draft freezes; the revisionId is what the write's ``writeControl`` names (D-50).
+    title and its body's paragraphs and tables. References and small values plus the section
+    text the draft freezes; the revisionId is what the write's ``writeControl`` names (D-50).
 
-    ``foreign`` is the UTF-16 index ranges of the body's non-paragraph elements (tables,
-    section breaks) and inline images: a section whose content range overlaps one is not
-    plain paragraphs, so the replace refuses it (D-50)."""
+    ``paragraphs`` are the body's top-level paragraphs (a table's cell paragraphs are in
+    ``tables``). ``foreign`` is the UTF-16 index ranges of the body's other non-paragraph
+    elements (section breaks) and inline images: a section whose content range overlaps one is
+    not plain text, so the replace refuses it (D-50)."""
 
     revision_id: str
     title: str
     paragraphs: tuple[DocParagraph, ...]
     foreign: tuple[tuple[int, int], ...] = ()
+    tables: tuple[DocTable, ...] = ()
+
+
+class DocEdit(NamedTuple):
+    """One edit of a section write, in the Doc's indices as read. The text is inserted first,
+    then the shifted old range ``[delete_start, delete_end)`` deleted, then the inserted range
+    ``[style_start, style_end)`` has its bold and underline switched off, and with
+    ``paragraphs`` its paragraphs set to NORMAL_TEXT with their bullets cleared. A write
+    carries its edits last-in-the-Doc first, so each one's indices still hold when it runs
+    (D-50)."""
+
+    insert_index: int
+    insert_text: str
+    delete_start: int
+    delete_end: int
+    style_start: int = 0
+    style_end: int = 0
+    paragraphs: bool = False
 
 
 def utf16_len(text: str) -> int:
@@ -486,25 +542,16 @@ class GoogleAccounts(Protocol):
         ...
 
     async def replace_doc_section(
-        self,
-        email: str,
-        file_id: str,
-        required_revision_id: str,
-        insert_index: int,
-        insert_text: str,
-        delete_start: int,
-        delete_end: int,
-        style_start: int = 0,
-        style_end: int = 0,
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
-        """Replace a section's content in ONE Docs ``documents.batchUpdate`` carrying
-        ``writeControl.requiredRevisionId``: insert ``insert_text`` at ``insert_index`` first
-        (the section's first content paragraph, so the new paragraphs take its NORMAL style),
-        then delete the shifted old range ``[delete_start, delete_end)``. A non-zero
-        ``[style_start, style_end)`` normalises that range to NORMAL_TEXT and clears its
-        bullets (an empty section, which has no content paragraph to inherit from). The
-        revision is the lock — a Doc that moved since the read answers 400
-        (``revision_mismatch``) and nothing is written. Returns the Doc's ID (D-50)."""
+        """Write a section's edits in ONE Docs ``documents.batchUpdate`` carrying
+        ``writeControl.requiredRevisionId``. Each edit (``DocEdit``) inserts its text first
+        (so the new paragraphs take the style at the index), then deletes the shifted old range;
+        a non-zero style range is normalised to plain text with its bullets cleared (an empty
+        part, which has no paragraph to inherit from). The edits come last-in-the-Doc first, so
+        every index still holds. The revision is the lock — a Doc that moved since the read
+        answers 400 (``revision_mismatch``) and nothing is written. Returns the Doc's ID
+        (D-50)."""
         ...
 
 
@@ -1500,12 +1547,13 @@ class RealGoogleAccounts:
                 self._check_drive(response)
                 body = _json_object(response)
                 try:
-                    paragraphs, foreign = _doc_body(body.get("body", {}))
+                    paragraphs, foreign, tables = _doc_body(body.get("body", {}))
                     return DocRead(
                         revision_id=str(body["revisionId"]),
                         title=str(body.get("title", "")),
                         paragraphs=paragraphs,
                         foreign=foreign,
+                        tables=tables,
                     )
                 except (KeyError, TypeError) as err:
                     raise GoogleError("unavailable") from err
@@ -1516,52 +1564,65 @@ class RealGoogleAccounts:
         return await asyncio.to_thread(call)
 
     async def replace_doc_section(
-        self,
-        email: str,
-        file_id: str,
-        required_revision_id: str,
-        insert_index: int,
-        insert_text: str,
-        delete_start: int,
-        delete_end: int,
-        style_start: int = 0,
-        style_end: int = 0,
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
         token = await self._drive_token(email)
 
         def call() -> str:
             session = self._drive_session_for_call()
             try:
-                # Insert the new text first at the section's first content paragraph, so the
-                # new paragraphs take that paragraph's NORMAL style, then delete the old range
-                # at its shifted position (the caller passes the shifted indices). An empty
-                # section has no content paragraph to inherit from, so the inserted range is
-                # normalised to NORMAL_TEXT and its bullets cleared. The writeControl locks the
+                # Each edit inserts its new text first, so the new paragraphs take the style
+                # at the index, then deletes the old range at its shifted position (the caller
+                # passes the shifted indices). Every inserted range has its bold and underline
+                # switched off, so a new line never takes the marker's look; an empty part has
+                # no paragraph to inherit from, so its range is also normalised to NORMAL_TEXT
+                # with its bullets cleared. The writeControl locks the
                 # batchUpdate to the read revision: a Doc that moved answers 400
                 # FAILED_PRECONDITION and nothing is written.
-                requests: list[dict] = [
-                    {"insertText": {"location": {"index": insert_index}, "text": insert_text}}
-                ]
-                if delete_end > delete_start:
-                    requests.append(
-                        {
-                            "deleteContentRange": {
-                                "range": {"startIndex": delete_start, "endIndex": delete_end}
+                requests: list[dict] = []
+                for edit in edits:
+                    if edit.insert_text:
+                        requests.append(
+                            {
+                                "insertText": {
+                                    "location": {"index": edit.insert_index},
+                                    "text": edit.insert_text,
+                                }
                             }
-                        }
-                    )
-                if style_end > style_start:
-                    style_range = {"startIndex": style_start, "endIndex": style_end}
-                    requests.append(
-                        {
-                            "updateParagraphStyle": {
-                                "range": style_range,
-                                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-                                "fields": "namedStyleType",
+                        )
+                    if edit.delete_end > edit.delete_start:
+                        requests.append(
+                            {
+                                "deleteContentRange": {
+                                    "range": {
+                                        "startIndex": edit.delete_start,
+                                        "endIndex": edit.delete_end,
+                                    }
+                                }
                             }
-                        }
-                    )
-                    requests.append({"deleteParagraphBullets": {"range": style_range}})
+                        )
+                    if edit.style_end > edit.style_start:
+                        style_range = {"startIndex": edit.style_start, "endIndex": edit.style_end}
+                        if edit.paragraphs:
+                            requests.append(
+                                {
+                                    "updateParagraphStyle": {
+                                        "range": style_range,
+                                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                        "fields": "namedStyleType",
+                                    }
+                                }
+                            )
+                            requests.append({"deleteParagraphBullets": {"range": style_range}})
+                        requests.append(
+                            {
+                                "updateTextStyle": {
+                                    "range": style_range,
+                                    "textStyle": {"bold": False, "underline": False},
+                                    "fields": "bold,underline",
+                                }
+                            }
+                        )
                 response = self._send(
                     session,
                     "POST",
@@ -1632,35 +1693,107 @@ def _doc_segment_texts(tabs: list) -> list[str]:
     return texts
 
 
-def _doc_body(body: dict) -> tuple[tuple[DocParagraph, ...], tuple[tuple[int, int], ...]]:
-    """A Doc body's structural elements as paragraphs and foreign ranges: each paragraph's
-    text (its text runs joined), its named style and its UTF-16 start/end index; a
-    non-paragraph element (a table, a section break) contributes its index range to
-    ``foreign``, and an inline image run contributes its range, so a section overlapping one
-    is refused as not plain paragraphs (D-50). A non-text run contributes no text."""
+def _doc_body(
+    body: dict,
+) -> tuple[tuple[DocParagraph, ...], tuple[tuple[int, int], ...], tuple[DocTable, ...]]:
+    """A Doc body's structural elements as paragraphs, foreign ranges and tables: each
+    paragraph's text (its text runs joined), its named style, whether its text is wholly bold
+    or underlined, whether it is a horizontal line, and its UTF-16 start/end index; a table
+    becomes a ``DocTable`` of its cells' text and ranges; any other non-paragraph element (a
+    section break) contributes its index range to ``foreign``, and an inline image run
+    contributes its range, so a section overlapping one is refused as not plain text (D-50). A
+    non-text run contributes no text."""
     paragraphs: list[DocParagraph] = []
     foreign: list[tuple[int, int]] = []
+    tables: list[DocTable] = []
     for element in body.get("content", []):
+        start = int(element.get("startIndex", 0))
+        end = int(element["endIndex"])
         paragraph = element.get("paragraph")
         if paragraph is None:
-            foreign.append((int(element["startIndex"]), int(element["endIndex"])))
+            if "table" in element:
+                tables.append(_doc_table(element["table"], start, end))
+            else:
+                foreign.append((start, end))
             continue
         text = ""
+        styled: list[tuple[bool, bool]] = []
+        rule = False
         for run in paragraph.get("elements", []):
             if "textRun" in run:
-                text += run["textRun"].get("content", "")
+                content = run["textRun"].get("content", "")
+                text += content
+                if content.strip():
+                    style = run["textRun"].get("textStyle", {})
+                    # A link is shown underlined by Docs without the owner underlining it:
+                    # it does not count as underline.
+                    styled.append(
+                        (
+                            bool(style.get("bold")),
+                            bool(style.get("underline")) and "link" not in style,
+                        )
+                    )
+            elif "horizontalRule" in run:
+                rule = True
             elif "inlineObjectElement" in run:
                 foreign.append((int(run["startIndex"]), int(run["endIndex"])))
-        style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+        named = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
         paragraphs.append(
             DocParagraph(
                 text=text,
-                style=style,
-                start_index=int(element["startIndex"]),
-                end_index=int(element["endIndex"]),
+                style=named,
+                start_index=start,
+                end_index=end,
+                bold=bool(styled) and all(b for b, _ in styled),
+                underline=bool(styled) and all(u for _, u in styled),
+                rule=rule,
             )
         )
-    return tuple(paragraphs), tuple(foreign)
+    return tuple(paragraphs), tuple(foreign), tuple(tables)
+
+
+def _cell_why(content: list) -> str:
+    """What stops a table cell being plain text, or "" when it is one paragraph of text runs:
+    an inline image, several paragraphs, or any other element (D-50)."""
+    if len(content) != 1 or "paragraph" not in content[0]:
+        return "several paragraphs" if len(content) > 1 else "other content"
+    for run in content[0]["paragraph"].get("elements", []):
+        if "inlineObjectElement" in run:
+            return "an image"
+        if "textRun" not in run:
+            return "other content"
+    return ""
+
+
+def _doc_table(table: dict, start: int, end: int) -> DocTable:
+    """A table element as rows of cells. A cell's editable range is its one paragraph's text,
+    without the paragraph's final newline; a cell with several paragraphs, an inline image or
+    any other element than text is not ``plain`` and says why (D-50)."""
+    rows: list[tuple[DocCell, ...]] = []
+    for row in table.get("tableRows", []):
+        cells: list[DocCell] = []
+        for cell in row.get("tableCells", []):
+            content = cell.get("content", [])
+            why = _cell_why(content)
+            if not why:
+                para = content[0]
+                text = "".join(
+                    run["textRun"].get("content", "")
+                    for run in para["paragraph"].get("elements", [])
+                )
+                cells.append(
+                    DocCell(
+                        text=text.removesuffix("\n"),
+                        start_index=int(para.get("startIndex", 0)),
+                        end_index=int(para["endIndex"]) - 1,
+                    )
+                )
+            else:
+                first = int(content[0].get("startIndex", 0)) if content else 0
+                last = int(content[-1]["endIndex"]) - 1 if content else 0
+                cells.append(DocCell("", first, last, plain=False, why=why))
+        rows.append(tuple(cells))
+    return DocTable(start, end, tuple(rows))
 
 
 def _split_doc_paragraphs(text: str) -> list[dict]:
@@ -1681,24 +1814,64 @@ def _u16_slice(text: str, start: int, end: int | None = None) -> str:
     return units[start * 2 : end * 2].decode("utf-16-le")
 
 
+def _fake_attrs(p: dict) -> dict:
+    """A fake paragraph's formatting (named style, bullet, bold, underline), without its text
+    and its structural markers: what an insertion at the paragraph inherits."""
+    return {
+        k: v
+        for k, v in p.items()
+        if k not in ("text", "kind", "rule", "size", "rows", "image_cells")
+    }
+
+
+def _fake_cell_footprint(text: str) -> int:
+    """A table cell's index units: its start, its text and the paragraph's final newline."""
+    return 1 + utf16_len(text) + 1
+
+
+def _fake_table_size(p: dict) -> int:
+    """A fake table's index units: a table with ``rows`` (lists of cell text) is laid out as
+    Google does (the table, each row and each cell take one unit, each cell's paragraph its text
+    and a newline); a table with only a ``size`` is opaque and keeps it."""
+    if "rows" not in p:
+        return int(p.get("size", 1))
+    return 1 + sum(1 + sum(_fake_cell_footprint(c) for c in row) for row in p["rows"])
+
+
+def _fake_table_cells(p: dict, start: int) -> list[list[tuple[int, int]]]:
+    """Each cell's text range ``(start, end)`` of a fake table that starts at ``start``."""
+    cells: list[list[tuple[int, int]]] = []
+    idx = start + 1
+    for row in p["rows"]:
+        idx += 1
+        row_cells: list[tuple[int, int]] = []
+        for text in row:
+            row_cells.append((idx + 1, idx + 1 + utf16_len(text)))
+            idx += _fake_cell_footprint(text)
+        cells.append(row_cells)
+    return cells
+
+
 def _fake_doc_index(paragraphs: list[dict]):
     """The fake Doc body's index model: each entry's ``(start, end)`` bound, the start index
-    of every table, the foreign ranges (tables and inline-image paragraphs) and the body's
-    end. A table entry (``kind == "table"``) occupies ``size`` index units and is not a
-    paragraph; an ``image`` paragraph carries an inline image (D-50)."""
+    of every table, the foreign ranges (opaque tables and inline-image paragraphs) and the
+    body's end. A table entry (``kind == "table"``) occupies its table size and is not a
+    paragraph; a ``rule`` paragraph is a horizontal line (one unit for the line, one for its
+    newline); an ``image`` paragraph carries an inline image (D-50)."""
     bounds: list[tuple[int, int]] = []
     table_starts: list[int] = []
     foreign: list[tuple[int, int]] = []
     idx = 0
     for p in paragraphs:
         if p.get("kind") == "table":
-            size = int(p.get("size", 1))
+            size = _fake_table_size(p)
             table_starts.append(idx)
-            foreign.append((idx, idx + size))
+            if "rows" not in p:
+                foreign.append((idx, idx + size))
             bounds.append((idx, idx + size))
             idx += size
         else:
-            end = idx + utf16_len(p["text"])
+            end = idx + utf16_len(p["text"]) + (1 if p.get("rule") else 0)
             if p.get("image"):
                 foreign.append((idx, end))
             bounds.append((idx, end))
@@ -1706,12 +1879,47 @@ def _fake_doc_index(paragraphs: list[dict]):
     return bounds, table_starts, foreign, idx
 
 
+def _fake_in_cell(paragraphs: list[dict], index: int, end: int | None = None):
+    """The ``(table position, row, column, cell start)`` whose text range holds ``index`` (and
+    ``end``, when given), or None. An index inside a table but outside every cell's text is
+    refused: a table's structure is not editable (D-50)."""
+    bounds, _, _, _ = _fake_doc_index(paragraphs)
+    for pos, (p, (s, e)) in enumerate(zip(paragraphs, bounds)):
+        if p.get("kind") != "table" or "rows" not in p or not (s <= index < e):
+            continue
+        for r, row in enumerate(_fake_table_cells(p, s)):
+            for c, (ts, te) in enumerate(row):
+                if ts <= index <= te and (end is None or end <= te):
+                    return pos, r, c, ts
+        raise GoogleError("refused", "Cannot edit a table's structure.", status=400)
+    return None
+
+
+def _fake_edit_cell(
+    paragraphs: list[dict], pos: int, r: int, c: int, offset: int, remove: int, text: str
+) -> list[dict]:
+    """A copy of ``paragraphs`` whose table at ``pos`` has ``remove`` units dropped at
+    ``offset`` of cell (r, c) and ``text`` inserted there."""
+    if "\n" in text:
+        raise GoogleError("refused", "A table cell takes one line here.", status=400)
+    rows = [list(row) for row in paragraphs[pos]["rows"]]
+    cell = rows[r][c]
+    rows[r][c] = _u16_slice(cell, 0, offset) + text + _u16_slice(cell, offset + remove)
+    return [*paragraphs[:pos], {**paragraphs[pos], "rows": rows}, *paragraphs[pos + 1 :]]
+
+
 def _fake_insert(paragraphs: list[dict], insert_index: int, insert_text: str) -> list[dict]:
     """Google's insertText: the inserted text takes the paragraph style at the insertion
-    index (lists included); a newline starts a new paragraph with that style. The text before
-    the first newline joins the paragraph at the index, the text after the last newline joins
-    its remainder. Inserting at a table's start index is refused (D-50)."""
+    index (lists, bold and underline included); a newline starts a new paragraph with that
+    style. The text before the first newline joins the paragraph at the index, the text after
+    the last newline joins its remainder. Text lands in a table cell's text; inserting at a
+    table's start index, or anywhere else in a table's structure, is refused; inserting at a
+    horizontal line's start index puts whole new paragraphs before it (D-50)."""
     bounds, table_starts, _, _ = _fake_doc_index(paragraphs)
+    cell = _fake_in_cell(paragraphs, insert_index)
+    if cell is not None:
+        pos, r, c, text_start = cell
+        return _fake_edit_cell(paragraphs, pos, r, c, insert_index - text_start, 0, insert_text)
     if insert_index in table_starts:
         raise GoogleError("refused", "Cannot insert text at the start of a table.", status=400)
     target = next((i for i, (s, e) in enumerate(bounds) if s <= insert_index < e), None)
@@ -1719,64 +1927,103 @@ def _fake_insert(paragraphs: list[dict], insert_index: int, insert_text: str) ->
         raise GoogleError("refused", "Cannot insert text at that index.", status=400)
     p = paragraphs[target]
     start, _ = bounds[target]
+    if p.get("rule"):
+        if insert_index != start or not insert_text.endswith("\n"):
+            raise GoogleError("refused", "Cannot insert text inside a line.", status=400)
+        fresh = [
+            {"text": line + "\n", "style": "NORMAL_TEXT"} for line in insert_text[:-1].split("\n")
+        ]
+        return paragraphs[:target] + fresh + paragraphs[target:]
     offset = insert_index - start
     head = _u16_slice(p["text"], 0, offset)
     tail = _u16_slice(p["text"], offset)
-    style, bullet = p.get("style", "NORMAL_TEXT"), p.get("bullet", False)
+    attrs = _fake_attrs(p)
     lines = insert_text.split("\n")
     if len(lines) == 1:
-        pieces = [{"text": head + lines[0] + tail, "style": style, "bullet": bullet}]
+        pieces = [{**attrs, "text": head + lines[0] + tail}]
     else:
-        pieces = [{"text": head + lines[0] + "\n", "style": style, "bullet": bullet}]
-        pieces += [{"text": line + "\n", "style": style, "bullet": bullet} for line in lines[1:-1]]
-        pieces.append({"text": lines[-1] + tail, "style": style, "bullet": bullet})
+        pieces = [{**attrs, "text": head + lines[0] + "\n"}]
+        pieces += [{**attrs, "text": line + "\n"} for line in lines[1:-1]]
+        pieces.append({**attrs, "text": lines[-1] + tail})
     return paragraphs[:target] + pieces + paragraphs[target + 1 :]
 
 
 def _fake_delete(paragraphs: list[dict], delete_start: int, delete_end: int) -> list[dict]:
     """Google's deleteContentRange: remove ``[delete_start, delete_end)`` from the body,
     merging paragraphs across the range. The body's final newline cannot be deleted, so a
-    range reaching the body end is refused (D-50)."""
-    _, _, _, body_end = _fake_doc_index(paragraphs)
+    range reaching the body end is refused. The range lies inside one table cell's text, or
+    inside one run of text paragraphs: a range over a table or a horizontal line is refused
+    (D-50)."""
+    bounds, table_starts, _, body_end = _fake_doc_index(paragraphs)
     if delete_end >= body_end:
         raise GoogleError("refused", "Cannot delete the document's final newline.", status=400)
-    text_paras = [p for p in paragraphs if p.get("kind") != "table"]
-    units = "".join(p["text"] for p in text_paras).encode("utf-16-le")
-    styles: list[str] = []
-    for p in text_paras:
-        styles.extend([p.get("style", "NORMAL_TEXT")] * utf16_len(p["text"]))
-    new_units = units[: delete_start * 2] + units[delete_end * 2 :]
-    new_styles = styles[:delete_start] + styles[delete_end:]
+    if delete_end in table_starts and _fake_in_cell(paragraphs, delete_start, delete_end) is None:
+        raise GoogleError("refused", "Cannot delete the newline before a table.", status=400)
+    cell = _fake_in_cell(paragraphs, delete_start, delete_end)
+    if cell is not None:
+        pos, r, c, text_start = cell
+        return _fake_edit_cell(
+            paragraphs, pos, r, c, delete_start - text_start, delete_end - delete_start, ""
+        )
+    first = next((i for i, (s, e) in enumerate(bounds) if s <= delete_start < e), None)
+    if first is None or not _fake_is_text(paragraphs[first]):
+        raise GoogleError("refused", "Cannot delete across a table or a line.", status=400)
+    last = first
+    while (
+        last + 1 < len(paragraphs)
+        and _fake_is_text(paragraphs[last + 1])
+        and bounds[last][1] < delete_end
+    ):
+        last += 1
+    if bounds[last][1] < delete_end:
+        raise GoogleError("refused", "Cannot delete across a table or a line.", status=400)
+    run = paragraphs[first : last + 1]
+    base = bounds[first][0]
+    units = "".join(p["text"] for p in run).encode("utf-16-le")
+    attrs: list[dict] = []
+    for p in run:
+        attrs.extend([_fake_attrs(p)] * utf16_len(p["text"]))
+    lo, hi = delete_start - base, delete_end - base
+    new_units = units[: lo * 2] + units[hi * 2 :]
+    new_attrs = attrs[:lo] + attrs[hi:]
     result: list[dict] = []
     buf = bytearray()
-    para_style = "NORMAL_TEXT"
-    have_style = False
+    para_attrs: dict = {}
+    have_attrs = False
     for cu in range(len(new_units) // 2):
         pair = new_units[cu * 2 : cu * 2 + 2]
-        if not have_style:
-            para_style = new_styles[cu]
-            have_style = True
+        if not have_attrs:
+            para_attrs = new_attrs[cu]
+            have_attrs = True
         buf.extend(pair)
         if pair.decode("utf-16-le") == "\n":
-            result.append({"text": bytes(buf).decode("utf-16-le"), "style": para_style})
+            result.append({**para_attrs, "text": bytes(buf).decode("utf-16-le")})
             buf = bytearray()
-            have_style = False
+            have_attrs = False
     if buf:
-        result.append({"text": bytes(buf).decode("utf-16-le"), "style": para_style})
-    return result
+        result.append({**para_attrs, "text": bytes(buf).decode("utf-16-le")})
+    return paragraphs[:first] + result + paragraphs[last + 1 :]
+
+
+def _fake_is_text(p: dict) -> bool:
+    """Whether a fake body entry is an ordinary text paragraph (not a table, not a line)."""
+    return p.get("kind") != "table" and not p.get("rule")
 
 
 def _fake_restyle(
     paragraphs: list[dict], style_start: int, style_end: int, *, clear_bullets: bool
 ) -> list[dict]:
-    """Google's updateParagraphStyle (NORMAL_TEXT) and deleteParagraphBullets over a range:
-    every paragraph the range touches takes the named style, and its bullets are cleared."""
+    """Google's updateTextStyle (no bold, no underline) over a range, and with ``clear_bullets``
+    also updateParagraphStyle (NORMAL_TEXT) and deleteParagraphBullets: every text paragraph the
+    range touches loses its bold and underline, and with ``clear_bullets`` takes the named
+    style and loses its bullets."""
     bounds, _, _, _ = _fake_doc_index(paragraphs)
     result: list[dict] = []
     for p, (s, e) in zip(paragraphs, bounds):
-        if p.get("kind") != "table" and s < style_end and e > style_start:
-            p = {**p, "style": "NORMAL_TEXT"}
+        if _fake_is_text(p) and s < style_end and e > style_start:
+            p = {**p, "bold": False, "underline": False}
             if clear_bullets:
+                p["style"] = "NORMAL_TEXT"
                 p["bullet"] = False
         result.append(p)
     return result
@@ -2581,24 +2828,52 @@ class FakeGoogleAccounts:
             paragraphs = doc["paragraphs"]
             revision_id = doc["revision_id"]
         bounds, _, foreign, _ = _fake_doc_index(paragraphs)
-        indexed = [
-            DocParagraph(p["text"], p.get("style", "NORMAL_TEXT"), s, e)
-            for p, (s, e) in zip(paragraphs, bounds)
-            if p.get("kind") != "table"
-        ]
-        return DocRead(revision_id, self.drive_files[file_id].name, tuple(indexed), tuple(foreign))
+        indexed: list[DocParagraph] = []
+        tables: list[DocTable] = []
+        for p, (s, e) in zip(paragraphs, bounds):
+            if p.get("kind") != "table":
+                indexed.append(
+                    DocParagraph(
+                        p["text"],
+                        p.get("style", "NORMAL_TEXT"),
+                        s,
+                        e,
+                        bold=bool(p.get("bold")) and bool(p["text"].strip()),
+                        underline=bool(p.get("underline")) and bool(p["text"].strip()),
+                        rule=bool(p.get("rule")),
+                    )
+                )
+            elif "rows" in p:
+                cells = _fake_table_cells(p, s)
+                tables.append(
+                    DocTable(
+                        s,
+                        e,
+                        tuple(
+                            tuple(
+                                DocCell(
+                                    text,
+                                    ts,
+                                    te,
+                                    plain=(r, c) not in p.get("image_cells", ()),
+                                    why="an image" if (r, c) in p.get("image_cells", ()) else "",
+                                )
+                                for c, (text, (ts, te)) in enumerate(zip(row, row_cells))
+                            )
+                            for r, (row, row_cells) in enumerate(zip(p["rows"], cells))
+                        ),
+                    )
+                )
+        return DocRead(
+            revision_id,
+            self.drive_files[file_id].name,
+            tuple(indexed),
+            tuple(foreign),
+            tuple(tables),
+        )
 
     async def replace_doc_section(
-        self,
-        email: str,
-        file_id: str,
-        required_revision_id: str,
-        insert_index: int,
-        insert_text: str,
-        delete_start: int,
-        delete_end: int,
-        style_start: int = 0,
-        style_end: int = 0,
+        self, email: str, file_id: str, required_revision_id: str, edits: list[DocEdit]
     ) -> str:
         self.doc_replace_calls.append((email, file_id))
         if file_id in self.drive_refused:
@@ -2617,13 +2892,19 @@ class FakeGoogleAccounts:
             )
         # Google's structural rules, in request order: insert first (the new paragraphs take
         # the style at the insertion index), then delete the shifted old range (never the
-        # body's final newline), then normalise an empty section's inserted range to
-        # NORMAL_TEXT and clear its bullets. A table's start index refuses an insert.
-        result = _fake_insert(doc["paragraphs"], insert_index, insert_text)
-        if delete_end > delete_start:
-            result = _fake_delete(result, delete_start, delete_end)
-        if style_end > style_start:
-            result = _fake_restyle(result, style_start, style_end, clear_bullets=True)
+        # body's final newline), then normalise an empty part's inserted range to
+        # NORMAL_TEXT and clear its bullets. A table's start index refuses an insert. A refused
+        # request leaves the Doc as it was.
+        result = doc["paragraphs"]
+        for edit in edits:
+            if edit.insert_text:
+                result = _fake_insert(result, edit.insert_index, edit.insert_text)
+            if edit.delete_end > edit.delete_start:
+                result = _fake_delete(result, edit.delete_start, edit.delete_end)
+            if edit.style_end > edit.style_start:
+                result = _fake_restyle(
+                    result, edit.style_start, edit.style_end, clear_bullets=edit.paragraphs
+                )
         doc["paragraphs"] = result
         # The revision is opaque, as Google's revisionId is: a write moves it to a fresh token,
         # never a number a caller could predict or compare arithmetically.

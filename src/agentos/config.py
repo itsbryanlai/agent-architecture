@@ -435,9 +435,13 @@ class DriveGrant:
     heading the creator names, stripped of surrounding whitespace. The section is
     everything under that heading up to the next heading of the same or higher level
     (``TITLE`` and ``SUBTITLE`` are the highest level). Submit checks the heading exists
-    exactly once and the section is plain paragraphs only. The write refuses when the
-    live grant's heading no longer matches the draft's, the heading is gone or duplicated,
-    the section holds a table or image, or the Doc moved since the read revision.
+    exactly once and the section holds text, horizontal lines and tables only. ``marker``
+    is the style signature of that line, read once when the version is submitted and frozen
+    into the definition (a heading style, or ``NORMAL_TEXT:`` with the bold and underline the
+    whole line carries, and caps when it is also all capitals); empty on a grant published
+    before, which marks the section by heading style only. The write refuses when the live grant's heading or marker no longer
+    matches the draft's, the line is gone, duplicated or restyled, the section holds an
+    image, or the Doc moved since the read revision.
     """
 
     id: str
@@ -452,6 +456,7 @@ class DriveGrant:
     drive_id: str = ""
     doc_id: str = ""
     heading: str = ""
+    marker: str = ""
 
 
 @dataclass
@@ -669,7 +674,12 @@ _DRIVE_ITEM_KEYS = frozenset({"id", "name"})
 _DRIVE_SHEET_KEYS = frozenset({"id", "name", "tab", "columns", "header_row", "first_column"})
 _COLUMN_LETTER = re.compile(r"[A-Z]{1,3}")
 _DRIVE_TEMPLATE_KEYS = frozenset({"id", "name", "folder_id", "blanks", "drive_id"})
-_DRIVE_SECTION_KEYS = frozenset({"id", "name", "doc_id", "heading"})
+_DRIVE_SECTION_KEYS = frozenset({"id", "name", "doc_id", "heading", "marker"})
+# The style signature of a section's marker line, recorded at submit: a heading style, or a
+# normal line that is wholly bold or underlined (``NORMAL_TEXT:bold+caps`` when also all capitals).
+_MARKER_SIGNATURE = re.compile(
+    r"TITLE|SUBTITLE|HEADING_[1-6]|NORMAL_TEXT:(bold|underline|caps)(\+(bold|underline|caps)){0,2}"
+)
 DRIVE_GRANT_KINDS = ("folder", "file", "shared_drive", "sheet", "template", "section")
 # A Drive file, folder or shared-drive ID: letters, digits, - and _, at least 10 of them.
 # The connector's link parser uses the same shape, so a grant and a resolved link agree.
@@ -924,12 +934,16 @@ def _parse_drive_section(agent_id: str, raw: dict[str, Any], index: int = 0) -> 
     heading = _text(where, "heading", _require(raw, "heading", where)).strip()
     if len(heading) > MAX_HEADING_NAME:
         raise ConfigError(f"{where}: a heading name may be at most {MAX_HEADING_NAME} characters")
+    marker = _text(where, "marker", raw.get("marker", "")) if "marker" in raw else ""
+    if marker and not _MARKER_SIGNATURE.fullmatch(marker):
+        raise ConfigError(f"{where}: 'marker' is not a style the agent can record")
     return DriveGrant(
         id=grant_id,
         name=_text(where, "name", _require(raw, "name", where)),
         kind="section",
         doc_id=doc_id,
         heading=heading,
+        marker=marker,
     )
 
 
@@ -1113,6 +1127,8 @@ def _drive_grant_entry(grant: DriveGrant) -> dict[str, Any]:
     if grant.kind == "section":
         entry["doc_id"] = grant.doc_id
         entry["heading"] = grant.heading
+        if grant.marker:
+            entry["marker"] = grant.marker
     return entry
 
 

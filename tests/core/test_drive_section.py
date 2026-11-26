@@ -8,6 +8,7 @@ import pytest
 from temporalio.testing import ActivityEnvironment
 
 from agentos import ids
+from agentos.activities import approval_card_blocks
 from agentos.config import TASK_QUEUE
 from agentos.connectors.drive import (
     DOC_MOVED_TEXT,
@@ -35,6 +36,7 @@ from tests.helpers.drive import (
     section_grant_block,
 )
 
+CONV = ids.conversation_id(TENANT, CHANNEL, THREAD)
 NONCE = "nonce-section"
 DOC_LINK = f"https://drive.google.com/file/d/{DRIVE_SECTION}"
 NEW_TEXT = "The VPN is back up."
@@ -71,7 +73,7 @@ async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEA
     task_id = ids.task_id(TENANT, str(uuid.uuid4()))
     grant = section_grant_block()
     doc = await DriveReader(h.google, "agent@x.iam.gserviceaccount.com").read_doc(DRIVE_SECTION)
-    start, end, before = section_bounds(doc.paragraphs, heading_matches(doc.paragraphs, heading)[0])
+    _, _, before = section_bounds(doc, heading_matches(doc.paragraphs, heading)[0])
     await h.acts.content.put_draft(
         TENANT,
         task_id,
@@ -84,8 +86,6 @@ async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEA
             "page_id": DRIVE_SECTION,
             "before": before,
             "revision_id": doc.revision_id,
-            "content_start": start,
-            "content_end": end,
             "item_title": grant["name"],
             "item_url": DOC_LINK,
         },
@@ -380,3 +380,125 @@ async def test_the_card_shows_the_whole_before_text_spread_over_blocks(dharness)
     joined = before_blocks[0][len("*Before*\n") :] + "".join(before_blocks[1:])
     assert long_text.strip() in joined
     assert joined.endswith("Restart the router.")
+
+
+def test_the_card_shows_each_horizontal_line_as_a_row_and_each_table_as_a_grid():
+    """Fails if the approval card shows a section's horizontal line as a bare --- or its table
+    as raw pipe rows, so the requester cannot tell what stays and which cells change."""
+    shown = {
+        "heading": SECTION_HEADING,
+        "before": "Intro.\n---\n| Item | Qty |\n| Pens | 2 |",
+        "text": "New intro.\n---\n| Item | Qty |\n| Pens | 5 |",
+        "item_title": "VPN guide",
+        "item_url": DOC_LINK,
+    }
+    spec = TaskSpec(ctx(), "replace_section", {}, NONCE, tool="replace_section")
+
+    blocks = approval_card_blocks(spec, "task-1", "IT helper", "", payload=shown)
+
+    texts = [b["text"]["text"] for b in blocks if b["type"] == "section"]
+    assert "*Before*\nIntro.\n———\n│ Item │ Qty │\n│ Pens │ 2 │" in texts
+    assert "*New text*\nNew intro.\n———\n│ Item │ Qty │\n│ Pens │ 5 │" in texts
+
+
+def add_shaped_section(google) -> None:
+    """The VPN guide's Status section with a horizontal line and a table in it."""
+    add_section_doc(google)
+    paragraphs = google.docs[DRIVE_SECTION]["paragraphs"]
+    paragraphs[2:2] = [
+        {"text": "\n", "style": "NORMAL_TEXT", "rule": True},
+        {"kind": "table", "rows": [["Item", "Qty"], ["Pens", "2"]]},
+        {"text": "After the table.\n", "style": "NORMAL_TEXT"},
+    ]
+
+
+SHAPED_VIEW = (
+    "The VPN is down.\n---\n| Item | Qty |\n| Pens | 2 |\nAfter the table.\nSteps\n"
+    "Restart the router."
+)
+
+
+@pytest.mark.parametrize(
+    ("chosen", "section", "expected"),
+    [
+        (["replace_section"], DRIVE_SECTION, SHAPED_VIEW),
+        (["comment_on_file"], DRIVE_SECTION, "This agent isn't set up to replace a section"),
+        (["replace_section"], "drive-nope-0001", "not been granted a section"),
+    ],
+    ids=["chosen and granted", "replace not chosen", "section not granted"],
+)
+async def test_the_section_read_shows_the_view_only_with_the_replace_action_and_the_grant(
+    dharness, chosen, section, expected
+):
+    """Fails if read_section hides the --- lines and pipe-row tables the replace must keep, or
+    answers an agent that may not replace sections or a section it was not granted."""
+    h = dharness
+    record = await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: (
+            d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+            d.update(actions=chosen),
+        ),
+    )
+    add_shaped_section(h.google)
+    call = ToolCall("tu_r", "read_section", {"section": section})
+
+    await ActivityEnvironment().run(h.acts.run_read_tool, ctx(record.version), CONV, call, 1)
+
+    text, is_error = (await h.tool_outputs.get_many(TENANT, CONV, ["tu_r"]))["tu_r"]
+    assert is_error == (expected != SHAPED_VIEW)
+    assert expected in text
+
+
+@pytest.mark.parametrize(
+    ("bad_text", "problem"),
+    [
+        (
+            "New intro.\n| Item | Qty |\n| Pens | 5 |\nEnd.",
+            "Keep the 1 horizontal line in 'Status'",
+        ),
+        (
+            "New intro.\n---\n| Item | Qty |\n| Pens | 5 |\n| Ink | 1 |\nEnd.",
+            "Keep the table in 'Status' at 2 rows and 2 columns",
+        ),
+    ],
+    ids=["line dropped", "table row added"],
+)
+async def test_a_draft_that_breaks_the_sections_lines_or_tables_is_refused_before_any_card(
+    dharness, bad_text, problem
+):
+    """Fails if a replacement dropping a line or reshaping a table posts a card (to fail only
+    at approval) instead of telling the model in plain words, or the corrected draft gets none."""
+    h = dharness
+    await republish(
+        h.agent_store,
+        "it-helper",
+        lambda d: d["grants"].setdefault("drive", {}).update(sections=[section_grant_block()]),
+    )
+    add_shaped_section(h.google)
+    good = "New intro.\n---\n| Item | Qty |\n| Pens | 5 |\nEnd."
+    h.llm.queue(
+        LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall("tu_1", "replace_section", {"section": DRIVE_SECTION, "text": bad_text})
+            ],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall("tu_2", "replace_section", {"section": DRIVE_SECTION, "text": good})
+            ],
+            stop_reason="tool_use",
+        ),
+        LLMResponse(text="Drafted.", tool_calls=[], stop_reason="end_turn"),
+    )
+
+    await start_stored_conversation(h, "Ev1", "update the VPN status section")
+
+    await eventually(lambda: cards(h), timeout=20)
+    assert problem in json.dumps(h.llm.calls[1]["messages"])
+    assert len(cards(h)) == 1
+    assert h.google.doc_replace_calls == []

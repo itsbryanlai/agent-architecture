@@ -11,7 +11,7 @@ from agentos.models import LLMResponse, ToolCall, TurnContext
 from tests.conftest import ALICE, TENANT, eventually
 from tests.helpers.agents import republish
 from tests.helpers.conversation import start_stored_conversation
-from tests.helpers.drive import DRIVE_SHEET, sheet_grant_block
+from tests.helpers.drive import DRIVE_SHEET, section_grant_block, sheet_grant_block
 from tests.helpers.tasks import approve, start_task
 
 CHANNEL = "C_GENERAL"
@@ -25,38 +25,52 @@ LEGACY = {
 NOT_SET_UP = "This agent isn't set up to {}."
 
 
-async def publish(h, actions, with_sheet=False):
-    """Republish it-helper with ``actions`` (None: the key left out) and maybe a Sheet grant."""
+async def publish(h, actions, with_sheet=False, with_section=False):
+    """Republish it-helper with ``actions`` (None: the key left out) and maybe a Sheet or a
+    section grant."""
 
     def change(definition):
         if actions is not None:
             definition["actions"] = actions
         if with_sheet:
             definition["grants"].setdefault("drive", {}).update(sheets=[sheet_grant_block()])
+        if with_section:
+            definition["grants"].setdefault("drive", {}).update(sections=[section_grant_block()])
 
     record = await republish(h.agent_store, "it-helper", change)
     return TurnContext(TENANT, "it-helper", record.version, ALICE, CHANNEL, THREAD, "channel")
 
 
 @pytest.mark.parametrize(
-    ("actions", "sheet", "offered"),
+    ("actions", "sheet", "section", "offered"),
     [
-        (None, False, LEGACY),
-        ([], False, set()),
-        (["append_row"], False, set()),
-        (["append_row"], True, {"append_row", "my_tasks"}),
-        (["search_items", "my_items"], False, {"search_items", "my_items"}),
+        (None, False, False, LEGACY),
+        ([], False, False, set()),
+        (["append_row"], False, False, set()),
+        (["append_row"], True, False, {"append_row", "my_tasks"}),
+        (["search_items", "my_items"], False, False, {"search_items", "my_items"}),
+        (["replace_section"], False, True, {"replace_section", "read_section", "my_tasks"}),
+        (["append_row"], True, True, {"append_row", "my_tasks"}),
     ],
-    ids=["legacy", "none ticked", "write without its grant", "write with its grant", "reads only"],
+    ids=[
+        "legacy",
+        "none ticked",
+        "write without its grant",
+        "write with its grant",
+        "reads only",
+        "section write brings its read",
+        "section granted but its action not chosen",
+    ],
 )
 async def test_a_tool_is_offered_only_when_its_action_is_chosen_and_its_grant_is_there(
-    dharness, actions, sheet, offered
+    dharness, actions, sheet, section, offered
 ):
     """Fails if the model is offered an action its creator did not choose or one whose grant is
     missing, a chosen action is withheld, or the task list is offered to an agent with no write
-    action; a version with no actions list must offer what its grants allow."""
+    action, or the section read is offered without the section replace (or withheld with it); a
+    version with no actions list must offer what its grants allow."""
     h = dharness
-    ctx = await publish(h, actions, with_sheet=sheet)
+    ctx = await publish(h, actions, with_sheet=sheet, with_section=section)
     h.llm.queue(LLMResponse(text="Hi", tool_calls=[], stop_reason="end_turn"))
 
     await ActivityEnvironment().run(h.acts.call_llm, ctx, CONV)

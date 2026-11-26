@@ -72,7 +72,34 @@ async def test_submit_reads_the_templates_blanks_once_and_stores_them(case):
     assert entry["blanks"] == expected
     assert entry["drive_id"] == TEMPLATE_DRIVE
     email = f"{ids.drive_account_id(TENANT)}@test-project.iam.gserviceaccount.com"
-    assert google.export_calls == [(email, DRIVE_TEMPLATE)]
+    assert google.template_read_calls == [(email, DRIVE_TEMPLATE)]
+
+
+@pytest.mark.parametrize(
+    ("body", "segments", "expected"),
+    [
+        ("Dear {{name}}", [], ["name"]),
+        ("Dear all", ["Client: {{client}}"], ["client"]),
+        ("Dear all", ["Page {{ref}}", "Ref {{ref}}"], ["ref"]),
+        ("Dear {{name}}", ["Client: {{client}}", "Ref {{name}}"], ["name", "client"]),
+    ],
+    ids=["body", "header-or-footer-only", "header-and-footer-once", "header-and-body"],
+)
+async def test_submit_offers_a_blank_found_in_a_header_or_footer_once(body, segments, expected):
+    """Fails if a blank written only in a header or footer is not stored with the template's
+    blanks, or one written in several places is stored twice."""
+    h, _drive, google = template_harness()
+    await h.seed_members()
+    await h.plane.connect_drive(TENANT, ROOT)
+    add_template_tree(google)
+    google.set_drive_content(DRIVE_TEMPLATE, [DriveSection("", body)])
+    google.set_drive_segments(DRIVE_TEMPLATE, segments)
+    await h.plane.add_agent(TENANT, OWNER, "it-helper", template_definition(TEMPLATE_FOLDER))
+
+    await h.plane.submit_version(TENANT, OWNER, "it-helper", 1)
+
+    record = await h.agents.get_version(TENANT, "it-helper", 1)
+    assert record.agent().grants.drive[0].blanks == tuple(expected)
 
 
 @pytest.mark.parametrize(

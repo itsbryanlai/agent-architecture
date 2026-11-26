@@ -254,6 +254,12 @@ REQUESTER_NAME_MAX = 80
 # Stop reasons whose reply is a fixed runtime text (agent off or unavailable, budget
 # reached, spend unknown), not a model answer: it carries no feedback buttons.
 FIXED_STOP_REASONS = frozenset({SWITCHED_OFF, BUDGET_STOP_REASON, SPEND_UNKNOWN})
+# Runtime instruction of the one retry for an answer that searched but cited nothing.
+CITATION_RETRY = (
+    "Your answer cites none of the passages the search returned. Answer again: cite the "
+    "passages you used by their number, like [1], or say plainly that the passages do "
+    "not answer the question."
+)
 
 T = TypeVar("T")
 
@@ -489,6 +495,8 @@ class AgentActivities:
             self.ingest_message,
             self.discard_message,
             self.call_model,
+            self.needs_citation_retry,
+            self.retry_model_for_citations,
             self.finalize_model_reply,
             self.post_final_model_reply,
             self.finalize_searched_model_reply,
@@ -1093,9 +1101,15 @@ class AgentActivities:
         return await self._model_response(ctx, conversation_id, refusal)
 
     async def _model_response(
-        self, ctx: TurnContext, conversation_id: str, refusal: Exception | None
+        self,
+        ctx: TurnContext,
+        conversation_id: str,
+        refusal: Exception | None,
+        extra: list[dict] | None = None,
     ) -> LLMResponse:
-        """One model call for the thread, unless a switch or a budget answers instead."""
+        """One model call for the thread, unless a switch or a budget answers instead.
+
+        ``extra`` messages follow the stored history for this call only; they are not kept."""
         agent = await self._pinned(ctx)
         if isinstance(refusal, AgentOff):
             log_stop(ctx.tenant_id, ctx.agent_id, refusal.switch)
@@ -1113,6 +1127,7 @@ class AgentActivities:
             if stopped is not None:
                 return stopped
         messages = prepare_for_model(await self.history.load_window(ctx.tenant_id, conversation_id))
+        messages = messages + (extra or [])
         tools = self._connector_for(ctx.tenant_id, agent).tools_for_llm()
         if agent.grants.drive:
             # The Drive tools join only an agent that was granted Drive folders or files;
@@ -1260,6 +1275,63 @@ class AgentActivities:
             tool_calls=[_call_ref(block) for block in uses],
             has_text=_has_text(step),
         )
+
+    @activity.defn(name="needs_citation_retry")
+    async def needs_citation_retry(
+        self,
+        ctx: TurnContext,
+        conversation_id: str,
+        step_key: str,
+        citations: list[Citation],
+    ) -> bool:
+        """Whether the final answer stored under ``step_key`` cites none of ``citations``.
+
+        A fixed stop text (agent off, budget reached) is not an answer, so it is never asked
+        again. Only the verdict leaves the activity; the answer stays in Postgres.
+        """
+        self._log("needs_citation_retry", ctx.tenant_id, ctx.agent_id)
+        step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
+        if step is None or step.reply_text is None or step.stop_reason in FIXED_STOP_REASONS:
+            return False
+        return not cited_markers(step.reply_text, citations)
+
+    @activity.defn(name="retry_model_for_citations")
+    async def retry_model_for_citations(
+        self, ctx: TurnContext, conversation_id: str, first_key: str, step_key: str
+    ) -> StepResult:
+        """Ask the model once more about an answer that searched but cited nothing.
+
+        The call sees the thread's history, the answer stored under ``first_key`` and a short
+        runtime instruction (not kept in history) to cite the passages by number or say they
+        do not answer. Its reply is stored under ``step_key`` and is final: a tool call in it
+        is dropped, so the turn never runs more tools. A repeat of this activity reads the
+        stored reply instead of asking again. It is a model call like any other, so it starts
+        at the gate and records a usage row.
+        """
+        self._log("retry_model_for_citations", ctx.tenant_id, ctx.agent_id)
+        refusal = await self._gate_refusal(ctx.tenant_id, ctx.agent_id, Effect.MODEL)
+        step = await self.content.get_step(ctx.tenant_id, conversation_id, step_key)
+        if step is None:
+            first = await self.content.get_step(ctx.tenant_id, conversation_id, first_key)
+            if first is None or first.reply_text is None:
+                raise ApplicationError(
+                    "the stored reply is missing", type="ValueError", non_retryable=True
+                )
+            extra = [
+                {"role": "assistant", "content": first.content},
+                {"role": "user", "content": [{"type": "text", "text": CITATION_RETRY}]},
+            ]
+            resp = await self._model_response(ctx, conversation_id, refusal, extra)
+            if resp.tool_calls:
+                resp = replace(
+                    resp,
+                    tool_calls=[],
+                    content=[b for b in resp.content if b.get("type") != "tool_use"],
+                )
+            step = await self.content.put_step(
+                ctx.tenant_id, conversation_id, step_key, _stored_step(resp)
+            )
+        return StepResult(stop_reason=step.stop_reason, tool_calls=[], has_text=_has_text(step))
 
     async def _show_final_text(
         self,

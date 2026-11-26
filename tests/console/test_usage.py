@@ -446,6 +446,21 @@ async def test_two_calls_of_one_conversation_are_two_rows(agents):
     assert len(store.events) == 2
 
 
+async def test_the_citation_retry_is_a_model_call_with_its_own_usage_row(agents):
+    """Fails if the extra model call for a missing citation is not recorded, or shares the first call's row."""
+    store, recorder = recorder_with()
+    acts = make_activities(agents, ScriptedLLMClient([answer(), answer()]), recorder)
+    first, retry = ActivityEnvironment(), ActivityEnvironment()
+    # A distinct activity id: the usage key is built from it, so two rows need two ids.
+    retry.info = replace(retry.info, activity_id="citation-retry")
+    conv = "acme:conv:C1:1.1"
+
+    await first.run(acts.call_model, turn_ctx(), conv, "ev:s1")
+    await retry.run(acts.retry_model_for_citations, turn_ctx(), conv, "ev:s1", "ev:s1:cite")
+
+    assert len(store.events) == 2
+
+
 async def test_a_call_to_a_model_with_no_price_records_tokens_and_null_cost(agents):
     store, recorder = recorder_with(entries=[])
     acts = make_activities(agents, ScriptedLLMClient([answer()]), recorder)

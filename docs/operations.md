@@ -1477,7 +1477,7 @@ answer did not cite. `hits` can exceed `dropped + kept`: hits whose page fails t
 re-check, or beyond the per-page and per-search passage caps, are not counted in either.
 
 An answer that cites its passages gets the Sources line. When a turn's searches returned
-passages but the answer cites none of them, the reply instead shows a Searched line naming
+passages but the answer cites none of them (after one retry that asks the model to cite, for a turn whose text is stored), the reply instead shows a Searched line naming
 up to three of those pages, nearest first, built from the same stored page metadata and
 only scopes still granted to the agent. A turn whose searches returned nothing shows no
 footer. The Searched line is behind the `searched-footer` patch marker, so histories

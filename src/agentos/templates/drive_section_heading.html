@@ -3,7 +3,7 @@
 {% block body %}
 <p><a href="{{ version_url }}">{{ agent_id }} version {{ version }}</a></p>
 <h1>Choose the section's heading in {{ doc.name }}</h1>
-<p>Pick the heading whose section the agent may replace, or type its name. The section is everything under that heading up to the next heading of the same or higher level; it must be plain paragraphs (no table or image). The heading is checked when the version is submitted.</p>
+<p>Pick the line that marks the section the agent may replace, or type its text: a heading, or a line that is wholly bold or underlined. The section is everything under it up to the next heading of the same or higher level (for a bold or underlined line, the next heading or the next line in its style); it may hold text, horizontal lines and tables, but not an image. The line is checked when the version is submitted.</p>
 <form method="post" action="{{ version_url }}/drive/pick/section">
   <input type="hidden" name="csrf" value="{{ ctx.csrf }}">
   <input type="hidden" name="request_id" value="{{ new_token() }}">

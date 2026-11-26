@@ -25,6 +25,7 @@ from agentos.connectors.google_iam import (
     MIME_FOLDER,
     MIME_SHEET,
     MIME_SLIDES,
+    DocEdit,
     DriveFile,
     DriveSection,
     GoogleError,
@@ -1387,9 +1388,10 @@ async def test_read_doc_returns_the_revision_title_and_paragraphs(deployment_key
 
 
 async def test_read_doc_parses_marker_styles_horizontal_lines_and_tables(deployment_key):
-    """Fails if documents.get is not read into bold and underlined lines, a horizontal line (its
-    own paragraph), a table's cells with their text ranges, and a non-text element as foreign
-    — the shapes a section write locates its marker, lines and cells by (D-50)."""
+    """Fails if documents.get is not read into bold and underlined lines (a link is not
+    underline), a horizontal line (its own paragraph), a table's cells with their text ranges
+    (a cell holding an image says so), and a non-text element as foreign — the shapes a section
+    write locates its marker, lines and cells by (D-50)."""
 
     def run(text: str, **style) -> dict:
         return {"textRun": {"content": text, "textStyle": style}}
@@ -1398,19 +1400,32 @@ async def test_read_doc_parses_marker_styles_horizontal_lines_and_tables(deploym
         return {"startIndex": start, "endIndex": end, "paragraph": {"elements": list(elements)}}
 
     cell = {
-        "startIndex": 21,
-        "endIndex": 25,
-        "content": [paragraph(22, 25, run("Ab\n"))],
+        "startIndex": 29,
+        "endIndex": 33,
+        "content": [paragraph(30, 33, run("Ab\n"))],
+    }
+    image_cell = {
+        "startIndex": 33,
+        "endIndex": 37,
+        "content": [
+            paragraph(
+                34,
+                37,
+                {"startIndex": 34, "endIndex": 35, "inlineObjectElement": {}},
+                run("\n"),
+            )
+        ],
     }
     content = [
         {"endIndex": 1, "sectionBreak": {}},
         paragraph(1, 8, run("Status", bold=True), run("\n")),
         paragraph(8, 12, run("Due\n", underline=True, bold=False)),
-        paragraph(12, 14, {"startIndex": 12, "endIndex": 13, "horizontalRule": {}}, run("\n")),
+        paragraph(12, 20, run("See docs\n", underline=True, link={"url": "https://x.example"})),
+        paragraph(20, 22, {"startIndex": 20, "endIndex": 21, "horizontalRule": {}}, run("\n")),
         {
-            "startIndex": 14,
-            "endIndex": 25,
-            "table": {"tableRows": [{"tableCells": [cell]}]},
+            "startIndex": 22,
+            "endIndex": 37,
+            "table": {"tableRows": [{"tableCells": [cell, image_cell]}]},
         },
     ]
 
@@ -1432,12 +1447,13 @@ async def test_read_doc_parses_marker_styles_horizontal_lines_and_tables(deploym
     assert [(p.text, p.bold, p.underline, p.rule) for p in doc.paragraphs] == [
         ("Status\n", True, False, False),
         ("Due\n", False, True, False),
+        ("See docs\n", False, False, False),
         ("\n", False, False, True),
     ]
     assert doc.foreign == ((0, 1),)
     [table] = doc.tables
-    assert [[(c.text, c.start_index, c.end_index) for c in row] for row in table.rows] == [
-        [("Ab", 22, 24)]
+    assert [[(c.text, c.start_index, c.end_index, c.why) for c in row] for row in table.rows] == [
+        [("Ab", 30, 32, ""), ("", 34, 36, "an image")]
     ]
 
 
@@ -1453,21 +1469,29 @@ async def test_replace_sends_one_batchupdate_locked_to_the_read_revision(deploym
     NORMAL_TEXT style, bullets, bold and underline cleared over the inserted range for an
     empty part), or a 400 failedPrecondition — by
     status or by reason alone — is not a revision_mismatch GoogleError (D-50)."""
-    # insert_index, insert_text, delete_start, delete_end, style_start, style_end
     plans = {
-        "writes": [(7, "new line\n", 16, 25, 0, 0)],
-        "insert-only": [(7, "new line\n", 7, 7, 0, 0)],
-        "normalize": [(7, "new line\n", 0, 0, 7, 16)],
-        "status mismatch": [(7, "new line\n", 16, 25, 0, 0)],
-        "reason-only mismatch": [(7, "new line\n", 16, 25, 0, 0)],
+        # A part: inserted text has bold and underline switched off, paragraph style kept.
+        "writes": [DocEdit(7, "new line\n", 16, 25, 7, 16)],
+        "insert-only": [DocEdit(7, "new line\n", 7, 7)],
+        # An empty part: also NORMAL_TEXT with bullets cleared.
+        "normalize": [DocEdit(7, "new line\n", 0, 0, 7, 16, True)],
+        "status mismatch": [DocEdit(7, "new line\n", 16, 25)],
+        "reason-only mismatch": [DocEdit(7, "new line\n", 16, 25)],
         # A part after a table cell edit, last in the Doc first (a cell's text is replaced in
         # place: insert, then delete the shifted range).
-        "two edits": [(40, "Done.\n", 46, 52, 0, 0), (20, "Pencils", 27, 31, 0, 0)],
+        "two edits": [DocEdit(40, "Done.\n", 46, 52), DocEdit(20, "Pencils", 27, 31)],
     }
     expected_requests = {
         "writes": [
             {"insertText": {"location": {"index": 7}, "text": "new line\n"}},
             {"deleteContentRange": {"range": {"startIndex": 16, "endIndex": 25}}},
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": 7, "endIndex": 16},
+                    "textStyle": {"bold": False, "underline": False},
+                    "fields": "bold,underline",
+                }
+            },
         ],
         "insert-only": [{"insertText": {"location": {"index": 7}, "text": "new line\n"}}],
         "two edits": [

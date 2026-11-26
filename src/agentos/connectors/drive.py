@@ -119,11 +119,12 @@ DOC_MOVED_TEXT = "The document changed since you approved; I'll draft it again"
 # the card never previews a body it cannot show whole (D-50).
 MAX_SECTION_BEFORE = 5000
 # The refusal for a section holding something the replace cannot write: an inline image, a
-# page or section break, or a table cell of several lines. Text, horizontal lines and table
-# cells are written; the rest is left to the owner (D-50).
+# page or section break, or a table cell of several paragraphs or holding an image. Text,
+# horizontal lines and table cells are written; the rest is left to the owner. It names what it
+# found (D-50).
 SECTION_NOT_PLAIN_TEXT = (
     "I can only replace a section made of text, lines and tables; "
-    "'{doc}' has an image or other content under '{heading}' that I can't edit"
+    "'{doc}' has {what} under '{heading}' that I can't edit"
 )
 # The refusal for a section holding a paragraph that reads like a divider or a table row: the
 # model's view of a section marks lines with --- and tables with pipe rows, so such text would
@@ -134,6 +135,19 @@ SECTION_AMBIGUOUS_TEXT = (
 # The refusal for new text that does not keep the section's horizontal lines: the Docs API
 # cannot insert one, so each existing line stays and the model writes --- where it is (D-50).
 SECTION_RULES_TEXT = "Keep the {count} horizontal {lines} in '{heading}': write --- where {each} is"
+# The refusals for new text that writes a ``---`` line or a pipe row where the section has none,
+# a ``|`` line that is not a whole row, a line equal to the marker line, or lines and tables in
+# another order than the section's (D-50).
+SECTION_NO_RULES_TEXT = "'{heading}' has no horizontal lines; don't write a line that is only ---"
+SECTION_NO_TABLE_TEXT = "'{heading}' has no table; don't write a line that starts and ends with |"
+SECTION_PIPE_LINE_TEXT = (
+    "A line under '{heading}' can't start with | unless it is a whole table row"
+)
+SECTION_MARKER_TEXT = (
+    "A line in the new text reads '{heading}', which is the line that marks the section; "
+    "write it another way"
+)
+SECTION_ORDER_TEXT = "Keep the horizontal lines and tables in '{heading}' in the order they are"
 # The refusal for new text that does not keep a table's rows and columns (D-50).
 SECTION_TABLE_TEXT = "Keep the table in '{heading}' at {rows} rows and {columns} columns"
 # The refusal for new text under a heading that sits right before a table with no line of
@@ -201,20 +215,38 @@ def heading_level(style: str) -> int | None:
     return None
 
 
+def style_flags(p: DocParagraph) -> frozenset[str]:
+    """Which of bold, underline and capitals the whole of a normal line carries (a heading
+    style or a horizontal line carries none for this purpose)."""
+    if p.rule:
+        return frozenset()
+    on = (("bold", p.bold), ("underline", p.underline), ("caps", p.caps))
+    return frozenset(name for name, flag in on if flag)
+
+
 def marker_signature(p: DocParagraph) -> str | None:
     """The style signature of a line that can mark a section, or None when the line cannot:
     a heading style is its own signature (``HEADING_2``); a normal line is a marker when its
-    whole text is bold, underlined or in capitals, and its signature names which
-    (``NORMAL_TEXT:bold+caps``). The grant freezes it at submit, so a line that later changes
-    style no longer marks the section (D-50)."""
+    whole text is bold or underlined, and its signature names which, with ``caps`` added when
+    its letters are also all capitals (``NORMAL_TEXT:bold+caps``). Capitals alone never mark a
+    section: a line like ``TBD`` is content. The grant freezes the signature at submit, so a
+    line that later changes style no longer marks the section (D-50)."""
     if p.rule:
         return None
     if heading_level(p.style) is not None:
         return p.style
-    flags = [
-        name for name, on in (("bold", p.bold), ("underline", p.underline), ("caps", p.caps)) if on
-    ]
-    return "NORMAL_TEXT:" + "+".join(flags) if flags else None
+    flags = style_flags(p)
+    if not flags & {"bold", "underline"}:
+        return None
+    return "NORMAL_TEXT:" + "+".join(f for f in ("bold", "underline", "caps") if f in flags)
+
+
+def _caps_only_signature(marker: str) -> bool:
+    """Whether a recorded signature names capitals without bold or underline: no line can
+    match it any more, so the write refuses it as a changed marker (D-50)."""
+    return marker.startswith("NORMAL_TEXT:") and not {"bold", "underline"} & set(
+        marker.split(":", 1)[1].split("+")
+    )
 
 
 def heading_matches(
@@ -241,9 +273,11 @@ def heading_matches(
 def locate_marker(doc: DocRead, heading: str, marker: str) -> int:
     """The index of the one line that marks the section, or a ``ConnectorError`` in plain
     words: the heading missing, more than once, or still there in another style (D-50)."""
-    matches = heading_matches(doc.paragraphs, heading, marker)
+    matches = (
+        [] if _caps_only_signature(marker) else heading_matches(doc.paragraphs, heading, marker)
+    )
     if not matches:
-        if marker and heading_matches(doc.paragraphs, heading):
+        if marker and (_caps_only_signature(marker) or heading_matches(doc.paragraphs, heading)):
             raise ConnectorError(heading_style_changed_text(heading, doc.title))
         raise ConnectorError(heading_missing_text(heading, doc.title))
     if len(matches) > 1:
@@ -291,24 +325,27 @@ class SectionLayout:
 
 def section_layout(doc: DocRead, marker_index: int) -> SectionLayout:
     """The layout of the section under the marker line at ``marker_index`` (D-50): the content
-    starts at the line's end and runs to the next line of the same signature, or for a heading
-    to the next heading of the same or a higher level, or to the body's end. Horizontal lines
+    starts at the line's end. A heading's section runs to the next heading of the same or a
+    higher level; a bold or underlined line's to the next line in its style or one carrying
+    more styles, or any heading; either to the body's end otherwise. Horizontal lines
     and tables inside it split the text into parts."""
     paragraphs = doc.paragraphs
     marker = paragraphs[marker_index]
-    signature = marker_signature(marker)
     level = heading_level(marker.style)
+    marker_flags = style_flags(marker)
     start = marker.end_index
     end = paragraphs[-1].end_index
     boundary = len(paragraphs)
     for j in range(marker_index + 1, len(paragraphs)):
         p = paragraphs[j]
         nxt = heading_level(p.style)
-        stops = (
-            (nxt is not None and nxt <= level)
-            if level is not None
-            else (marker_signature(p) == signature)
-        )
+        if level is not None:
+            stops = nxt is not None and nxt <= level
+        else:
+            # A bold or underlined marker's section ends at any heading, or at a line in the
+            # marker's style or one that carries all its styles and more (bold+underline
+            # after a bold marker).
+            stops = nxt is not None or marker_flags <= style_flags(p)
         if stops:
             end, boundary = p.start_index, j
             break
@@ -375,19 +412,29 @@ def section_bounds(doc: DocRead, marker_index: int) -> tuple[int, int, str]:
 def section_plain_error(doc: DocRead, heading: str, marker_index: int) -> str | None:
     """The refusal for a section holding something the replace cannot write, or None: an
     inline image or any other element that is not text, a horizontal line or a table, a
-    table cell of several lines, or a paragraph that reads like a divider (``---``) or a table
-    row (starts with ``|``), which would make the model's view ambiguous (D-50). Such a section is refused at submit, at draft and at
-    the write."""
+    table cell of several paragraphs or holding an image, or a paragraph that reads like a
+    divider (``---``) or a table row (starts with ``|``), which would make the model's view
+    ambiguous (D-50). Such a section is refused at submit, at draft and at the write; the
+    refusal names what it found."""
     layout = section_layout(doc, marker_index)
-    refused = any(fs < layout.end and fe > layout.start for fs, fe in doc.foreign) or any(
-        not cell.plain or len(row) != len(sep.table.rows[0])
-        for sep in layout.seps
-        if sep.table is not None
-        for row in sep.table.rows
-        for cell in row
-    )
-    if refused:
-        return SECTION_NOT_PLAIN_TEXT.format(doc=doc.title, heading=heading)
+    what = None
+    if any(fs < layout.end and fe > layout.start for fs, fe in doc.foreign):
+        what = "an image or other content"
+    for sep in layout.seps:
+        if sep.table is None or what is not None:
+            continue
+        width = len(sep.table.rows[0])
+        for row in sep.table.rows:
+            for cell in row:
+                if not cell.plain:
+                    what = f"a table cell with {cell.why or 'other content'}"
+                    break
+            if what is None and len(row) != width:
+                what = "a table with merged or uneven cells"
+            if what is not None:
+                break
+    if what is not None:
+        return SECTION_NOT_PLAIN_TEXT.format(doc=doc.title, heading=heading, what=what)
     for part in layout.parts:
         for line in part.text.split("\n"):
             if line.strip() == RULE_LINE or line.strip().startswith("|"):
@@ -419,21 +466,21 @@ class SectionText:
 def parse_section_text(text: str, layout: SectionLayout, heading: str) -> SectionText:
     """The new text split at its ``---`` lines and pipe-row tables, checked to keep the
     section's horizontal lines and tables as they are: the same lines in the same places, the
-    same tables at the same rows and columns. A section without lines (or tables) takes a
-    ``---`` line (or a pipe row) as ordinary text. A text that does not keep them is refused in
-    plain words, before the card (D-50)."""
-    has_rules = any(sep.kind == RULE for sep in layout.seps)
-    has_tables = any(sep.kind == TABLE for sep in layout.seps)
+    same tables at the same rows and columns. A ``---`` line and a pipe row are always
+    structure, so text that carries one the section does not have is refused too, and the card
+    always shows what is written. A line that reads like the marker line is refused, and so is
+    a line that starts with ``|`` but is not a whole row. Refused in plain words, before the
+    card (D-50)."""
     lines = text.split("\n")
     parts: list[list[str]] = [[]]
     seps: list[tuple[str, tuple[tuple[str, ...], ...]]] = []
     i = 0
     while i < len(lines):
-        if has_rules and lines[i].strip() == RULE_LINE:
+        if lines[i].strip() == RULE_LINE:
             seps.append((RULE, ()))
             parts.append([])
             i += 1
-        elif has_tables and _is_table_row(lines[i]):
+        elif _is_table_row(lines[i]):
             rows: list[tuple[str, ...]] = []
             while i < len(lines) and _is_table_row(lines[i]):
                 rows.append(_table_row(lines[i]))
@@ -441,45 +488,58 @@ def parse_section_text(text: str, layout: SectionLayout, heading: str) -> Sectio
             seps.append((TABLE, tuple(rows)))
             parts.append([])
         else:
+            line = lines[i].strip()
+            if line.startswith("|"):
+                raise ConnectorError(SECTION_PIPE_LINE_TEXT.format(heading=heading))
+            if line and line == heading.strip():
+                raise ConnectorError(SECTION_MARKER_TEXT.format(heading=heading))
             parts[-1].append(lines[i])
             i += 1
     parsed = SectionText(tuple("".join(f"{ln}\n" for ln in part) for part in parts), tuple(seps))
-    _check_section_text(parsed, layout, heading)
+    _check_rule_count(parsed, layout, heading)
+    _check_table_shapes(parsed, layout, heading)
     return parsed
 
 
-def _check_section_text(parsed: SectionText, layout: SectionLayout, heading: str) -> None:
-    old_kinds = [sep.kind for sep in layout.seps]
-    new_kinds = [kind for kind, _ in parsed.seps]
-    rules = old_kinds.count(RULE)
-    old_tables = [sep.table for sep in layout.seps if sep.table is not None]
-    if old_kinds != new_kinds and (
-        new_kinds.count(RULE) != rules or new_kinds.count(TABLE) == len(old_tables)
-    ):
-        raise ConnectorError(
-            SECTION_RULES_TEXT.format(
-                count=rules,
-                lines="line" if rules == 1 else "lines",
-                heading=heading,
-                each="it" if rules == 1 else "each one",
-            )
+def _check_rule_count(parsed: SectionText, layout: SectionLayout, heading: str) -> None:
+    rules = sum(sep.kind == RULE for sep in layout.seps)
+    if sum(kind == RULE for kind, _ in parsed.seps) == rules:
+        return
+    if rules == 0:
+        raise ConnectorError(SECTION_NO_RULES_TEXT.format(heading=heading))
+    raise ConnectorError(
+        SECTION_RULES_TEXT.format(
+            count=rules,
+            lines="line" if rules == 1 else "lines",
+            heading=heading,
+            each="it" if rules == 1 else "each one",
         )
-    new_tables = [rows for kind, rows in parsed.seps if kind == TABLE]
-    shapes_match = len(new_tables) == len(old_tables) and all(
-        len(rows) == len(old.rows) and all(len(row) == len(old.rows[0]) for row in rows)
-        for rows, old in zip(new_tables, old_tables)
     )
-    if not shapes_match:
-        first = old_tables[0]
-        for rows, old in zip(new_tables, old_tables):
-            first = old
-            if len(rows) != len(old.rows) or any(len(row) != len(old.rows[0]) for row in rows):
-                break
+
+
+def _check_table_shapes(parsed: SectionText, layout: SectionLayout, heading: str) -> None:
+    old_tables = [sep.table for sep in layout.seps if sep.table is not None]
+    new_tables = [rows for kind, rows in parsed.seps if kind == TABLE]
+    if not old_tables:
+        if new_tables:
+            raise ConnectorError(SECTION_NO_TABLE_TEXT.format(heading=heading))
+        return
+    for i, old in enumerate(old_tables):
+        rows = new_tables[i] if i < len(new_tables) else ()
+        if len(rows) != len(old.rows) or any(len(row) != len(old.rows[0]) for row in rows):
+            raise ConnectorError(
+                SECTION_TABLE_TEXT.format(
+                    heading=heading, rows=len(old.rows), columns=len(old.rows[0])
+                )
+            )
+    if len(new_tables) != len(old_tables):
         raise ConnectorError(
             SECTION_TABLE_TEXT.format(
-                heading=heading, rows=len(first.rows), columns=len(first.rows[0])
+                heading=heading, rows=len(old_tables[0].rows), columns=len(old_tables[0].rows[0])
             )
         )
+    if [sep.kind for sep in layout.seps] != [kind for kind, _ in parsed.seps]:
+        raise ConnectorError(SECTION_ORDER_TEXT.format(heading=heading))
 
 
 def section_card_text(text: str) -> str:
@@ -521,41 +581,43 @@ def section_control_char_error(text: str) -> str | None:
 
 
 def section_write_plan(
-    doc: DocRead, start: int, end: int, text: str
-) -> tuple[int, str, int, int, int, int]:
-    """The Docs batchUpdate plan that replaces the section ``[start, end)`` with ``text`` and
-    keeps the heading, as real Google accepts it (D-50): ``(insert_index, insert_text,
-    delete_start, delete_end, style_start, style_end)``.
+    doc: DocRead, start: int, end: int, text: str, *, keep_newline: bool = False
+) -> DocEdit:
+    """The Docs batchUpdate plan that replaces the section part ``[start, end)`` with ``text``
+    and keeps what surrounds it, as real Google accepts it (D-50).
 
-    The new text is inserted FIRST at the start of the section's first content paragraph, so
-    the new paragraphs take that paragraph's NORMAL style; the old range is then deleted at
-    its shifted position (``+ utf16_len(insert_text)``). An empty section has no content
-    paragraph to inherit from, so the inserted range is normalised to NORMAL_TEXT and its
-    bullets cleared (``style_start``/``style_end``); a section that ends at the body end keeps
-    the body's final newline (delete up to ``end - 1``, insert without a trailing newline); a
+    The new text is inserted FIRST at the start of the part's first paragraph, so the new
+    paragraphs take that paragraph's NORMAL style; the old range is then deleted at its
+    shifted position (``+ utf16_len(insert_text)``). Every inserted range has its bold and
+    underline switched off, so a new paragraph never takes the marker's look and ends the
+    section. An empty part has no paragraph to inherit from, so its inserted range is also
+    normalised to NORMAL_TEXT with its bullets cleared (``paragraphs``). A part that ends at
+    the body end, or right before a table (``keep_newline``), keeps its final newline (Google
+    refuses to delete it): insert without a trailing newline, delete up to ``end - 1``. A
     heading that is the Doc's last paragraph inserts before that final newline, with a leading
-    newline to start the new paragraph. ``style_start == style_end`` means no normalisation.
-    """
+    newline to start the new paragraph."""
     body_end = doc.paragraphs[-1].end_index
     if start == end and start == body_end:
         # The heading is the Doc's last paragraph: insert before the body's final newline.
         insert_index = body_end - 1
         insert_text = "\n" + text
         length = utf16_len(insert_text)
-        return insert_index, insert_text, 0, 0, insert_index + 1, insert_index + length
+        return DocEdit(
+            insert_index, insert_text, 0, 0, insert_index + 1, insert_index + length, True
+        )
     if start == end:
-        # An empty section before another heading: insert, then normalise the inserted range.
+        # An empty part before another heading: insert, then normalise the inserted range.
         insert_text = text + "\n"
         length = utf16_len(insert_text)
-        return start, insert_text, 0, 0, start, start + length
-    if end == body_end:
-        # The section ends at the body end: keep the final newline, insert without a trailing one.
-        insert_text = text
-        length = utf16_len(insert_text)
-        return start, insert_text, start + length, end - 1 + length, 0, 0
+        return DocEdit(start, insert_text, 0, 0, start, start + length, True)
+    if end == body_end or keep_newline:
+        # The part ends at the body end or a table: keep the final newline, insert without a
+        # trailing one.
+        length = utf16_len(text)
+        return DocEdit(start, text, start + length, end - 1 + length, start, start + length, False)
     insert_text = text + "\n"
     length = utf16_len(insert_text)
-    return start, insert_text, start + length, end + length, 0, 0
+    return DocEdit(start, insert_text, start + length, end + length, start, start + length, False)
 
 
 def section_edits(doc: DocRead, layout: SectionLayout, text: str, heading: str) -> list[DocEdit]:
@@ -567,18 +629,24 @@ def section_edits(doc: DocRead, layout: SectionLayout, text: str, heading: str) 
     table (Google refuses text at a table's first index)."""
     parsed = parse_section_text(text, layout, heading)
     body_end = doc.paragraphs[-1].end_index
+    before_structure = {sep.start for sep in layout.seps if sep.kind == TABLE} | {
+        fs for fs, _ in doc.foreign
+    }
     found: list[tuple[int, DocEdit]] = []
     for i, (part, new) in enumerate(zip(layout.parts, parsed.parts)):
         if new == part.text:
             continue
+        keep = part.end in before_structure
         if not new:
-            end = part.end - 1 if part.end == body_end else part.end
+            end = part.end - 1 if part.end == body_end or keep else part.end
             if end > part.start:
-                found.append((part.start, (0, "", part.start, end, 0, 0)))
+                found.append((part.start, DocEdit(0, "", part.start, end, 0, 0, False)))
             continue
         if part.start == part.end and i < len(layout.seps) and layout.seps[i].kind == TABLE:
             raise ConnectorError(SECTION_BEFORE_TABLE_TEXT.format(heading=heading))
-        found.append((part.start, section_write_plan(doc, part.start, part.end, new[:-1])))
+        found.append(
+            (part.start, section_write_plan(doc, part.start, part.end, new[:-1], keep_newline=keep))
+        )
     for sep, (_, rows) in zip(
         (sep for sep in layout.seps if sep.table is not None),
         (entry for entry in parsed.seps if entry[0] == TABLE),
@@ -591,13 +659,14 @@ def section_edits(doc: DocRead, layout: SectionLayout, text: str, heading: str) 
                 found.append(
                     (
                         cell.start_index,
-                        (
+                        DocEdit(
                             cell.start_index,
                             new_text,
                             cell.start_index + shift,
                             cell.end_index + shift,
                             0,
                             0,
+                            False,
                         ),
                     )
                 )
@@ -1186,8 +1255,6 @@ class DriveConnector:
         return {
             "revision_id": doc.revision_id,
             "before": before,
-            "content_start": layout.start,
-            "content_end": layout.end,
             "item_title": doc.title,
             "item_url": file.web_view_link or f"https://drive.google.com/file/d/{grant.doc_id}",
         }

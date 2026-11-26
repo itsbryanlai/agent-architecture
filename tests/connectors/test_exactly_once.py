@@ -39,7 +39,6 @@ from tests.helpers.drive import (
     DRIVE_TEMPLATE,
     SECTION_BEFORE,
     SECTION_HEADING,
-    SECTION_PARAGRAPHS,
     SHEET_COLUMNS,
     SHEET_TAB,
     TEMPLATE_BLANKS,
@@ -803,17 +802,6 @@ async def grant_section_doc(h):
 
 
 def replace_spec(text: str = "The VPN is back up.") -> TaskSpec:
-    from agentos.connectors.drive import heading_matches, section_bounds
-    from agentos.connectors.google_iam import DocParagraph, DocRead, utf16_len
-
-    paragraphs = []
-    idx = 0
-    for p in SECTION_PARAGRAPHS:
-        end = idx + utf16_len(p["text"])
-        paragraphs.append(DocParagraph(p["text"], p["style"], idx, end))
-        idx = end
-    doc = DocRead("1", "VPN guide", tuple(paragraphs))
-    start, end, _ = section_bounds(doc, heading_matches(doc.paragraphs, SECTION_HEADING)[0])
     ctx = TurnContext(TENANT, "it-helper", 1, ALICE, "C_GENERAL", "1700000000.000100", "channel")
     payload = {
         "page_id": DRIVE_SECTION,
@@ -823,8 +811,6 @@ def replace_spec(text: str = "The VPN is back up.") -> TaskSpec:
         "text": text,
         "before": SECTION_BEFORE,
         "revision_id": "1",
-        "content_start": start,
-        "content_end": end,
         "item_title": "VPN guide",
         "item_url": f"https://drive.google.com/file/d/{DRIVE_SECTION}",
     }

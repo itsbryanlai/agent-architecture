@@ -52,7 +52,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import NamedTuple, Protocol
 from urllib.parse import quote
 
 import requests
@@ -328,12 +328,14 @@ class DocCell:
     """One cell of a table: its text (a single paragraph, without its final newline) and the
     UTF-16 range ``[start_index, end_index)`` of that text, which a cell write deletes and
     refills. ``plain`` is False for a cell holding several paragraphs or anything but text,
-    which the section write does not edit (D-50)."""
+    which the section write does not edit; ``why`` names what it holds ("an image", "several
+    paragraphs", "other content") (D-50)."""
 
     text: str
     start_index: int
     end_index: int
     plain: bool = True
+    why: str = ""
 
 
 @dataclass(frozen=True)
@@ -363,12 +365,21 @@ class DocRead:
     tables: tuple[DocTable, ...] = ()
 
 
-# One edit of a section write, in the Doc's indices as read: ``(insert_index, insert_text,
-# delete_start, delete_end, style_start, style_end)``. The text is inserted first, then the
-# shifted old range deleted, then the inserted range normalised to plain text when
-# ``style_end > style_start``. A write carries its edits last-in-the-Doc first, so each one's
-# indices still hold when it runs (D-50).
-DocEdit = tuple[int, str, int, int, int, int]
+class DocEdit(NamedTuple):
+    """One edit of a section write, in the Doc's indices as read. The text is inserted first,
+    then the shifted old range ``[delete_start, delete_end)`` deleted, then the inserted range
+    ``[style_start, style_end)`` has its bold and underline switched off, and with
+    ``paragraphs`` its paragraphs set to NORMAL_TEXT with their bullets cleared. A write
+    carries its edits last-in-the-Doc first, so each one's indices still hold when it runs
+    (D-50)."""
+
+    insert_index: int
+    insert_text: str
+    delete_start: int
+    delete_end: int
+    style_start: int = 0
+    style_end: int = 0
+    paragraphs: bool = False
 
 
 def utf16_len(text: str) -> int:
@@ -1562,42 +1573,47 @@ class RealGoogleAccounts:
             try:
                 # Each edit inserts its new text first, so the new paragraphs take the style
                 # at the index, then deletes the old range at its shifted position (the caller
-                # passes the shifted indices). An empty part has no paragraph to inherit
-                # from, so its inserted range is normalised to NORMAL_TEXT, its bullets
-                # cleared and its bold and underline switched off. The writeControl locks the
+                # passes the shifted indices). Every inserted range has its bold and underline
+                # switched off, so a new line never takes the marker's look; an empty part has
+                # no paragraph to inherit from, so its range is also normalised to NORMAL_TEXT
+                # with its bullets cleared. The writeControl locks the
                 # batchUpdate to the read revision: a Doc that moved answers 400
                 # FAILED_PRECONDITION and nothing is written.
                 requests: list[dict] = []
-                for insert_index, insert_text, delete_start, delete_end, s_start, s_end in edits:
-                    if insert_text:
+                for edit in edits:
+                    if edit.insert_text:
                         requests.append(
                             {
                                 "insertText": {
-                                    "location": {"index": insert_index},
-                                    "text": insert_text,
+                                    "location": {"index": edit.insert_index},
+                                    "text": edit.insert_text,
                                 }
                             }
                         )
-                    if delete_end > delete_start:
+                    if edit.delete_end > edit.delete_start:
                         requests.append(
                             {
                                 "deleteContentRange": {
-                                    "range": {"startIndex": delete_start, "endIndex": delete_end}
+                                    "range": {
+                                        "startIndex": edit.delete_start,
+                                        "endIndex": edit.delete_end,
+                                    }
                                 }
                             }
                         )
-                    if s_end > s_start:
-                        style_range = {"startIndex": s_start, "endIndex": s_end}
-                        requests.append(
-                            {
-                                "updateParagraphStyle": {
-                                    "range": style_range,
-                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-                                    "fields": "namedStyleType",
+                    if edit.style_end > edit.style_start:
+                        style_range = {"startIndex": edit.style_start, "endIndex": edit.style_end}
+                        if edit.paragraphs:
+                            requests.append(
+                                {
+                                    "updateParagraphStyle": {
+                                        "range": style_range,
+                                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                        "fields": "namedStyleType",
+                                    }
                                 }
-                            }
-                        )
-                        requests.append({"deleteParagraphBullets": {"range": style_range}})
+                            )
+                            requests.append({"deleteParagraphBullets": {"range": style_range}})
                         requests.append(
                             {
                                 "updateTextStyle": {
@@ -1709,7 +1725,14 @@ def _doc_body(
                 text += content
                 if content.strip():
                     style = run["textRun"].get("textStyle", {})
-                    styled.append((bool(style.get("bold")), bool(style.get("underline"))))
+                    # A link is shown underlined by Docs without the owner underlining it:
+                    # it does not count as underline.
+                    styled.append(
+                        (
+                            bool(style.get("bold")),
+                            bool(style.get("underline")) and "link" not in style,
+                        )
+                    )
             elif "horizontalRule" in run:
                 rule = True
             elif "inlineObjectElement" in run:
@@ -1729,21 +1752,34 @@ def _doc_body(
     return tuple(paragraphs), tuple(foreign), tuple(tables)
 
 
+def _cell_why(content: list) -> str:
+    """What stops a table cell being plain text, or "" when it is one paragraph of text runs:
+    an inline image, several paragraphs, or any other element (D-50)."""
+    if len(content) != 1 or "paragraph" not in content[0]:
+        return "several paragraphs" if len(content) > 1 else "other content"
+    for run in content[0]["paragraph"].get("elements", []):
+        if "inlineObjectElement" in run:
+            return "an image"
+        if "textRun" not in run:
+            return "other content"
+    return ""
+
+
 def _doc_table(table: dict, start: int, end: int) -> DocTable:
     """A table element as rows of cells. A cell's editable range is its one paragraph's text,
-    without the paragraph's final newline; a cell with several paragraphs or a non-paragraph
-    element is not ``plain`` (D-50)."""
+    without the paragraph's final newline; a cell with several paragraphs, an inline image or
+    any other element than text is not ``plain`` and says why (D-50)."""
     rows: list[tuple[DocCell, ...]] = []
     for row in table.get("tableRows", []):
         cells: list[DocCell] = []
         for cell in row.get("tableCells", []):
             content = cell.get("content", [])
-            if len(content) == 1 and "paragraph" in content[0]:
+            why = _cell_why(content)
+            if not why:
                 para = content[0]
                 text = "".join(
                     run["textRun"].get("content", "")
                     for run in para["paragraph"].get("elements", [])
-                    if "textRun" in run
                 )
                 cells.append(
                     DocCell(
@@ -1755,7 +1791,7 @@ def _doc_table(table: dict, start: int, end: int) -> DocTable:
             else:
                 first = int(content[0].get("startIndex", 0)) if content else 0
                 last = int(content[-1]["endIndex"]) - 1 if content else 0
-                cells.append(DocCell("", first, last, plain=False))
+                cells.append(DocCell("", first, last, plain=False, why=why))
         rows.append(tuple(cells))
     return DocTable(start, end, tuple(rows))
 
@@ -1781,7 +1817,11 @@ def _u16_slice(text: str, start: int, end: int | None = None) -> str:
 def _fake_attrs(p: dict) -> dict:
     """A fake paragraph's formatting (named style, bullet, bold, underline), without its text
     and its structural markers: what an insertion at the paragraph inherits."""
-    return {k: v for k, v in p.items() if k not in ("text", "kind", "rule", "size", "rows")}
+    return {
+        k: v
+        for k, v in p.items()
+        if k not in ("text", "kind", "rule", "size", "rows", "image_cells")
+    }
 
 
 def _fake_cell_footprint(text: str) -> int:
@@ -1914,9 +1954,11 @@ def _fake_delete(paragraphs: list[dict], delete_start: int, delete_end: int) -> 
     range reaching the body end is refused. The range lies inside one table cell's text, or
     inside one run of text paragraphs: a range over a table or a horizontal line is refused
     (D-50)."""
-    bounds, _, _, body_end = _fake_doc_index(paragraphs)
+    bounds, table_starts, _, body_end = _fake_doc_index(paragraphs)
     if delete_end >= body_end:
         raise GoogleError("refused", "Cannot delete the document's final newline.", status=400)
+    if delete_end in table_starts and _fake_in_cell(paragraphs, delete_start, delete_end) is None:
+        raise GoogleError("refused", "Cannot delete the newline before a table.", status=400)
     cell = _fake_in_cell(paragraphs, delete_start, delete_end)
     if cell is not None:
         pos, r, c, text_start = cell
@@ -1971,15 +2013,17 @@ def _fake_is_text(p: dict) -> bool:
 def _fake_restyle(
     paragraphs: list[dict], style_start: int, style_end: int, *, clear_bullets: bool
 ) -> list[dict]:
-    """Google's updateParagraphStyle (NORMAL_TEXT), deleteParagraphBullets and updateTextStyle
-    (no bold, no underline) over a range: every text paragraph the range touches takes the
-    named style, loses its bullets and its bold and underline."""
+    """Google's updateTextStyle (no bold, no underline) over a range, and with ``clear_bullets``
+    also updateParagraphStyle (NORMAL_TEXT) and deleteParagraphBullets: every text paragraph the
+    range touches loses its bold and underline, and with ``clear_bullets`` takes the named
+    style and loses its bullets."""
     bounds, _, _, _ = _fake_doc_index(paragraphs)
     result: list[dict] = []
     for p, (s, e) in zip(paragraphs, bounds):
         if _fake_is_text(p) and s < style_end and e > style_start:
-            p = {**p, "style": "NORMAL_TEXT", "bold": False, "underline": False}
+            p = {**p, "bold": False, "underline": False}
             if clear_bullets:
+                p["style"] = "NORMAL_TEXT"
                 p["bullet"] = False
         result.append(p)
     return result
@@ -2794,8 +2838,8 @@ class FakeGoogleAccounts:
                         p.get("style", "NORMAL_TEXT"),
                         s,
                         e,
-                        bold=bool(p.get("bold")),
-                        underline=bool(p.get("underline")),
+                        bold=bool(p.get("bold")) and bool(p["text"].strip()),
+                        underline=bool(p.get("underline")) and bool(p["text"].strip()),
                         rule=bool(p.get("rule")),
                     )
                 )
@@ -2806,8 +2850,17 @@ class FakeGoogleAccounts:
                         s,
                         e,
                         tuple(
-                            tuple(DocCell(text, ts, te) for text, (ts, te) in zip(row, row_cells))
-                            for row, row_cells in zip(p["rows"], cells)
+                            tuple(
+                                DocCell(
+                                    text,
+                                    ts,
+                                    te,
+                                    plain=(r, c) not in p.get("image_cells", ()),
+                                    why="an image" if (r, c) in p.get("image_cells", ()) else "",
+                                )
+                                for c, (text, (ts, te)) in enumerate(zip(row, row_cells))
+                            )
+                            for r, (row, row_cells) in enumerate(zip(p["rows"], cells))
                         ),
                     )
                 )
@@ -2843,13 +2896,15 @@ class FakeGoogleAccounts:
         # NORMAL_TEXT and clear its bullets. A table's start index refuses an insert. A refused
         # request leaves the Doc as it was.
         result = doc["paragraphs"]
-        for insert_index, insert_text, delete_start, delete_end, style_start, style_end in edits:
-            if insert_text:
-                result = _fake_insert(result, insert_index, insert_text)
-            if delete_end > delete_start:
-                result = _fake_delete(result, delete_start, delete_end)
-            if style_end > style_start:
-                result = _fake_restyle(result, style_start, style_end, clear_bullets=True)
+        for edit in edits:
+            if edit.insert_text:
+                result = _fake_insert(result, edit.insert_index, edit.insert_text)
+            if edit.delete_end > edit.delete_start:
+                result = _fake_delete(result, edit.delete_start, edit.delete_end)
+            if edit.style_end > edit.style_start:
+                result = _fake_restyle(
+                    result, edit.style_start, edit.style_end, clear_bullets=edit.paragraphs
+                )
         doc["paragraphs"] = result
         # The revision is opaque, as Google's revisionId is: a write moves it to a fresh token,
         # never a number a caller could predict or compare arithmetically.

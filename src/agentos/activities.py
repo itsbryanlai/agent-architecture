@@ -2541,8 +2541,6 @@ class AgentActivities:
             "page_id": grant.doc_id,
             "before": section["before"],
             "revision_id": section["revision_id"],
-            "content_start": section["content_start"],
-            "content_end": section["content_end"],
             "item_title": section["item_title"],
             "item_url": section["item_url"],
         }
@@ -4006,7 +4004,7 @@ def format_section_view(heading: str, title: str, view: str) -> str:
     """A section's view as the model reads it: wrapped as untrusted data, so no text inside
     can close the tag. Only a closing tag is neutralised; the rest stays as the Doc has it, so
     the model can write it back."""
-    body = re.sub(r"</(section)", r"&lt;/\1", view, flags=re.IGNORECASE)
+    body = re.sub(r"<(\s*/\s*section)", r"&lt;\1", view, flags=re.IGNORECASE)
     return (
         f'<section heading="{escape_attribute(heading)}" doc="{escape_attribute(title)}">\n'
         f"{body}\n</section>\n"

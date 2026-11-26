@@ -73,7 +73,7 @@ async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEA
     task_id = ids.task_id(TENANT, str(uuid.uuid4()))
     grant = section_grant_block()
     doc = await DriveReader(h.google, "agent@x.iam.gserviceaccount.com").read_doc(DRIVE_SECTION)
-    start, end, before = section_bounds(doc, heading_matches(doc.paragraphs, heading)[0])
+    _, _, before = section_bounds(doc, heading_matches(doc.paragraphs, heading)[0])
     await h.acts.content.put_draft(
         TENANT,
         task_id,
@@ -86,8 +86,6 @@ async def start_replace_task(h, text: str = NEW_TEXT, heading: str = SECTION_HEA
             "page_id": DRIVE_SECTION,
             "before": before,
             "revision_id": doc.revision_id,
-            "content_start": start,
-            "content_end": end,
             "item_title": grant["name"],
             "item_url": DOC_LINK,
         },

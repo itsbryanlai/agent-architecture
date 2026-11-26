@@ -1277,10 +1277,10 @@ class ControlPlane:
             if file.mime_type != MIME_DOC or file.trashed:
                 raise ConfigError(f"template '{grant.name}' must be a Google Doc")
             try:
-                sections = await reader.export_file(grant.id, MIME_DOC)
+                text = await reader.read_template_text(grant.id)
             except GoogleError as err:
                 raise ConfigError(f"could not read the template '{grant.name}': {err}") from err
-            names = list(template_blank_names("\n".join(s.text for s in sections)))
+            names = list(template_blank_names(text))
             if len(names) > MAX_TEMPLATE_BLANKS:
                 raise ConfigError(
                     f"template '{grant.name}' has more than {MAX_TEMPLATE_BLANKS} blanks"

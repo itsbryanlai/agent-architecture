@@ -471,6 +471,13 @@ class GoogleAccounts(Protocol):
         is left."""
         ...
 
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        """The text of every part of a Doc that can hold a ``{{blank}}``: one
+        ``documents.get`` of every tab's body, headers, footers and footnotes, joined with
+        newlines. The plain-text export leaves headers and footers out, so the template
+        blank read and the post-fill check use this instead (D-49)."""
+        ...
+
     async def read_doc(self, email: str, file_id: str) -> DocRead:
         """One ``documents.get`` of a Doc: its revisionId, title and body paragraphs (each
         with its text, named style and UTF-16 start/end index). The section write reads the
@@ -1422,7 +1429,11 @@ class RealGoogleAccounts:
                 # One replaceAllText per replacement, in order, literal text (no markup
                 # interpretation): the create write's two passes — blank forms to sentinels,
                 # sentinels to values. A string no longer present is a no-op, so a retry
-                # fills only what is left.
+                # fills only what is left. ``replaceAllText`` takes no segment or header
+                # setting: its reference says only "all instances of text matching a
+                # criteria" and, without ``tabsCriteria``, every tab. Whether that reaches
+                # headers and footers is not stated there, so the create write reads every
+                # segment after the fill and refuses while a blank is left.
                 response = self._send(
                     session,
                     "POST",
@@ -1442,6 +1453,31 @@ class RealGoogleAccounts:
                 )
                 self._check_drive(response)
                 _json_object(response)
+            finally:
+                if self._drive_session is None:
+                    session.close()
+
+        return await asyncio.to_thread(call)
+
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        token = await self._drive_token(email)
+
+        def call() -> str:
+            session = self._drive_session_for_call()
+            try:
+                response = self._send(
+                    session,
+                    "GET",
+                    f"{DOCS}/documents/{quote(file_id, safe='')}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"includeTabsContent": "true", "fields": "tabs"},
+                )
+                self._check_drive(response)
+                body = _json_object(response)
+                try:
+                    return "\n".join(_doc_segment_texts(body.get("tabs", [])))
+                except (KeyError, TypeError, AttributeError) as err:
+                    raise GoogleError("unavailable") from err
             finally:
                 if self._drive_session is None:
                     session.close()
@@ -1561,6 +1597,39 @@ def _is_revision_mismatch(response: requests.Response) -> bool:
     except (ValueError, KeyError, TypeError):
         pass
     return _drive_reason(response) == "failedPrecondition"
+
+
+def _structural_text(content: list) -> str:
+    """The text of a list of structural elements: paragraph runs joined within a paragraph,
+    table cells and tables of contents walked, one line per paragraph."""
+    lines: list[str] = []
+    for element in content:
+        if "paragraph" in element:
+            runs = element["paragraph"].get("elements", [])
+            lines.append(
+                "".join(r.get("textRun", {}).get("content", "") for r in runs).rstrip("\n")
+            )
+        elif "table" in element:
+            for row in element["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    lines.append(_structural_text(cell.get("content", [])))
+        elif "tableOfContents" in element:
+            lines.append(_structural_text(element["tableOfContents"].get("content", [])))
+    return "\n".join(lines)
+
+
+def _doc_segment_texts(tabs: list) -> list[str]:
+    """The text of the body, every header, every footer and every footnote of each tab
+    (child tabs included), each as one string."""
+    texts: list[str] = []
+    for tab in tabs:
+        doc_tab = tab.get("documentTab", {})
+        texts.append(_structural_text(doc_tab.get("body", {}).get("content", [])))
+        for key in ("headers", "footers", "footnotes"):
+            for segment in doc_tab.get(key, {}).values():
+                texts.append(_structural_text(segment.get("content", [])))
+        texts.extend(_doc_segment_texts(tab.get("childTabs", [])))
+    return texts
 
 
 def _doc_body(body: dict) -> tuple[tuple[DocParagraph, ...], tuple[tuple[int, int], ...]]:
@@ -1875,6 +1944,12 @@ class FakeGoogleAccounts:
         self.drive_files: dict[str, DriveFile] = {}
         self.drive_children: dict[str, list[str]] = {}
         self.drive_content: dict[str, list[DriveSection]] = {}
+        # The text of a Doc's headers and footers, which the plain-text export leaves out:
+        # the structural read returns it, a copy carries it and the fill replaces in it.
+        self.drive_segments: dict[str, list[str]] = {}
+        # False models a fill that does not reach headers and footers, so the post-fill
+        # check has something to catch.
+        self.fill_reaches_segments = True
         self.drive_refused: set[str] = set()
         # The comments each file carries, as Google returns them (id, content, author).
         # ``comment_calls`` and ``comment_list_calls`` record the (email, file ID) of every
@@ -1912,6 +1987,7 @@ class FakeGoogleAccounts:
         # index refuses an insert). The replace failure injections live in ``_after_write``.
         self.docs: dict[str, dict] = {}
         self.doc_read_calls: list[tuple[str, str]] = []
+        self.template_read_calls: list[tuple[str, str]] = []
         self.doc_replace_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
         self.get_calls: list[tuple[str, str]] = []
@@ -2057,6 +2133,10 @@ class FakeGoogleAccounts:
 
     def set_drive_content(self, file_id: str, sections: list[DriveSection]) -> None:
         self.drive_content[file_id] = list(sections)
+
+    def set_drive_segments(self, file_id: str, texts: list[str]) -> None:
+        """A Doc's header and footer texts, as ``documents.get`` returns them."""
+        self.drive_segments[file_id] = list(texts)
 
     def trash_drive_file(self, file_id: str) -> None:
         self.drive_files[file_id] = replace(self.drive_files[file_id], trashed=True)
@@ -2427,6 +2507,7 @@ class FakeGoogleAccounts:
         )
         self.drive_files[new_id] = copied
         self.drive_content[new_id] = list(self.drive_content.get(template_id, []))
+        self.drive_segments[new_id] = list(self.drive_segments.get(template_id, []))
         self.drive_children.setdefault(folder_id, []).append(new_id)
         # The marker lands with the copy, as the one files.copy request carries it.
         self.drive_app_properties.setdefault(new_id, {})[key] = value
@@ -2467,7 +2548,22 @@ class FakeGoogleAccounts:
                 text = text.replace(old, new)
             filled.append(DriveSection(section.heading, text))
         self.drive_content[file_id] = filled
+        segments = []
+        for text in self.drive_segments.get(file_id, []):
+            for old, new in replacements if self.fill_reaches_segments else []:
+                text = text.replace(old, new)
+            segments.append(text)
+        self.drive_segments[file_id] = segments
         await self._after_write("fill")
+
+    async def read_template_text(self, email: str, file_id: str) -> str:
+        self.template_read_calls.append((email, file_id))
+        if file_id in self.drive_refused:
+            raise GoogleError("permission_denied", DRIVE_REFUSED_TEXT, status=403)
+        if file_id not in self.drive_files:
+            raise GoogleError("not_found", status=404)
+        body = [s.text for s in self.drive_content.get(file_id, [])]
+        return "\n".join(body + self.drive_segments.get(file_id, []))
 
     async def read_doc(self, email: str, file_id: str) -> DocRead:
         self.doc_read_calls.append((email, file_id))

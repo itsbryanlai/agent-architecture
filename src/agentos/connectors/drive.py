@@ -49,7 +49,6 @@ from agentos.config import DRIVE_ID, DriveGrant, Grants
 from agentos.connectors import drive_errors
 from agentos.connectors.base import MAX_WALK_DEPTH, ConnectorError, GrantDenied, UnknownItem
 from agentos.connectors.google_iam import (
-    MIME_DOC,
     MIME_FOLDER,
     DocParagraph,
     DocRead,
@@ -90,6 +89,11 @@ DOC_APP_PROPERTY_KEY = "agentos_write"
 DOC_SHAPE_CHANGED_TEXT = (
     "The template's blanks or folder changed since this agent was published; "
     "ask the creator to republish"
+)
+# The refusal when a blank is still in the copy after the fill (a header, a footer or a
+# footnote the replacement did not reach): the Doc is not reported as done.
+DOC_FILL_INCOMPLETE_TEXT = (
+    "The new Doc still has a blank the fill could not replace; it was not reported as done"
 )
 # The refusal when the destination folder sits in no shared drive: the same plain words
 # the publish refuses with, so a folder moved to My Drive reads the same everywhere.
@@ -357,6 +361,9 @@ class DriveReader:
 
     async def export_file(self, file_id: str, mime_type: str) -> list[DriveSection]:
         return await self._google.export_file(self._email, file_id, mime_type)
+
+    async def read_template_text(self, file_id: str) -> str:
+        return await self._google.read_template_text(self._email, file_id)
 
     async def get_drive(self, drive_id: str) -> DriveFile:
         return await self._google.get_drive(self._email, drive_id)
@@ -784,8 +791,7 @@ class DriveConnector:
         copy = await self._find_copy(grant, idem_key)
         if copy is None:
             return None
-        sections = await self._reader.export_file(copy.id, MIME_DOC)
-        text = "\n".join(section.text for section in sections)
+        text = await self._reader.read_template_text(copy.id)
         if any(fill_sentinel(blank) in text for blank in grant.blanks):
             return None
         if set(template_blank_names(text)) & set(grant.blanks):
@@ -816,8 +822,7 @@ class DriveConnector:
                 DOC_APP_PROPERTY_KEY,
                 doc_marker(idem_key),
             )
-        sections = await self._reader.export_file(copy.id, MIME_DOC)
-        forms = template_blank_forms("\n".join(section.text for section in sections))
+        forms = template_blank_forms(await self._reader.read_template_text(copy.id))
         replacements: list[tuple[str, str]] = []
         for blank in payload["blanks"]:
             for form in forms.get(blank, ()):
@@ -826,6 +831,13 @@ class DriveConnector:
             replacements.append((fill_sentinel(blank), payload["values"].get(blank, "")))
         if replacements:
             await self._reader.fill_doc(copy.id, replacements)
+            # The fill is proved, not assumed: no blank's form or sentinel may remain in the
+            # body, a header, a footer or a footnote.
+            left = await self._reader.read_template_text(copy.id)
+            if any(fill_sentinel(blank) in left for blank in payload["blanks"]) or set(
+                template_blank_names(left)
+            ) & set(payload["blanks"]):
+                raise ConnectorError(DOC_FILL_INCOMPLETE_TEXT)
         return NotionItem(page_id=copy.id, url=copy.web_view_link, title=copy.name, status=None)
 
     async def read_section(self, grant: DriveGrant) -> dict:

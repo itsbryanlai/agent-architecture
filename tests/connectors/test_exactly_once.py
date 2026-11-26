@@ -752,6 +752,43 @@ async def test_a_drive_create_whose_fill_response_was_lost_is_found_filled_by_th
     assert len(h.google.fill_calls) == 1
 
 
+async def test_a_blank_in_a_header_is_filled_and_a_lost_fill_response_still_makes_one_doc(
+    dharness,
+):
+    """Fails if a header blank is left in the new Doc, or the retry of a create whose fill
+    response was lost copies a second Doc or fills again."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_segments(DRIVE_TEMPLATE, ["Offer for {{name}}"])
+    task_id = ids.task_id(TENANT, "drive-create-header")
+    h.google.fail_after_write("fill")
+    with pytest.raises(GoogleError):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_segments[new_id] == ["Offer for Bob"]
+    assert len(h.google.copy_calls) == 1
+    assert len(h.google.fill_calls) == 1
+
+
+async def test_a_create_whose_fill_leaves_a_header_blank_is_not_reported_done(dharness):
+    """Fails if a create whose fill did not reach a header blank returns the Doc as done."""
+    h = dharness
+    await grant_create_template(h)
+    h.google.set_drive_segments(DRIVE_TEMPLATE, ["Offer for {{name}}"])
+    h.google.fill_reaches_segments = False
+    task_id = ids.task_id(TENANT, "drive-create-header-left")
+
+    with pytest.raises(ApplicationError, match="still has a blank"):
+        await run(h.acts.create_drive_doc, create_doc_spec(), task_id)
+
+    [new_id] = h.google.drive_children[TEMPLATE_FOLDER]
+    assert h.google.drive_segments[new_id] == ["Offer for {{name}}"]
+    assert len(h.google.copy_calls) == 1
+
+
 # --- a Drive section replace (D-50) ------------------------------------------------------
 
 
